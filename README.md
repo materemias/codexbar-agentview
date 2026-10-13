@@ -89,7 +89,7 @@ run there.
 | Requirement | Plasma widget | Tern extension | What it enables |
 | --- | :---: | :---: | --- |
 | KDE Plasma **6** (with KWin) | Required | — | The panel widget itself |
-| [Tern](https://docs.stencil.so/tern/) | — | Required | The extension itself |
+| [Tern](https://stencil.so/tern) | — | Required | The extension itself |
 | Python 3 | Required | Required | The shared helpers |
 | [`codexbar`](https://github.com/steipete/CodexBar) CLI | Required | Required | Provider usage. Without it, Agents and History still work |
 | CMake 3.21+, a C++17 compiler, Qt 6 Core/QML development files | Required | — | Building the widget. On Arch: `base-devel`, `cmake`, `qt6-declarative` |
@@ -372,7 +372,7 @@ enabled, even with the Agents tab hidden.
 ### Tern plugin
 
 The native Tern extension lives in `tern/`. It shows the same Usage, Agents
-and History tabs inside [Tern](https://docs.stencil.so/tern/), drawn with
+and History tabs inside [Tern](https://stencil.so/tern), drawn with
 Tern's own cards, meters, lists and theme. It uses the shared helpers in
 `contents/scripts` from this checkout. It runs without the Plasma widget and
 without KDE, or alongside the widget using the same cached provider
