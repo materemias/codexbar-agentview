@@ -42,24 +42,42 @@ It started as a Linux port of the macOS
 `codexbar` CLI for usage data.
 This is an independent project, not an official CodexBar module.
 
+[KDE Plasma widget](#kde-plasma-widget) · [Tern extension](#tern-terminal-extension) ·
 [Requirements](#requirements) · [Install](#install) ·
-[Tern extension](#tern-plugin) · [Keyboard shortcuts](#keyboard-shortcuts) ·
+[Keyboard shortcuts](#keyboard-shortcuts) ·
 [Features](#features) · [Supported providers](#supported-providers) ·
 [Supported agents](#supported-agent-sessions) ·
 [Credentials](#configure-provider-credentials) · [Configuration](#configuration) ·
 [Update](#update)
 
-**Panel:** usage rings per provider and window, coloured by pace, and dots
-counting working, blocked and idle agents.
+## KDE Plasma widget
+
+The panel shows usage rings per provider and window, coloured by pace, and
+dots counting working, blocked and idle agents. Clicking it, or `Super+A`,
+opens the popup.
 
 [![Panel indicators](docs/panel.png)](docs/panel.png)
 
 | Usage | Agents | History |
 | :---: | :---: | :---: |
-| [![Usage tab](docs/usage.png)](docs/usage.png) | [![Agents tab](docs/agents.png)](docs/agents.png) | [![History tab](docs/history.png)](docs/history.png) |
+| [![Usage tab](docs/plasma-usage.png)](docs/plasma-usage.png) | [![Agents tab](docs/plasma-agents.png)](docs/plasma-agents.png) | [![History tab](docs/plasma-history.png)](docs/plasma-history.png) |
 
 The screenshots use made-up accounts and sessions. Drag the popup's edges
 to resize it within the available screen space.
+
+## Tern terminal extension
+
+Tern's status line shows Claude and Codex usage and the agent counts in
+every window. Clicking a segment, `Ctrl+Alt+A` or `Ctrl+Alt+U` opens the
+dashboard as a temporary sidebar. Details are under [Tern plugin](#tern-plugin).
+
+![Tern status line](docs/tern/status-line.png)
+
+| Usage | Agents | History | Settings |
+| :---: | :---: | :---: | :---: |
+| [![Tern usage](docs/tern/usage.png)](docs/tern/usage.png) | [![Tern agents](docs/tern/agents.png)](docs/tern/agents.png) | [![Tern history](docs/tern/history.png)](docs/tern/history.png) | [![Tern settings](docs/tern/settings-general.png)](docs/tern/settings-general.png) |
+
+The screenshots use a demo account, made-up provider accounts and sessions.
 
 ## Requirements
 
@@ -360,29 +378,9 @@ Tern's own cards, meters, lists and theme. It uses the shared helpers in
 without KDE, or alongside the widget using the same cached provider
 measurements and session snapshot.
 
-| Usage | Agents | History |
-| :---: | :---: | :---: |
-| [![Tern usage](docs/tern/usage.png)](docs/tern/usage.png) | [![Tern agents](docs/tern/agents.png)](docs/tern/agents.png) | [![Tern history](docs/tern/history.png)](docs/tern/history.png) |
-| **Conversation** | **Row actions** | **Filter** |
-| [![Selected session's conversation](docs/tern/agents-conversation.png)](docs/tern/agents-conversation.png) | [![Selected row's actions](docs/tern/agents-actions.png)](docs/tern/agents-actions.png) | [![Filtered agents](docs/tern/agents-filtered.png)](docs/tern/agents-filtered.png) |
-| **History peek** | **Sidebar open** | **Sidebar closed** |
-| [![History conversation](docs/tern/history-conversation.png)](docs/tern/history-conversation.png) | [![Dashboard as a sidebar](docs/tern/sidebar-open.png)](docs/tern/sidebar-open.png) | [![Layout after closing](docs/tern/sidebar-closed.png)](docs/tern/sidebar-closed.png) |
-
-| Settings: General | Settings: Providers | Settings: Search |
-| :---: | :---: | :---: |
-| [![General settings](docs/tern/settings-general.png)](docs/tern/settings-general.png) | [![Provider settings](docs/tern/settings-providers.png)](docs/tern/settings-providers.png) | [![Settings search](docs/tern/settings-search.png)](docs/tern/settings-search.png) |
-| **Usage** | **Agents** | **About** |
-| [![Usage settings](docs/tern/settings-usage.png)](docs/tern/settings-usage.png) | [![Agent settings](docs/tern/settings-agents.png)](docs/tern/settings-agents.png) | [![About](docs/tern/settings-about.png)](docs/tern/settings-about.png) |
-
-The screenshots use a demo account, made-up provider accounts and sessions.
-
 ```sh
 tern plugin link tern        # from the repository root
 ```
-
-The status line at the bottom of every Tern window:
-
-![Tern status line](docs/tern/status-line.png)
 
 - **Status line.** Claude and Codex usage (`5h · 7d`, coloured by pace; other
   providers appear once a window runs hot), agent counts and sessions waiting

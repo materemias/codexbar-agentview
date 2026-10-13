@@ -229,6 +229,19 @@ Window {
 '''
 
 
+def drop_png_dpi(path):
+    """Remove Qt's pHYs chunk: some Markdown viewers scale tagged images to icon size."""
+    data = path.read_bytes()
+    out, pos = bytearray(data[:8]), 8
+    while pos < len(data):
+        length = int.from_bytes(data[pos:pos + 4], "big")
+        end = pos + 12 + length
+        if data[pos + 4:pos + 8] != b"pHYs":
+            out += data[pos:end]
+        pos = end
+    path.write_bytes(bytes(out))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=Path("/tmp/codexbar-screenshots"))
@@ -314,6 +327,8 @@ def main():
     captures = re.findall(r"CAPTURE ([\w-]+)", log)
     if captures != ["usage", "agents", "history"] or re.search(r"(?:ReferenceError|TypeError|Error:|Unable to assign)", log):
         raise RuntimeError("Incomplete or invalid render; see render.log")
+    for name in captures:
+        drop_png_dpi(output / f"{name}.png")
     geometry = [json.loads(line) for line in re.findall(r"GEOMETRY (.+)", log)]
     (output / "geometry.json").write_text(json.dumps(geometry, indent=2) + "\n")
     if len(geometry) != len(captures) or any(len(scene["tabs"]) != 3 for scene in geometry):
