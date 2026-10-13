@@ -1,15 +1,30 @@
-# CodexBar KDE
+# CodexBar AgentView
 
-KDE Plasma 6 system-tray applet for AI provider usage and active coding-agent sessions. It ports the macOS CodexBar CLI data to Linux and adds a machine-wide agent view.
+Independent Linux project for AI provider usage and active coding-agent sessions, with a KDE Plasma 6 system-tray applet and a Tern plugin. Usage data comes from the upstream CodexBar CLI.
+
+Identities: Plasma applet `io.github.materemias.codexbaragentview`, Tern plugin `codexbar-agentview`, URL scheme `codexbar-agentview://`. Our state lives in `$XDG_STATE_HOME/codexbar-agentview` (default `~/.local/state/codexbar-agentview`, see `contents/scripts/state_paths.py`, which moves legacy files out of `~/.codexbar` once). `~/.codexbar/` belongs to the third-party CodexBar CLI (`config.json`, its own caches); only read `config.json` there.
 
 ## Architecture
 
 - `contents/ui/main.qml` owns polling and normalized snapshots. `contents/scripts/codexbar_fetch.py` is the single provider normalization path.
-- `contents/scripts/codexbar_agents.py` scans `/proc`, reads transcripts, and writes `~/.codexbar/agents.json`.
+- `contents/scripts/codexbar_agents.py` scans `/proc`, reads transcripts, and writes `agents.json` in the state dir.
 - `contents/config/main.xml` is the sole configuration schema. Settings pages live in `contents/ui/config*.qml`.
 - `contents/scripts/codexbar_focus.py` and `contents/scripts/install_integration.py` implement terminal focus and integration setup.
 - `native/` exposes asynchronous `QProcess` commands to QML. Keep execution here;
   unique executable DataSource names make Plasma's dynamic metadata grow.
+- `tern/` is a Tern plugin over the same helpers (`../contents/scripts`
+  relative to the plugin dir): `host.luau` runs one poller per daemon and the
+  `codexbar-agentview.dashboard` block, `window.luau` the status line and palette
+  commands, `codexbar.css` the styles. The applet owns usage polling: each
+  fetch is a Claude OAuth call, and a rate-limited one falls back to a real
+  Claude Code probe session. The plugin reads the cache, treats records
+  measured within 2 × `refreshSeconds` as live (`--cache-only` marks every
+  record stale), and fetches only when nothing measured usage for that long,
+  passing `--min-interval`: the fetcher stamps every fetch start in
+  `fetch_claim` under a lock and answers cache-only when one started within
+  the interval. It sweeps agents only when agents.json is over 15 s old.
+  The plugin never uses KWin or qdbus: it passes `--tern` to
+  `codexbar_focus.py`, which then skips every KWin step.
 
 Extend these paths instead of adding another polling, normalization, or configuration path.
 
@@ -31,23 +46,29 @@ systemctl --user start plasma-plasmashell.service
 
 # Clean reinstall after deleting packaged files
 systemctl --user stop plasma-plasmashell.service
-kpackagetool6 -t Plasma/Applet -r org.codexbar.plasmoid
+kpackagetool6 -t Plasma/Applet -r io.github.materemias.codexbaragentview
 kpackagetool6 -t Plasma/Applet -i build/package
 systemctl --user start plasma-plasmashell.service
 ```
 
-Confirm with `systemctl --user is-active plasma-plasmashell.service`.
 `kquitapp6 plasmashell` returns before the process exits, so an immediate
-`systemctl --user start` hits a still-active unit, does nothing, and the panel
-stays down; `kstart plasmashell` from an agent's tool shell also left it down.
-`systemctl --user stop` blocks until the unit is inactive. The unit takes its
-locale from `systemctl --user show-environment`, which carries
-`LC_TIME=hu_HU.UTF-8` for 24 hour formatting.
+`systemctl --user start` hits a still-active unit and the panel stays down;
+`kstart plasmashell` from an agent's tool shell also left it down. Use
+`systemctl --user stop`, which blocks until the unit is inactive.
 
-For changed QML, run `qmllint` on the staged files under `build/package`.
-For changed Python, run `uv run python -m py_compile <files>`. Install the
-built package and verify UI behavior in the actual panel. `plasmoidviewer`
-is unreliable on Wayland and can exit on focus loss.
+Lint changed QML with `qmllint` on the staged files under `build/package`,
+then verify in the actual panel; `plasmoidviewer` is unreliable on Wayland.
+
+For `tern/` changes, `tern plugin reload` restarts open dashboards with their
+saved tab, but the window half loses the layout snapshot it took on open, so
+closing such a dashboard leaves the evened-out layout. Drive it in a window on
+its own daemon: start `tern --control
+<sock> <dir>` with `TERN_DAEMON_SOCKET` set to a scratch socket and the
+desktop session's `WAYLAND_DISPLAY`, then `tern ctl --control <sock>`
+`click`/`key`/`type`/`shot`. A control window on the user's daemon shares
+their sessions, so `ctl run` and typing reach their focused pane. Helpers the
+scratch daemon runs inherit its socket, so focus and launch there target the
+scratch daemon.
 
 When completing a feature, update README.md in the same change.
 
@@ -63,13 +84,6 @@ When completing a feature, update README.md in the same change.
 - TypeSafe (`typesafe`, CLI 0.64.0+) is balance-only and off by default: no `primary`, header shows `Balance` parsed from `loginMethod`, no tray meter. Browser cookie import is macOS-only; Linux needs `cookieSource: "manual"` plus `cookieHeader` in `~/.codexbar/config.json`.
 - Recent consumption (`window.recent`: `hours`, `consumedPercent`) is computed by the fetcher for `windowMinutes` 10080 (24h lookback) and 300 (1h). Its run-length `history` lives in `usage_cache.json` next to `providers`, keyed `<provider>:<casefolded email>:<slot or extra:id>`, written under the same lock. A usage drop or a reset time moving later starts a new cycle whose usage counts in full; a change across a gap over 15 minutes spanning the lookback start is left out. QML only displays it.
 
-Plasmashell does not inherit API keys from shell startup files.
-`~/.codexbar/config.json` must be mode `0600`; the CLI reads it for provider
-`apiKey` values and additional Codex profile homes. Default Codex and Claude
-authentication remains in `~/.codex/auth.json` and
-`~/.claude/.credentials.json`. See README.md section "Configure provider
-credentials" for setup.
-
 ## Agent contracts
 
 - The aggregator scans `/proc` every tick. Processes without a hook sentinel remain visible as `untracked`.
@@ -77,9 +91,11 @@ credentials" for setup.
 - omp advisor sidecars named `__advisor.*.jsonl` are never session rollouts.
 - Live records carry the latest `recap` and `recapStale` (turns followed it; QML prefixes `Earlier:`). omp: the newest `session_recaps` row in `~/.omp/agent/history.db` (read-only, one query per tick), stale when older than the last turn; `created_at` is whole seconds. Claude: the transcript's last `system`/`away_summary` record, minus its `(disable recaps in /config)` suffix, stale after any later user or assistant record. Codex has none. History rows keep a non-stale `recap` and turn `ts`; `_aggregate` backfills `lastState: idle` omp rows, and a row without turn `ts` drops its saved recap, recovers `ts` from the rollout, and is skipped if it still cannot be dated. QML shows it only under the keyboard-selected row (`selectedKey`) on both tabs.
 - Session filtering matches one field at a time: a case-insensitive substring, else a subsequence whose every run of matched characters starts a word. Recent conversation text uses exact case-insensitive substring matching. Every match is visible, highlighted in a shown label or as a snippet line for an unshown field. Filtering toggles row `visible`; the Repeater models stay unfiltered so typing does not rebuild delegates.
-- `codexbar://focus/<sessionId>` dispatches to `codexbar_focus.py`. It walks
-  process ancestors, tries Kitty remote control or `tern focus`, then falls
-  back to KWin activation. `install_integration.py` registers the handler.
+- `codexbar-agentview://focus/<sessionId>` dispatches to `codexbar_focus.py`. It walks
+  process ancestors, tries Kitty remote control or `tern focus` (success
+  ends there; the applet then raises the Tern window best effort), then falls
+  back to KWin activation, except under `--tern`. `install_integration.py`
+  registers the handler and removes the legacy `codexbar://` one.
 - Tern runs panes under a `tern daemon` that outlives its windows, so a
   window need not be a pane's ancestor; `tern` host chains append every
   non-daemon `tern` pid. Focus reads `TERN_PANE` and `TERN_PANE_SOCKET` from
@@ -95,7 +111,9 @@ credentials" for setup.
   block of the tab `tern ls` shows, or of a session's only tab; a Tern
   window marks only a record whose `ternSession` equals its caption. Other
   hosts pick one candidate by pid, then by `windowTitle` or cwd basename in
-  the caption; ambiguity marks nothing.
+  the caption; ambiguity marks nothing. Every Tern record also carries
+  `ternPane`, its block id from `TERN_PANE`; the Tern plugin marks the record
+  whose pane matches the last focused non-dashboard pane in its low 44 bits.
 - `agents.json` `history` holds ended sessions with `closedBy`: `reboot`
   rows (every session of the previous boot, kept until live again) and
   `exit` rows (same-boot exits, newest 100, untracked excluded). The History
@@ -123,27 +141,18 @@ credentials" for setup.
   `claude daemon`, with no terminal ancestor; they are not listed.
 - omp and pi under `--mode rpc` or `--mode json` are program-driven, like
   Tern's built-in Carly assistant, and are not listed.
-- `codexbar_focus.py --launch <provider> <sessionId>` resumes a kitty or
-  Tern history record only when its saved resume command matches
-  `_resume_command` and the session is not live. For kitty it runs kitty under
-  `systemd-run --user --scope` so a plasmashell stop does not kill it. It
-  switches to the saved desktop before starting kitty, and a self-unloading
-  KWin script keeps the window there by pid and activates it.
-  `--launch-all <uri-json [[provider, id]]>` runs `launch` sequentially over
-  exactly those kitty and Tern reboot rows in desktop order and prints the pairs that
-  launched; QML keeps the cooldown only for those. `codexbar_agents.py --dismiss <uri-json [[provider, id]]>`
-  removes history rows under the aggregate writer lock; QML never edits
-  `agents.json` itself.
-- `codexbar_focus.py --teleport <provider> <sessionId>` moves an idle live
-  kitty session to a new Tern tab. It re-reads the pid's session id and
-  state, starts Tern first, sends the agent SIGHUP (SIGTERM after 3 s),
-  hangs up its shell when that shell is kitty's direct child (closing the
-  window), and resumes only after the agent exited, since a session file has
-  one live writer. QML shows the button when `agents.json` `ternInstalled`
-  is true and the row has a `resumeCommand`.
+- `codexbar_focus.py --launch` resumes a kitty or Tern history record only
+  when its saved resume command matches `_resume_command` and the session is
+  not live. Kitty runs under `systemd-run --user --scope` so a plasmashell stop
+  does not kill it; outside `--tern` a self-unloading KWin script places it on
+  the saved desktop. `--launch-all` returns the pairs that launched, and QML
+  keeps the cooldown only for those. QML never edits `agents.json`; dismissal
+  goes through `codexbar_agents.py --dismiss` under the writer lock.
+- `--teleport` ends an idle kitty session (SIGHUP, then SIGTERM) and resumes
+  it in a new Tern tab only after the agent exited, since a session file has
+  one live writer.
 
 ## Plasma constraints
 
 - Plasma clamps popup height. Keep usage sections compact.
 - Claude OAuth fetches can take about 16 seconds. Keep the provider helper timeout at least 30 seconds.
-- `systemctl --user restart plasma-plasmashell` is fine for a plain restart, but an upgrade must stop Plasma before `kpackagetool6 -u` replaces the loaded native library; use the stop, install, start sequence under Development.

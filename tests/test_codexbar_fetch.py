@@ -23,6 +23,7 @@ SCRIPT_PATH = (
     / "scripts"
     / "codexbar_fetch.py"
 )
+sys.path.insert(0, str(SCRIPT_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("codexbar_fetch", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 fetch = importlib.util.module_from_spec(SPEC)
@@ -76,6 +77,7 @@ class IsolatedUsageTestCase(unittest.TestCase):
         self.home = Path(directory.name)
         environment = mock.patch.dict(fetch.os.environ, {
             "HOME": directory.name,
+            "XDG_STATE_HOME": str(self.home / ".local" / "state"),
             "CODEX_HOME": str(self.home / ".codex"),
             "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
         })
@@ -162,7 +164,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
         super().setUp()
         self.now = dt.datetime.now(dt.timezone.utc)
         self.measured = self.now - dt.timedelta(minutes=5)
-        self.cache_path = self.home / ".codexbar" / "usage_cache.json"
+        self.cache_path = self.home / ".local/state/codexbar-agentview/usage_cache.json"
 
     def record(self, provider="codex", account="a@example.com", used=42) -> dict:
         return fetch._normalize_record(provider, {
@@ -178,11 +180,14 @@ class UsageCacheTests(IsolatedUsageTestCase):
             },
         })
 
-    def snapshot(self, records=None, providers="codex", cache_only=False, cli="/bin/true") -> dict:
+    def snapshot(self, records=None, providers="codex", cache_only=False, cli="/bin/true",
+                 min_interval=None) -> dict:
         output = io.StringIO()
         arguments = ["--cli-path", cli, "--providers", providers]
         if cache_only:
             arguments += ["--cache-only", "--forecast-url", "https://example.invalid/forecast"]
+        if min_interval is not None:
+            arguments += ["--min-interval", str(min_interval)]
         with (
             mock.patch.object(fetch, "_fetch_provider", side_effect=lambda _, p, __: [
                 record for record in (records or []) if record["id"] == p
@@ -195,6 +200,13 @@ class UsageCacheTests(IsolatedUsageTestCase):
         ):
             self.assertEqual(fetch.main(arguments), 0)
         return json.loads(output.getvalue())
+
+    def test_min_interval_serves_cache_after_a_recent_fetch(self) -> None:
+        first = self.snapshot([self.record(used=42)], min_interval=60)
+        self.assertNotIn("cacheOnly", first)
+        second = self.snapshot([self.record(used=99)], min_interval=60)
+        self.assertTrue(second["cacheOnly"])
+        self.assertEqual([r["primary"]["usedPercent"] for r in second["providers"]], [42])
 
     def test_startup_restores_private_normalized_usage_without_refresh(self) -> None:
         record = self.record()
@@ -315,6 +327,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
         self.assertEqual(self.snapshot(cache_only=True)["providers"], [])
         self.snapshot([self.record()])
         config = self.home / ".codexbar" / "config.json"
+        config.parent.mkdir(exist_ok=True)
         config.write_text(json.dumps({
             "providers": [{"id": "codex", "codexProfileHomePaths": ["~/.codex-other"]}],
         }))
@@ -422,6 +435,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
             [r["primary"]["usedPercent"] for r in self.snapshot(cache_only=True)["providers"]], [42],
         )
         config = self.home / ".codexbar" / "config.json"
+        config.parent.mkdir(exist_ok=True)
         config.write_text("{")
         unscoped = self.snapshot([self.record(used=88)])["providers"][0]
         self.assertNotIn("sourceScope", unscoped)
@@ -566,11 +580,57 @@ class UsageCacheTests(IsolatedUsageTestCase):
         self.assertNotEqual(moved, original)
 
 
+class StateMigrationTests(IsolatedUsageTestCase):
+    def test_first_run_moves_our_legacy_files_and_keeps_the_cli_files(self) -> None:
+        legacy = self.home / ".codexbar"
+        (legacy / "agents").mkdir(parents=True)
+        (legacy / "agents" / "sentinel.json").write_text("{}")
+        for name in (
+            "agents.json", "agents.parsers.json", "usage_cache.json", "forecast_cache.json",
+            "agents.lock", "usage_cache.json.lock", "tern_fetch_claim",
+        ):
+            (legacy / name).write_text(name)
+        (legacy / "config.json").write_text('{"providers": []}')
+        (legacy / "claude-oauth-cache.lock").write_text("")
+
+        target = fetch.state_paths.migrate()
+        self.assertEqual(target, self.home / ".local/state/codexbar-agentview")
+        self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(sorted(path.name for path in target.iterdir()), [
+            "agents", "agents.json", "agents.parsers.json", "forecast_cache.json", "usage_cache.json",
+        ])
+        self.assertEqual((target / "usage_cache.json").read_text(), "usage_cache.json")
+        self.assertEqual((target / "agents" / "sentinel.json").read_text(), "{}")
+        self.assertEqual(sorted(path.name for path in legacy.iterdir()),
+                         ["claude-oauth-cache.lock", "config.json"])
+        self.assertEqual((legacy / "config.json").read_text(), '{"providers": []}')
+
+        (legacy / "agents.json").write_text("written by an old helper")
+        fetch.state_paths.migrate()
+        self.assertEqual((target / "agents.json").read_text(), "agents.json")
+
+    def test_retry_finishes_an_interrupted_migration_without_overwriting(self) -> None:
+        legacy = self.home / ".codexbar"
+        legacy.mkdir()
+        (legacy / "agents.json").write_text("old history")
+        (legacy / "usage_cache.json").write_text("old usage")
+        target = self.home / ".local/state/codexbar-agentview"
+        target.mkdir(parents=True)
+        (target / "agents.json").write_text("new history")
+
+        fetch.state_paths.migrate()
+        self.assertEqual((target / "agents.json").read_text(), "new history")
+        self.assertEqual((target / "usage_cache.json").read_text(), "old usage")
+
+
 class CodexRotationTests(unittest.TestCase):
     def setUp(self) -> None:
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
-        home = mock.patch.dict(fetch.os.environ, {"HOME": directory.name})
+        home = mock.patch.dict(fetch.os.environ, {
+            "HOME": directory.name,
+            "XDG_STATE_HOME": str(Path(directory.name) / ".local" / "state"),
+        })
         home.start()
         self.addCleanup(home.stop)
         self.directory = Path(directory.name) / ".omp" / "agent" / "codex-rotation"
@@ -989,8 +1049,7 @@ class ForecastTests(IsolatedUsageTestCase):
             "expectedAt": "2026-09-02T23:00:00+00:00",
         }
         with tempfile.TemporaryDirectory() as directory:
-            cache_path = Path(directory) / "forecast.json"
-            with mock.patch.object(fetch, "FORECAST_CACHE_PATH", str(cache_path)):
+            with mock.patch.dict(fetch.os.environ, {"XDG_STATE_HOME": directory}):
                 fetch._forecast_cache_write(cached)
                 with mock.patch.object(fetch, "FORECAST_CACHE_TTL", -1):
                     with mock.patch.object(
@@ -1013,8 +1072,7 @@ class ForecastTests(IsolatedUsageTestCase):
             "windowEndHour": 2,
         }
         with tempfile.TemporaryDirectory() as directory:
-            cache_path = Path(directory) / "forecast.json"
-            with mock.patch.object(fetch, "FORECAST_CACHE_PATH", str(cache_path)):
+            with mock.patch.dict(fetch.os.environ, {"XDG_STATE_HOME": directory}):
                 fetch._forecast_cache_write(cached)
                 with mock.patch.object(fetch, "FORECAST_CACHE_TTL", -1):
                     with mock.patch.object(
@@ -1035,7 +1093,7 @@ class ForecastTests(IsolatedUsageTestCase):
         }).encode()
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory) / "forecast.json"
-            with mock.patch.object(fetch, "FORECAST_CACHE_PATH", str(cache)):
+            with mock.patch.object(fetch, "_state_file", lambda name: str(cache)):
                 with forecast_server(body) as (url, _):
                     result = fetch._fetch_forecast(url, 2)
                 cached = fetch._fetch_forecast(url, 0.1)
@@ -1057,7 +1115,7 @@ class ForecastTests(IsolatedUsageTestCase):
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory) / "forecast.json"
             with (
-                mock.patch.object(fetch, "FORECAST_CACHE_PATH", str(cache)),
+                mock.patch.object(fetch, "_state_file", lambda name: str(cache)),
                 mock.patch.object(fetch, "FORECAST_CACHE_TTL", -1),
                 forecast_server(body, interval=0.05) as (url, requested),
                 ThreadPoolExecutor(max_workers=1) as pool,
@@ -1080,7 +1138,7 @@ class ForecastTests(IsolatedUsageTestCase):
         with tempfile.TemporaryDirectory() as directory:
             cache = Path(directory) / "forecast.json"
             with (
-                mock.patch.object(fetch, "FORECAST_CACHE_PATH", str(cache)),
+                mock.patch.object(fetch, "_state_file", lambda name: str(cache)),
                 forecast_server(body) as (url, _),
             ):
                 result = fetch._fetch_forecast(url, 2)

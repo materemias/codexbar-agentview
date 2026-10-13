@@ -2,7 +2,8 @@
 """CodexBar agent state aggregator.
 
 Polls running Claude / Codex / OpenCode / pi / omp processes and writes the
-aggregate state to ~/.codexbar/agents.json. The plasmoid widget reads that
+aggregate state to agents.json in the state directory (state_paths.STATE_DIR,
+~/.local/state/codexbar-agentview by default). The plasmoid widget reads that
 file on its own poll cycle (XHR).
 
 Designed to run continuously as a systemd `--user` service. Hooks are no
@@ -15,7 +16,7 @@ process keeps open:
 
 Usage:
   codexbar_agents.py                  one-shot, prints aggregate to stdout
-  codexbar_agents.py --once           one-shot, writes ~/.codexbar/agents.json
+  codexbar_agents.py --once           one-shot, writes agents.json
   codexbar_agents.py --watch [-i N]   daemon; sweep + write every N seconds
   --history-limit N                   keep the N newest same-boot exits
 """
@@ -39,7 +40,9 @@ from datetime import datetime
 from pathlib import Path
 from urllib.parse import unquote
 
-AGGREGATE_PATH = Path.home() / ".codexbar" / "agents.json"
+import state_paths
+
+AGGREGATE_PATH = state_paths.STATE_DIR / "agents.json"
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 LOCK_PATH = AGGREGATE_PATH.with_suffix(".lock")
 
@@ -87,7 +90,7 @@ _PROMPT_SKIP_PREFIXES = (
 
 
 # Peek preview: how many recent messages to keep per session and the cap on
-# each message's text. Both bound the size of ~/.codexbar/agents.json, which
+# each message's text. Both bound the size of agents.json, which
 # the plasmoid re-reads every poll tick.
 _PEEK_MSGS = 8
 _PEEK_CHARS = 320
@@ -1413,15 +1416,17 @@ def _tern_visible_panes(socket: str) -> dict[int, str]:
 
 
 def _mark_tern_panes(records: list[dict]) -> None:
-    """Set `ternSession` on Tern records whose pane is visible, so the popup
-    can tell which session the focused Tern window shows. Agents inherit
-    TERN_PANE and TERN_PANE_SOCKET from the pane's shell."""
+    """Set `ternPane` (the agent's Tern block id) on Tern records, and
+    `ternSession` on those whose pane is visible, so the popup can tell
+    which session the focused Tern window shows. Agents inherit TERN_PANE
+    and TERN_PANE_SOCKET from the pane's shell."""
     by_socket: dict[str, list[tuple[dict, int]]] = {}
     for record in records:
         if record["host"] != "tern":
             continue
         pane = _environ_value(record["pid"], "TERN_PANE")
         if pane.isdigit():
+            record["ternPane"] = int(pane)
             socket = _environ_value(record["pid"], "TERN_PANE_SOCKET")
             by_socket.setdefault(socket, []).append((record, int(pane)))
     for socket, rows in by_socket.items():
@@ -1993,6 +1998,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--dismiss")
     parser.add_argument("--history-limit", type=_history_limit, default=HISTORY_LIMIT)
     args = parser.parse_args(argv)
+    state_paths.migrate()
     desktop_map = _parse_desktop_map(args.desktop_map)
     requested_at = _parse_requested_at(args.requested_at)
 

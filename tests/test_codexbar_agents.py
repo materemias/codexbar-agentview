@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import shlex
@@ -21,6 +22,7 @@ SCRIPT_PATH = (
     / "scripts"
     / "codexbar_agents.py"
 )
+sys.path.insert(0, str(SCRIPT_PATH.parent))
 SPEC = importlib.util.spec_from_file_location("codexbar_agents", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 agents = importlib.util.module_from_spec(SPEC)
@@ -1054,6 +1056,27 @@ class TernHostTests(unittest.TestCase):
         with mock.patch.object(agents.subprocess, "run", return_value=out):
             self.assertEqual(agents._tern_visible_panes(""), {3: "work", 4: "solo"})
 
+    def test_every_tern_record_carries_its_pane_and_only_visible_ones_a_session(self) -> None:
+        env = {
+            (10, "TERN_PANE"): "3", (10, "TERN_PANE_SOCKET"): "/s",
+            (11, "TERN_PANE"): "2", (11, "TERN_PANE_SOCKET"): "/s",
+        }
+        records = [
+            {"pid": 10, "host": "tern"},
+            {"pid": 11, "host": "tern"},
+            {"pid": 12, "host": "kitty"},
+        ]
+        with (
+            mock.patch.object(agents, "_environ_value", side_effect=lambda pid, name: env.get((pid, name), "")),
+            mock.patch.object(agents, "_tern_visible_panes", return_value={3: "work"}),
+        ):
+            agents._mark_tern_panes(records)
+        self.assertEqual(records, [
+            {"pid": 10, "host": "tern", "ternPane": 3, "ternSession": "work"},
+            {"pid": 11, "host": "tern", "ternPane": 2},
+            {"pid": 12, "host": "kitty"},
+        ])
+
 
 class PersistenceTests(unittest.TestCase):
     def test_older_requested_at_is_skipped_only_for_same_boot(self) -> None:
@@ -1335,6 +1358,7 @@ class IncrementalParserTests(unittest.TestCase):
             script = r"""
 import importlib.util, json, sys
 from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).parent))
 spec = importlib.util.spec_from_file_location("agents", sys.argv[1])
 a = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(a)
@@ -1350,8 +1374,10 @@ a._locked_sweep = lambda *args, **kwargs: sweep(*args, **kwargs, aggregate_path=
 a.main(["--once"])
 print(count[0])
 """
+            # main() migrates the state directory, so keep it inside the sandbox.
+            environment = dict(os.environ, HOME=directory, XDG_STATE_HOME=str(Path(directory) / "state"))
             def run(mode="scan"):
-                return int(subprocess.check_output([sys.executable, "-c", script, str(SCRIPT_PATH), str(path), str(aggregate), mode], text=True))
+                return int(subprocess.check_output([sys.executable, "-c", script, str(SCRIPT_PATH), str(path), str(aggregate), mode], text=True, env=environment))
             self.assertEqual(run(), 3)
             self.assertEqual(run(), 0)
             with path.open("a") as output:
@@ -1363,9 +1389,10 @@ print(count[0])
             self.assertEqual(json.loads(cache_path.read_text())["entries"], {})
 
     def test_stdout_does_not_write_and_scan_timestamp_is_completion_time(self):
-        with mock.patch.object(agents, "_build_records", return_value=[]), mock.patch.object(agents, "_write_aggregate") as write, mock.patch.object(agents.sys, "stdout"):
-            agents.main([])
-            write.assert_not_called()
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(agents.os.environ, {"HOME": directory, "XDG_STATE_HOME": directory}):
+            with mock.patch.object(agents, "_build_records", return_value=[]), mock.patch.object(agents, "_write_aggregate") as write, mock.patch.object(agents.sys, "stdout"):
+                agents.main([])
+                write.assert_not_called()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "agents.json"
             with mock.patch.object(agents, "_build_records", return_value=[]), mock.patch.object(agents, "_read_boot_id", return_value="boot"), mock.patch.object(agents.time, "time", side_effect=[1.0, 4.0]):

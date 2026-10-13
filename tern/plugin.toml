@@ -1,0 +1,21 @@
+schema = 1
+id = "codexbar-agentview"
+name = "CodexBar AgentView"
+version = "0.1.0"
+description = "AI provider usage and coding-agent sessions, from the CodexBar AgentView helpers."
+icon = "gauge"
+host = "host.luau"
+window = "window.luau"
+styles = ["codexbar.css"]
+
+[[blocks]]
+id = "dashboard"
+title = "CodexBar AgentView"
+icon = "gauge"
+palette = true
+
+[[blocks]]
+id = "settings"
+title = "CodexBar AgentView Settings"
+icon = "sliders"
+palette = true

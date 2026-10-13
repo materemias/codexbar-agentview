@@ -117,7 +117,7 @@ Item {
             spacing: Kirigami.Units.smallSpacing
 
             PC3.Label {
-                text: "CodexBar"
+                text: "CodexBar AgentView"
                 font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 1.3
                 font.weight: Font.Bold
                 Layout.alignment: Qt.AlignBaseline

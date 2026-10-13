@@ -193,6 +193,27 @@ ColumnLayout {
         return excerpt ? _excerpt(norm, pos) : _styled(norm, pos, 0, norm.length)
     }
 
+    function titleParts(text) {
+        var t = String(text || "")
+        var q = filterText.toLowerCase()
+        if (q) t = t.replace(/\s+/g, " ")
+        var code = t.codePointAt(0)
+        var privateUse = (code >= 0xe000 && code <= 0xf8ff)
+            || (code >= 0xf0000 && code <= 0xffffd)
+            || (code >= 0x100000 && code <= 0x10fffd)
+        var iconEnd = privateUse ? (code > 0xffff ? 2 : 1) : 0
+        var labelStart = iconEnd
+        if (privateUse) {
+            while (labelStart < t.length && /\s/.test(t[labelStart])) labelStart++
+        }
+        var positions = q ? (_matchPositions(t, q) || []) : null
+        return {
+            glyph: t.slice(0, iconEnd),
+            icon: q ? _styled(t, positions, 0, iconEnd) : t.slice(0, iconEnd),
+            label: q ? _styled(t, positions, labelStart, t.length) : t.slice(labelStart)
+        }
+    }
+
     // The record field a session row shows as its task label.
     function labelField(record) {
         if (record.windowTitle) return "windowTitle"
@@ -360,7 +381,7 @@ ColumnLayout {
         if (index < 0) return
         var a = flatAgents[index]
         if (a && a.sessionId) {
-            Qt.openUrlExternally("codexbar://focus/" + a.sessionId)
+            Qt.openUrlExternally("codexbar-agentview://focus/" + a.sessionId)
         }
     }
 
@@ -549,11 +570,10 @@ ColumnLayout {
                         Layout.alignment: Qt.AlignVCenter
                     }
 
-                    PC3.Label {
+                    AgentTitle {
                         id: taskText
-                        text: agents.highlighted(rowItem.taskLabel)
+                        parts: agents.titleParts(rowItem.taskLabel)
                         textFormat: agents.filterText ? Text.StyledText : Text.PlainText
-                        elide: Text.ElideRight
                         Layout.fillWidth: true
                         Layout.alignment: Qt.AlignVCenter
                     }
@@ -848,7 +868,7 @@ ColumnLayout {
                 onClicked: {
                     if (!rowItem.modelData.sessionId) return
                     Qt.openUrlExternally(
-                        "codexbar://focus/" + rowItem.modelData.sessionId
+                        "codexbar-agentview://focus/" + rowItem.modelData.sessionId
                     )
                 }
             }

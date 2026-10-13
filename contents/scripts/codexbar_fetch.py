@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""CodexBar KDE plasmoid data fetcher.
+"""CodexBar AgentView data fetcher.
 
 Runs `codexbar usage --json --provider <id> [--source <s>]` for each enabled
 provider in parallel, merges the per-provider results into a single JSON
@@ -8,6 +8,7 @@ document on stdout. The QML widget calls this once per polling tick.
 Usage:
   codexbar_fetch.py --cli-path PATH --providers codex,claude,zai,opencodego,openrouter,kilo,typesafe
   codexbar_fetch.py --cli-path PATH --providers codex,claude --cache-only
+  codexbar_fetch.py --cli-path PATH --providers codex,claude --min-interval 60
 
 With --forecast-url it also attaches a `forecast` object describing when the next
 OpenAI usage-limit reset is expected (data from codex-reset.com).
@@ -16,6 +17,12 @@ it without executing the CLI; refresh failures retain matching accounts with
 stale, cachedAt, and refreshError fields. The same file keeps a run-length
 usage history per 7d and 5h window, reported as `recent` consumption over the
 last 24 hours and 1 hour respectively.
+
+Every fetch that runs the CLI stamps a shared claim. With --min-interval N a
+fetch that finds a claim younger than N seconds returns the --cache-only result
+instead, so pollers in several processes do not refresh the same usage twice.
+Our files live in the state directory from state_paths; the CLI's own
+~/.codexbar/config.json is only read.
 """
 from __future__ import annotations
 
@@ -36,6 +43,8 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+import state_paths
 
 # Per-provider source flag. None = let the CLI auto-pick.
 # Claude defaults to OAuth so we get extraRateWindows (Claude Design,
@@ -73,6 +82,10 @@ CODEX_ROTATION_DESCRIPTIONS = {
 
 def _expand(path: str) -> str:
     return os.path.expanduser(os.path.expandvars(path))
+
+
+def _state_file(name: str) -> str:
+    return str(state_paths.state_dir() / name)
 
 
 def _codex_rotation_accounts(state: dict) -> dict:
@@ -493,7 +506,7 @@ FORECAST_MAX_BODY_BYTES = 256 * 1024
 # Resets happen every few days and the model refreshes slowly, so a short
 # cache keeps a 30-second poll tick from hammering a third-party endpoint.
 FORECAST_CACHE_TTL = 900.0
-FORECAST_CACHE_PATH = "~/.codexbar/forecast_cache.json"
+FORECAST_CACHE_NAME = "forecast_cache.json"
 FORECAST_MAX_MEDIAN_DAYS = 365.0
 # Same origin as the forecast. Open Codex incidents precede compensation
 # resets, so the status feed rides along with the forecast fetch.
@@ -530,7 +543,9 @@ def _parse_iso(value) -> _dt.datetime | None:
         return None
 
 
-USAGE_CACHE_PATH = "~/.codexbar/usage_cache.json"
+USAGE_CACHE_NAME = "usage_cache.json"
+# Stamped with the start time of every fetch that runs the CLI.
+FETCH_CLAIM_NAME = "fetch_claim"
 USAGE_CACHE_TTL = 24 * 60 * 60
 # Recent-consumption lookback per window length: minutes → hours.
 RECENT_LOOKBACK_HOURS = {10080: 24, 300: 1}
@@ -716,7 +731,7 @@ def _cached_usage_record(record: object, now: _dt.datetime) -> dict | None:
 
 def _usage_cache_payload() -> dict:
     try:
-        with open(_expand(USAGE_CACHE_PATH), encoding="utf-8") as fh:
+        with open(_state_file(USAGE_CACHE_NAME), encoding="utf-8") as fh:
             payload = json.load(fh)
     except (OSError, ValueError):
         return {}
@@ -766,7 +781,7 @@ def _usage_cache_write(scopes: dict[str, str], records: list[dict], now: _dt.dat
         normalized = _cached_usage_record(record, now)
         if normalized is not None and normalized["id"] in replacements:
             replacements[normalized["id"]]["records"].append(normalized)
-    path = _expand(USAGE_CACHE_PATH)
+    path = _state_file(USAGE_CACHE_NAME)
     temporary = None
     history: dict[str, list[list]] = {}
     try:
@@ -1010,7 +1025,7 @@ def _forecast_eta(
 
 def _forecast_cache_read(max_age: float | None) -> dict | None:
     try:
-        with open(_expand(FORECAST_CACHE_PATH), "r", encoding="utf-8") as fh:
+        with open(_state_file(FORECAST_CACHE_NAME), "r", encoding="utf-8") as fh:
             cached = json.load(fh)
     except (OSError, ValueError):
         return None
@@ -1026,7 +1041,7 @@ def _forecast_cache_read(max_age: float | None) -> dict | None:
 
 
 def _forecast_cache_write(payload: dict) -> None:
-    path = _expand(FORECAST_CACHE_PATH)
+    path = _state_file(FORECAST_CACHE_NAME)
     tmp = path + ".tmp"
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1184,7 +1199,7 @@ def _http_worker() -> int:
     """Private HTTP worker: request on stdin, bounded body on stdout."""
     try:
         request_data = json.load(sys.stdin)
-        headers = {"User-Agent": "codexbar-kde", "Accept": "application/json"}
+        headers = {"User-Agent": "codexbar-agentview", "Accept": "application/json"}
         headers.update(request_data.get("headers") or {})
         request = urllib.request.Request(request_data["url"], headers=headers)
         with urllib.request.urlopen(
@@ -1297,11 +1312,36 @@ def _fetch_forecast(url: str, timeout: float) -> dict:
     return payload
 
 
-def _positive_timeout(value: str) -> float:
-    timeout = _as_float(value)
-    if timeout is None or timeout <= 0:
-        raise argparse.ArgumentTypeError("timeout must be finite and positive")
-    return timeout
+def _positive_seconds(value: str) -> float:
+    seconds = _as_float(value)
+    if seconds is None or seconds <= 0:
+        raise argparse.ArgumentTypeError("must be finite and positive")
+    return seconds
+
+
+def _claim_fetch(min_interval: float | None) -> bool:
+    """Stamp the shared fetch claim unless a fetch started under
+    `min_interval` seconds ago. The flock makes check and stamp atomic across
+    processes. An unusable claim file never blocks a fetch."""
+    path = _state_file(FETCH_CLAIM_NAME)
+    try:
+        os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return True
+    with os.fdopen(fd, "r+", encoding="utf-8") as fh:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            now = time.time()
+            last = _as_float(fh.read().strip())
+            if min_interval is not None and last is not None and 0 <= now - last < min_interval:
+                return False
+            fh.seek(0)
+            fh.truncate()
+            fh.write(f"{now}\n")
+        except (OSError, ValueError):
+            pass
+    return True
 
 
 def main(argv: list[str]) -> int:
@@ -1312,7 +1352,7 @@ def main(argv: list[str]) -> int:
         default="codex,claude,zai,opencodego,openrouter,kilo,typesafe",
         help="Comma-separated provider ids to query.",
     )
-    parser.add_argument("--timeout", type=_positive_timeout, default=30.0)
+    parser.add_argument("--timeout", type=_positive_seconds, default=30.0)
     parser.add_argument(
         "--forecast-url",
         default=None,
@@ -1322,7 +1362,12 @@ def main(argv: list[str]) -> int:
         "--cache-only", action="store_true",
         help="Read last-known usage without invoking the CLI or network.",
     )
+    parser.add_argument(
+        "--min-interval", type=_positive_seconds, default=None,
+        help="Return cached usage when another fetch started this many seconds ago.",
+    )
     args = parser.parse_args(argv)
+    state_paths.migrate()
 
     cli = _expand(args.cli_path)
     providers = list(dict.fromkeys(p.strip() for p in args.providers.split(",") if p.strip()))
@@ -1339,9 +1384,10 @@ def main(argv: list[str]) -> int:
         "cliVersion": None,
     }
     cli_missing = not (os.path.isfile(cli) and os.access(cli, os.X_OK)) and not shutil.which(cli)
-    if args.cache_only or cli_missing:
+    cache_only = args.cache_only or (not cli_missing and not _claim_fetch(args.min_interval))
+    if cache_only or cli_missing:
         _attach_recent_usage(restored, _usage_history_entries(_usage_cache_payload(), now), now)
-    if args.cache_only:
+    if cache_only:
         out["cacheOnly"] = True
         json.dump(out, sys.stdout)
         sys.stdout.write("\n")

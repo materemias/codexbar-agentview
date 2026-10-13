@@ -3,10 +3,11 @@
 relaunch a history record in a new kitty window or Tern tab.
 
 Invoked as a URL handler via Qt.openUrlExternally() from the plasmoid:
-  codexbar://focus/<sessionId>
+  codexbar-agentview://focus/<sessionId>
 
-It looks up the matching sentinel in ~/.codexbar/agents/, walks the agent's
-process ancestry, and tries (in order):
+It looks up the matching sentinel in the state directory's agents/ folder or
+the agents.json aggregate, walks the agent's process ancestry, and tries (in
+order):
   1. kitty's remote control if kitty is somewhere up the tree, or Tern's
      `tern focus` for the session's pane
   2. KWin scripting to activate any window owned by an ancestor pid
@@ -26,6 +27,11 @@ new tab in the running Tern window, whose session daemon owns the process.
 moves an idle live kitty session into a new Tern tab: it hangs up the agent
 as closing its window would, closes that kitty window, and resumes the
 session in Tern.
+
+A leading --tern (e.g. `--tern --launch <provider> <sessionId>`) is passed by
+the Tern plugin, which may run outside KDE: the helper then never calls KWin.
+Kitty and Tern focus still work, T3 Code opens its thread link, kitty
+launches open on the current desktop, and other hosts fail.
 """
 from __future__ import annotations
 
@@ -44,9 +50,12 @@ from pathlib import Path
 from urllib.parse import quote
 
 import codexbar_agents as agents
+import state_paths
 
-AGENTS_DIR = Path.home() / ".codexbar" / "agents"
-AGGREGATE_PATH = Path.home() / ".codexbar" / "agents.json"
+AGENTS_DIR = state_paths.STATE_DIR / "agents"
+AGGREGATE_PATH = state_paths.STATE_DIR / "agents.json"
+# False under --tern: the Tern plugin must not depend on KWin.
+USE_KWIN = True
 T3_DIR = Path.home() / ".t3" / "userdata"
 
 
@@ -392,7 +401,7 @@ def launch(provider: str, session_id: str) -> int:
         shell, "-ic", f"{command}; exec {shlex.quote(shell)} -i",
     ]
     desktop = record.get("desktop")
-    if not agents._valid_desktop(desktop):
+    if not USE_KWIN or not agents._valid_desktop(desktop):
         desktop = ""
     elif desktop != "all" and int(desktop) > _desktop_count():
         sys.stderr.write(
@@ -569,9 +578,10 @@ def _launch_tern(cwd: str, shell: str, command: str) -> int:
         block = None
     if isinstance(block, int):
         _tern(["focus", str(block)])
-    windows = agents.tern_window_pids()
-    if not windows or not _kwin_activate(windows):
-        sys.stderr.write("codexbar_focus: launched, but could not raise Tern\n")
+    if USE_KWIN:
+        windows = agents.tern_window_pids()
+        if not windows or not _kwin_activate(windows):
+            sys.stderr.write("codexbar_focus: launched, but could not raise Tern\n")
     return 0
 
 
@@ -631,19 +641,20 @@ def _t3_thread_link(session_id: str) -> str:
     return f"t3code://threads/{quote(env, safe='')}/{quote(row[0], safe='')}"
 
 
-def _t3_open(session_id: str) -> None:
+def _t3_open(session_id: str) -> bool:
     """Ask T3 Code to show the thread. T3 Code 0.0.44 only raises its window
     for this link; pingdotgg/t3code#9745 tracks opening the thread itself."""
     link = _t3_thread_link(session_id)
     if not link:
-        return
+        return False
     try:
         subprocess.Popen(
             ["xdg-open", link], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True,
         )
     except OSError:
-        pass
+        return False
+    return True
 
 
 def focus(session_id: str) -> int:
@@ -658,29 +669,42 @@ def focus(session_id: str) -> int:
         sys.stderr.write("codexbar_focus: no ancestry — claude pid already gone\n")
         return 3
 
-    if record.get("host") == "t3code":
-        _t3_open(session_id)
+    host = record.get("host")
+    if host == "t3code":
+        if _t3_open(session_id) and not USE_KWIN:
+            return 0
         candidates += [p for p in agents.t3_window_pids() if p not in candidates]
 
-    if record.get("host") == "tern":
-        _tern_focus(pid)
-        candidates += [p for p in agents.tern_window_pids() if p not in candidates]
+    if host == "tern":
+        windows = [p for p in agents.tern_window_pids() if p not in candidates]
+        if _tern_focus(pid):
+            # The pane already shows; raising its window is best effort.
+            if USE_KWIN:
+                _kwin_activate(candidates + windows, record)
+            return 0
+        candidates += windows
     # Skip kitty branch if no kitty in the tree.
     elif any(agents._comm_of(p) == "kitty" for p in candidates) and _kitty_focus(candidates):
         return 0
 
-    if _kwin_activate(candidates, record):
+    if USE_KWIN and _kwin_activate(candidates, record):
         return 0
 
+    reason = "" if USE_KWIN else " (KWin is unavailable to the Tern plugin)"
     sys.stderr.write(
-        f"codexbar_focus: couldn't focus pids={candidates} host={record.get('host')}\n"
+        f"codexbar_focus: couldn't focus pids={candidates} host={host}{reason}\n"
     )
     return 4
 
 
 def main(argv: list[str]) -> int:
+    global USE_KWIN
+    if argv[:1] == ["--tern"]:
+        USE_KWIN = False
+        argv = argv[1:]
     if not argv:
         return 1
+    state_paths.migrate()
     if argv[0] in ("--launch", "--teleport"):
         if len(argv) != 3:
             return 1
@@ -691,7 +715,7 @@ def main(argv: list[str]) -> int:
             return 1
         return launch_all(agents._parse_session_keys(argv[1]))
     arg = argv[0]
-    prefix = "codexbar://focus/"
+    prefix = "codexbar-agentview://focus/"
     if arg.startswith(prefix):
         session_id = arg[len(prefix):]
     else:

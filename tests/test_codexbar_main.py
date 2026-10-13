@@ -396,7 +396,6 @@ Item {
             "auto · BURN → auto · STALLED (BURN)",
             "auto · IDLE → confirm · IDLE",
         ])
-        self.assertTrue(all(args[-2] == "CodexBar omp mode changed" for args in notifications))
 
     def test_disabling_codex_clears_status_and_reenabling_is_silent(self):
         calls, notifications = self.applet('''

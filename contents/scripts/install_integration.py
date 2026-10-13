@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""Set up CodexBar's agent integration.
+"""Set up CodexBar AgentView's agent integration.
 
 Hookless — the widget itself runs the aggregator every poll tick. This
 script handles the bits the widget can't:
 
   * QML XHR env: drops env files so plasmashell gets QML_XHR_ALLOW_FILE_READ=1
     on every login, no matter how it's restarted.
-  * codexbar:// URL scheme: registers a desktop entry so the widget's
-    click-to-focus action can launch codexbar_focus.py.
+  * codexbar-agentview:// URL scheme: registers a desktop entry so the
+    widget's click-to-focus action can launch codexbar_focus.py.
   * Legacy hook cleanup: strips any old Claude Code hooks left over from
     pre-hookless versions of the plasmoid.
+  * Legacy identity cleanup: removes the codexbar:// handler and
+    codexbar-xhr env files earlier versions installed.
 
 Usage:
   install_integration.py              install everything
@@ -27,6 +29,8 @@ import sys
 import time
 from pathlib import Path
 
+import state_paths
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -41,11 +45,12 @@ HOOK_MARKER = "codexbar_agent_hook"
 
 # Sourced by plasmashell at session start (KDE-specific path).
 PLASMA_ENV_DIR = Path.home() / ".config" / "plasma-workspace" / "env"
-PLASMA_ENV_FILE = PLASMA_ENV_DIR / "codexbar-xhr.sh"
+PLASMA_ENV_FILE = PLASMA_ENV_DIR / "codexbar-agentview-xhr.sh"
 PLASMA_ENV_CONTENTS = (
     "#!/bin/sh\n"
-    "# Installed by codexbar-kde — enables file:// XHR reads in plasmashell\n"
-    "# so the widget can read ~/.codexbar/agents.json directly.\n"
+    "# Installed by CodexBar AgentView. Enables file:// XHR reads in plasmashell\n"
+    "# so the widget can read agents.json from ~/.local/state/codexbar-agentview\n"
+    "# (or $XDG_STATE_HOME/codexbar-agentview) directly.\n"
     "export QML_XHR_ALLOW_FILE_READ=1\n"
 )
 
@@ -54,19 +59,26 @@ PLASMA_ENV_CONTENTS = (
 # or `plasmashell --replace` from an existing terminal that the plasma-
 # workspace/env script doesn't reach.
 SYSTEMD_ENV_DIR = Path.home() / ".config" / "environment.d"
-SYSTEMD_ENV_FILE = SYSTEMD_ENV_DIR / "codexbar-xhr.conf"
+SYSTEMD_ENV_FILE = SYSTEMD_ENV_DIR / "codexbar-agentview-xhr.conf"
 SYSTEMD_ENV_CONTENTS = (
-    "# Installed by codexbar-kde — keeps QML_XHR_ALLOW_FILE_READ in the\n"
+    "# Installed by CodexBar AgentView. Keeps QML_XHR_ALLOW_FILE_READ in the\n"
     "# systemd-user environment so plasmashell picks it up no matter how\n"
-    "# it's launched.\n"
+    "# it's launched, letting the widget read agents.json from\n"
+    "# ~/.local/state/codexbar-agentview (or $XDG_STATE_HOME/codexbar-agentview).\n"
     "QML_XHR_ALLOW_FILE_READ=1\n"
 )
 
 # URL handler for the focus-on-click action.
 DESKTOP_DIR = Path.home() / ".local" / "share" / "applications"
-DESKTOP_FILE = DESKTOP_DIR / "org.codexbar.focus.desktop"
+DESKTOP_FILE = DESKTOP_DIR / "codexbar-agentview-focus.desktop"
 MIMEAPPS_FILE = Path.home() / ".config" / "mimeapps.list"
-SCHEME_KEY = "x-scheme-handler/codexbar"
+SCHEME = "codexbar-agentview"
+SCHEME_KEY = f"x-scheme-handler/{SCHEME}"
+
+# Legacy: names used before the CodexBar AgentView rename.
+LEGACY_DESKTOP_FILE = DESKTOP_DIR / "org.codexbar.focus.desktop"
+LEGACY_SCHEME_KEY = "x-scheme-handler/codexbar"
+LEGACY_ENV_FILES = (PLASMA_ENV_DIR / "codexbar-xhr.sh", SYSTEMD_ENV_DIR / "codexbar-xhr.conf")
 
 # Legacy: earlier versions shipped a systemd user service that ran the
 # aggregator. The widget now drives the refresh itself, so we just clean
@@ -189,12 +201,12 @@ def install_focus_url_handler() -> str:
         pass
     desktop_contents = (
         "[Desktop Entry]\n"
-        "Name=CodexBar Focus Agent\n"
+        "Name=CodexBar AgentView Focus Agent\n"
         f"Exec={FOCUS_SCRIPT_PATH} %u\n"
         "Type=Application\n"
         "NoDisplay=true\n"
         f"MimeType={SCHEME_KEY};\n"
-        "X-KDE-Protocols=codexbar\n"
+        f"X-KDE-Protocols={SCHEME}\n"
     )
     DESKTOP_DIR.mkdir(parents=True, exist_ok=True)
     DESKTOP_FILE.write_text(desktop_contents)
@@ -206,20 +218,44 @@ def install_focus_url_handler() -> str:
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         pass
-    return f"registered codexbar:// → {DESKTOP_FILE.name}"
+    return f"registered {SCHEME}:// → {DESKTOP_FILE.name}"
 
 
 def remove_focus_url_handler() -> str:
     if DESKTOP_FILE.is_file():
         DESKTOP_FILE.unlink()
-    if MIMEAPPS_FILE.is_file():
-        try:
-            text = MIMEAPPS_FILE.read_text()
-        except OSError:
-            return f"removed {DESKTOP_FILE.name}"
-        kept = [ln for ln in text.splitlines() if ln.split("=", 1)[0].strip() != SCHEME_KEY]
-        MIMEAPPS_FILE.write_text("\n".join(kept) + "\n")
-    return f"removed {DESKTOP_FILE.name} and unregistered codexbar://"
+    _drop_mimeapps_key(SCHEME_KEY)
+    return f"removed {DESKTOP_FILE.name} and unregistered {SCHEME}://"
+
+
+def _drop_mimeapps_key(scheme: str) -> bool:
+    """Remove every mimeapps.list line for scheme; True when one went."""
+    try:
+        text = MIMEAPPS_FILE.read_text()
+    except OSError:
+        return False
+    lines = text.splitlines()
+    kept = [ln for ln in lines if ln.split("=", 1)[0].strip() != scheme]
+    if len(kept) == len(lines):
+        return False
+    MIMEAPPS_FILE.write_text("\n".join(kept) + "\n")
+    return True
+
+
+def remove_legacy_identity() -> str:
+    """Earlier versions registered codexbar:// and installed codexbar-xhr env
+    files. Remove them so a stale handler never answers old links."""
+    removed: list[str] = []
+    for f in (LEGACY_DESKTOP_FILE, *LEGACY_ENV_FILES):
+        if f.is_file():
+            try:
+                f.unlink()
+                removed.append(f.name)
+            except OSError:
+                pass
+    if _drop_mimeapps_key(LEGACY_SCHEME_KEY):
+        removed.append("codexbar://")
+    return "removed legacy " + ", ".join(removed) if removed else ""
 
 
 def _set_mimeapps_default(scheme: str, desktop_name: str) -> None:
@@ -294,8 +330,10 @@ def remove_legacy_systemd_service() -> str:
 def install_all() -> str:
     """Install: env scripts so plasmashell gets QML_XHR_ALLOW_FILE_READ on
     every launch, URL scheme handler for click-to-focus, and legacy cleanup
-    (Claude Code hooks + the systemd service we used to ship)."""
+    (Claude Code hooks, the systemd service we used to ship, and the
+    pre-rename codexbar:// handler and env files)."""
     parts = [
+        remove_legacy_identity(),
         install_env_script(),
         install_focus_url_handler(),
         remove_legacy_hooks(),
@@ -304,7 +342,7 @@ def install_all() -> str:
     # Seed the aggregate so the widget has something to read on first open.
     # An existing one is left alone: this sweep would trim History to the
     # default limit instead of the configured one.
-    if not (Path.home() / ".codexbar" / "agents.json").exists():
+    if not (state_paths.migrate() / "agents.json").exists():
         try:
             subprocess.run(
                 [sys.executable or "python3", str(AGGREGATOR_PATH), "--once"],
@@ -319,10 +357,11 @@ def uninstall_all() -> str:
     parts = [
         remove_legacy_systemd_service(),
         remove_legacy_hooks(),
+        remove_legacy_identity(),
         remove_focus_url_handler(),
         remove_env_script(),
     ]
-    return "\n".join(parts)
+    return "\n".join(p for p in parts if p)
 
 
 def status_all() -> str:

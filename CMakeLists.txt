@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.21)
-project(CodexBar LANGUAGES CXX)
+project(CodexBarAgentView LANGUAGES CXX)
 
 find_package(Qt6 REQUIRED COMPONENTS Core Qml)
 set(CMAKE_AUTOMOC ON)

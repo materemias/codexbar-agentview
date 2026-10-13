@@ -219,7 +219,7 @@ Item {
             }
 
             QQC2.Label {
-                text: "Installs the QML XHR env scripts (so plasmashell can read the agent state file) and registers codexbar:// for click-to-focus. Also cleans up any legacy Claude Code hooks or systemd unit from earlier widget versions."
+                text: "Installs the QML XHR env scripts (so plasmashell can read the agent state file) and registers codexbar-agentview:// for click-to-focus. Also cleans up legacy Claude Code hooks, the systemd unit, and the codexbar:// handler from earlier widget versions."
                 wrapMode: Text.WordWrap
                 Layout.fillWidth: true
                 opacity: 0.55

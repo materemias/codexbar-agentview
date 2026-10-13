@@ -72,7 +72,7 @@ PlasmoidItem {
     // QtCore's QML StandardPaths returns a QUrl, not a filesystem string.
     // Keep its URL escaping intact for XHR.
     readonly property string agentsFileUrl: StandardPaths.writableLocation(
-        StandardPaths.HomeLocation).toString().replace(/\/$/, "") + "/.codexbar/agents.json"
+        StandardPaths.GenericStateLocation).toString().replace(/\/$/, "") + "/codexbar-agentview/agents.json"
     readonly property int agentsRefreshMs: Math.max(2, Plasmoid.configuration.agentsRefreshSeconds || 5) * 1000
     readonly property bool agentsEnabled: Plasmoid.configuration.showAgents !== false
         || Plasmoid.configuration.showAgentStateDots !== false
@@ -163,7 +163,7 @@ PlasmoidItem {
         if (diff <= 0) return "soon"
         return relativeMs(diff).replace(/^in /, "")
     }
-    toolTipMainText: root.lastError ? "CodexBar — error" : "CodexBar"
+    toolTipMainText: root.lastError ? "CodexBar AgentView — error" : "CodexBar AgentView"
     // RichText so the body can use an HTML table to right-align the percent
     // and time-left columns. PC3.Label inside Plasma's tooltip honours this.
     toolTipTextFormat: Text.RichText
@@ -186,7 +186,7 @@ PlasmoidItem {
         // Cellpadding gives horizontal breathing room between label / pct /
         // time-left without forcing a wider column with &nbsp;.
         var html = '<table width="240" cellpadding="2" cellspacing="0">'
-        // Spacer row beneath the "CodexBar" title.
+        // Spacer row beneath the app title.
         html += '<tr><td colspan="3" style="font-size: 6px">&nbsp;</td></tr>'
         var anyData = false
         for (var i = 0; i < arr.length; i++) {
@@ -253,7 +253,7 @@ PlasmoidItem {
             var event = events[i]
             var cmd = "if ! command -v notify-send >/dev/null 2>&1; then "
                 + "printf '%s\\n' 'notify-send is unavailable; install libnotify to enable desktop notifications.' >&2; "
-                + "exit 127; fi; notify-send --app-name " + Command.shellQuote("CodexBar")
+                + "exit 127; fi; notify-send --app-name " + Command.shellQuote("CodexBar AgentView")
                 + " --icon " + Command.shellQuote("dialog-information")
                 // Plasma never auto-hides critical urgency, so every alert
                 // stays normal and expires.

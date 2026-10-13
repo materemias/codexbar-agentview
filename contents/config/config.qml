@@ -22,4 +22,9 @@ ConfigModel {
         icon: "system-run"
         source: "configAgents.qml"
     }
+    ConfigCategory {
+        name: "About"
+        icon: "help-about"
+        source: "configAbout.qml"
+    }
 }

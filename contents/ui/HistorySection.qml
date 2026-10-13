@@ -297,11 +297,10 @@ ColumnLayout {
                     Layout.alignment: Qt.AlignVCenter
                 }
 
-                PC3.Label {
+                AgentTitle {
                     id: closedTitle
-                    text: history.agentsView.highlighted(closedRow.taskLabel)
+                    parts: history.agentsView.titleParts(closedRow.taskLabel)
                     textFormat: history.agentsView.filterText ? Text.StyledText : Text.PlainText
-                    elide: Text.ElideRight
                     Layout.fillWidth: true
                     Layout.alignment: Qt.AlignVCenter
                 }

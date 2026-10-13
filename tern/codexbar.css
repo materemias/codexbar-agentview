@@ -1,0 +1,164 @@
+/* CodexBar AgentView dashboard. Every rule is scoped to the block's regions. */
+
+[data-surface='plugin.codexbar-agentview.dashboard'] {
+	/* Agents and History: the list takes all the height under the tabs and filter. */
+	&.sf-main {
+		display: flex;
+		flex-direction: column;
+	}
+	&.sf-main > * {
+		flex: none;
+	}
+	&.sf-main > .sf-list {
+		flex: 1 1 0;
+		min-height: 0;
+		display: flex;
+		flex-direction: column;
+	}
+	.sf-list-scroll.max {
+		flex: 1 1 0;
+		min-height: 0;
+	}
+
+	/* Tab strip, drawn like Tern's own `tabs` kind. */
+	.cb-tabs {
+		display: flex;
+		gap: 18px;
+		padding: 0 4px;
+		margin-bottom: 2px;
+		box-shadow: inset 0 -1px 0 var(--l2);
+	}
+	.cb-tab {
+		padding: 4px 2px 6px;
+		font-family: var(--sans);
+		font-size: 12px;
+		color: var(--t3);
+		cursor: pointer;
+		transition: color .15s;
+	}
+	.cb-tab:hover {
+		color: var(--t2);
+	}
+	.cb-tab.on {
+		color: inherit;
+		box-shadow: inset 0 -2px 0 var(--accent);
+	}
+	.cb-settings {
+		margin-left: auto;
+		flex-shrink: 0;
+		font-size: 16px;
+		padding: 4px 6px 6px;
+	}
+	.cb-count {
+		margin-left: 5px;
+		color: var(--t3);
+	}
+	.cb-count.warn {
+		color: var(--sf-warn);
+	}
+	[data-role='codexbar.pct'] {
+		text-align: right;
+	}
+
+	/* Usage: the brighter tail of a bar is the recent share; the rest is dimmed. */
+	.sf-meter[data-role='codexbar.bar'] .sf-mt-part.first:not(.last),
+	.sf-meter[data-role='codexbar.bar-orange'] .sf-mt-part.first:not(.last) {
+		opacity: .5;
+	}
+	.sf-meter[data-role='codexbar.bar-orange'] .sf-mt-fill,
+	.sf-meter[data-role='codexbar.bar-orange'] .sf-mt-part {
+		background: #f97316;
+	}
+	[data-role='codexbar.unused'] {
+		opacity: .5;
+	}
+
+	/* Agents and History: folder and section heads inside the list. */
+	[data-role='codexbar.group'] {
+		align-items: center;
+		gap: 10px;
+		padding: 10px 8px 3px;
+		color: var(--t2);
+	}
+	[data-role='codexbar.group']:first-child {
+		padding-top: 2px;
+	}
+
+	/* Working and blocked sessions: a tinted row with a bar on the left. */
+	.sf-item[data-tone='success'] {
+		background: rgb(from var(--sf-ok) r g b / 7%);
+		box-shadow: inset 2px 0 0 var(--sf-ok);
+	}
+	.sf-item[data-tone='error'] {
+		background: rgb(from var(--sf-bad) r g b / 9%);
+		box-shadow: inset 2px 0 0 var(--sf-bad);
+	}
+	.sf-item[data-tone='success'] .sf-item-label .sf-t-success:first-child {
+		animation: codexbar-pulse 1.6s ease-in-out infinite;
+	}
+	.sf-item[data-role='codexbar.old'] {
+		opacity: .55;
+	}
+
+	/* Model family by vendor: Claude orange, OpenAI violet. */
+	.sf-item-value .sf-t-warning {
+		color: #e08a5f;
+	}
+	.sf-item-value .sf-t-info {
+		color: #a78bfa;
+	}
+
+	/* The selected row's recap, buttons and conversation. */
+	.cb-peek {
+		display: flex;
+		flex-direction: column;
+		gap: 6px;
+		margin: 3px 0 8px 30px;
+		padding: 3px 0 3px 12px;
+		box-shadow: inset 1px 0 0 var(--l2);
+	}
+	.cb-recap {
+		color: var(--t3);
+		font-style: italic;
+	}
+	.cb-actions {
+		display: flex;
+		flex-wrap: wrap;
+		gap: 6px;
+	}
+	.cb-btn {
+		padding: 1px 10px;
+		border-radius: 6px;
+		background: var(--l1);
+		color: var(--t2);
+		box-shadow: inset 0 0 0 1px var(--l2);
+		cursor: pointer;
+	}
+	.cb-btn:hover {
+		background: var(--l2);
+	}
+	.cb-btn.accent {
+		background: rgb(from var(--accent) r g b / 18%);
+		box-shadow: inset 0 0 0 1px rgb(from var(--accent) r g b / 45%);
+	}
+	.cb-btn.off {
+		opacity: .45;
+	}
+	.cb-turn {
+		white-space: normal;
+	}
+	.cb-user {
+		align-self: flex-end;
+		padding: 3px 10px;
+		border-radius: 8px;
+		background: rgb(from var(--accent) r g b / 16%);
+	}
+	.cb-tools {
+		color: var(--t3);
+	}
+}
+
+@keyframes codexbar-pulse {
+	0%, 100% { opacity: 1; }
+	50% { opacity: .35; }
+}

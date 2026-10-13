@@ -1,36 +1,51 @@
-# CodexBar for KDE Plasma 6
+# CodexBar AgentView
 
-**Never lose track of an agent again.**
+CodexBar AgentView shows AI provider usage and coding-agent sessions through two
+interfaces on Linux:
 
-You run a handful of coding agents across several monitors and desktops. One
-is waiting for your answer, two just finished, and your weekly limit is closer
-than you think. Then a crash takes every terminal down with it. CodexBar keeps
-all of that in your Plasma panel:
+- A **KDE Plasma 6 widget** puts usage rings and agent counts in your panel,
+  with a popup for Usage, Agents and History and a global keyboard shortcut.
+- A **native Tern extension** puts usage and agent counts in Tern's status
+  line, opens the same three tabs as a temporary sidebar, and has its own
+  native settings tab.
+
+Use either interface on its own, or both together. The Tern extension does
+not require building or installing the Plasma widget, and it does not use
+KWin or any other KDE service. Both use the same Python helpers, provider
+usage cache and session snapshot in `~/.local/state/codexbar-agentview/`.
+The extension reuses fresh usage measurements from the widget and fetches
+only when they are missing or stale.
+
+Each interface keeps its own display settings. Provider credentials in
+`~/.codexbar/config.json`, the file the `codexbar` CLI reads, are shared.
 
 - **No surprise limits.** Every account's usage in one place, with pace
   ticks and projections that warn you before a limit hits, not after.
-- **Who needs you, at a glance.** Panel dots count working, blocked and
-  idle agents, so you see a session waiting for input without looking for it.
+- **Who needs you, at a glance.** Panel dots or Tern's status line count
+  working, blocked and idle agents, so you see a session waiting for input
+  without looking for it.
 - **Find any session by typing.** Every Claude Code, Codex, OpenCode, pi
   and omp session running in a terminal or T3 Code, filtered as you type, with a peek at
   its last messages.
-- **Jump straight to it.** One click switches to the right desktop and
-  raises the session's terminal, whichever monitor it is on.
-- **Never leave the keyboard.** `Super+A` opens the agent list, typing
-  fuzzy-finds a session, `↑`/`↓` select it, `Space` peeks and `Enter` jumps
-  to its terminal.
+- **Jump straight to it.** In the Plasma widget, one click switches to the
+  right desktop and raises the session's terminal, whichever monitor it is
+  on. In Tern, `Enter` shows the session's pane.
+- **Never leave the keyboard.** `Super+A` in Plasma or `Ctrl+Alt+A` in Tern
+  opens the agent list, typing fuzzy-finds a session, `↑`/`↓` select it,
+  `Space` peeks and `Enter` jumps to it.
 - **Get it all back.** After a reboot or crash, **Restore all** reopens your
-  kitty sessions, each in its own window on the desktop it ran on, and your
-  Tern sessions as tabs. Closed one by mistake? Find it in History and bring
-  it back with one click.
+  kitty sessions, each in its own window, and your Tern sessions as tabs.
+  Closed one by mistake? Find it in History and bring it back with one click.
 
 It started as a Linux port of the macOS
 [CodexBar](https://github.com/steipete/CodexBar) menu-bar app and uses its
 `codexbar` CLI for usage data.
+This is an independent project, not an official CodexBar module.
 
 [Requirements](#requirements) · [Install](#install) ·
-[Keyboard shortcuts](#keyboard-shortcuts) · [Features](#features) ·
-[Supported providers](#supported-providers) · [Supported agents](#supported-agent-sessions) ·
+[Tern extension](#tern-plugin) · [Keyboard shortcuts](#keyboard-shortcuts) ·
+[Features](#features) · [Supported providers](#supported-providers) ·
+[Supported agents](#supported-agent-sessions) ·
 [Credentials](#configure-provider-credentials) · [Configuration](#configuration) ·
 [Update](#update)
 
@@ -43,56 +58,76 @@ counting working, blocked and idle agents.
 | :---: | :---: | :---: |
 | [![Usage tab](docs/usage.png)](docs/usage.png) | [![Agents tab](docs/agents.png)](docs/agents.png) | [![History tab](docs/history.png)](docs/history.png) |
 
-The popup screenshots use made-up accounts and sessions.
-Drag the popup's edges to resize it within the available screen space.
+The screenshots use made-up accounts and sessions. Drag the popup's edges
+to resize it within the available screen space.
 
 ## Requirements
 
+Linux only. The agent scanner reads `/proc`, so Agents and History do not
+work on macOS, and the helpers use POSIX-only Python modules. Windows is not
+supported: there is no native `codexbar` CLI for it, and the helpers do not
+run there.
+
 | Requirement | Needed for |
 | --- | --- |
-| KDE Plasma **6** (with KWin) | Everything |
-| Python 3 | Everything (bundled with Plasma 6 systems) |
-| CMake 3.21+, a C++17 compiler, Qt 6 Core/QML development files | Building. On Arch: `base-devel`, `cmake`, `qt6-declarative` |
-| [`codexbar`](https://github.com/steipete/CodexBar) CLI | Usage tab and tray rings. Without it, Agents and History still work |
-| `qdbus6` (Plasma's Qt tools) | *Optional:* click to focus and desktop switching |
+| KDE Plasma **6** (with KWin) | Plasma widget |
+| [Tern](https://docs.stencil.so/tern/) | Tern extension |
+| Python 3 | Both interfaces |
+| CMake 3.21+, a C++17 compiler, Qt 6 Core/QML development files | Building the Plasma widget. On Arch: `base-devel`, `cmake`, `qt6-declarative` |
+| [`codexbar`](https://github.com/steipete/CodexBar) CLI | Provider usage in either interface. Without it, Agents and History still work |
+| `qdbus6` (Plasma's Qt tools) | *Optional, Plasma widget:* click to focus, desktop switching and placing restored kitty windows |
 | kitty or Tern | *Optional:* **Launch** and **Restore all**; with both, **Teleport to Tern**. Other terminals keep the copyable resume command |
-| systemd user session | *Optional:* **Launch**, so restored terminals survive a plasmashell restart |
-| kitty remote control (`allow_remote_control`, `listen_on`) | *Optional:* faster, exact focus of kitty windows. KWin is used otherwise |
+| systemd user session | *Optional:* **Launch**, so restored kitty windows survive a plasmashell restart |
+| kitty remote control (`allow_remote_control`, `listen_on`) | *Optional:* exact focus of kitty windows. Without it the Plasma widget falls back to KWin, and the Tern extension cannot focus kitty windows |
 | `notify-send` (libnotify) | *Optional:* desktop usage warnings and agent waiting-for-input notifications |
 
-The `codexbar` CLI path defaults to `/usr/bin/codexbar`, which is what the
-Arch `codexbar-cli` package installs. Set another path in Settings → Backend.
+The Plasma widget's `codexbar` CLI path defaults to `/usr/bin/codexbar`,
+which is what the Arch `codexbar-cli` package installs. Set another path in
+Settings → Backend. The Tern extension has its own CLI path setting.
 
 ## Install
 
-1. Build and install the widget. The package contains a small native plugin,
-   so build it on the machine that runs it:
+### Plasma widget
+
+1. Build and install the widget. The package contains a small native QML
+   plugin, so build it on the machine that runs it:
 
    ```sh
-   git clone https://github.com/materemias/codexbar-kde
-   cd codexbar-kde
+   git clone https://github.com/materemias/codexbar-agentview
+   cd codexbar-agentview
    cmake -S . -B build
    cmake --build build
    kpackagetool6 -t Plasma/Applet -i build/package
    ```
 
    Install `build/package`, not the source directory. The installed copy lives
-   in `~/.local/share/plasma/plasmoids/org.codexbar.plasmoid/`, so the source
-   checkout can be moved or deleted afterwards.
+   in `~/.local/share/plasma/plasmoids/io.github.materemias.codexbaragentview/`.
+   A widget-only installation no longer needs the source checkout. Keep the
+   checkout if you also use the Tern extension, which runs its helpers from
+   there.
 
 2. Add it to a panel: right-click the panel → **Enter Edit Mode** →
-   **Add Widgets…**, search for **CodexBar**, and drag it onto the panel.
+   **Add Widgets…**, search for **CodexBar AgentView**, and drag it onto the panel.
 
 3. Enable the agent integration: widget settings → **Agents** → **Install**.
-   This lets the widget read `~/.codexbar/agents.json` and registers the
-   `codexbar://` handler used by click to focus. Agents and History stay empty
-   until it is installed and plasmashell has been restarted once (see
-   [Restarting plasmashell](#restarting-plasmashell)).
+   This lets the widget read the agent snapshot and registers the
+   `codexbar-agentview://` handler used by click to focus. Agents and History stay empty
+   until it is installed and plasmashell has been restarted once
+   (`systemctl --user restart plasma-plasmashell.service`).
 
 4. [Configure credentials](#configure-provider-credentials) for any provider
    beyond Claude and Codex.
 
+### Tern extension
+
+Clone this repository and run `tern plugin link tern` from its root.
+No CMake build, Plasma widget installation or widget integration setup is
+needed. Keep the checkout in place while the extension is linked.
+See [Tern plugin](#tern-plugin) for its dashboard, shortcuts and settings.
+
 ## Keyboard shortcuts
+
+### Plasma widget
 
 | Shortcut         | Action                                                        |
 | ---------------- | ------------------------------------------------------------- |
@@ -105,6 +140,26 @@ Arch `codexbar-cli` package installs. Set another path in Settings → Backend.
 | Printable text   | Filter the Agents and History tabs                            |
 | `Backspace`      | Edit the active filter                                        |
 | `Esc`            | Clear the active filter, then close the popup                 |
+
+### Tern extension
+
+| Shortcut         | Action                                                        |
+| ---------------- | ------------------------------------------------------------- |
+| `Ctrl+Alt+A`     | Open or close the dashboard on the Agents tab                 |
+| `Ctrl+Alt+U`     | Open or close the dashboard on the Usage tab                  |
+| Palette          | `CodexBar AgentView: History` and `CodexBar AgentView: Settings` have no default key |
+| `←` / `→`        | Switch tabs                                                   |
+| `↑` / `↓`        | Move the selection on Agents or History                       |
+| `Space`          | Show or hide the selected row's conversation                  |
+| `Enter`          | Agents: show the session's pane. History: launch it           |
+| `Delete`         | Dismiss the selected History row                              |
+| `R`              | Refresh (Usage tab only)                                      |
+| Printable text   | Filter the Agents and History tabs                            |
+| `Esc`            | Clear the filter, then close the dashboard                    |
+
+KDE binds `Ctrl+Alt+A` to Activate Window Demanding Attention by default.
+Clear that in System Settings → Shortcuts → KWin, or Tern never sees the key.
+The settings tab has its own keys, listed under [Tern plugin](#tern-plugin).
 
 ## Features
 
@@ -144,7 +199,7 @@ Arch `codexbar-cli` package installs. Set another path in Settings → Backend.
   pools it in Plus units like its fill. History starts with the first poll
   after install, is
   kept as run-length samples (one entry per change, or per gap over 15
-  minutes) in `~/.codexbar/usage_cache.json`, pruned to 24 hours, and
+  minutes) in `~/.local/state/codexbar-agentview/usage_cache.json`, pruned to 24 hours, and
   survives restarts. Toggle it with `showRecentUsage` in Settings → Providers.
 - **Codex 5h window.** A Codex weekly reset also resets the 5h window, so when
   the weekly reset comes first, the 5h row ends there and its pace spans the
@@ -177,7 +232,7 @@ Arch `codexbar-cli` package installs. Set another path in Settings → Backend.
   Cached rows say `Last known` with the measurement time and any refresh
   error. Their bars are muted, with no live pace projection or reset
   countdown. Records expire after 24 hours. The cache contains normalized
-  display data, not credentials, in `~/.codexbar/usage_cache.json` with mode
+  display data, not credentials, in `~/.local/state/codexbar-agentview/usage_cache.json` with mode
   `0600`. The helper rechecks the CLI path, configuration and account inputs
   before restoring cached data; unverifiable data is cleared. Codex token
   refreshes and rotation among the same configured accounts preserve the cache.
@@ -193,7 +248,7 @@ Arch `codexbar-cli` package installs. Set another path in Settings → Backend.
   alert history. Alerts name the account by email, for example
   `Codex · me@example.com · 7d`. After an applet restart, the first fresh high
   reading can alert again.
-- **Notification timeout.** All CodexBar desktop notifications close after 10
+- **Notification timeout.** All CodexBar AgentView desktop notifications close after 10
   seconds and stay in the notification history. They are sent at normal
   urgency, since Plasma never closes critical ones on its own.
 
@@ -206,6 +261,8 @@ Arch `codexbar-cli` package installs. Set another path in Settings → Backend.
   its state (`7m`, `23h`, `4d`). Model names are tinted by vendor: Claude
   orange, OpenAI violet. The age is brightest within 15 minutes, muted after
   that and dim from a day on.
+  Leading Nerd Font title markers have their own icon slot on Agents and
+  History, keeping omp's robot and flask clear of the title.
   The state marker differs by shape as well as colour: working is a green dot
   with an expanding halo, blocked on your input a red diamond, idle a hollow
   grey ring, untracked a blue dot (the process has no resolvable session).
@@ -214,6 +271,7 @@ Arch `codexbar-cli` package installs. Set another path in Settings → Backend.
   rows idle for over a day are dimmed.
 - **Desktop badges.** The number of the virtual desktop the session's window
   is on, softly filled when it is the current one and outlined otherwise.
+  The Plasma widget looks the desktops up; Tern shows the saved number dimmed.
 - **Focused session.** A thin ring around the state dot marks the session
   shown in the window you last focused. Tern reports its visible
   pane; kitty and VS Code are told apart by window caption (session title or
@@ -227,14 +285,14 @@ Arch `codexbar-cli` package installs. Set another path in Settings → Backend.
   new turns, prefixed `Earlier:`. History keeps the recap of a session that
   ended idle, only when it covers the final exchange. Codex writes no recap.
 - **Click to focus.** Clicking a row, or `Enter`, raises the terminal hosting
-  the session, switching desktop if needed.
+  the session. The Plasma widget switches desktop first if needed.
 - **Conversation peek.** The arrow shown on hover, or `Space`, expands the
   last eight user, assistant and tool turns, laid out like a chat: your turns
   in tinted bubbles on the right, the agent's replies as plain text, and tool
   runs as one muted line.
 - **Teleport to Tern.** When Tern is installed, kitty sessions with a known
   resume command get a new-tab button on hover. It works on idle sessions
-  only: CodexBar hangs up the agent the way closing its window would, closes
+  only: CodexBar AgentView hangs up the agent the way closing its window would, closes
   that kitty window, and resumes the session in a new tab of the running
   Tern window. Tern is started first, and a session that fails to exit is
   never resumed twice.
@@ -263,8 +321,9 @@ Arch `codexbar-cli` package installs. Set another path in Settings → Backend.
   turns, laid out like the Agents peek.
 - **Restore.** Each row has a copyable resume command, shown only when the
   exact provider session is known. Sessions that ran in kitty also get
-  **Launch**: CodexBar switches to the saved desktop, opens a new kitty window
-  there and resumes the session in your shell. Sessions that ran in Tern
+  **Launch**: the Plasma widget switches to the saved desktop, opens a new kitty window
+  there and resumes the session in your shell; from Tern the window opens on
+  the current desktop. Sessions that ran in Tern
   resume in a new tab of the running Tern window, which is opened first when
   none runs. **Restore all** does this for every restart row in desktop order,
   one at a time. Running sessions are never launched twice, and a row leaves
@@ -286,11 +345,91 @@ Arch `codexbar-cli` package installs. Set another path in Settings → Backend.
 ### How agents are found
 
 A helper script scans `/proc` for agent processes on every poll, reads their
-session transcripts, and writes `~/.codexbar/agents.json`. No daemon or agent
-hooks are needed. Parsed transcript state is cached in
-`~/.codexbar/agents.parsers.json` (mode `0600`), so unchanged transcripts are
+session transcripts, and writes `~/.local/state/codexbar-agentview/agents.json`.
+No daemon or agent hooks are needed. Parsed transcript state is cached in
+`agents.parsers.json` next to it (mode `0600`), so unchanged transcripts are
 not reparsed. Polling continues while the tray dots, badge or task label are
 enabled, even with the Agents tab hidden.
+
+### Tern plugin
+
+The native Tern extension lives in `tern/`. It shows the same Usage, Agents
+and History tabs inside [Tern](https://docs.stencil.so/tern/), drawn with
+Tern's own cards, meters, lists and theme. It uses the shared helpers in
+`contents/scripts` from this checkout. It runs without the Plasma widget and
+without KDE, or alongside the widget using the same cached provider
+measurements and session snapshot.
+
+| Usage | Agents | Settings |
+| :---: | :---: | :---: |
+| [![Tern usage](docs/tern/usage.png)](docs/tern/usage.png) | [![Tern agents](docs/tern/agents-conversation.png)](docs/tern/agents-conversation.png) | [![Tern settings](docs/tern/settings-general.png)](docs/tern/settings-general.png) |
+
+```sh
+tern plugin link tern        # from the repository root
+```
+
+The status line at the bottom of every Tern window:
+
+![Tern status line](docs/tern/status-line.png)
+
+- **Status line.** Claude and Codex usage (`5h · 7d`, coloured by pace; other
+  providers appear once a window runs hot), agent counts and sessions waiting
+  to be restored. Clicking a segment opens the dashboard on that tab;
+  clicking it again while the dashboard shows that tab closes it. The
+  dashboard opens to the right of the tab's rightmost pane and evens out the
+  splits. It is a temporary sidebar: focusing any other pane, tab or session
+  closes it. However it closes, the window's layout returns to how it was
+  before it opened, unless other blocks opened or closed in the meantime.
+- **Palette.** `CodexBar AgentView: Agents`, `Usage` and `History` toggle the
+  dashboard the same way; `Settings` opens the settings tab. Keys are listed
+  under [Keyboard shortcuts](#tern-extension-1). Switching to a session
+  (`Enter` or **Focus**) closes the dashboard once the pane is shown.
+- **Rows.** The selected row shows its recap and buttons for Focus, Launch,
+  Teleport to Tern, Copy resume command and Dismiss. Working rows pulse
+  green, blocked rows are tinted red, and the session in the Tern pane you
+  last focused has a ringed dot (`◉`, `◎`).
+- **Focus and launch.** Tern sessions are shown with `tern focus`, kitty
+  windows through kitty remote control, T3 Code threads through their
+  `t3code://` link. Sessions in other terminals cannot be focused from Tern.
+  Launch, Restore all and Teleport to Tern work as in the widget.
+- **Polling.** When the Plasma widget runs, it polls usage and the plugin
+  reads what it measured. Every usage fetch calls Anthropic's OAuth usage
+  endpoint, and when that is rate-limited the CLI falls back to starting a
+  Claude Code session, so a second poller costs real sessions. The plugin
+  sweeps agents itself only when the snapshot is over 15 seconds old, and
+  fetches usage only when nothing measured it for twice `refreshSeconds`.
+  The fetcher holds a lock while it records each fetch start, so plugins in
+  several Tern daemons and the widget never start more than one automatic
+  fetch per interval, even on a first start. `R` fetches at once.
+- **Settings.** Open `CodexBar AgentView: Settings` from the palette or click the
+  cog at the right edge of the dashboard's tab strip. The native settings
+  page opens in its own tab; opening it again focuses that tab. Usage,
+  Providers, Agents and General expose every plugin option, with search
+  across all pages.
+  Switches, steppers and provider toggles save immediately. Text edits save
+  with `Enter` and cancel with `Esc`; `Ctrl+A` clears the draft. `Tab` or
+  `↑`/`↓` selects rows, `Space` toggles, `+`/`-` adjusts numbers,
+  `Delete` resets the selected row and `Ctrl+F` returns to search.
+  `Esc` cancels an edit, then clears search, then closes the settings tab.
+  Each changed row has a Reset button.
+  **Include non-Tern agents** defaults on and includes sessions from Kitty,
+  VS Code and other hosts in Agents, History and their counts. Turn it off
+  for a Tern-only view. This does not change the KDE applet's view.
+  Settings survive closing the tab and reloading the plugin. They live in
+  the `settings` table in
+  `~/.local/state/tern/plugin-data/codexbar-agentview/kv.json`.
+  `refreshSeconds` defaults to 300 and accepts 60 to 3600 seconds.
+  `historyLimit` defaults to 100 and accepts 10 to 1000 same-boot exits.
+  `cliPath` defaults to the first of `~/.local/bin/codexbar`,
+  `/usr/bin/codexbar`, `/usr/local/bin/codexbar`. Saving settings does not
+  fetch live usage. Turning off every provider disables usage polling in
+  the plugin. Provider credentials remain in `~/.codexbar/config.json`;
+  this page does not change the KDE applet's settings.
+  The About page links to this project's GitHub repository and upstream
+  CodexBar. Open either link with its button or select the row and press
+  `Enter` or `Space`.
+- **Not in the plugin.** Desktop notifications, the panel tray, and
+  `Super+A`, which is the widget's global shortcut.
 
 ## Supported providers
 
@@ -331,8 +470,8 @@ after switching to another thread.
 
 Sessions are recognised in kitty, Tern, Konsole, WezTerm, Alacritty, Ghostty,
 foot, GNOME Terminal, Tilix, Yakuake, xterm, tmux and VS Code terminals.
-Clicking a Tern session shows its tab with `tern focus`, then raises the Tern
-window. Claude and Codex threads that T3 Code runs are listed too, with T3
+Clicking a Tern session shows its tab with `tern focus`; the Plasma widget
+then raises the Tern window. Claude and Codex threads that T3 Code runs are listed too, with T3
 Code as the host.
 Clicking one raises the T3 Code window and sends it the thread's
 `t3code://threads/<environment>/<thread>` link. T3 Code 0.0.44 ignores the
@@ -349,7 +488,7 @@ Tern's built-in Carly assistant, are not listed.
 ## Configure provider credentials
 
 Plasmashell runs in its own environment, so API keys exported in `~/.zshrc` or
-`~/.bashrc` are invisible to the plasmoid. The `codexbar` CLI reads
+`~/.bashrc` are invisible to the Plasma widget. The `codexbar` CLI reads
 `~/.codexbar/config.json` and injects each provider's `apiKey` before fetching.
 The same file can list additional Codex profile homes:
 
@@ -402,7 +541,11 @@ window, so it has no tray meter; enable it in Settings → Providers.
 
 ## Configuration
 
-Right-click the widget → **Configure CodexBar**. Four tabs:
+The two interfaces have separate settings. Open `CodexBar AgentView: Settings` in
+Tern for the extension's options, described under [Tern plugin](#tern-plugin).
+The pages below configure the Plasma widget.
+
+Right-click the widget → **Configure CodexBar AgentView**. Five pages:
 
 ### Backend
 - Path to the `codexbar` CLI binary (default `/usr/bin/codexbar`). Custom paths,
@@ -432,7 +575,7 @@ Right-click the widget → **Configure CodexBar**. Four tabs:
 - Icon and ring size (14–48px, capped by panel thickness)
 
 ### Agents
-- Show/hide the Agents section in the popup
+- Show/hide the Agents tab in the popup
 - Include untracked processes without a resolved provider session
 - Show last user prompt under each session row
 - Agent state refresh interval (2–120 seconds)
@@ -443,12 +586,19 @@ Right-click the widget → **Configure CodexBar**. Four tabs:
 - Desktop waiting-for-input alerts (`agentNotifications`, off by default).
   Agent polling continues with alerts enabled even if agent indicators are hidden.
 - Install, remove or check the agent integration's XHR env scripts and
-  `codexbar://` URL handler.
+  `codexbar-agentview://` URL handler.
+
+### About
+Links to [CodexBar AgentView](https://github.com/materemias/codexbar-agentview), this
+Plasma applet and Tern plugin, and upstream
+[CodexBar](https://github.com/steipete/CodexBar), whose CLI supplies usage data.
 
 ## Update
 
+### Plasma widget
+
 ```sh
-cd /path/to/codexbar-kde
+cd /path/to/codexbar-agentview
 git pull
 cmake -S . -B build
 cmake --build build
@@ -465,31 +615,66 @@ If files were deleted between versions, do a clean reinstall:
 
 ```sh
 systemctl --user stop plasma-plasmashell.service
-kpackagetool6 -t Plasma/Applet -r org.codexbar.plasmoid
+kpackagetool6 -t Plasma/Applet -r io.github.materemias.codexbaragentview
 kpackagetool6 -t Plasma/Applet -i build/package
 systemctl --user start plasma-plasmashell.service
+```
+
+### Tern extension
+
+Close any open CodexBar AgentView dashboard before reloading, so it can restore the
+original split layout before its saved layout snapshot is lost.
+
+```sh
+cd /path/to/codexbar-agentview
+git pull
+tern plugin reload
+```
+
+### Upgrading from codexbar-kde
+
+The project was called codexbar-kde. Its Plasma widget ID, Tern plugin ID
+and URL handler changed with the new name. Sessions, history and the usage
+cache move from `~/.codexbar/` to `~/.local/state/codexbar-agentview/`
+automatically the first time a helper runs; `~/.codexbar/config.json`
+stays where it is, because the `codexbar` CLI reads it.
+
+Point the existing panel widget at the new package, so it keeps its place
+and settings:
+
+```sh
+cd /path/to/codexbar-agentview
+git pull
+cmake -S . -B build && cmake --build build
+systemctl --user stop plasma-plasmashell.service
+kpackagetool6 -t Plasma/Applet -i build/package
+sed -i 's/^plugin=org\.codexbar\.plasmoid$/plugin=io.github.materemias.codexbaragentview/' \
+  ~/.config/plasma-org.kde.plasma.desktop-appletsrc
+kpackagetool6 -t Plasma/Applet -r org.codexbar.plasmoid
+systemctl --user start plasma-plasmashell.service
+```
+
+Then run widget settings → **Agents** → **Install** once more to register
+the new URL handler and remove the old one.
+
+Relink the Tern extension. It copies its settings from the old plugin on
+first start:
+
+```sh
+tern plugin unlink codexbar
+tern plugin link tern        # from the repository root
 ```
 
 ## Uninstall
 
 ```sh
-kpackagetool6 -t Plasma/Applet -r org.codexbar.plasmoid
+kpackagetool6 -t Plasma/Applet -r io.github.materemias.codexbaragentview
 ```
 
 Settings → Agents → **Remove** first if you installed the agent integration.
 
-## Restarting plasmashell
-
-If the widget doesn't pick up changes (new environment, deleted files, icon
-caches), restart plasmashell through systemd:
-
-```sh
-systemctl --user restart plasma-plasmashell.service
-```
-
-This keeps the session's environment and locale, including the time format
-the popup uses. `plasmashell --replace` or `kstart plasmashell` from a terminal
-inherit that terminal's environment instead.
+To unlink the Tern extension, run `tern plugin unlink codexbar-agentview`. This does
+not uninstall the Plasma widget.
 
 ## License
 

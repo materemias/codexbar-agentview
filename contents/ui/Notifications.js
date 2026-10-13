@@ -91,7 +91,7 @@ function usage(previous, records, now, enabled) {
             var detail = level === 1 ? "Projected to exhaust before reset at the current pace."
                 : Math.round(win.usedPercent) + "% of the allowance used."
             events.push({ kind: "usage", usageKey: key, cycle: cycle, level: level,
-                title: "CodexBar " + (level === 3 ? "usage critical" : "usage warning"),
+                title: "CodexBar AgentView " + (level === 3 ? "usage critical" : "usage warning"),
                 // Never pass provider-supplied titles or unknown slot IDs into notification text.
                 body: label + " · " + (Usage.windowLabel(record.id, entry.slot, win)
                     || "Usage window") + ": " + detail })
@@ -133,7 +133,7 @@ function ompMode(previous, status, enabled) {
     if (mode !== old.mode) {
         state.sequence++
         state.transition = { kind: "ompMode",
-            sequence: state.sequence, title: "CodexBar omp mode changed",
+            sequence: state.sequence, title: "CodexBar AgentView omp mode changed",
             body: old.mode + " → " + mode }
     } else {
         state.transition = old.transition
@@ -169,7 +169,7 @@ function agents(previous, records, enabled) {
         if (enabled && old.enabled && old.sessions[key] !== undefined
                 && old.sessions[key] !== "blocked" && record.state === "blocked") {
             events.push({ kind: "agent",
-                title: "CodexBar agent waiting for input",
+                title: "CodexBar AgentView agent waiting for input",
                 body: providerName(record.provider) + " is waiting for your input." })
         }
     }
