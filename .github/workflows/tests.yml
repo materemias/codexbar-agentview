@@ -26,3 +26,15 @@ jobs:
         run: |
           python -m py_compile contents/scripts/*.py
           python -m unittest discover -s tests -v
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Python and Darwin bridge tests
+        run: |
+          python -m py_compile contents/scripts/*.py
+          python -m unittest discover -s tests -v

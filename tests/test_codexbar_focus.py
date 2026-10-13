@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import ExitStack
 import io
 import json
 import sys
+import runpy
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,6 +42,7 @@ class T3LinkTests(unittest.TestCase):
                     ("t-claude", "2", json.dumps({"threadId": "t-claude", "resume": "claude-sid"})),
                     ("t-codex", "1", json.dumps({"threadId": "codex-sid"})),
                 ])
+            db.close()
             with mock.patch.object(focus, "T3_DIR", root):
                 self.assertEqual(focus._t3_thread_link("claude-sid"), "t3code://threads/env-1/t-claude")
                 self.assertEqual(focus._t3_thread_link("codex-sid"), "t3code://threads/env-1/t-codex")
@@ -55,6 +58,7 @@ class LaunchTests(unittest.TestCase):
             path.write_text(json.dumps(payload))
             popen = mock.MagicMock()
             popen.return_value.pid = 4242
+            popen.return_value.poll.return_value = None
             stderr = io.StringIO()
             with (
                 mock.patch.object(focus, "AGGREGATE_PATH", path),
@@ -62,6 +66,10 @@ class LaunchTests(unittest.TestCase):
                 mock.patch.object(focus, "_desktop_count", return_value=desktops),
                 mock.patch.object(focus, "_kwin_place", return_value=True) as place,
                 mock.patch.object(focus, "_set_current_desktop") as switch,
+                mock.patch.object(focus.sys, "platform", "linux"),
+                mock.patch.object(focus, "USE_KWIN", True),
+                mock.patch.object(focus.agents, "tern_bin", return_value="tern"),
+                mock.patch.dict(focus.os.environ, {"TERN_DAEMON_SOCKET": ""}),
                 mock.patch.object(focus.sys, "stderr", stderr),
             ):
                 code = focus.launch("omp", "sid-1")
@@ -208,7 +216,7 @@ class TeleportTests(unittest.TestCase):
             path.write_text(json.dumps({"agents": [live], "history": []}))
             with (
                 mock.patch.object(focus, "AGGREGATE_PATH", path),
-                mock.patch.object(focus.shutil, "which", return_value="/usr/bin/tern"),
+                mock.patch.object(focus.agents, "tern_bin", return_value="/usr/bin/tern"),
                 mock.patch.dict(focus.agents._INFO_FN, {"omp": lambda _pid: info}),
                 mock.patch.object(focus.agents, "_parent_walk_for_host",
                                   return_value=(host, [])),
@@ -255,6 +263,243 @@ class TeleportTests(unittest.TestCase):
         self.assertEqual([s for _, s in signals],
                          [focus.signal.SIGHUP, focus.signal.SIGTERM])
         launch.assert_not_called()
+
+
+class PlatformFocusTests(unittest.TestCase):
+    def test_default_and_plugin_modes_disable_only_platform_specific_focus(self) -> None:
+        for platform, expected in (("darwin", False), ("linux", True)):
+            with mock.patch.object(focus.sys, "platform", platform):
+                module = runpy.run_path(str(SCRIPTS / "codexbar_focus.py"))
+                self.assertIs(module["USE_KWIN"], expected)
+        with (
+            mock.patch.object(focus.sys, "platform", "linux"),
+            mock.patch.object(focus, "USE_KWIN", True),
+            mock.patch.object(focus.state_paths, "migrate"),
+            mock.patch.object(focus, "focus", return_value=0) as action,
+        ):
+            self.assertEqual(focus.main(["--tern", "sid-1"]), 0)
+            self.assertFalse(focus.USE_KWIN)
+            action.assert_called_once_with("sid-1")
+
+    def test_linux_t3_opener_reports_handler_failure(self) -> None:
+        with (
+            mock.patch.object(focus.sys, "platform", "linux"),
+            mock.patch.object(focus, "_t3_thread_link", return_value="t3code://threads/env/thread"),
+            mock.patch.object(focus.subprocess, "run",
+                              return_value=focus.subprocess.CompletedProcess([], 1)) as run,
+        ):
+            self.assertFalse(focus._t3_open("sid-1"))
+        self.assertEqual(run.call_args.args[0], ["xdg-open", "t3code://threads/env/thread"])
+
+
+class MacFocusTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.object(focus.sys, "platform", "darwin"))
+        self.stack.enter_context(mock.patch.object(focus, "USE_KWIN", False))
+        self.stack.enter_context(mock.patch.object(focus.sys, "stderr", io.StringIO()))
+        self.kwin = self.stack.enter_context(mock.patch.object(focus, "_kwin_activate"))
+        self.place = self.stack.enter_context(mock.patch.object(focus, "_kwin_place"))
+        self.switch = self.stack.enter_context(mock.patch.object(focus, "_set_current_desktop"))
+        self.desktops = self.stack.enter_context(mock.patch.object(focus, "_desktop_count"))
+        self.addCleanup(self.assert_no_linux_desktop_calls)
+
+    def assert_no_linux_desktop_calls(self) -> None:
+        for method in (self.kwin, self.place, self.switch, self.desktops):
+            method.assert_not_called()
+
+    def payload(self, records: list[dict], live: list[dict] | None = None) -> None:
+        directory = self.stack.enter_context(tempfile.TemporaryDirectory())
+        path = Path(directory) / "agents.json"
+        path.write_text(json.dumps({"agents": live or [], "history": records}))
+        self.stack.enter_context(mock.patch.object(focus, "AGGREGATE_PATH", path))
+
+    def test_kitty_bundle_discovery_requires_executable_file(self) -> None:
+        directory = self.stack.enter_context(tempfile.TemporaryDirectory())
+        home = Path(directory)
+        executable = home / "Applications/kitty.app/Contents/MacOS/kitty"
+        executable.mkdir(parents=True)
+        original = focus.Path.is_file
+        with (
+            mock.patch.object(focus.shutil, "which", return_value=None),
+            mock.patch.object(focus.Path, "home", return_value=home),
+            mock.patch.object(focus.Path, "is_file", autospec=True,
+                              side_effect=lambda path: original(path) if home in path.parents else False),
+        ):
+            # An executable directory is not a usable app-bundle binary.
+            self.assertEqual(focus._kitty_bin(), "")
+            executable.rmdir()
+            executable.write_text("#!/bin/sh\nexit 0\n")
+            executable.chmod(0o700)
+            self.assertEqual(focus._kitty_bin(), str(executable))
+            executable.chmod(0o600)
+            self.assertEqual(focus._kitty_bin(), "")
+
+    def test_resume_shell_preserves_helper_home_across_terminal_environment(self) -> None:
+        directory = self.stack.enter_context(tempfile.TemporaryDirectory())
+        home = Path(directory) / "helper-home"
+        home.mkdir()
+        terminal_home = Path(directory) / "terminal-home"
+        terminal_home.mkdir()
+        with mock.patch.dict(focus.os.environ, {"HOME": str(home)}):
+            argv = focus._resume_shell_argv("/bin/sh", 'printf "%s\\n" "$HOME"')
+        result = focus.subprocess.run(
+            argv, input="exit\n", text=True, capture_output=True, timeout=5,
+            env={"HOME": str(terminal_home), "PATH": "/usr/bin:/bin"},
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), str(home))
+
+    def test_failed_kitty_start_and_missing_installation_are_failures(self) -> None:
+        self.payload([entry()])
+        with (
+            mock.patch.object(focus, "_kitty_bin", return_value="/bad/kitty"),
+            mock.patch.object(focus.subprocess, "Popen", side_effect=OSError("cannot execute")) as spawn,
+        ):
+            self.assertEqual(focus.launch("omp", "sid-1"), 8)
+            self.assertEqual(spawn.call_count, 1)
+        with (
+            mock.patch.object(focus, "_kitty_bin", return_value=""),
+            mock.patch.object(focus.subprocess, "Popen") as spawn,
+        ):
+            self.assertEqual(focus.launch("omp", "sid-1"), 8)
+            spawn.assert_not_called()
+
+    def test_restore_reports_only_selected_verified_successful_rows(self) -> None:
+        rows = [entry(sessionId=sid, closedBy="reboot",
+                      resumeCommand=f"cd -- /work/project && omp --resume {sid}")
+                for sid in ("good", "bad", "live", "not-selected", "failed")]
+        rows[1]["resumeCommand"] = "unexpected command"
+        self.payload(rows, [{"provider": "omp", "sessionId": "live"}])
+        stdout = io.StringIO()
+        def spawn(argv, **kwargs):
+            if "omp --resume failed;" in argv[-1]:
+                raise OSError("cannot launch")
+            return mock.Mock(pid=42)
+        with (
+            mock.patch.object(focus, "_kitty_bin", return_value="/bundle/kitty"),
+            mock.patch.object(focus.subprocess, "Popen", side_effect=spawn) as started,
+            mock.patch.object(focus.sys, "stdout", stdout),
+        ):
+            self.assertEqual(focus.launch_all({("omp", sid) for sid in
+                                              ("good", "bad", "live", "failed")}), 0)
+        self.assertEqual(json.loads(stdout.getvalue()), [["omp", "good"]])
+        self.assertEqual(started.call_count, 2)
+        self.assertTrue(all(call.args[0][0] == "/bundle/kitty" for call in started.call_args_list))
+
+    def test_kitty_focus_prefers_inherited_socket_without_abstract_fallbacks(self) -> None:
+        record = entry(pid=42)
+        addresses = []
+        def remote(argv, **kwargs):
+            address = argv[argv.index("--to") + 1] if "--to" in argv else ""
+            addresses.append(address)
+            return focus.subprocess.CompletedProcess(argv, 0 if address == "unix:/private/custom.sock" else 1)
+        with (
+            mock.patch.object(focus, "_find_sentinel", return_value=record),
+            mock.patch.object(focus, "_ancestor_pids", return_value=[42, 41]),
+            mock.patch.object(focus.agents, "_comm_of", return_value="kitty"),
+            mock.patch.object(focus.agents, "_environ_value", return_value="unix:/private/custom.sock"),
+            mock.patch.object(focus, "_kitty_bin", return_value="/bundle/kitty"),
+            mock.patch.object(focus.subprocess, "run", side_effect=remote),
+        ):
+            self.assertEqual(focus.focus("sid-1"), 0)
+        self.assertEqual(addresses, ["unix:/private/custom.sock"])
+        with (
+            mock.patch.object(focus, "_kitty_bin", return_value="/bundle/kitty"),
+            mock.patch.object(focus.agents, "_environ_value", return_value=""),
+            mock.patch.object(focus.Path, "glob", return_value=[]),
+            mock.patch.object(focus.subprocess, "run",
+                              return_value=focus.subprocess.CompletedProcess([], 1)) as run,
+        ):
+            self.assertFalse(focus._kitty_focus([42]))
+        self.assertTrue(all("--to" not in call.args[0] for call in run.call_args_list))
+
+    def test_t3_focus_requires_opener_success(self) -> None:
+        with (
+            mock.patch.object(focus, "_find_sentinel", return_value=entry(host="t3code", pid=42)),
+            mock.patch.object(focus, "_ancestor_pids", return_value=[42]),
+            mock.patch.object(focus.agents, "t3_window_pids", return_value=[43]),
+            mock.patch.object(focus.agents, "_comm_of", return_value="Code"),
+            mock.patch.object(focus, "_t3_thread_link", return_value="t3code://threads/env/thread"),
+            mock.patch.object(focus.subprocess, "run") as run,
+        ):
+            for result, expected in ((0, 0), (1, 4)):
+                run.return_value = focus.subprocess.CompletedProcess([], result)
+                self.assertEqual(focus.focus("sid-1"), expected)
+                self.assertEqual(run.call_args.args[0], ["/usr/bin/open", "t3code://threads/env/thread"])
+            for failure in (OSError("no handler"), focus.subprocess.TimeoutExpired("open", 5)):
+                run.side_effect = failure
+                self.assertEqual(focus.focus("sid-1"), 4)
+
+    def test_other_daemon_window_does_not_make_target_ready(self) -> None:
+        self.payload([entry(host="tern")])
+        calls = []
+        def tern(args, socket=""):
+            calls.append(args)
+            return focus.subprocess.CompletedProcess(args, 0, '{"block": 9}', "")
+        with (
+            mock.patch.dict(focus.os.environ, {"TERN_DAEMON_SOCKET": "/tmp/target.sock"}),
+            mock.patch.object(focus.agents, "tern_window_pids", return_value=[77]),
+            mock.patch.object(focus.agents, "_environ_value", return_value="/tmp/unrelated.sock"),
+            mock.patch.object(focus, "_tern", side_effect=tern),
+            mock.patch.object(focus, "_start_tern", return_value=False) as start,
+        ):
+            self.assertEqual(focus.launch("omp", "sid-1"), 8)
+            start.assert_called_once()
+        self.assertEqual(calls, [])  # No hidden tab in the answering target daemon.
+        with (
+            mock.patch.dict(focus.os.environ, {"TERN_DAEMON_SOCKET": "/tmp/target.sock"}),
+            mock.patch.object(focus.agents, "tern_window_pids", return_value=[77]),
+            mock.patch.object(focus.agents, "_environ_value", return_value="/tmp/target.sock"),
+            mock.patch.object(focus, "_tern", side_effect=tern),
+            mock.patch.object(focus, "_start_tern") as start,
+        ):
+            self.assertEqual(focus.launch("omp", "sid-1"), 0)
+            start.assert_not_called()
+        self.assertEqual(calls[-2][:2], ["new", "tab"])
+        self.assertEqual(calls[-1], ["focus", "9"])
+
+    def test_tern_focus_failure_does_not_claim_success(self) -> None:
+        with (
+            mock.patch.object(focus, "_find_sentinel", return_value=entry(host="tern", pid=42)),
+            mock.patch.object(focus, "_ancestor_pids", return_value=[42]),
+            mock.patch.object(focus.agents, "tern_window_pids", return_value=[43]),
+            mock.patch.object(focus.agents, "_environ_value",
+                              side_effect=lambda _pid, name: "9" if name == "TERN_PANE" else "/tmp/target.sock"),
+            mock.patch.object(focus, "_tern") as tern,
+        ):
+            tern.return_value = focus.subprocess.CompletedProcess([], 1)
+            self.assertEqual(focus.focus("sid-1"), 4)
+            tern.return_value = focus.subprocess.CompletedProcess([], 0)
+            self.assertEqual(focus.focus("sid-1"), 0)
+            self.assertEqual(tern.call_args.args, (["focus", "9"], "/tmp/target.sock"))
+
+    def test_tern_start_preserves_environment_and_reports_early_exit(self) -> None:
+        isolated = {"HOME": "/tmp/test-home", "TERN_DAEMON_SOCKET": "/tmp/test.sock",
+                    "TERN_CONFIG_DIR": "/tmp/test-config"}
+        with (
+            mock.patch.dict(focus.os.environ, isolated),
+            mock.patch.object(focus.agents, "tern_bin", return_value="/bundle/tern"),
+            mock.patch.object(focus.time, "sleep"),
+            mock.patch.object(focus, "_tern_ready", side_effect=[False, True]),
+            mock.patch.object(focus.subprocess, "Popen") as spawn,
+        ):
+            spawn.return_value.poll.return_value = None
+            self.assertTrue(focus._start_tern())
+            self.assertEqual(spawn.call_args.args[0], ["/bundle/tern"])
+            # No env replacement: the direct executable inherits all three.
+            self.assertNotIn("env", spawn.call_args.kwargs)
+            spawn.return_value.poll.return_value = 1
+            self.assertFalse(focus._start_tern())
+        self.payload([entry(host="tern")])
+        with (
+            mock.patch.object(focus, "_tern_ready", return_value=False),
+            mock.patch.object(focus, "_start_tern", return_value=False),
+            mock.patch.object(focus, "_tern") as tern,
+        ):
+            self.assertEqual(focus.launch("omp", "sid-1"), 8)
+            tern.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -14,7 +14,33 @@ local KIND = "codexbar-agentview.dashboard"
 local SETTINGS_KIND = "codexbar-agentview.settings"
 local PANE_TAG = 2 ^ 44
 local HOME = tern.getenv("HOME") or ""
-local TERN = if HOME ~= "" and tern.fs.exists(HOME .. "/.local/bin/tern") then HOME .. "/.local/bin/tern" else "tern"
+local function ternPath(): string
+	local localBin = HOME .. "/.local/bin/tern"
+	if HOME ~= "" and tern.fs.exists(localBin) then
+		return localBin
+	end
+	if tern.runtime.os == "macos" then
+		for dir in string.gmatch(tern.getenv("PATH") or "", "[^:]+") do
+			local p = dir .. "/tern"
+			if tern.fs.exists(p) then
+				return p
+			end
+		end
+		for _, p in {
+			HOME .. "/Applications/Tern.app/Contents/MacOS/tern",
+			"/Applications/Tern.app/Contents/MacOS/tern",
+			"/opt/homebrew/bin/tern",
+			"/usr/local/bin/tern",
+		} do
+			if tern.fs.exists(p) then
+				return p
+			end
+		end
+	end
+	return "tern"
+end
+
+local TERN = ternPath()
 
 local function cli(args: { string }, done: ((ProcessResult, WindowCx?) -> ())?, timeout: number?): boolean
 	local argv = { TERN }

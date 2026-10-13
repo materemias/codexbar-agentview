@@ -56,6 +56,14 @@ KNOWN_HOSTS = {
     "Terminal", "iTerm2", "wezterm-gui",
 }
 
+_MAC_APP_HOSTS = {
+    "Visual Studio Code.app": ("Code", "Code Helper", "code"),
+    "Visual Studio Code - Insiders.app": ("Code - Insiders", "Code - Insiders Helper", "code-insiders"),
+    "T3 Code.app": ("T3 Code", "T3 Code Helper", "t3code"),
+    "Tern.app": ("tern", "", "tern"),
+    "kitty.app": ("kitty", "", "kitty"),
+}
+
 # Hosts whose history rows codexbar_focus.py --launch can reopen.
 LAUNCH_HOSTS = {"kitty", "tern"}
 
@@ -199,11 +207,14 @@ def _open_paths(pid: int) -> list[str]:
     return out
 
 
-def _read_boot_id() -> str:
+def _linux_boot_id() -> str:
     try:
         return BOOT_ID_PATH.read_text().strip()
     except (OSError, UnicodeError):
         return ""
+
+
+_read_boot_id = _linux_boot_id
 
 
 if sys.platform == "darwin":
@@ -219,6 +230,50 @@ if sys.platform == "darwin":
     _exe_of = proc_darwin.exe_of
     _open_paths = proc_darwin.open_paths
     _read_boot_id = proc_darwin.boot_id
+
+
+def _host_identity(comm: str, executable: str) -> str:
+    """Normalize supported app executables to the shared host keys.
+
+    Electron is not itself a host: only a named application's main binary
+    or its own helper bundle identifies it."""
+    if comm in KNOWN_HOSTS:
+        return comm
+    parts = Path(executable).parts
+    for i, part in enumerate(parts):
+        if part not in _MAC_APP_HOSTS:
+            continue
+        main, helper, host = _MAC_APP_HOSTS[part]
+        suffix = parts[i + 1:]
+        if suffix == ("Contents", "MacOS", main):
+            return host
+        if helper and len(suffix) == 6 and suffix[:2] == ("Contents", "Frameworks"):
+            name = suffix[2].removesuffix(".app")
+            if (
+                name in {helper, f"{helper} (GPU)", f"{helper} (Renderer)", f"{helper} (Plugin)"}
+                and suffix[2] == f"{name}.app"
+                and suffix[3:] == ("Contents", "MacOS", name)
+            ):
+                return host
+        # A different binary within a supported bundle is not its host.
+        return ""
+    # Linux's remote VS Code server and packaged executables.
+    if "vscode-server" in executable or "/code/" in executable or "code-insiders" in executable:
+        return "code"
+    return ""
+
+
+def _host_of(pid: int) -> str:
+    comm = _comm_of(pid)
+    if comm in KNOWN_HOSTS:
+        return comm
+    if sys.platform == "darwin":
+        # GUI launchers may leave only a basename in argv[0]. The kernel's
+        # executable path still identifies the app bundle.
+        executable = _exe_of(pid)
+    else:
+        executable = (_argv_of(pid) or [""])[0]
+    return _host_identity(comm, executable)
 
 
 def _parent_walk_for_host(
@@ -239,18 +294,12 @@ def _parent_walk_for_host(
         seen.add(cur)
         chain.append(cur)
         depth -= 1
-        comm = _comm_of(cur)
-        if comm in KNOWN_HOSTS:
-            host, host_pid = comm, cur
+        identity = _host_of(cur)
+        if identity:
+            host, host_pid = identity, cur
             break
         if _is_t3_server(cur):
             host, host_pid, t3_server = "t3code", cur, True
-            break
-        # Match the executable only; arguments can name any path, such as
-        # ~/code/<project> passed to the agent.
-        exe = (_argv_of(cur) or [""])[0]
-        if "vscode-server" in exe or "/code/" in exe or "code-insiders" in exe:
-            host, host_pid = "code", cur
             break
         nxt = _ppid_of(cur)
         if not nxt or nxt == cur:
@@ -259,14 +308,14 @@ def _parent_walk_for_host(
     if not host:
         return "", []
 
-    # Electron hosts run several same-named helper processes (pty host,
-    # extension host); the window-owning main process may sit further up.
-    # Extend the chain through the contiguous run of same-comm hosts so the
+    # Electron hosts run named helper processes (pty host, extension host);
+    # the window-owning main process may sit further up. Extend the chain
+    # through the contiguous run of normalized hosts so the
     # window pid is part of the family. Plain terminals stop at systemd or
     # the shell, so this only ever adds pids for multi-process hosts.
     while depth > 0:
         nxt = _ppid_of(host_pid)
-        if nxt <= 1 or nxt in seen or _comm_of(nxt) != host:
+        if nxt <= 1 or nxt in seen or _host_of(nxt) != host:
             break
         seen.add(nxt)
         chain.append(nxt)
@@ -296,8 +345,16 @@ def tern_bin() -> str:
     found = shutil.which("tern")
     if found:
         return found
-    for path in (Path.home() / ".local/bin/tern", Path("/Applications/Tern.app/Contents/MacOS/tern")):
-        if os.access(path, os.X_OK):
+    paths = [Path.home() / ".local/bin/tern"]
+    if sys.platform == "darwin":
+        paths.extend((
+            Path("/Applications/Tern.app/Contents/MacOS/tern"),
+            Path.home() / "Applications/Tern.app/Contents/MacOS/tern",
+            Path("/opt/homebrew/bin/tern"),
+            Path("/usr/local/bin/tern"),
+        ))
+    for path in paths:
+        if path.is_file() and os.access(path, os.X_OK):
             return str(path)
     return ""
 
@@ -307,7 +364,7 @@ def tern_window_pids() -> list[int]:
     session daemon."""
     return [
         pid for pid in _all_pids()
-        if _comm_of(pid) == "tern" and _argv_of(pid)[1:2] != ["daemon"]
+        if _host_of(pid) == "tern" and _argv_of(pid)[1:2] != ["daemon"]
     ]
 
 
@@ -325,7 +382,7 @@ def t3_window_pids() -> list[int]:
     Electron helpers rewrite their cmdline into one string with `--type=`."""
     return [
         pid for pid in _all_pids()
-        if _comm_of(pid) == "t3code" and "--type=" not in " ".join(_argv_of(pid))
+        if _host_of(pid) == "t3code" and "--type=" not in " ".join(_argv_of(pid))
     ]
 
 
@@ -364,7 +421,7 @@ def _under_t3(pid: int) -> bool:
     seen: set[int] = set()
     cur = _ppid_of(pid)
     while cur > 1 and cur not in seen and len(seen) < 12:
-        if _comm_of(cur) == "t3code" or _is_t3_server(cur):
+        if _host_of(cur) == "t3code" or _is_t3_server(cur):
             return True
         seen.add(cur)
         cur = _ppid_of(cur)

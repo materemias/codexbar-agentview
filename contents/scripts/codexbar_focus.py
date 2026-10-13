@@ -18,9 +18,9 @@ Konsole, Yakuake, Wezterm, etc.
   codexbar_focus.py --launch <provider> <sessionId>
 
 starts the saved resume command of a history record. A kitty record gets a
-new kitty window in its own systemd scope, so a plasmashell restart does not
-kill it, moved to the record's saved virtual desktop. A Tern record gets a
-new tab in the running Tern window, whose session daemon owns the process.
+new window: Linux uses a systemd scope and its saved virtual desktop; macOS
+opens directly on the current desktop. A Tern record gets a new tab in
+the running Tern window, whose session daemon owns the process.
 
   codexbar_focus.py --teleport <provider> <sessionId>
 
@@ -54,8 +54,8 @@ import state_paths
 
 AGENTS_DIR = state_paths.STATE_DIR / "agents"
 AGGREGATE_PATH = state_paths.STATE_DIR / "agents.json"
-# False under --tern: the Tern plugin must not depend on KWin.
-USE_KWIN = True
+# Darwin has neither KWin nor systemd; --tern also disables KWin on Linux.
+USE_KWIN = sys.platform != "darwin"
 T3_DIR = Path.home() / ".t3" / "userdata"
 
 
@@ -93,23 +93,37 @@ def _ancestor_pids(start_pid: int, max_depth: int = 16) -> list[int]:
     return pids
 
 
+def _kitty_bin() -> str:
+    """Find Kitty even when a GUI-launched helper inherits a reduced PATH."""
+    found = shutil.which("kitty")
+    if found:
+        return found
+    if sys.platform == "darwin":
+        for root in (Path("/Applications"), Path.home() / "Applications"):
+            path = root / "kitty.app" / "Contents" / "MacOS" / "kitty"
+            if path.is_file() and os.access(path, os.X_OK):
+                return str(path)
+    return ""
+
+
 def _kitty_focus(candidate_pids: list[int]) -> bool:
     """Try every kitty socket we can find for a window matching one of the pids.
 
     Works only when kitty has `allow_remote_control yes` and a `listen_on`
-    socket. We try abstract sockets first (newer kitty default) then anything
-    under /tmp.
+    socket. Prefer the address inherited by the agent; legacy sockets are
+    fallbacks, and abstract Unix sockets are Linux-only.
     """
-    sockets: list[str] = []
-    for path in Path("/tmp").glob("mykitty-*"):
-        sockets.append(f"unix:{path}")
-    for path in Path("/tmp").glob("kitty-*"):
-        sockets.append(f"unix:{path}")
-    # Abstract sockets — kitty's default `listen_on` template.
-    for pid in candidate_pids:
-        sockets.append(f"unix:@kitty-{pid}")
-        sockets.append(f"unix:@mykitty-{pid}")
-
+    executable = _kitty_bin()
+    if not executable:
+        return False
+    sockets = [address for pid in candidate_pids
+               if (address := agents._environ_value(pid, "KITTY_LISTEN_ON"))]
+    for pattern in ("mykitty-*", "kitty-*"):
+        sockets.extend(f"unix:{path}" for path in Path("/tmp").glob(pattern))
+    if sys.platform != "darwin":
+        for pid in candidate_pids:
+            sockets.append(f"unix:@kitty-{pid}")
+            sockets.append(f"unix:@mykitty-{pid}")
     seen = set()
     for sock in sockets:
         if sock in seen:
@@ -118,21 +132,21 @@ def _kitty_focus(candidate_pids: list[int]) -> bool:
         for pid in candidate_pids:
             try:
                 proc = subprocess.run(
-                    ["kitty", "@", "--to", sock, "focus-window", "--match", f"pid:{pid}"],
+                    [executable, "@", "--to", sock, "focus-window", "--match", f"pid:{pid}"],
                     capture_output=True, timeout=2.0, check=False,
                 )
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                return False  # kitty not installed → no point retrying
+            except (OSError, subprocess.TimeoutExpired):
+                return False
             if proc.returncode == 0:
                 return True
     # Last attempt: default socket (no --to).
     for pid in candidate_pids:
         try:
             proc = subprocess.run(
-                ["kitty", "@", "focus-window", "--match", f"pid:{pid}"],
+                [executable, "@", "focus-window", "--match", f"pid:{pid}"],
                 capture_output=True, timeout=2.0, check=False,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired):
             return False
         if proc.returncode == 0:
             return True
@@ -147,7 +161,7 @@ def _tern(args: list[str], socket: str = "") -> subprocess.CompletedProcess | No
             [agents.tern_bin() or "tern", *args], capture_output=True, text=True, timeout=5.0,
             check=False, env=env,
         )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
+    except (OSError, subprocess.TimeoutExpired):
         return None
 
 
@@ -395,11 +409,16 @@ def launch(provider: str, session_id: str) -> int:
         return _launch_tern(cwd, shell, command)
     # An interactive shell loads the user's PATH; the trailing shell keeps
     # the window open after the agent exits, like the original terminal.
+    executable = _kitty_bin() if sys.platform == "darwin" else "kitty"
+    if not executable:
+        sys.stderr.write("codexbar_focus: Kitty is not installed\n")
+        return 8
     argv = [
-        "systemd-run", "--user", "--scope", "--quiet", "--collect", "--",
-        "kitty", "--directory", cwd or str(Path.home()), "--",
-        shell, "-ic", f"{command}; exec {shlex.quote(shell)} -i",
+        executable, "--directory", cwd or str(Path.home()), "--",
+        *_resume_shell_argv(shell, command),
     ]
+    if sys.platform != "darwin":
+        argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", *argv]
     desktop = record.get("desktop")
     if not USE_KWIN or not agents._valid_desktop(desktop):
         desktop = ""
@@ -428,6 +447,15 @@ def launch(provider: str, session_id: str) -> int:
 
 def _user_shell() -> str:
     return os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
+
+
+def _resume_shell_argv(shell: str, command: str) -> list[str]:
+    argv = [shell, "-ic", f"{command}; exec {shlex.quote(shell)} -i"]
+    if sys.platform == "darwin":
+        # Mac terminals customize direct-shell startup. Keep the helper's
+        # home even when a daemon supplies its own shell environment.
+        argv = ["/usr/bin/env", f"HOME={Path.home()}", *argv]
+    return argv
 
 
 # Shells whose exit closes the kitty window they run in.
@@ -534,20 +562,28 @@ def teleport(provider: str, session_id: str) -> int:
 def _tern_ready() -> bool:
     """A Tern window shows the daemon's sessions. The daemon outlives its
     windows, so an answering daemon alone would take a hidden tab."""
-    if not agents.tern_window_pids():
+    windows = agents.tern_window_pids()
+    socket = os.environ.get("TERN_DAEMON_SOCKET", "")
+    if socket:
+        windows = [pid for pid in windows
+                   if agents._environ_value(pid, "TERN_DAEMON_SOCKET") == socket]
+    if not windows:
         return False
     proc = _tern(["ls"])
     return proc is not None and proc.returncode == 0
 
 
 def _start_tern() -> bool:
-    """Open a Tern window, which starts its session daemon: on Linux in its
-    own systemd scope so a plasmashell stop does not kill it, on macOS
-    through Launch Services."""
-    argv = (["open", "-a", "Tern"] if sys.platform == "darwin" else
-            ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", "tern"])
+    """Open a Tern window with the helper's HOME and daemon/config environment.
+    Linux uses a scope so a plasmashell stop does not kill the window."""
+    executable = agents.tern_bin()
+    if not executable:
+        return False
+    argv = [executable]
+    if sys.platform != "darwin":
+        argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", *argv]
     try:
-        subprocess.Popen(
+        proc = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True,
@@ -557,6 +593,8 @@ def _start_tern() -> bool:
     deadline = time.monotonic() + TERN_START_TIMEOUT
     while time.monotonic() < deadline:
         time.sleep(0.3)
+        if proc.poll() is not None:
+            return False
         if _tern_ready():
             return True
     return False
@@ -571,7 +609,7 @@ def _launch_tern(cwd: str, shell: str, command: str) -> int:
         return 8
     proc = _tern([
         "new", "tab", "--json", "--cwd", cwd or str(Path.home()), "--",
-        shell, "-ic", f"{command}; exec {shlex.quote(shell)} -i",
+        *_resume_shell_argv(shell, command),
     ])
     if proc is None or proc.returncode != 0:
         detail = (proc.stderr.strip() if proc else "") or "tern is not available"
@@ -632,7 +670,8 @@ def _t3_thread_link(session_id: str) -> str:
     `threadId` in each thread's resume cursor."""
     try:
         env = (T3_DIR / "environment-id").read_text().strip()
-        with sqlite3.connect(f"file:{T3_DIR / 'state.sqlite'}?mode=ro", uri=True, timeout=1) as db:
+        db = sqlite3.connect(f"file:{T3_DIR / 'state.sqlite'}?mode=ro", uri=True, timeout=1)
+        try:
             row = db.execute(
                 "SELECT thread_id FROM provider_session_runtime"
                 " WHERE ? IN (json_extract(resume_cursor_json, '$.resume'),"
@@ -640,6 +679,8 @@ def _t3_thread_link(session_id: str) -> str:
                 " ORDER BY last_seen_at DESC LIMIT 1",
                 (session_id,),
             ).fetchone()
+        finally:
+            db.close()
     except (OSError, sqlite3.Error):
         return ""
     if not env or not row:
@@ -654,13 +695,14 @@ def _t3_open(session_id: str) -> bool:
     if not link:
         return False
     try:
-        subprocess.Popen(
-            ["xdg-open", link], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True,
+        proc = subprocess.run(
+            ["/usr/bin/open" if sys.platform == "darwin" else "xdg-open", link],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=5.0, check=False,
         )
-    except OSError:
+    except (OSError, subprocess.TimeoutExpired):
         return False
-    return True
+    return proc.returncode == 0
 
 
 def focus(session_id: str) -> int:
@@ -696,7 +738,7 @@ def focus(session_id: str) -> int:
     if USE_KWIN and _kwin_activate(candidates, record):
         return 0
 
-    reason = "" if USE_KWIN else " (KWin is unavailable to the Tern plugin)"
+    reason = "" if USE_KWIN else " (KWin is unavailable)"
     sys.stderr.write(
         f"codexbar_focus: couldn't focus pids={candidates} host={host}{reason}\n"
     )

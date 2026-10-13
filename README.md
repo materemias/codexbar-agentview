@@ -1,13 +1,13 @@
 # CodexBar AgentView
 
 CodexBar AgentView shows AI provider usage and coding-agent sessions through two
-interfaces on Linux:
+interfaces:
 
 - A **KDE Plasma 6 widget** puts usage rings and agent counts in your panel,
   with a popup for Usage, Agents and History and a global keyboard shortcut.
-- A **native Tern extension** puts usage and agent counts in Tern's status
-  line, opens the same three tabs as a temporary sidebar, and has its own
-  native settings tab.
+- A **native Tern extension** runs on Linux and macOS. It puts usage and agent
+  counts in Tern's status line, opens the same three tabs as a temporary sidebar,
+  and has its own native settings tab.
 
 Use either interface on its own, or both together. The Tern extension does
 not require building or installing the Plasma widget, and it does not use
@@ -81,22 +81,21 @@ The screenshots use a demo account, made-up provider accounts and sessions.
 
 ## Requirements
 
-Linux. The Tern extension also runs on macOS in alpha state: the agent
-scanner reads processes through libproc there and lists agents in Tern panes;
-see [Tern extension](#tern-extension). Windows is not supported: there is no
-native `codexbar` CLI for it, and the helpers use POSIX-only Python modules.
+The Plasma widget requires Linux and KDE Plasma 6. The Tern extension runs on
+Linux and macOS without KDE. Windows is not supported: there is no native
+`codexbar` CLI for it, and the helpers use POSIX-only Python modules.
 
 | Requirement | Plasma widget | Tern extension | What it enables |
 | --- | :---: | :---: | --- |
 | KDE Plasma **6** (with KWin) | Required | — | The panel widget itself |
 | [Tern](https://stencil.so/tern) | — | Required | The extension itself |
-| Python 3 | Required | Required | The shared helpers |
+| Python 3.10+ | Required | Required | The shared helpers |
 | [`codexbar`](https://github.com/steipete/CodexBar) CLI | Required | Required | Provider usage. Without it, Agents and History still work |
 | CMake 3.21+, a C++17 compiler, Qt 6 Core/QML development files | Required | — | Building the widget. On Arch: `base-devel`, `cmake`, `qt6-declarative` |
 | `qdbus6` (Plasma's Qt tools) | Optional | — | Click to focus, desktop switching, placing restored kitty windows |
 | kitty or Tern | Optional | Optional | **Launch** and **Restore all**; with both, **Teleport to Tern**. Other terminals keep the copyable resume command |
 | kitty remote control (`allow_remote_control`, `listen_on`) | Optional | Optional | Exact focus of kitty windows. Without it the widget falls back to KWin, and the extension cannot focus kitty windows |
-| systemd user session | Optional | Optional | Restored kitty windows survive a plasmashell restart |
+| systemd user session | Optional | Optional on Linux | Restored kitty windows survive a plasmashell restart |
 | `notify-send` (libnotify) | Optional | — | Usage warnings and waiting-for-input notifications |
 
 The Plasma widget's `codexbar` CLI path defaults to `/usr/bin/codexbar`,
@@ -143,13 +142,37 @@ No CMake build, Plasma widget installation or widget integration setup is
 needed. Keep the checkout in place while the extension is linked.
 See [Tern plugin](#tern-plugin) for its dashboard, shortcuts and settings.
 
-macOS support is alpha. The extension runs there, with the helpers reading
-processes through libproc instead of `/proc`; it lists and focuses agents in
-Tern panes.
-Install the CLI with Homebrew (`/opt/homebrew/bin/codexbar` is found without
-setting a path). The CLI reads Claude's OAuth token from the login Keychain
-item `Claude Code-credentials`, which is locked over SSH, so Claude usage
-only loads in the desktop session.
+#### macOS
+
+Install Tern, Python 3.10+ and the upstream CodexBar CLI, then link the extension
+as above. No Qt build, Plasma integration script, systemd service or URL-handler
+installation is needed. `install_integration.py` is Linux-only and rejects
+installation or removal on macOS before changing files.
+
+The extension finds Python and CodexBar in both Homebrew prefixes,
+`/opt/homebrew/bin` and `/usr/local/bin`, including when Tern starts from Finder
+with a reduced `PATH`. The CodexBar CLI path can also be set in the extension's
+General settings. Tern and kitty are found through `PATH` or their app bundles
+in `/Applications` and `~/Applications`.
+
+The scanner uses libproc and sysctl instead of `/proc`. Tern sessions can be
+focused, resumed from History and restored after a reboot. Kitty sessions can
+also be resumed in new windows or teleported to Tern once idle; focusing kitty
+requires its remote-control socket. Restores open on the current macOS desktop,
+not a saved KDE virtual desktop.
+
+**Include non-Tern agents** also lists recognized terminal and app hosts on
+macOS, including kitty and VS Code. Hosts without a supported focus route keep
+their copyable resume command. T3 Code uses its registered `t3code://` handler;
+whether it opens the exact thread depends on the installed T3 Code version.
+
+The CLI reads Claude's OAuth token from the login Keychain item
+`Claude Code-credentials`, which is locked over SSH, so Claude usage requires
+the unlocked desktop session.
+
+Python CI runs on Linux and macOS. The Mac suite includes real child-process
+introspection for ancestry, arguments, environment, cwd and rollout ownership;
+the Linux job also builds and tests the native Plasma command runner.
 
 ## Keyboard shortcuts
 
@@ -370,12 +393,14 @@ The settings tab has its own keys, listed under [Tern plugin](#tern-plugin).
 
 ### How agents are found
 
-A helper script scans `/proc` for agent processes on every poll, reads their
-session transcripts, and writes `~/.local/state/codexbar-agentview/agents.json`.
-No daemon or agent hooks are needed. Parsed transcript state is cached in
-`agents.parsers.json` next to it (mode `0600`), so unchanged transcripts are
-not reparsed. Polling continues while the tray dots, badge or task label are
-enabled, even with the Agents tab hidden.
+A helper script scans `/proc` on Linux or libproc/sysctl on macOS for agent
+processes on every poll, reads their session transcripts, and writes
+`~/.local/state/codexbar-agentview/agents.json`. An absolute `XDG_STATE_HOME`
+overrides the state root on either platform. No daemon or agent hooks are
+needed. Parsed transcript state is cached in `agents.parsers.json` next to it
+(mode `0600`), so unchanged transcripts are not reparsed. Plasma polling
+continues while the tray dots, badge or task label are enabled, even with the
+Agents tab hidden.
 
 ### Tern plugin
 
@@ -409,7 +434,8 @@ tern plugin link tern        # from the repository root
 - **Focus and launch.** Tern sessions are shown with `tern focus`, kitty
   windows through kitty remote control, T3 Code threads through their
   `t3code://` link. Sessions in other terminals cannot be focused from Tern.
-  Launch, Restore all and Teleport to Tern work as in the widget.
+  Launch, Restore all and Teleport to Tern use the shared helper on both
+  platforms. macOS does not use KWin or systemd; restores use the current desktop.
 - **Polling.** When the Plasma widget runs, it polls usage and the plugin
   reads what it measured. Every usage fetch calls Anthropic's OAuth usage
   endpoint, and when that is rate-limited the CLI falls back to starting a
@@ -431,8 +457,8 @@ tern plugin link tern        # from the repository root
   `Esc` cancels an edit, then clears search, then closes the settings tab.
   Each changed row has a Reset button.
   **Include non-Tern agents** defaults off. Turned on, it includes sessions
-  from Kitty, VS Code and other hosts in Agents, History and their counts.
-  It is tested on Linux only and probably does not work on other platforms.
+  from kitty, VS Code and other recognized hosts in Agents, History and their
+  counts on Linux and macOS. Focus still requires a supported host route.
   This does not change the KDE applet's view.
   Settings survive closing the tab and reloading the plugin. They live in
   the `settings` table in

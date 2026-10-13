@@ -138,7 +138,7 @@ def _sysctl(mib: list[int], size: int) -> bytes:
     arr = (ctypes.c_int * len(mib))(*mib)
     buf = ctypes.create_string_buffer(size)
     length = ctypes.c_size_t(size)
-    if _libc.sysctl(arr, len(mib), buf, ctypes.byref(length), None, 0) != 0:
+    if _libc.sysctl(arr, len(mib), buf, ctypes.byref(length), None, 0) != 0 or length.value > size:
         return b""
     return buf.raw[:length.value]
 
@@ -146,17 +146,22 @@ def _sysctl(mib: list[int], size: int) -> bytes:
 def _procargs(pid: int) -> tuple[list[str], list[bytes]]:
     """(argv, environment entries) from KERN_PROCARGS2: argc, the exec
     path, NUL padding, argc arguments, then the environment."""
-    argmax = struct.unpack("=i", _sysctl([_CTL_KERN, _KERN_ARGMAX], 4) or b"\0\0\0\0")[0]
-    raw = _sysctl([_CTL_KERN, _KERN_PROCARGS2, pid], argmax or 1 << 20)
+    limit = _sysctl([_CTL_KERN, _KERN_ARGMAX], 4)
+    argmax = struct.unpack("=i", limit)[0] if len(limit) == 4 else 0
+    raw = _sysctl([_CTL_KERN, _KERN_PROCARGS2, pid], argmax if argmax > 0 else 1 << 20)
     if len(raw) < 4:
         return [], []
     argc = struct.unpack_from("=i", raw)[0]
     pos = raw.find(b"\0", 4)
-    if pos < 0:
+    if argc <= 0 or pos <= 4:
         return [], []
     while pos < len(raw) and raw[pos] == 0:
         pos += 1
     parts = raw[pos:].split(b"\0")
+    # Every argument must be present and NUL-terminated. A negative or
+    # oversized argc must not turn environment entries into session argv.
+    if argc >= len(parts):
+        return [], []
     argv = [a.decode("utf-8", "replace") for a in parts[:argc]]
     env = []
     for entry in parts[argc:]:

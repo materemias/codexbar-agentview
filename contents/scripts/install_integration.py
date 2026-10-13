@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Set up CodexBar AgentView's agent integration.
+"""Set up CodexBar AgentView's Linux Plasma integration.
 
 Hookless — the widget itself runs the aggregator every poll tick. This
 script handles the bits the widget can't:
@@ -327,11 +327,17 @@ def remove_legacy_systemd_service() -> str:
 # Top-level
 # ---------------------------------------------------------------------------
 
+def _require_linux() -> None:
+    if sys.platform != "linux":
+        raise RuntimeError("Plasma integration is Linux-only; Tern needs no integration setup.")
+
+
 def install_all() -> str:
     """Install: env scripts so plasmashell gets QML_XHR_ALLOW_FILE_READ on
     every launch, URL scheme handler for click-to-focus, and legacy cleanup
     (Claude Code hooks, the systemd service we used to ship, and the
     pre-rename codexbar:// handler and env files)."""
+    _require_linux()
     parts = [
         remove_legacy_identity(),
         install_env_script(),
@@ -354,6 +360,7 @@ def install_all() -> str:
 
 
 def uninstall_all() -> str:
+    _require_linux()
     parts = [
         remove_legacy_systemd_service(),
         remove_legacy_hooks(),
@@ -365,6 +372,11 @@ def uninstall_all() -> str:
 
 
 def status_all() -> str:
+    if sys.platform != "linux":
+        return (
+            "Plasma integration is Linux-only.\n"
+            "Tern needs no Plasma integration; it calls the helpers directly."
+        )
     plasma_env = "yes" if PLASMA_ENV_FILE.is_file() else "no"
     systemd_env = "yes" if SYSTEMD_ENV_FILE.is_file() else "no"
     url_ok = "yes" if DESKTOP_FILE.is_file() else "no"
@@ -383,7 +395,12 @@ def main(argv: list[str]) -> int:
     if args.status:
         print(status_all())
         return 0
-    print(uninstall_all() if args.uninstall else install_all())
+    try:
+        result = uninstall_all() if args.uninstall else install_all()
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    print(result)
     return 0
 
 

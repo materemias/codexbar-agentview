@@ -500,15 +500,15 @@ class BoundaryParsingTests(unittest.TestCase):
             {("omp", "a")},
         )
 
-    def test_boot_id_reader_returns_empty_for_missing_and_empty_files(self) -> None:
+    def test_linux_boot_id_reader_returns_empty_for_missing_and_empty_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "boot_id"
             with mock.patch.object(agents, "BOOT_ID_PATH", path):
-                self.assertEqual(agents._read_boot_id(), "")
+                self.assertEqual(agents._linux_boot_id(), "")
                 path.write_text("   \n")
-                self.assertEqual(agents._read_boot_id(), "")
+                self.assertEqual(agents._linux_boot_id(), "")
                 path.write_text("boot-id\n")
-                self.assertEqual(agents._read_boot_id(), "boot-id")
+                self.assertEqual(agents._linux_boot_id(), "boot-id")
 
     def test_percent_encoded_desktop_map_uses_composite_identity(self) -> None:
         encoded = quote(json.dumps([
@@ -642,10 +642,7 @@ class ResumeAndIdentityTests(unittest.TestCase):
             rollout = base / "session.jsonl"
             rollout.write_text("{}\n")
 
-            with (
-                mock.patch.object(agents.os, "listdir", return_value=["3"]),
-                mock.patch.object(agents.os, "readlink", return_value=str(rollout)),
-            ):
+            with mock.patch.object(agents, "_open_paths", return_value=[str(rollout)]):
                 self.assertEqual(
                     agents._open_jsonl_under(42, "/.omp/agent/sessions/"),
                     (str(rollout), True),
@@ -657,10 +654,7 @@ class ResumeAndIdentityTests(unittest.TestCase):
             owner.write_text("{}\n")
             sidecar = sidecar_dir / "__advisor.test.jsonl"
             sidecar.write_text("{}\n")
-            with (
-                mock.patch.object(agents.os, "listdir", return_value=["4"]),
-                mock.patch.object(agents.os, "readlink", return_value=str(sidecar)),
-            ):
+            with mock.patch.object(agents, "_open_paths", return_value=[str(sidecar)]):
                 self.assertEqual(
                     agents._open_jsonl_under(42, "/.omp/agent/sessions/"),
                     (str(owner), False),
@@ -871,6 +865,124 @@ class HeadlessArgvTests(unittest.TestCase):
         self.assertFalse(agents._is_service_argv(["omp", "--mode"]))
 
 
+class MacBundleHostTests(unittest.TestCase):
+    def test_supported_bundle_main_and_helper_ancestry_share_host_keys(self) -> None:
+        bundles = (
+            ("Visual Studio Code", "Code", "code"),
+            ("Visual Studio Code - Insiders", "Code - Insiders", "code-insiders"),
+            ("T3 Code", "T3 Code", "t3code"),
+        )
+        for bundle, binary, expected in bundles:
+            for role in ("", " (Renderer)", " (GPU)", " (Plugin)"):
+                helper = f"{binary} Helper{role}"
+                argv = {
+                    10: ["claude", "--output-format", "stream-json"],
+                    5: [f"/Applications/{bundle}.app/Contents/Frameworks/{helper}.app/Contents/MacOS/{helper}", "--type=renderer"],
+                    4: [f"/Applications/{bundle}.app/Contents/MacOS/{binary}"],
+                }
+                with (
+                    self.subTest(bundle=bundle, helper=helper),
+                    mock.patch.object(agents, "_comm_of", side_effect=lambda p: Path(argv.get(p, [""])[0]).name),
+                    mock.patch.object(agents, "_argv_of", side_effect=lambda p: argv.get(p, [])),
+                    mock.patch.object(agents, "_ppid_of", side_effect=lambda p: {10: 5, 5: 4, 4: 1}.get(p, 0)),
+                    mock.patch.object(agents, "_exe_of", side_effect=lambda p: argv.get(p, [""])[0]),
+                    mock.patch.object(agents, "_all_pids", return_value=[5, 4]),
+                ):
+                    self.assertEqual(agents._parent_walk_for_host(10), (expected, [10, 5, 4]))
+                    self.assertEqual(agents._under_t3(10), expected == "t3code")
+                    if expected == "t3code":
+                        self.assertEqual(agents.t3_window_pids(), [4])
+
+    def test_unrelated_electron_and_lookalike_bundle_binaries_are_unknown(self) -> None:
+        for path in (
+            "/Applications/Other.app/Contents/MacOS/Electron",
+            "/Applications/Other.app/Contents/MacOS/Code",
+            "/Applications/T3 Code.app/Contents/MacOS/Electron",
+            "/Applications/T3 Code.app/Contents/Frameworks/Other Helper.app/Contents/MacOS/Other Helper",
+            "/Applications/Visual Studio Code.app/Contents/MacOS/Other",
+        ):
+            with (
+                self.subTest(path=path),
+                mock.patch.object(agents, "_comm_of", side_effect=lambda p: "claude" if p == 10 else Path(path).name),
+                mock.patch.object(agents, "_argv_of", side_effect=lambda p: ["claude"] if p == 10 else [path]),
+                mock.patch.object(agents, "_exe_of", side_effect=lambda p: "claude" if p == 10 else path),
+                mock.patch.object(agents, "_ppid_of", side_effect=lambda p: 5 if p == 10 else 1),
+                mock.patch.object(agents, "_all_pids", return_value=[5]),
+            ):
+                self.assertEqual(agents._parent_walk_for_host(10), ("", []))
+                self.assertFalse(agents._under_t3(10))
+                self.assertEqual(agents.t3_window_pids(), [])
+
+    def test_mac_tern_windows_and_kitty_use_launchable_host_keys(self) -> None:
+        argv = {
+            10: ["omp"],
+            5: ["/Applications/Tern.app/Contents/MacOS/tern", "daemon"],
+            4: ["/Applications/Tern.app/Contents/MacOS/tern"],
+            3: ["/Applications/kitty.app/Contents/MacOS/kitty"],
+        }
+        with (
+            mock.patch.object(agents, "_comm_of", side_effect=lambda p: Path(argv[p][0]).name),
+            mock.patch.object(agents, "_argv_of", side_effect=lambda p: argv.get(p, [])),
+            mock.patch.object(agents, "_ppid_of", side_effect=lambda p: 5 if p == 10 else 1),
+            mock.patch.object(agents, "_exe_of", return_value=""),
+            mock.patch.object(agents, "_all_pids", return_value=[5, 4, 3]),
+        ):
+            self.assertEqual(agents.tern_window_pids(), [4])
+            self.assertEqual(agents._parent_walk_for_host(10), ("tern", [10, 5, 4]))
+            self.assertEqual(agents._parent_walk_for_host(3), ("kitty", [3]))
+
+
+class TernExecutableTests(unittest.TestCase):
+    def test_path_executable_takes_precedence_over_bundle(self) -> None:
+        with mock.patch.object(agents.shutil, "which", return_value="/custom/bin/tern"):
+            self.assertEqual(agents.tern_bin(), "/custom/bin/tern")
+
+    def test_fallback_requires_executable_file_and_supports_mac_install_locations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            locations = (
+                home / ".local/bin/tern",
+                Path("/Applications/Tern.app/Contents/MacOS/tern"),
+                home / "Applications/Tern.app/Contents/MacOS/tern",
+                Path("/opt/homebrew/bin/tern"),
+                Path("/usr/local/bin/tern"),
+            )
+            for location in locations:
+                with (
+                    self.subTest(location=location),
+                    mock.patch.object(agents.sys, "platform", "darwin"),
+                    mock.patch.object(agents.Path, "home", return_value=home),
+                    mock.patch.object(agents.shutil, "which", return_value=None),
+                    mock.patch.object(agents.Path, "is_file", autospec=True, side_effect=lambda p: p == location),
+                    mock.patch.object(agents.os, "access", side_effect=lambda p, mode: p == location),
+                ):
+                    self.assertEqual(agents.tern_bin(), str(location))
+            with (
+                mock.patch.object(agents.sys, "platform", "darwin"),
+                mock.patch.object(agents.Path, "home", return_value=home),
+                mock.patch.object(agents.shutil, "which", return_value=None),
+                mock.patch.object(agents.Path, "is_file", return_value=False),
+                mock.patch.object(agents.os, "access", return_value=True),
+            ):
+                self.assertEqual(agents.tern_bin(), "")
+            # Exercise real mode/type boundaries without touching installed apps.
+            candidate = locations[0]
+            candidate.parent.mkdir(parents=True)
+            with (
+                mock.patch.object(agents.sys, "platform", "linux"),
+                mock.patch.object(agents.Path, "home", return_value=home),
+                mock.patch.object(agents.shutil, "which", return_value=None),
+            ):
+                candidate.mkdir()
+                self.assertEqual(agents.tern_bin(), "")
+                candidate.rmdir()
+                candidate.write_text("#!/bin/sh\n")
+                candidate.chmod(0o600)
+                self.assertEqual(agents.tern_bin(), "")
+                candidate.chmod(0o700)
+                self.assertEqual(agents.tern_bin(), str(candidate))
+
+
 class T3CodeTests(unittest.TestCase):
     # T3 Code runs Claude as stream-json and Codex as one app-server per
     # thread, directly under its Electron main process.
@@ -890,18 +1002,19 @@ class T3CodeTests(unittest.TestCase):
             mock.patch.object(agents, "_comm_of", side_effect=lambda p: self.COMM.get(p, "")),
             mock.patch.object(agents, "_ppid_of", side_effect=lambda p: self.PPID.get(p, 0)),
             mock.patch.object(agents, "_argv_of", side_effect=lambda p: self.ARGV.get(p, [])),
+            mock.patch.object(agents, "_exe_of", side_effect=lambda p: self.ARGV.get(p, [""])[0]),
         )
 
     def test_pgrep_keeps_t3_sessions_interactive(self) -> None:
         out = subprocess.CompletedProcess([], 0, stdout="10\n11\n12\n")
-        a, b, c = self._patch()
-        with a, b, c, mock.patch.object(agents.subprocess, "run", return_value=out):
+        a, b, c, d = self._patch()
+        with a, b, c, d, mock.patch.object(agents.subprocess, "run", return_value=out):
             self.assertEqual(agents._pgrep("claude"), [10, 12])
             self.assertEqual(agents._pgrep("claude", services=True), [11])
 
     def test_host_walk_stops_at_t3_not_code_in_args(self) -> None:
-        a, b, c = self._patch()
-        with a, b, c, mock.patch.object(agents, "t3_window_pids", return_value=[4, 9]):
+        a, b, c, d = self._patch()
+        with a, b, c, d, mock.patch.object(agents, "t3_window_pids", return_value=[4, 9]):
             # Window 9 is another T3 window; this session sits under window 4.
             self.assertEqual(agents._parent_walk_for_host(10), ("t3code", [10, 5, 4]))
 
@@ -920,18 +1033,16 @@ class T3CodeTests(unittest.TestCase):
             4: ["/opt/t3code-bin/t3code"],
         }
 
-        def readlink(path: str) -> str:
-            pid = int(path.split("/")[2])
-            if pid not in argv:
-                raise OSError
+        def executable(pid: int) -> str:
             # The running server's version was deleted by a self-update.
-            return argv[pid][0] + (" (deleted)" if pid == 7 else "")
+            return (argv.get(pid, [""])[0]
+                    + (" (deleted)" if pid == 7 else ""))
 
         out = subprocess.CompletedProcess([], 0, stdout="20\n21\n")
         with mock.patch.object(agents, "_comm_of", side_effect=lambda p: comm.get(p, "")), \
                 mock.patch.object(agents, "_ppid_of", side_effect=lambda p: ppid.get(p, 0)), \
                 mock.patch.object(agents, "_argv_of", side_effect=lambda p: argv.get(p, [])), \
-                mock.patch.object(agents.os, "readlink", side_effect=readlink), \
+                mock.patch.object(agents, "_exe_of", side_effect=executable), \
                 mock.patch.object(agents, "t3_window_pids", return_value=[4]), \
                 mock.patch.object(agents.subprocess, "run", return_value=out):
             self.assertEqual(agents._pgrep("claude"), [20, 21])

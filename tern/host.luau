@@ -10,6 +10,31 @@
 local ui = tern.ui
 
 local HOME = tern.getenv("HOME") or ""
+local MACOS = tern.runtime.os == "macos"
+
+local function pythonPath(): string
+	if not MACOS then
+		return "python3"
+	end
+	-- Honour a shell's Python, but Apple's /usr/bin/python3 can be an older
+	-- developer-tools shim. GUI launches should use Homebrew before that.
+	for dir in string.gmatch(tern.getenv("PATH") or "", "[^:]+") do
+		if dir ~= "/usr/bin" and dir ~= "/usr/bin/" then
+			local p = dir .. "/python3"
+			if tern.fs.exists(p) then
+				return p
+			end
+		end
+	end
+	for _, p in { "/opt/homebrew/bin/python3", "/usr/local/bin/python3" } do
+		if tern.fs.exists(p) then
+			return p
+		end
+	end
+	return "python3"
+end
+
+local PYTHON = pythonPath()
 local SCRIPTS = tern.plugin.dir .. "/../contents/scripts"
 local XDG_STATE = tern.getenv("XDG_STATE_HOME") or ""
 local STATE_DIR = (if string.sub(XDG_STATE, 1, 1) == "/" then XDG_STATE else HOME .. "/.local/state") .. "/codexbar-agentview"
@@ -120,8 +145,8 @@ local function cliPath(): string
 	for _, p in {
 		HOME .. "/.local/bin/codexbar",
 		"/usr/bin/codexbar",
-		"/usr/local/bin/codexbar",
-		"/opt/homebrew/bin/codexbar",
+		if MACOS then "/opt/homebrew/bin/codexbar" else "/usr/local/bin/codexbar",
+		if MACOS then "/usr/local/bin/codexbar" else "/opt/homebrew/bin/codexbar",
 	} do
 		if tern.fs.exists(p) then
 			return p
@@ -345,7 +370,7 @@ local function renderAll()
 end
 
 local function python(script: string, args: { string }, timeout: number, done: (ProcessResult) -> ())
-	local argv = { "python3", SCRIPTS .. "/" .. script }
+	local argv = { PYTHON, SCRIPTS .. "/" .. script }
 	for _, a in args do
 		table.insert(argv, a)
 	end
@@ -2184,13 +2209,13 @@ for _, provider in PROVIDER_ORDER do
 	table.insert(SETTINGS_ROWS, {
 		id = "provider." .. provider, provider = provider, page = "providers", section = "Usage providers",
 		label = PROVIDER_NAMES[provider],
-		hint = if provider == "typesafe" then "Balance only. Requires a manual cookie header in the credentials file."
+		hint = if provider == "typesafe" then "Balance only. Configure its cookie source in the CodexBar CLI credentials file."
 			else "Use the shared provider cache and existing authentication.",
 	})
 end
 for _, row in {
 	{ id = "includeNonTern", page = "agents", section = "Session visibility", label = "Include non-Tern agents",
-		hint = "Show agents from other hosts in Agents and History. Tested on Linux only; probably does not work on other platforms." },
+		hint = "Show agents from other recognized hosts in Agents and History on Linux and macOS. Focus requires a supported host route." },
 	{ id = "includeUntracked", page = "agents", section = "Live sessions", label = "Include untracked agents",
 		hint = "Show processes without a hook sentinel." },
 	{ id = "historyLimit", page = "agents", section = "History", label = "Recently closed sessions",
@@ -2396,7 +2421,8 @@ local function activateSetting(b: SettingsBlock, row: any)
 	b.focus = row.id
 	b.searching = false
 	if row.kind == "action" then
-		local ok, err = pcall(tern.process.run, { "xdg-open", row.hint }, { timeout_ms = 10000 }, function(res: ProcessResult)
+		local opener = if MACOS then "/usr/bin/open" else "xdg-open"
+		local ok, err = pcall(tern.process.run, { opener, row.hint }, { timeout_ms = 10000 }, function(res: ProcessResult)
 			report(b.cx, "open GitHub", res)
 		end)
 		if not ok then

@@ -5,6 +5,7 @@ import datetime as dt
 import importlib.util
 import io
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,9 @@ SPEC = importlib.util.spec_from_file_location("codexbar_fetch", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 fetch = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(fetch)
+
+TRUE_EXECUTABLE = shutil.which("true")
+assert TRUE_EXECUTABLE is not None, "provider tests require the true executable"
 
 
 @contextlib.contextmanager
@@ -110,7 +114,7 @@ class ProviderFailureTests(IsolatedUsageTestCase):
         for error in (PermissionError("denied"), OSError("I/O error")):
             with self.subTest(error=type(error).__name__):
                 with mock.patch.object(fetch.subprocess, "run", side_effect=error):
-                    result = fetch._run_cli("/bin/true", "kilo", None, 1)[0]
+                    result = fetch._run_cli(TRUE_EXECUTABLE, "kilo", None, 1)[0]
                 self.assertEqual(result["id"], "kilo")
                 self.assertFalse(result["ok"])
                 self.assertEqual(result["error"]["code"], "cli_error")
@@ -133,7 +137,7 @@ class ProviderFailureTests(IsolatedUsageTestCase):
             mock.patch("sys.stdout", output),
         ):
             exit_code = fetch.main(
-                ["--cli-path", "/bin/true", "--providers", "kilo,codex"]
+                ["--cli-path", TRUE_EXECUTABLE, "--providers", "kilo,codex"]
             )
         payload = json.loads(output.getvalue())
         self.assertEqual(exit_code, 0)
@@ -154,7 +158,7 @@ class ProviderFailureTests(IsolatedUsageTestCase):
                     self.assertRaises(SystemExit) as raised,
                 ):
                     fetch.main(
-                        ["--cli-path", "/bin/true", f"--timeout={value}"]
+                        ["--cli-path", TRUE_EXECUTABLE, f"--timeout={value}"]
                     )
                 self.assertEqual(raised.exception.code, 2)
 
@@ -180,7 +184,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
             },
         })
 
-    def snapshot(self, records=None, providers="codex", cache_only=False, cli="/bin/true",
+    def snapshot(self, records=None, providers="codex", cache_only=False, cli=TRUE_EXECUTABLE,
                  min_interval=None) -> dict:
         output = io.StringIO()
         arguments = ["--cli-path", cli, "--providers", providers]
@@ -254,7 +258,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
         self.assertEqual(old["primary"]["usedPercent"], 42)
         self.assertEqual(old["refreshError"], "Timed out")
         self.assertEqual(old["cachedAt"], self.measured.isoformat())
-        scopes = fetch._usage_cache_scopes("/bin/true", ["codex", "kilo"])
+        scopes = fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["codex", "kilo"])
         expired = fetch._usage_cache_read(scopes, self.measured + dt.timedelta(hours=24, seconds=1))
         self.assertEqual(expired, {})
         recovered = self.snapshot([self.record(used=49)])["providers"][0]
@@ -360,7 +364,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
             with self.subTest(succeeds=succeeds):
                 auth.write_text('{"tokens":{"account_id":"account-a"}}')
                 self.snapshot([self.record()])
-                old_scope = fetch._usage_cache_scopes("/bin/true", ["codex"])["codex"]
+                old_scope = fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["codex"])["codex"]
                 output = io.StringIO()
 
                 def changed_fetch(_cli, provider, _timeout):
@@ -377,12 +381,12 @@ class UsageCacheTests(IsolatedUsageTestCase):
                     mock.patch.object(fetch, "_read_codex_rotation", return_value=None),
                     mock.patch("sys.stdout", output),
                 ):
-                    fetch.main(["--cli-path", "/bin/true", "--providers", "codex,kilo"])
+                    fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "codex,kilo"])
                 failed, healthy = json.loads(output.getvalue())["providers"]
                 self.assertFalse(failed["ok"])
                 self.assertEqual(failed["error"]["code"], "credential_scope_changed")
                 self.assertNotIn("primary", failed)
-                new_scope = fetch._usage_cache_scopes("/bin/true", ["codex"])["codex"]
+                new_scope = fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["codex"])["codex"]
                 self.assertNotEqual(new_scope, old_scope)
                 self.assertEqual(failed["sourceScope"], new_scope)
                 self.assertEqual(healthy["primary"]["usedPercent"], 17)
@@ -416,7 +420,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
             [fetch._result_error("kilo", "timeout", "Offline")], providers="kilo",
         )["providers"][0]
         self.assertEqual(
-            fresh_error["sourceScope"], fetch._usage_cache_scopes("/bin/true", ["kilo"])["kilo"],
+            fresh_error["sourceScope"], fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["kilo"])["kilo"],
         )
 
     def test_partial_provider_writes_preserve_untouched_cache_and_prune_expired(self) -> None:
@@ -424,7 +428,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
         self.snapshot([self.record(used=61)])
         restored = self.snapshot(providers="kilo", cache_only=True)["providers"]
         self.assertEqual([r["primary"]["usedPercent"] for r in restored], [12])
-        scopes = fetch._usage_cache_scopes("/bin/true", ["codex"])
+        scopes = fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["codex"])
         fetch._usage_cache_write(scopes, [], self.now + dt.timedelta(hours=25))
         self.assertEqual(json.loads(self.cache_path.read_text())["providers"].get("kilo"), None)
 
@@ -446,7 +450,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
         )
 
     def test_restart_restores_recent_consumption_from_history(self) -> None:
-        scopes = fetch._usage_cache_scopes("/bin/true", ["codex"])
+        scopes = fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["codex"])
         for minutes, used in ((70, 40), (60, 40), (50, 42), (40, 43), (30, 44), (20, 45), (10, 46), (5, 46)):
             record = self.record(used=used)
             record["updatedAt"] = (self.now - dt.timedelta(minutes=minutes)).isoformat()
@@ -480,19 +484,19 @@ class UsageCacheTests(IsolatedUsageTestCase):
             "anthropic": {"type": "oauth", "access": "unrelated-a"},
         }))
         kilo.write_text('{"kilo":{"access":"kilo-a"}}')
-        scopes = fetch._usage_cache_scopes("/bin/true", ["opencodego", "kilo"])
+        scopes = fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["opencodego", "kilo"])
         opencode.write_text(json.dumps({
             "opencode-go": {"type": "api", "key": "go-a"},
             "anthropic": {"type": "oauth", "access": "unrelated-b"},
         }))
-        self.assertEqual(fetch._usage_cache_scopes("/bin/true", ["opencodego", "kilo"]), scopes)
+        self.assertEqual(fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["opencodego", "kilo"]), scopes)
         kilo.write_text('{"kilo":{"access":"kilo-b"}}')
-        updated = fetch._usage_cache_scopes("/bin/true", ["opencodego", "kilo"])
+        updated = fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["opencodego", "kilo"])
         self.assertEqual(updated["opencodego"], scopes["opencodego"])
         self.assertNotEqual(updated["kilo"], scopes["kilo"])
         opencode.write_text('{"opencode-go":{"type":"api","key":"go-b"}}')
         self.assertNotEqual(
-            fetch._usage_cache_scopes("/bin/true", ["opencodego"])["opencodego"],
+            fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["opencodego"])["opencodego"],
             scopes["opencodego"],
         )
 
@@ -500,7 +504,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
         auth = self.home / ".codex/auth.json"
         auth.parent.mkdir()
         auth.write_text('{"tokens":{"account_id":"same","access_token":"old"}}')
-        original_scope = fetch._usage_cache_scopes("/bin/true", ["codex"])["codex"]
+        original_scope = fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["codex"])["codex"]
         output = io.StringIO()
 
         def refreshed_fetch(*_args):
@@ -513,7 +517,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
             mock.patch.object(fetch, "_read_codex_rotation", return_value=None),
             mock.patch("sys.stdout", output),
         ):
-            fetch.main(["--cli-path", "/bin/true", "--providers", "codex"])
+            fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "codex"])
         record = json.loads(output.getvalue())["providers"][0]
         self.assertTrue(record["ok"])
         self.assertEqual(record["primary"]["usedPercent"], 57)
@@ -560,11 +564,11 @@ class UsageCacheTests(IsolatedUsageTestCase):
         restored = self.snapshot(cache_only=True)["providers"]
         self.assertEqual([r["primary"]["usedPercent"] for r in restored], [42, 71])
         self.assertEqual(
-            fetch._usage_cache_scopes("/bin/true", ["codex"])["codex"], original_scope,
+            fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["codex"])["codex"], original_scope,
         )
         auth.write_text('{"tokens":{"account_id":"c","access_token":"new-account"}}')
         self.assertNotEqual(
-            fetch._usage_cache_scopes("/bin/true", ["codex"])["codex"], original_scope,
+            fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["codex"])["codex"], original_scope,
         )
         self.assertEqual(self.snapshot(cache_only=True)["providers"], [])
 
@@ -574,9 +578,9 @@ class UsageCacheTests(IsolatedUsageTestCase):
         for home in (first, second):
             home.mkdir()
             (home / "auth.json").write_text('{"tokens":{"access_token":"opaque"}}')
-        original = fetch._usage_cache_scopes("/bin/true", ["codex"])["codex"]
+        original = fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["codex"])["codex"]
         with mock.patch.dict(fetch.os.environ, {"CODEX_HOME": str(second)}):
-            moved = fetch._usage_cache_scopes("/bin/true", ["codex"])["codex"]
+            moved = fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["codex"])["codex"]
         self.assertNotEqual(moved, original)
 
 
@@ -792,7 +796,7 @@ class CodexRotationTests(unittest.TestCase):
                 mock.patch("sys.stdout", output),
             ):
                 self.assertEqual(fetch.main([
-                    "--cli-path", "/bin/true", "--providers", "codex",
+                    "--cli-path", TRUE_EXECUTABLE, "--providers", "codex",
                 ]), 0)
             return json.loads(output.getvalue())
 
@@ -1028,7 +1032,7 @@ class ForecastTests(IsolatedUsageTestCase):
             exit_code = fetch.main(
                 [
                     "--cli-path",
-                    "/bin/true",
+                    TRUE_EXECUTABLE,
                     "--providers",
                     "",
                     "--forecast-url",
@@ -1178,7 +1182,7 @@ class CliVersionTests(IsolatedUsageTestCase):
             mock.patch.object(fetch, "_cli_version", return_value="0.56.3"),
             mock.patch("sys.stdout", output),
         ):
-            exit_code = fetch.main(["--cli-path", "/bin/true", "--providers", ""])
+            exit_code = fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", ""])
 
         payload = json.loads(output.getvalue())
         self.assertEqual(exit_code, 0)
