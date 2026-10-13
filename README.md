@@ -86,18 +86,18 @@ work on macOS, and the helpers use POSIX-only Python modules. Windows is not
 supported: there is no native `codexbar` CLI for it, and the helpers do not
 run there.
 
-| Requirement | Needed for |
-| --- | --- |
-| KDE Plasma **6** (with KWin) | Plasma widget |
-| [Tern](https://docs.stencil.so/tern/) | Tern extension |
-| Python 3 | Both interfaces |
-| CMake 3.21+, a C++17 compiler, Qt 6 Core/QML development files | Building the Plasma widget. On Arch: `base-devel`, `cmake`, `qt6-declarative` |
-| [`codexbar`](https://github.com/steipete/CodexBar) CLI | Provider usage in either interface. Without it, Agents and History still work |
-| `qdbus6` (Plasma's Qt tools) | *Optional, Plasma widget:* click to focus, desktop switching and placing restored kitty windows |
-| kitty or Tern | *Optional:* **Launch** and **Restore all**; with both, **Teleport to Tern**. Other terminals keep the copyable resume command |
-| systemd user session | *Optional:* **Launch**, so restored kitty windows survive a plasmashell restart |
-| kitty remote control (`allow_remote_control`, `listen_on`) | *Optional:* exact focus of kitty windows. Without it the Plasma widget falls back to KWin, and the Tern extension cannot focus kitty windows |
-| `notify-send` (libnotify) | *Optional:* desktop usage warnings and agent waiting-for-input notifications |
+| Requirement | Plasma widget | Tern extension | What it enables |
+| --- | :---: | :---: | --- |
+| KDE Plasma **6** (with KWin) | Required | — | The panel widget itself |
+| [Tern](https://docs.stencil.so/tern/) | — | Required | The extension itself |
+| Python 3 | Required | Required | The shared helpers |
+| [`codexbar`](https://github.com/steipete/CodexBar) CLI | Required | Required | Provider usage. Without it, Agents and History still work |
+| CMake 3.21+, a C++17 compiler, Qt 6 Core/QML development files | Required | — | Building the widget. On Arch: `base-devel`, `cmake`, `qt6-declarative` |
+| `qdbus6` (Plasma's Qt tools) | Optional | — | Click to focus, desktop switching, placing restored kitty windows |
+| kitty or Tern | Optional | Optional | **Launch** and **Restore all**; with both, **Teleport to Tern**. Other terminals keep the copyable resume command |
+| kitty remote control (`allow_remote_control`, `listen_on`) | Optional | Optional | Exact focus of kitty windows. Without it the widget falls back to KWin, and the extension cannot focus kitty windows |
+| systemd user session | Optional | Optional | Restored kitty windows survive a plasmashell restart |
+| `notify-send` (libnotify) | Optional | — | Usage warnings and waiting-for-input notifications |
 
 The Plasma widget's `codexbar` CLI path defaults to `/usr/bin/codexbar`,
 which is what the Arch `codexbar-cli` package installs. Set another path in
