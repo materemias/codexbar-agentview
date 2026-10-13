@@ -1,0 +1,28 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    # Arch matches the target desktop: current Qt 6, its qml tool and
+    # Kirigami, so the QML tests run instead of skipping.
+    container: archlinux:latest
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed base-devel cmake python qt6-declarative kirigami git
+      - uses: actions/checkout@v4
+      - name: Build native package
+        run: |
+          cmake -S . -B build -DCODEXBAR_BUILD_TESTS=ON
+          cmake --build build
+      - name: Native tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Python tests
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m py_compile contents/scripts/*.py
+          python -m unittest discover -s tests -v

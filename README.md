@@ -360,9 +360,21 @@ Tern's own cards, meters, lists and theme. It uses the shared helpers in
 without KDE, or alongside the widget using the same cached provider
 measurements and session snapshot.
 
-| Usage | Agents | Settings |
+| Usage | Agents | History |
 | :---: | :---: | :---: |
-| [![Tern usage](docs/tern/usage.png)](docs/tern/usage.png) | [![Tern agents](docs/tern/agents-conversation.png)](docs/tern/agents-conversation.png) | [![Tern settings](docs/tern/settings-general.png)](docs/tern/settings-general.png) |
+| [![Tern usage](docs/tern/usage.png)](docs/tern/usage.png) | [![Tern agents](docs/tern/agents.png)](docs/tern/agents.png) | [![Tern history](docs/tern/history.png)](docs/tern/history.png) |
+| **Conversation** | **Row actions** | **Filter** |
+| [![Selected session's conversation](docs/tern/agents-conversation.png)](docs/tern/agents-conversation.png) | [![Selected row's actions](docs/tern/agents-actions.png)](docs/tern/agents-actions.png) | [![Filtered agents](docs/tern/agents-filtered.png)](docs/tern/agents-filtered.png) |
+| **History peek** | **Sidebar open** | **Sidebar closed** |
+| [![History conversation](docs/tern/history-conversation.png)](docs/tern/history-conversation.png) | [![Dashboard as a sidebar](docs/tern/sidebar-open.png)](docs/tern/sidebar-open.png) | [![Layout after closing](docs/tern/sidebar-closed.png)](docs/tern/sidebar-closed.png) |
+
+| Settings: General | Settings: Providers | Settings: Search |
+| :---: | :---: | :---: |
+| [![General settings](docs/tern/settings-general.png)](docs/tern/settings-general.png) | [![Provider settings](docs/tern/settings-providers.png)](docs/tern/settings-providers.png) | [![Settings search](docs/tern/settings-search.png)](docs/tern/settings-search.png) |
+| **Usage** | **Agents** | **About** |
+| [![Usage settings](docs/tern/settings-usage.png)](docs/tern/settings-usage.png) | [![Agent settings](docs/tern/settings-agents.png)](docs/tern/settings-agents.png) | [![About](docs/tern/settings-about.png)](docs/tern/settings-about.png) |
+
+The screenshots use a demo account, made-up provider accounts and sessions.
 
 ```sh
 tern plugin link tern        # from the repository root
