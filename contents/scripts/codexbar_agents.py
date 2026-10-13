@@ -52,6 +52,8 @@ KNOWN_HOSTS = {
     "tmux", "tmux: server", "wezterm", "alacritty", "ghostty",
     "gnome-terminal", "gnome-terminal-", "xterm", "foot",
     "yakuake", "tilix", "ptyhost", "t3code", "tern",
+    # macOS
+    "Terminal", "iTerm2", "wezterm-gui",
 }
 
 # Hosts whose history rows codexbar_focus.py --launch can reopen.
@@ -170,6 +172,55 @@ def _start_ms(pid: int) -> int:
     return int((btime + ticks / os.sysconf("SC_CLK_TCK")) * 1000)
 
 
+def _all_pids() -> list[int]:
+    return [int(e.name) for e in Path("/proc").iterdir() if e.name.isdigit()]
+
+
+def _exe_of(pid: int) -> str:
+    try:
+        return os.readlink(f"/proc/{pid}/exe")
+    except OSError:
+        return ""
+
+
+def _open_paths(pid: int) -> list[str]:
+    """Paths of the files `pid` holds open."""
+    fd_dir = f"/proc/{pid}/fd"
+    try:
+        entries = os.listdir(fd_dir)
+    except OSError:
+        return []
+    out = []
+    for entry in entries:
+        try:
+            out.append(os.readlink(os.path.join(fd_dir, entry)))
+        except OSError:
+            continue
+    return out
+
+
+def _read_boot_id() -> str:
+    try:
+        return BOOT_ID_PATH.read_text().strip()
+    except (OSError, UnicodeError):
+        return ""
+
+
+if sys.platform == "darwin":
+    import proc_darwin
+
+    _ppid_of = proc_darwin.ppid_of
+    _cwd_of = proc_darwin.cwd_of
+    _comm_of = proc_darwin.comm_of
+    _argv_of = proc_darwin.argv_of
+    _environ_value = proc_darwin.environ_value
+    _start_ms = proc_darwin.start_ms
+    _all_pids = proc_darwin.all_pids
+    _exe_of = proc_darwin.exe_of
+    _open_paths = proc_darwin.open_paths
+    _read_boot_id = proc_darwin.boot_id
+
+
 def _parent_walk_for_host(
     start_pid: int, windows: dict[str, list[int]] | None = None
 ) -> tuple[str, list[int]]:
@@ -238,43 +289,44 @@ def _parent_walk_for_host(
     return host, chain
 
 
+def tern_bin() -> str:
+    """The `tern` executable, or "". A Tern daemon started from the macOS
+    app bundle runs plugin helpers with PATH=/usr/bin:/bin:/usr/sbin:/sbin,
+    so look where Tern's installer and bundle put it too."""
+    found = shutil.which("tern")
+    if found:
+        return found
+    for path in (Path.home() / ".local/bin/tern", Path("/Applications/Tern.app/Contents/MacOS/tern")):
+        if os.access(path, os.X_OK):
+            return str(path)
+    return ""
+
+
 def tern_window_pids() -> list[int]:
     """Pids of running Tern windows: `tern` processes other than its
     session daemon."""
-    pids = []
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        if _comm_of(pid) == "tern" and _argv_of(pid)[1:2] != ["daemon"]:
-            pids.append(pid)
-    return pids
+    return [
+        pid for pid in _all_pids()
+        if _comm_of(pid) == "tern" and _argv_of(pid)[1:2] != ["daemon"]
+    ]
 
 
 def _is_t3_server(pid: int) -> bool:
     """True for the `t3` backend that T3 Code 0.0.44 runs as a systemd user
     service; its sessions are not under the Electron window. It is a Node
     single-executable whose comm is `node-MainThread`, so match the binary."""
-    try:
-        exe = os.readlink(f"/proc/{pid}/exe")
-    except OSError:
-        return False
     # A self-update deletes the version the running server was started from.
-    exe = exe.removesuffix(" (deleted)")
+    exe = _exe_of(pid).removesuffix(" (deleted)")
     return "/.t3/runtime/" in exe and exe.endswith("/t3")
 
 
 def t3_window_pids() -> list[int]:
     """Pids of T3 Code Electron main processes, which own its windows.
     Electron helpers rewrite their cmdline into one string with `--type=`."""
-    pids = []
-    for entry in Path("/proc").iterdir():
-        if not entry.name.isdigit():
-            continue
-        pid = int(entry.name)
-        if _comm_of(pid) == "t3code" and "--type=" not in " ".join(_argv_of(pid)):
-            pids.append(pid)
-    return pids
+    return [
+        pid for pid in _all_pids()
+        if _comm_of(pid) == "t3code" and "--type=" not in " ".join(_argv_of(pid))
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -761,20 +813,10 @@ def _codex_meta(path: str) -> tuple[str, str, int]:
 
 def _held_rollouts(pid: int, needle: str) -> set[str]:
     """Every rollout under `needle` that `pid` holds open."""
-    fd_dir = f"/proc/{pid}/fd"
-    out: set[str] = set()
-    try:
-        entries = os.listdir(fd_dir)
-    except OSError:
-        return out
-    for entry in entries:
-        try:
-            target = os.readlink(os.path.join(fd_dir, entry))
-        except OSError:
-            continue
-        if needle in target and target.endswith(".jsonl"):
-            out.add(target)
-    return out
+    return {
+        target for target in _open_paths(pid)
+        if needle in target and target.endswith(".jsonl")
+    }
 
 
 def _codex_rollout_named(home: str, session_id: str) -> str:
@@ -1184,18 +1226,9 @@ def _open_jsonl_under(pid: int, *needles: str) -> tuple[str, bool]:
     terminal. Sidecars still count as a fallback, because omp keeps them open
     for sessions whose own rollout fd it has already closed. Nested subagents
     normalize to their owning root before each tier is ranked by mtime."""
-    fd_dir = f"/proc/{pid}/fd"
-    try:
-        entries = os.listdir(fd_dir)
-    except OSError:
-        return "", False
     direct: set[str] = set()
     via_sidecar: set[str] = set()
-    for entry in entries:
-        try:
-            target = os.readlink(os.path.join(fd_dir, entry))
-        except OSError:
-            continue
+    for target in _open_paths(pid):
         if not target.endswith(".jsonl"):
             continue
         if not any(n in target for n in needles):
@@ -1390,7 +1423,7 @@ def _tern_visible_panes(socket: str) -> dict[int, str]:
     env = dict(os.environ, TERN_DAEMON_SOCKET=socket) if socket else None
     try:
         proc = subprocess.run(
-            ["tern", "ls", "--json"], capture_output=True, text=True,
+            [tern_bin() or "tern", "ls", "--json"], capture_output=True, text=True,
             timeout=3.0, check=False, env=env,
         )
         data = json.loads(proc.stdout) if proc.returncode == 0 else {}
@@ -1434,13 +1467,6 @@ def _mark_tern_panes(records: list[dict]) -> None:
         for record, pane in rows:
             if pane in visible:
                 record["ternSession"] = visible[pane]
-
-
-def _read_boot_id() -> str:
-    try:
-        return BOOT_ID_PATH.read_text().strip()
-    except (OSError, UnicodeError):
-        return ""
 
 
 def _load_payload(path: Path = AGGREGATE_PATH) -> dict:
@@ -1751,7 +1777,7 @@ def _merge_snapshot(
         "agents": current,
         "history": rebooted + exited,
         # Live kitty rows offer a move to Tern only when it is installed.
-        "ternInstalled": shutil.which("tern") is not None,
+        "ternInstalled": bool(tern_bin()),
     }
 
 

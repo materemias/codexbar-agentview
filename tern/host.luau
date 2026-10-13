@@ -59,7 +59,7 @@ local DEFAULTS = {
 	composite7d = true,
 	recentUsage = true,
 	includeUntracked = true,
-	includeNonTern = true,
+	includeNonTern = false,
 }
 
 local NUMBER_LIMITS = { refreshSeconds = { 60, 3600 }, historyLimit = { 10, 1000 } }
@@ -117,7 +117,12 @@ local function cliPath(): string
 	if type(configured) == "string" and configured ~= "" then
 		return (string.gsub(configured, "^~", HOME))
 	end
-	for _, p in { HOME .. "/.local/bin/codexbar", "/usr/bin/codexbar", "/usr/local/bin/codexbar" } do
+	for _, p in {
+		HOME .. "/.local/bin/codexbar",
+		"/usr/bin/codexbar",
+		"/usr/local/bin/codexbar",
+		"/opt/homebrew/bin/codexbar",
+	} do
 		if tern.fs.exists(p) then
 			return p
 		end
@@ -2185,7 +2190,7 @@ for _, provider in PROVIDER_ORDER do
 end
 for _, row in {
 	{ id = "includeNonTern", page = "agents", section = "Session visibility", label = "Include non-Tern agents",
-		hint = "Show agents from other hosts in Agents and History." },
+		hint = "Show agents from other hosts in Agents and History. Tested on Linux only; probably does not work on other platforms." },
 	{ id = "includeUntracked", page = "agents", section = "Live sessions", label = "Include untracked agents",
 		hint = "Show processes without a hook sentinel." },
 	{ id = "historyLimit", page = "agents", section = "History", label = "Recently closed sessions",

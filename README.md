@@ -81,10 +81,10 @@ The screenshots use a demo account, made-up provider accounts and sessions.
 
 ## Requirements
 
-Linux only. The agent scanner reads `/proc`, so Agents and History do not
-work on macOS, and the helpers use POSIX-only Python modules. Windows is not
-supported: there is no native `codexbar` CLI for it, and the helpers do not
-run there.
+Linux. The Tern extension also runs on macOS in alpha state: the agent
+scanner reads processes through libproc there and lists agents in Tern panes;
+see [Tern extension](#tern-extension). Windows is not supported: there is no
+native `codexbar` CLI for it, and the helpers use POSIX-only Python modules.
 
 | Requirement | Plasma widget | Tern extension | What it enables |
 | --- | :---: | :---: | --- |
@@ -142,6 +142,14 @@ Clone this repository and run `tern plugin link tern` from its root.
 No CMake build, Plasma widget installation or widget integration setup is
 needed. Keep the checkout in place while the extension is linked.
 See [Tern plugin](#tern-plugin) for its dashboard, shortcuts and settings.
+
+macOS support is alpha. The extension runs there, with the helpers reading
+processes through libproc instead of `/proc`; it lists and focuses agents in
+Tern panes.
+Install the CLI with Homebrew (`/opt/homebrew/bin/codexbar` is found without
+setting a path). The CLI reads Claude's OAuth token from the login Keychain
+item `Claude Code-credentials`, which is locked over SSH, so Claude usage
+only loads in the desktop session.
 
 ## Keyboard shortcuts
 
@@ -422,9 +430,10 @@ tern plugin link tern        # from the repository root
   `Delete` resets the selected row and `Ctrl+F` returns to search.
   `Esc` cancels an edit, then clears search, then closes the settings tab.
   Each changed row has a Reset button.
-  **Include non-Tern agents** defaults on and includes sessions from Kitty,
-  VS Code and other hosts in Agents, History and their counts. Turn it off
-  for a Tern-only view. This does not change the KDE applet's view.
+  **Include non-Tern agents** defaults off. Turned on, it includes sessions
+  from Kitty, VS Code and other hosts in Agents, History and their counts.
+  It is tested on Linux only and probably does not work on other platforms.
+  This does not change the KDE applet's view.
   Settings survive closing the tab and reloading the plugin. They live in
   the `settings` table in
   `~/.local/state/tern/plugin-data/codexbar-agentview/kv.json`.

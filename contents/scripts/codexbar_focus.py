@@ -144,7 +144,7 @@ def _tern(args: list[str], socket: str = "") -> subprocess.CompletedProcess | No
     env = dict(os.environ, TERN_DAEMON_SOCKET=socket) if socket else None
     try:
         return subprocess.run(
-            ["tern", *args], capture_output=True, text=True, timeout=5.0,
+            [agents.tern_bin() or "tern", *args], capture_output=True, text=True, timeout=5.0,
             check=False, env=env,
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -437,6 +437,9 @@ TELEPORT_TERM_WAIT = 7.0
 
 
 def _exited(pid: int) -> bool:
+    if sys.platform == "darwin":
+        import proc_darwin
+        return proc_darwin.exited(pid)
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
@@ -466,7 +469,7 @@ def teleport(provider: str, session_id: str) -> int:
 
     The agent must exit first: a session file has one live writer, so Tern
     starts only after the kitty process is gone."""
-    if shutil.which("tern") is None:
+    if not agents.tern_bin():
         sys.stderr.write("codexbar_focus: Tern is not installed\n")
         return 7
     payload = agents._load_payload(AGGREGATE_PATH)
@@ -538,11 +541,14 @@ def _tern_ready() -> bool:
 
 
 def _start_tern() -> bool:
-    """Open a Tern window, which starts its session daemon, in its own
-    systemd scope so a plasmashell stop does not kill it."""
+    """Open a Tern window, which starts its session daemon: on Linux in its
+    own systemd scope so a plasmashell stop does not kill it, on macOS
+    through Launch Services."""
+    argv = (["open", "-a", "Tern"] if sys.platform == "darwin" else
+            ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", "tern"])
     try:
         subprocess.Popen(
-            ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", "tern"],
+            argv,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, start_new_session=True,
         )
