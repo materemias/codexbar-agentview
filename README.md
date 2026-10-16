@@ -185,6 +185,7 @@ the Linux job also builds and tests the native Plasma command runner.
 | `↑` / `↓`        | Move the selection on Agents or History; an open peek follows |
 | `Space`          | Open or close the selected row's peek                         |
 | `Enter`          | Agents: focus the session's terminal. History: launch it      |
+| `Tab`            | Agents: hide or show sessions older than a day                |
 | `R`              | Refresh (Usage tab only; elsewhere `r` types into the filter) |
 | Printable text   | Filter the Agents and History tabs                            |
 | `Backspace`      | Edit the active filter                                        |
@@ -201,6 +202,7 @@ the Linux job also builds and tests the native Plasma command runner.
 | `↑` / `↓`        | Move the selection on Agents or History                       |
 | `Space`          | Show or hide the selected row's conversation                  |
 | `Enter`          | Agents: show the session's pane. History: launch it           |
+| `Tab`            | Agents: hide or show sessions older than a day                |
 | `Delete`         | Dismiss the selected History row                              |
 | `R`              | Refresh (Usage tab only)                                      |
 | Printable text   | Filter the Agents and History tabs                            |
@@ -318,6 +320,11 @@ The settings tab has its own keys, listed under [Tern plugin](#tern-plugin).
   Working and blocked rows get a tinted background and a left accent bar.
   Freshly idle rows show a green ring and wash that fade over five minutes;
   rows idle for over a day are dimmed.
+- **Hide old sessions.** The clock switch at the top right (next to the
+  state counts in Plasma, next to the gear in Tern), or `Tab` on the Agents
+  tab, hides sessions that have been in their state for over a day. Working
+  and blocked sessions always stay, a filter searches the hidden ones too, and
+  the switch shows how many it hides. The choice persists.
 - **Desktop badges.** The number of the virtual desktop the session's window
   is on, softly filled when it is the current one and outlined otherwise.
   The Plasma widget looks the desktops up; Tern shows the saved number dimmed.

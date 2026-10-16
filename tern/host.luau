@@ -85,6 +85,7 @@ local DEFAULTS = {
 	recentUsage = true,
 	includeUntracked = true,
 	includeNonTern = false,
+	hideOld = false,
 }
 
 local NUMBER_LIMITS = { refreshSeconds = { 60, 3600 }, historyLimit = { 10, 1000 } }
@@ -1517,12 +1518,31 @@ end
 
 type Row = { key: string, record: any, history: boolean }
 
--- Agents grouped by folder (alphabetical), newest state change first.
+-- Over a day in a state other than working or blocked: the tab's clock switch hides these.
+local function isOld(a: any, nowMs: number): boolean
+	local since = tonumber(val(a.stateChangedAt)) or 0
+	return since > 0 and nowMs - since > 86400000 and a.state ~= "working" and a.state ~= "blocked"
+end
+
+local function oldCount(): number
+	local nowMs = os.time() * 1000
+	local n = 0
+	for _, a in liveAgents() do
+		if isOld(a, nowMs) then
+			n += 1
+		end
+	end
+	return n
+end
+
+-- Agents grouped by folder (alphabetical), newest state change first. A filter searches old sessions too.
 local function agentRows(q: string): { { folder: string, rows: { any } } }
 	local groups: { [string]: { any } } = {}
 	local order: { string } = {}
+	local hideOld = q == "" and setting("hideOld")
+	local nowMs = os.time() * 1000
 	for _, a in liveAgents() do
-		if recordMatches(a, q) then
+		if recordMatches(a, q) and not (hideOld and isOld(a, nowMs)) then
 			local folder = cwdLabel(a.cwd)
 			if folder == "" then
 				folder = str(a.provider)
@@ -1615,9 +1635,12 @@ local function selected(b: Block): Row?
 end
 
 -- A capped list scrolls itself and keeps the selected row in view. The cap is
--- the whole window; codexbar.css then shrinks the list to the height left in
--- the pane (blocks report 80×24 cells whatever their size in Tern 0.4.5).
-local LIST_MAX = 1
+-- larger than any pane; codexbar.css shrinks the list to the height left under
+-- the tabs and filter (blocks report 80×24 cells whatever their size, still in
+-- Tern 0.9).
+local LIST_MAX = { lines = 1000 }
+-- Node path of list rows: the `fill` box in the main region, then the list.
+local LIST_PATH = "main.fill.list."
 
 local function peekNode(b: Block, r: any, history: boolean): Node
 	local kids: { Node } = {}
@@ -1712,7 +1735,7 @@ local function listView(b: Block, children: { Node }, empty: string): Node
 	local sel = selected(b)
 	return ui.node("list", {
 		key = "list",
-		selected = if sel then "main.list." .. sel.key else nil,
+		selected = if sel then LIST_PATH .. sel.key else nil,
 		filter = b.filter,
 		empty = { ui.span(empty, "muted") },
 		max = LIST_MAX,
@@ -1735,7 +1758,10 @@ local function agentsView(b: Block, now: number): Node
 			end
 		end
 	end
-	local empty = if b.filter ~= "" then "No session matches “" .. b.filter .. "”." else "No coding agents are running."
+	local hidden = if b.filter == "" and setting("hideOld") then oldCount() else 0
+	local empty = if b.filter ~= "" then "No session matches “" .. b.filter .. "”."
+		elseif hidden > 0 then "All " .. hidden .. " sessions are older than a day."
+		else "No coding agents are running."
 	return listView(b, kids, empty)
 end
 
@@ -1821,7 +1847,10 @@ local function dockView(b: Block, now: number): Node
 		} do
 			table.insert(hints, n)
 		end
-		if b.tab == "history" then
+		if b.tab == "agents" then
+			table.insert(hints, key("tab"))
+			table.insert(hints, ui.span(if setting("hideOld") then " show old   " else " hide old   ", "dim"))
+		elseif b.tab == "history" then
 			table.insert(hints, key("del"))
 			table.insert(hints, ui.span(" dismiss   ", "dim"))
 		end
@@ -1852,6 +1881,20 @@ local function tabsNode(b: Block): Node
 			key = id,
 			class = "cb-tab" .. (if b.tab == id then " on" else ""),
 			actions = { click = "tab=" .. id },
+		}, kids))
+	end
+	if b.tab == "agents" then
+		local hide = setting("hideOld")
+		local n = if hide then oldCount() else 0
+		local tip = (if hide then "Show " .. n .. " sessions older than a day" else "Hide sessions older than a day") .. " (Tab)"
+		local kids: { Node } = { ui.el("span", { text = "◷" }) }
+		if n > 0 then
+			table.insert(kids, ui.el("span", { class = "cb-count", text = tostring(n) }))
+		end
+		table.insert(tabs, ui.el("button", {
+			key = "old", class = "cb-tab cb-old" .. (if hide then " on" else ""), title = tip,
+			attrs = { ["aria-label"] = tip, ["aria-pressed"] = if hide then "true" else "false" },
+			actions = { click = "hide_old" },
 		}, kids))
 	end
 	table.insert(tabs, ui.el("button", {
@@ -1996,6 +2039,12 @@ local function act(b: Block, name: string)
 		scanAgents(true)
 	elseif name == "settings" then
 		tern.kv.set("settingsRequest", { pane = b.cx.pane, seq = tern.now() })
+	elseif name == "hide_old" then
+		local raw = tern.kv.get("settings")
+		local settings = if type(raw) == "table" then table.clone(raw) else {}
+		settings.hideOld = not setting("hideOld")
+		tern.kv.set("settings", settings)
+		renderAll()
 	elseif name == "restore_all" then
 		restoreAll(b)
 	elseif name == "dismiss_all" then
@@ -2087,6 +2136,9 @@ tern.block.define("dashboard", {
 			else
 				table.insert(main, historyView(b, now * 1000))
 			end
+			-- Tern 0.9 lays the main region out at its content height, so a flexed list gets none
+			-- of the pane; this box is absolutely sized to the region and gives the list the rest.
+			main = { ui.el("div", { key = "fill", class = "cb-fill" }, main) }
 		end
 		return { main = withp(ui.col(main), { role = "codexbar.main" }), dock = dockView(b, now) }
 	end,
@@ -2121,6 +2173,10 @@ tern.block.define("dashboard", {
 				return true
 			end
 			return false
+		end
+		if name == "tab" and b.tab == "agents" then
+			act(b, "hide_old")
+			return true
 		end
 		if name == "up" then
 			move(b, -1)
@@ -2161,9 +2217,8 @@ tern.block.define("dashboard", {
 			b.tab = ev.value
 			b.sel = nil
 		elseif (ev.ev == "select" or ev.ev == "activate") and type(ev.item) == "string" then
-			local prefix = "main.list."
-			if string.sub(ev.item, 1, #prefix) == prefix then
-				b.sel = string.sub(ev.item, #prefix + 1)
+			if string.sub(ev.item, 1, #LIST_PATH) == LIST_PATH then
+				b.sel = string.sub(ev.item, #LIST_PATH + 1)
 				if ev.ev == "activate" then
 					activate(b)
 				end

@@ -14,6 +14,22 @@ ColumnLayout {
     readonly property var list: snap && Array.isArray(snap.agents) ? snap.agents : []
     readonly property bool hasSomething: (counts.total || 0) > 0
     readonly property bool showPrompts: Plasmoid.configuration.showAgentPrompts === true
+    // Header clock switch: hide sessions in their state for over a day.
+    // Working and blocked sessions always stay, and a filter searches the
+    // hidden ones too.
+    readonly property bool hideOld: Plasmoid.configuration.hideOldAgents === true
+    readonly property int oldCount: list.filter(isOld).length
+
+    function isOld(a) {
+        var since = Number(a && a.stateChangedAt) || 0
+        return since > 0 && root.nowMs - since > 86400000
+            && a.state !== "working" && a.state !== "blocked"
+    }
+
+    function recordShown(a) {
+        if (filterText) return recordMatches(a)
+        return !!a && !(hideOld && isOld(a))
+    }
 
     // Cluster sessions by cwd. Groups are sorted alphabetically by folder name,
     // and rows within each group are newest first by stateChangedAt.
@@ -62,7 +78,7 @@ ColumnLayout {
         for (var i = 0; i < groups.length; i++) {
             for (var j = 0; j < groups[i].sessions.length; j++) {
                 var a = groups[i].sessions[j]
-                if (agents.recordMatches(a)) out.push(a)
+                if (agents.recordShown(a)) out.push(a)
             }
         }
         return out
@@ -427,6 +443,25 @@ ColumnLayout {
             }
         }
 
+        PC3.ToolButton {
+            readonly property string tip: (agents.hideOld
+                ? "Show " + agents.oldCount + " sessions older than a day"
+                : "Hide sessions older than a day") + " (Tab)"
+            visible: agents.hasSomething
+            checkable: true
+            checked: agents.hideOld
+            onToggled: Plasmoid.configuration.hideOldAgents = checked
+            icon.name: "clock"
+            text: agents.hideOld && agents.oldCount > 0 ? String(agents.oldCount) : ""
+            display: QQC2.AbstractButton.TextBesideIcon
+            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+            Layout.alignment: Qt.AlignVCenter
+            Accessible.name: tip
+            QQC2.ToolTip.text: tip
+            QQC2.ToolTip.visible: hovered
+            QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
+        }
+
         PC3.Label {
             visible: !agents.hasSomething
             text: "none"
@@ -484,7 +519,7 @@ ColumnLayout {
             required property var modelData
             title: groupItem.modelData.folder
             visible: groupItem.modelData.sessions.some(function(s) {
-                return agents.recordMatches(s)
+                return agents.recordShown(s)
             })
 
             Repeater {
@@ -502,7 +537,7 @@ ColumnLayout {
             id: rowItem
             Layout.fillWidth: true
             required property var modelData
-            visible: agents.recordMatches(modelData)
+            visible: agents.recordShown(modelData)
 
             implicitHeight: rowCol.implicitHeight + 4
             readonly property string sessionKey: agents.agentKey(modelData)
