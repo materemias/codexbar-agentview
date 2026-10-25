@@ -501,7 +501,7 @@ Item {
             root.runAggregator()
             event.accepted = true
         } else if (event.key === Qt.Key_Tab && tabHost.activeTab === 1) {
-            // Tab on the Agents tab = the header's hide-old clock switch.
+            // Tab on the Agents tab = the header's hide-old eye switch.
             Plasmoid.configuration.hideOldAgents = !agentsSection.hideOld
             event.accepted = true
         } else if (event.key === Qt.Key_Backspace) {

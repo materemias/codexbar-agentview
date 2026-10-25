@@ -14,7 +14,7 @@ ColumnLayout {
     readonly property var list: snap && Array.isArray(snap.agents) ? snap.agents : []
     readonly property bool hasSomething: (counts.total || 0) > 0
     readonly property bool showPrompts: Plasmoid.configuration.showAgentPrompts === true
-    // Header clock switch: hide sessions in their state for over a day.
+    // Header eye switch: hide sessions in their state for over a day.
     // Working and blocked sessions always stay, and a filter searches the
     // hidden ones too.
     readonly property bool hideOld: Plasmoid.configuration.hideOldAgents === true
@@ -451,7 +451,9 @@ ColumnLayout {
             checkable: true
             checked: agents.hideOld
             onToggled: Plasmoid.configuration.hideOldAgents = checked
-            icon.name: "clock"
+            icon.name: "view-hidden"
+            icon.width: Kirigami.Units.iconSizes.small
+            icon.height: Kirigami.Units.iconSizes.small
             text: agents.hideOld && agents.oldCount > 0 ? String(agents.oldCount) : ""
             display: QQC2.AbstractButton.TextBesideIcon
             font.pixelSize: Kirigami.Theme.smallFont.pixelSize

@@ -1518,7 +1518,7 @@ end
 
 type Row = { key: string, record: any, history: boolean }
 
--- Over a day in a state other than working or blocked: the tab's clock switch hides these.
+-- Over a day in a state other than working or blocked: the tab's eye switch hides these.
 local function isOld(a: any, nowMs: number): boolean
 	local since = tonumber(val(a.stateChangedAt)) or 0
 	return since > 0 and nowMs - since > 86400000 and a.state ~= "working" and a.state ~= "blocked"
@@ -1887,7 +1887,7 @@ local function tabsNode(b: Block): Node
 		local hide = setting("hideOld")
 		local n = if hide then oldCount() else 0
 		local tip = (if hide then "Show " .. n .. " sessions older than a day" else "Hide sessions older than a day") .. " (Tab)"
-		local kids: { Node } = { ui.el("span", { text = "◷" }) }
+		local kids: { Node } = { ui.el("span", { class = "cb-eye", text = "\u{f441}" }) }
 		if n > 0 then
 			table.insert(kids, ui.el("span", { class = "cb-count", text = tostring(n) }))
 		end

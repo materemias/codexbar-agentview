@@ -59,7 +59,7 @@
 		font-size: 16px;
 		padding: 4px 6px 6px;
 	}
-	/* Agents: the clock switch hiding old sessions sits before the gear. */
+	/* Agents: the eye switch hiding old sessions sits before the gear. */
 	.cb-old {
 		margin-left: auto;
 		flex-shrink: 0;
@@ -68,6 +68,10 @@
 	}
 	.cb-old + .cb-settings {
 		margin-left: 0;
+	}
+	/* Octicons eye from the bundled Nerd Font; the sans face has no glyph. */
+	.cb-eye {
+		font-family: var(--mono);
 	}
 	.cb-old.on {
 		color: var(--accent);

@@ -109,7 +109,7 @@
             <default>true</default>
         </entry>
         <entry name="hideOldAgents" type="Bool">
-            <label>Hide Agents-tab sessions that have been idle for over a day (the popup header's clock switch)</label>
+            <label>Hide Agents-tab sessions that have been idle for over a day (the popup header's eye switch)</label>
             <default>false</default>
         </entry>
         <entry name="agentsRefreshSeconds" type="Int">
