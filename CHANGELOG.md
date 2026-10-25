@@ -66,7 +66,7 @@
 
 ### Docs
 
-- README covers provider authentication, requirements per interface, installation, and Plasma and Tern screenshots.
+- README opens each interface with an intro film, keeps screenshots folded beneath it, and covers provider authentication, requirements per interface and installation.
 
 ### Internal
 
