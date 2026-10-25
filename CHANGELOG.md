@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.1.0 (2026-10-26)
+
 ### Breaking
 
 - The project is now CodexBar AgentView. Remove the old applet, add `io.github.materemias.codexbaragentview` to the panel, and rerun the integration installer to register the `codexbar-agentview://` handler. State moves to `~/.local/state/codexbar-agentview` on first run.
