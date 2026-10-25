@@ -19,6 +19,7 @@ Identities: applet `io.github.materemias.codexbaragentview`, Tern plugin `codexb
 - Test `tern/` changes on a scratch daemon: `tern --control <sock> <dir>` with `TERN_DAEMON_SOCKET` set to a scratch socket, driven by `tern ctl --control <sock>`. On the user's daemon, `ctl` input reaches their focused pane.
 - After visible UI changes, re-render the films in `film/`.
 - Ship README.md updates in the same change as the feature.
+- Commit with Conventional Commits (`feat(scope): …`, `fix`, `docs`, `ci`, `refactor`, `test`, `chore`), one change per commit. History before October 2026 uses plain sentences; don't copy it.
 
 ## Invariants
 
