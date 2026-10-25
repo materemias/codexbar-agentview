@@ -102,10 +102,10 @@ windowLabel accountAvailabilityIndicator providerDisplayName agentStateColor cwd
 historyLaunchAllowed launchHost canTeleport modelTint""".split()
 
 
-def display_helpers():
+def display_helpers(names=HELPERS):
     source = (REPO / "contents/ui/main.qml").read_text()
     functions = []
-    for name in HELPERS:
+    for name in names:
         match = re.search(r"^    function " + re.escape(name)
                           + r"\([^\n]*?\{(?:[^\n]*\}$|\n.*?^    \})", source, re.M | re.S)
         if not match:
@@ -242,15 +242,13 @@ def drop_png_dpi(path):
     path.write_bytes(bytes(out))
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=Path("/tmp/codexbar-screenshots"))
-    parser.add_argument("--width", type=int, default=864)
-    parser.add_argument("--height", type=int, default=895)
-    args = parser.parse_args()
-    if not 360 <= args.width <= 1200 or not 280 <= args.height <= 1200:
-        parser.error("Size must be 360..1200 wide and 280..1200 high")
-    output = args.output.resolve()
+PLASMOID = ' property var configuration: ({showAgents: true, showAgentPrompts: true, showComposite5h: false, showComposite7d: true})\n'
+
+
+def prepare(output, plasmoid=PLASMOID):
+    """Fill `output` with a scratch locale, appearance copied from the live session, the real UI
+    and a Plasmoid stub whose body is `plasmoid`. Returns the isolated Qt host's environment and
+    the theme it uses ("<plasma theme>/<color scheme file>")."""
     output.mkdir(parents=True, exist_ok=True)
     locale_dir = output / "locales"
     locale_dir.mkdir(exist_ok=True)
@@ -297,16 +295,7 @@ def main():
     module = output / "imports/org/kde/plasma/plasmoid"
     module.mkdir(parents=True, exist_ok=True)
     (module / "qmldir").write_text("module org.kde.plasma.plasmoid\nsingleton Plasmoid 1.0 Plasmoid.qml\n")
-    (module / "Plasmoid.qml").write_text('pragma Singleton\nimport QtQuick\nQtObject {\n'
-        ' property var configuration: ({showAgents: true, showAgentPrompts: true, showComposite5h: false, showComposite7d: true})\n}\n')
-    data = fixture()
-    (output / "fixture.json").write_text(json.dumps(data, indent=2) + "\n")
-    host = HOST.replace("@WIDTH@", str(args.width)).replace("@NOW@", str(NOW_MS))
-    host = host.replace("@HEIGHT@", str(args.height))
-    host = host.replace("@SNAPSHOT@", json.dumps(data["snapshot"]))
-    host = host.replace("@AGENTS@", json.dumps(data["agentSnapshot"]))
-    host = host.replace("@HELPERS@", display_helpers())
-    (output / "host.qml").write_text(host)
+    (module / "Plasmoid.qml").write_text('pragma Singleton\nimport QtQuick\nQtObject {\n' + plasmoid + '}\n')
     environment = dict(os.environ, HOME=str(output / "home"), XDG_CONFIG_HOME=str(output / "config"),
                        XDG_CACHE_HOME=str(output / "cache"), XDG_DATA_HOME=str(output / "data"),
                        XDG_RUNTIME_DIR=str(output / "runtime"), XDG_DATA_DIRS="/usr/local/share:/usr/share",
@@ -318,6 +307,27 @@ def main():
                        QT_FORCE_STDERR_LOGGING="1",
                        LANG="en_GB.UTF-8", LC_ALL="en_GB.UTF-8", LOCPATH=str(locale_dir),
                        DBUS_SESSION_BUS_ADDRESS="unix:path=/nonexistent-codexbar-preview-bus", TZ="UTC")
+    return environment, f"{theme_name}/{scheme.name}"
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=Path("/tmp/codexbar-screenshots"))
+    parser.add_argument("--width", type=int, default=864)
+    parser.add_argument("--height", type=int, default=895)
+    args = parser.parse_args()
+    if not 360 <= args.width <= 1200 or not 280 <= args.height <= 1200:
+        parser.error("Size must be 360..1200 wide and 280..1200 high")
+    output = args.output.resolve()
+    environment, theme = prepare(output)
+    data = fixture()
+    (output / "fixture.json").write_text(json.dumps(data, indent=2) + "\n")
+    host = HOST.replace("@WIDTH@", str(args.width)).replace("@NOW@", str(NOW_MS))
+    host = host.replace("@HEIGHT@", str(args.height))
+    host = host.replace("@SNAPSHOT@", json.dumps(data["snapshot"]))
+    host = host.replace("@AGENTS@", json.dumps(data["agentSnapshot"]))
+    host = host.replace("@HELPERS@", display_helpers())
+    (output / "host.qml").write_text(host)
     process = subprocess.run(["qml6", "--apptype", "widget", str(output / "host.qml")], cwd=output,
                              env=environment, capture_output=True, text=True, timeout=45)
     log = process.stdout + process.stderr
@@ -345,7 +355,7 @@ def main():
             raise RuntimeError(f"Selected and unselected geometry not exercised: {name}")
     sources = {str(path.relative_to(output)): hashlib.sha256(path.read_bytes()).hexdigest()
                for path in sorted((output / "contents/ui").glob("*")) if path.is_file()}
-    report = {"synthetic_only": True, "theme": f"{theme_name}/{scheme.name}",
+    report = {"synthetic_only": True, "theme": theme,
               "logical_size": [args.width, args.height],
               "screenshots": [name + ".png" for name in captures], "source_sha256": sources,
               "display_helpers_from_main": HELPERS,
