@@ -62,6 +62,7 @@
 - Early pace alerts stay quiet.
 - Program-driven omp and pi sessions, such as Tern's Carly assistant, are hidden.
 - Agents and History lists get their full height on Tern 0.9.
+- The Backend, Providers and About settings pages scroll when taller than the dialog.
 
 ### Docs
 
