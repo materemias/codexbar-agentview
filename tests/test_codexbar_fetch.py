@@ -82,8 +82,10 @@ class IsolatedUsageTestCase(unittest.TestCase):
         environment = mock.patch.dict(fetch.os.environ, {
             "HOME": directory.name,
             "XDG_STATE_HOME": str(self.home / ".local" / "state"),
+            "XDG_CONFIG_HOME": str(self.home / ".config"),
             "CODEX_HOME": str(self.home / ".codex"),
             "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
+            "MERIDIAN_PORT": "3456",
         })
         environment.start()
         self.addCleanup(environment.stop)
@@ -163,6 +165,357 @@ class ProviderFailureTests(IsolatedUsageTestCase):
                 self.assertEqual(raised.exception.code, 2)
 
 
+class ClaudeAccountTests(IsolatedUsageTestCase):
+    """One record per Claude login: a running Meridian's usage, else the CLI per login."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cli = self.home / "codexbar"
+        self.cli.write_text(
+            "#!/bin/sh\n"
+            'cat "$CLAUDE_CONFIG_DIR/usage.json" 2>/dev/null'
+            " || echo '{\"provider\":\"claude\",\"error\":{\"message\":\"rate limited\"}}'\n",
+        )
+        self.cli.chmod(0o700)
+        self.meridian = self.home / ".config" / "meridian"
+        self.profile_urls: list[str] = []
+
+    def login(self, name: str, email: str | None = None, cli_email: str | None = None,
+              used: float | None = None) -> Path:
+        directory = self.home / name
+        directory.mkdir()
+        expires = int((time.time() + 3600) * 1000)
+        (directory / ".credentials.json").write_text(json.dumps(
+            {"claudeAiOauth": {"accessToken": f"token-{name}", "expiresAt": expires}}))
+        if email:
+            (directory / ".claude.json").write_text(json.dumps(
+                {"oauthAccount": {"accountUuid": f"uuid-{email}", "emailAddress": email}}))
+        if used is not None:
+            (directory / "usage.json").write_text(json.dumps({
+                "provider": "claude", "source": "oauth",
+                "usage": {"accountEmail": cli_email, "loginMethod": "Claude Max 5x",
+                          "primary": {"usedPercent": used, "windowMinutes": 300}},
+            }))
+        return directory
+
+    def profiles(self, entries: list[tuple[str, Path]], order: list[str]) -> None:
+        self.meridian.mkdir(parents=True)
+        (self.meridian / "profiles.json").write_text(json.dumps(
+            [{"id": name, "claudeConfigDir": str(path)} for name, path in entries]))
+        (self.meridian / "settings.json").write_text(json.dumps({"profileOrder": order}))
+
+    def fetch_claude(self) -> list[dict]:
+        def http(url, _timeout, headers):
+            if url != fetch.CLAUDE_PROFILE_URL:
+                raise OSError("offline")
+            self.profile_urls.append(headers["Authorization"])
+            return json.dumps({"account": {"email": "profile@example.com"}}).encode()
+
+        with mock.patch.object(fetch, "_read_http_body", side_effect=http):
+            return fetch._fetch_provider(str(self.cli), "claude", 10)
+
+    def test_stopped_meridian_profiles_are_fetched_in_profile_order_once_per_account(self) -> None:
+        team = self.login("team", email="team@example.com", cli_email="team@example.com", used=10)
+        max_ = self.login("max", used=20)
+        twin = self.login("twin", cli_email="TEAM@example.com", used=99)
+        self.profiles([("team", team), ("max", max_), ("twin", twin)], ["max", "team", "twin"])
+        records = self.fetch_claude()
+        self.assertEqual(
+            [(r["accountEmail"], r["primary"]["usedPercent"]) for r in records],
+            [("profile@example.com", 20), ("team@example.com", 10)],
+        )
+        self.assertEqual({r["accountCount"] for r in records}, {2})
+        # Only the login without a saved or reported email asks the profile endpoint.
+        self.assertEqual(self.profile_urls, ["Bearer token-max"])
+
+    def test_failed_login_still_names_its_account(self) -> None:
+        team = self.login("team", email="team@example.com")
+        self.profiles([("team", team)], ["team"])
+        [record] = self.fetch_claude()
+        self.assertFalse(record["ok"])
+        self.assertEqual(record["accountEmail"], "team@example.com")
+
+    def test_without_meridian_the_local_login_is_used(self) -> None:
+        self.login(".claude", email="local@example.com", cli_email="local@example.com", used=5)
+        self.login("ignored", email="other@example.com", cli_email="other@example.com", used=50)
+        [record] = self.fetch_claude()
+        self.assertEqual((record["accountEmail"], record["primary"]["usedPercent"]),
+                         ("local@example.com", 5))
+
+    def test_running_meridian_supplies_every_profile_without_the_cli(self) -> None:
+        team = self.login("team")
+        now_ms = int(time.time() * 1000)
+        responses = {
+            "/profiles/list": {"profileOrder": ["max", "team"], "profiles": [
+                {"id": "team", "type": "claude-max", "email": "team@example.com",
+                 "subscriptionType": "team", "rateLimitTier": "default_claude_max_5x",
+                 "credentialDir": str(team)},
+                {"id": "gpt", "type": "chatgpt", "email": "gpt@example.com"},
+                {"id": "max", "type": "claude-max", "email": "max@example.com",
+                 "subscriptionType": "max", "rateLimitTier": "default_claude_max_20x"},
+            ]},
+            "/v1/usage/quota/all": {"profiles": [
+                {"id": "team", "fetchedAt": now_ms, "windows": [
+                    {"type": "five_hour", "utilization": 0.07, "resetsAt": now_ms + 3_600_000},
+                    {"type": "seven_day", "utilization": 0.19, "resetsAt": now_ms + 86_400_000},
+                    {"type": "seven_day_sonnet", "utilization": 0.3, "resetsAt": None},
+                    {"type": "seven_day_fable", "utilization": 0.01, "resetsAt": None},
+                    {"type": "seven_day_cowork", "utilization": 0.02, "resetsAt": None},
+                    {"type": "seven_day_omelette", "utilization": 0.5, "resetsAt": None},
+                ]},
+                {"id": "max", "windows": None, "failure": {"reason": "rate_limited"}},
+            ]},
+        }
+        reset_tokens = []
+
+        def http(url, _timeout, headers=None):
+            if url == fetch.CLAUDE_RESET_URL:
+                reset_tokens.append(headers["Authorization"])
+                return b'{"cedar_ember": {"eligible": true, "grants": [{"resets_left": 2}]}}'
+            return json.dumps(responses[url.split(":3456", 1)[1]]).encode()
+
+        with (
+            mock.patch.object(fetch, "_read_http_body", side_effect=http),
+            mock.patch.object(fetch.subprocess, "run", side_effect=AssertionError("CLI ran")),
+        ):
+            unavailable, team_record = fetch._fetch_provider(str(self.cli), "claude", 10)
+        self.assertEqual(
+            (unavailable["ok"], unavailable["accountEmail"], unavailable["loginMethod"]),
+            (False, "max@example.com", "Claude Max 20x"),
+        )
+        self.assertIn("rate_limited", unavailable["error"]["message"])
+        self.assertEqual(team_record["loginMethod"], "Claude Team")
+        # A Team seat on the Max 5x tier pools as five Pro allowances.
+        self.assertEqual(team_record["planWeight"], 5)
+        self.assertEqual(
+            [team_record[slot]["usedPercent"] for slot in ("primary", "secondary", "tertiary")],
+            [7, 19, 30],
+        )
+        self.assertEqual(team_record["primary"]["windowMinutes"], 300)
+        self.assertEqual(
+            [(extra["id"], extra["title"]) for extra in team_record["extraRateWindows"]],
+            [("claude-weekly-scoped-fable", "Fable only"), ("claude-routines", "Daily Routines")],
+        )
+        self.assertEqual(team_record["resetCredits"]["count"], 2)
+        self.assertEqual(reset_tokens, ["Bearer token-team"])
+        self.assertEqual({team_record["accountCount"], unavailable["accountCount"]}, {2})
+        # Saved resets share Anthropic's per-token usage limit: the next
+        # refresh within the hour reuses the answer.
+        with (
+            mock.patch.object(fetch, "_read_http_body", side_effect=http),
+            mock.patch.object(fetch.subprocess, "run", side_effect=AssertionError("CLI ran")),
+        ):
+            _, again = fetch._fetch_provider(str(self.cli), "claude", 10)
+        self.assertEqual(again["resetCredits"]["count"], 2)
+        self.assertEqual(reset_tokens, ["Bearer token-team"])
+
+    def test_failed_saved_resets_ask_waits_like_an_answered_one(self) -> None:
+        team = self.login("team")
+        now_ms = int(time.time() * 1000)
+        responses = {
+            "/profiles/list": {"profiles": [
+                {"id": "team", "type": "claude-max", "email": "team@example.com",
+                 "subscriptionType": "team", "credentialDir": str(team)}]},
+            "/v1/usage/quota/all": {"profiles": [
+                {"id": "team", "fetchedAt": now_ms,
+                 "windows": [{"type": "five_hour", "utilization": 0.1, "resetsAt": None}]}]},
+        }
+        asks = []
+
+        def http(url, _timeout, headers=None):
+            if url == fetch.CLAUDE_RESET_URL:
+                asks.append(url)
+                raise OSError("HTTP Error 429")
+            return json.dumps(responses[url.split(":3456", 1)[1]]).encode()
+
+        with mock.patch.object(fetch, "_read_http_body", side_effect=http):
+            first = fetch._fetch_provider(str(self.cli), "claude", 10)
+            second = fetch._fetch_provider(str(self.cli), "claude", 10)
+        self.assertEqual(len(asks), 1)
+        self.assertEqual([r["ok"] for r in first + second], [True, True])
+
+    def test_meridian_banked_resets_replace_the_anthropic_ask(self) -> None:
+        team = self.login("team")
+        now_ms = int(time.time() * 1000)
+        day = 86_400_000
+        banked = {"eligible": True, "ineligibleReason": None, "grants": [
+            {"id": "late", "resetsLeft": 2, "expiresAt": now_ms + 9 * day, "usableNow": True},
+            {"id": "soon", "resetsLeft": 1, "expiresAt": now_ms + 2 * day, "usableNow": None},
+            {"id": "used", "resetsLeft": 0, "expiresAt": now_ms + day},
+            {"id": "paused", "resetsLeft": 3, "expiresAt": None, "paused": True},
+            {"id": "unusable", "resetsLeft": 3, "expiresAt": None, "usableNow": False},
+            {"id": "future", "resetsLeft": 3, "startsAt": now_ms + day, "expiresAt": None},
+            {"id": "expired", "resetsLeft": 3, "expiresAt": now_ms - day},
+        ]}
+        responses = {
+            "/profiles/list": {"profiles": [
+                {"id": id_, "type": "claude-max", "email": f"{id_}@example.com",
+                 "subscriptionType": "team", "credentialDir": str(team)}
+                for id_ in ("team", "spent", "unknown")]},
+            "/v1/usage/quota/all": {"profiles": [
+                {"id": id_, "fetchedAt": now_ms, "bankedResets": value,
+                 "windows": [{"type": "five_hour", "utilization": 0.1, "resetsAt": None}]}
+                for id_, value in (("team", banked), ("spent", {"eligible": True, "grants": []}),
+                                   ("unknown", None))]},
+        }
+
+        def http(url, _timeout, headers=None):
+            if url == fetch.CLAUDE_RESET_URL:
+                raise AssertionError("asked Anthropic")
+            return json.dumps(responses[url.split(":3456", 1)[1]]).encode()
+
+        with mock.patch.object(fetch, "_read_http_body", side_effect=http):
+            team_record, spent, unknown = fetch._fetch_provider(str(self.cli), "claude", 10)
+        self.assertEqual(team_record["resetCredits"]["count"], 3)
+        self.assertEqual(
+            fetch._parse_iso(team_record["resetCredits"]["soonestExpiresAt"]).timestamp(),
+            (now_ms + 2 * day) / 1000,
+        )
+        self.assertEqual(spent["resetCredits"], {"count": 0, "soonestExpiresAt": None})
+        self.assertIsNone(unknown["resetCredits"])
+
+    def test_meridian_facts_come_first_and_the_login_fills_what_it_lacks(self) -> None:
+        full = self.login("full", email="saved@example.com")
+        bare = self.login("bare", email="bare@example.com")
+        oauth = json.loads((bare / ".credentials.json").read_text())
+        oauth["claudeAiOauth"].update(subscriptionType="max", rateLimitTier="default_claude_max_20x")
+        (bare / ".credentials.json").write_text(json.dumps(oauth))
+        now_ms = int(time.time() * 1000)
+        responses = {
+            "/profiles/list": {"profiles": [
+                {"id": "full", "type": "claude-max", "email": "meridian@example.com",
+                 "subscriptionType": "team", "rateLimitTier": "default_claude_max_5x",
+                 "credentialDir": str(full)},
+                {"id": "bare", "type": "claude-max", "email": None, "subscriptionType": None,
+                 "rateLimitTier": None, "credentialDir": str(bare)},
+            ]},
+            "/v1/usage/quota/all": {"profiles": [
+                {"id": id_, "fetchedAt": now_ms, "bankedResets": {"eligible": True, "grants": []},
+                 "windows": [{"type": "five_hour", "utilization": 0.1, "resetsAt": None}]}
+                for id_ in ("full", "bare")]},
+        }
+        urls = []
+
+        def http(url, _timeout, _headers=None):
+            urls.append(url)
+            return json.dumps(responses[url.split(":3456", 1)[1]]).encode()
+
+        with (
+            mock.patch.object(fetch, "_read_http_body", side_effect=http),
+            mock.patch.object(fetch.subprocess, "run", side_effect=AssertionError("CLI ran")),
+        ):
+            records = fetch._fetch_provider(str(self.cli), "claude", 10)
+        self.assertEqual(
+            [(r["accountEmail"], r["loginMethod"], r["planWeight"]) for r in records],
+            [("meridian@example.com", "Claude Team", 5), ("bare@example.com", "Claude Max 20x", 20)])
+        # Meridian and the login directories answered everything: no Anthropic call.
+        self.assertTrue(all(url.startswith("http://127.0.0.1:3456/") for url in urls), urls)
+
+    def test_meridian_chatgpt_seats_fill_in_codex_accounts_the_cli_cannot_read(self) -> None:
+        now_ms = int(time.time() * 1000)
+        responses = {
+            "/profiles/list": {"profiles": [
+                {"id": "shared", "type": "chatgpt", "email": "a@example.com", "subscriptionType": "plus"},
+                {"id": "seat", "type": "chatgpt", "email": "b@example.com", "subscriptionType": "pro",
+                 "resets": {"available": 2, "expiresAt": [now_ms + 86_400_000, None]}},
+                {"id": "free", "type": "chatgpt", "email": "c@example.com", "subscriptionType": "free"},
+            ]},
+            "/v1/usage/quota/all": {"profiles": [
+                {"id": "shared", "type": "chatgpt", "fetchedAt": now_ms,
+                 "windows": [{"type": "five_hour", "utilization": 0.9, "resetsAt": None}]},
+                {"id": "seat", "type": "chatgpt", "fetchedAt": now_ms, "windows": [
+                    {"type": "seven_day", "utilization": 0.25, "resetsAt": now_ms + 3_600_000},
+                    {"type": "five_hour", "utilization": 0.5, "resetsAt": None}]},
+                {"id": "free", "type": "chatgpt", "fetchedAt": now_ms,
+                 "windows": [{"type": "30d", "utilization": 0.1, "resetsAt": None}]},
+            ]},
+        }
+
+        def http(url, _timeout, _headers=None):
+            return json.dumps(responses[url.split(":3456", 1)[1]]).encode()
+
+        cli_account = fetch._normalize_record("codex", {"usage": {
+            "accountEmail": "A@example.com", "loginMethod": "plus",
+            "primary": {"usedPercent": 10, "windowMinutes": 300}}})
+        for cli_records, expected in (
+            ([cli_account], [("A@example.com", 10), ("b@example.com", 50), ("c@example.com", None)]),
+            ([fetch._result_error("codex", "cli_missing", "CLI not found")],
+             [("a@example.com", 90), ("b@example.com", 50), ("c@example.com", None)]),
+        ):
+            with (
+                mock.patch.object(fetch, "_read_http_body", side_effect=http),
+                mock.patch.object(fetch, "_fetch_sources", return_value=cli_records),
+            ):
+                records = fetch._fetch_provider(str(self.cli), "codex", 10)
+            self.assertEqual(
+                [(r["accountEmail"], (r["primary"] or {}).get("usedPercent")) for r in records], expected)
+        _, seat, free = records
+        self.assertEqual((seat["loginMethod"], seat["secondary"]["usedPercent"]), ("pro", 25))
+        self.assertEqual(seat["resetCredits"]["count"], 2)
+        self.assertEqual(
+            fetch._parse_iso(seat["resetCredits"]["soonestExpiresAt"]).timestamp(),
+            (now_ms + 86_400_000) / 1000)
+        self.assertEqual((free["secondary"]["windowMinutes"], free["secondary"]["usedPercent"]),
+                         (43200, 10))
+
+    def test_meridian_without_profiles_serves_the_local_login_as_default(self) -> None:
+        local = self.login(".claude", email="local@example.com")
+        oauth = json.loads((local / ".credentials.json").read_text())
+        oauth["claudeAiOauth"].update(subscriptionType="max", rateLimitTier="default_claude_max_20x")
+        (local / ".credentials.json").write_text(json.dumps(oauth))
+        responses = {
+            "/profiles/list": {"profiles": []},
+            "/v1/usage/quota/all": {"profiles": [
+                {"id": "default", "fetchedAt": int(time.time() * 1000), "bankedResets": None,
+                 "windows": [{"type": "five_hour", "utilization": 0.3, "resetsAt": None}]}]},
+        }
+        keys = []
+
+        def http(url, _timeout, headers=None):
+            keys.append((headers or {}).get("x-api-key"))
+            return json.dumps(responses[url.split(":3456", 1)[1]]).encode()
+
+        with (
+            mock.patch.dict(fetch.os.environ, {"MERIDIAN_API_KEY": "secret"}),
+            mock.patch.object(fetch, "_read_http_body", side_effect=http),
+            mock.patch.object(fetch.subprocess, "run", side_effect=AssertionError("CLI ran")),
+        ):
+            [record] = fetch._fetch_provider(str(self.cli), "claude", 10)
+        self.assertEqual(
+            (record["accountEmail"], record["loginMethod"], record["planWeight"],
+             record["primary"]["usedPercent"]),
+            ("local@example.com", "Claude Max 20x", 20, 30))
+        self.assertEqual(keys, ["secret", "secret"])
+
+    def test_meridian_stale_reading_stays_last_known_in_the_snapshot(self) -> None:
+        measured = int(time.time() * 1000) - 600_000
+        responses = {
+            "/profiles/list": {"profiles": [
+                {"id": "team", "type": "claude-max", "email": "team@example.com",
+                 "subscriptionType": "team"}]},
+            "/v1/usage/quota/all": {"profiles": [
+                {"id": "team", "fetchedAt": measured, "stale": True,
+                 "failure": {"reason": "rate_limited"},
+                 "windows": [{"type": "five_hour", "utilization": 0.4, "resetsAt": None}]}]},
+        }
+        output = io.StringIO()
+        with (
+            mock.patch.object(fetch, "_read_http_body",
+                              side_effect=lambda url, *_: json.dumps(
+                                  responses[url.split(":3456", 1)[1]]).encode()),
+            mock.patch.object(fetch.subprocess, "run", side_effect=AssertionError("CLI ran")),
+            mock.patch.object(fetch, "_cli_version", return_value=None),
+            mock.patch("sys.stdout", output),
+        ):
+            self.assertEqual(fetch.main(["--cli-path", str(self.cli), "--providers", "claude"]), 0)
+        [record] = json.loads(output.getvalue())["providers"]
+        self.assertTrue(record["ok"])
+        self.assertTrue(record["stale"])
+        self.assertIn("rate_limited", record["refreshError"])
+        self.assertEqual(fetch._parse_iso(record["cachedAt"]).timestamp(), measured / 1000)
+        self.assertEqual(record["primary"]["usedPercent"], 40)
+
+
 class UsageCacheTests(IsolatedUsageTestCase):
     def setUp(self) -> None:
         super().setUp()
@@ -193,11 +546,11 @@ class UsageCacheTests(IsolatedUsageTestCase):
         if min_interval is not None:
             arguments += ["--min-interval", str(min_interval)]
         with (
-            mock.patch.object(fetch, "_fetch_provider", side_effect=lambda _, p, __: [
+            mock.patch.object(fetch, "_fetch_provider", side_effect=lambda _, p, *__: [
                 record for record in (records or []) if record["id"] == p
             ]),
             mock.patch.object(fetch, "_cli_version", return_value=None),
-            mock.patch.object(fetch, "_read_codex_rotation", return_value=None),
+            mock.patch.object(fetch, "_read_rotation", return_value=None),
             mock.patch.object(fetch.subprocess, "run", side_effect=AssertionError("unexpected subprocess")),
             mock.patch.object(fetch, "_read_http_body", side_effect=AssertionError("unexpected network")),
             mock.patch("sys.stdout", output),
@@ -211,6 +564,24 @@ class UsageCacheTests(IsolatedUsageTestCase):
         second = self.snapshot([self.record(used=99)], min_interval=60)
         self.assertTrue(second["cacheOnly"])
         self.assertEqual([r["primary"]["usedPercent"] for r in second["providers"]], [42])
+
+    def test_cached_claude_accounts_keep_their_plan_weight(self) -> None:
+        # Tern renders the combined Claude bar from the cache alone.
+        heavy = {**self.record("claude", "max@example.com"), "planWeight": 5}
+        light = self.record("claude", "pro@example.com")
+        self.snapshot([heavy, light], providers="claude")
+        restored = self.snapshot(providers="claude", cache_only=True)["providers"]
+        self.assertEqual([r.get("planWeight") for r in restored], [5, None])
+
+    def test_cache_read_keeps_a_source_reported_stale_reading_last_known(self) -> None:
+        # Meridian can serve a recent reading whose own poll then failed.
+        stale = fetch._last_known(self.record("claude"), "Meridian refresh failed (rate_limited)")
+        stale["cachedAt"] = stale["updatedAt"]
+        live = self.snapshot([stale], providers="claude")["providers"][0]
+        self.assertTrue(live["stale"])
+        restored = self.snapshot(providers="claude", cache_only=True)["providers"][0]
+        self.assertTrue(restored["stale"])
+        self.assertEqual(restored["refreshError"], "Meridian refresh failed (rate_limited)")
 
     def test_startup_restores_private_normalized_usage_without_refresh(self) -> None:
         record = self.record()
@@ -242,10 +613,21 @@ class UsageCacheTests(IsolatedUsageTestCase):
         startup = self.snapshot(cache_only=True, cli=cli)
         self.assertEqual(startup["providers"][0]["primary"]["usedPercent"], 42)
         self.assertIsNone(startup["fatal"])
-        failed = self.snapshot(cli=cli)
+        missing = fetch._result_error("codex", "cli_missing", f"CLI not found at {cli}")
+        failed = self.snapshot([missing], cli=cli)
         self.assertEqual(failed["fatal"]["code"], "cli_missing")
-        self.assertEqual(failed["providers"][0]["refreshError"], failed["fatal"]["message"])
+        [kept] = failed["providers"]
+        self.assertEqual((kept["stale"], kept["primary"]["usedPercent"]), (True, 42))
         self.assertEqual(failed["updatedAt"], self.measured.isoformat())
+
+    def test_missing_cli_is_not_fatal_while_meridian_serves_a_provider(self) -> None:
+        cli = str(self.home / "removed-cli")
+        served = self.record("claude")
+        missing = fetch._result_error("codex", "cli_missing", f"CLI not found at {cli}")
+        result = self.snapshot([served, missing], providers="claude,codex", cli=cli)
+        self.assertIsNone(result["fatal"])
+        self.assertEqual([(r["id"], r["ok"]) for r in result["providers"]],
+                         [("claude", True), ("codex", False)])
 
     def test_provider_failure_retains_only_that_provider_and_does_not_renew_age(self) -> None:
         self.snapshot([self.record(), self.record("kilo", None, 12)], providers="codex,kilo")
@@ -367,7 +749,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
                 old_scope = fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["codex"])["codex"]
                 output = io.StringIO()
 
-                def changed_fetch(_cli, provider, _timeout):
+                def changed_fetch(_cli, provider, _timeout, *_rest):
                     if provider == "kilo":
                         return [self.record("kilo", None, 17)]
                     auth.write_text('{"tokens":{"account_id":"account-b"}}')
@@ -378,7 +760,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
                 with (
                     mock.patch.object(fetch, "_fetch_provider", side_effect=changed_fetch),
                     mock.patch.object(fetch, "_cli_version", return_value=None),
-                    mock.patch.object(fetch, "_read_codex_rotation", return_value=None),
+                    mock.patch.object(fetch, "_read_rotation", return_value=None),
                     mock.patch("sys.stdout", output),
                 ):
                     fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "codex,kilo"])
@@ -391,6 +773,27 @@ class UsageCacheTests(IsolatedUsageTestCase):
                 self.assertEqual(failed["sourceScope"], new_scope)
                 self.assertEqual(healthy["primary"]["usedPercent"], 17)
                 self.assertEqual(self.snapshot(cache_only=True)["providers"], [])
+
+    def test_switching_meridian_mid_fetch_discards_the_old_instances_accounts(self) -> None:
+        self.snapshot([self.record("claude")], providers="claude")
+        for name, value in (("MERIDIAN_PORT", "3457"), ("MERIDIAN_API_KEY", "other")):
+            with self.subTest(name=name):
+                output = io.StringIO()
+
+                def switched_fetch(*_args):
+                    fetch.os.environ[name] = value
+                    return [self.record("claude", used=91)]
+
+                with (
+                    mock.patch.dict(fetch.os.environ),
+                    mock.patch.object(fetch, "_fetch_provider", side_effect=switched_fetch),
+                    mock.patch.object(fetch, "_cli_version", return_value=None),
+                    mock.patch("sys.stdout", output),
+                ):
+                    fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "claude"])
+                [record] = json.loads(output.getvalue())["providers"]
+                self.assertEqual(record["error"]["code"], "credential_scope_changed")
+                self.assertNotIn("primary", record)
 
     def test_known_codex_account_refresh_preserves_scope_and_cache(self) -> None:
         auth = self.home / ".codex" / "auth.json"
@@ -514,7 +917,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
         with (
             mock.patch.object(fetch, "_fetch_provider", side_effect=refreshed_fetch),
             mock.patch.object(fetch, "_cli_version", return_value=None),
-            mock.patch.object(fetch, "_read_codex_rotation", return_value=None),
+            mock.patch.object(fetch, "_read_rotation", return_value=None),
             mock.patch("sys.stdout", output),
         ):
             fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "codex"])
@@ -637,17 +1040,17 @@ class CodexRotationTests(unittest.TestCase):
         })
         home.start()
         self.addCleanup(home.stop)
-        self.directory = Path(directory.name) / ".omp" / "agent" / "codex-rotation"
+        self.directory = Path(directory.name) / ".omp" / "agent" / "sub-rotate"
 
     def write_state(self, state: object) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
-        (self.directory / "state.json").write_text(json.dumps(state), encoding="utf-8")
+        (self.directory / "codex-state.json").write_text(json.dumps(state), encoding="utf-8")
 
     def test_missing_directory_or_state_hides_rotation(self) -> None:
-        self.assertIsNone(fetch._read_codex_rotation())
+        self.assertIsNone(fetch._read_rotation("codex"))
         self.directory.mkdir(parents=True)
-        (self.directory / "mode.json").write_text('{"operatingMode":"auto"}', encoding="utf-8")
-        self.assertIsNone(fetch._read_codex_rotation())
+        (self.directory / "codex-mode.json").write_text('{"operatingMode":"auto"}', encoding="utf-8")
+        self.assertIsNone(fetch._read_rotation("codex"))
 
     def test_all_rules_with_missing_mode_default_to_confirm(self) -> None:
         rules = {
@@ -661,7 +1064,7 @@ class CodexRotationTests(unittest.TestCase):
         for mode, description in rules.items():
             with self.subTest(mode=mode):
                 self.write_state({"mode": mode})
-                self.assertEqual(fetch._read_codex_rotation(), {
+                self.assertEqual(fetch._read_rotation("codex"), {
                     "mode": mode,
                     "description": description,
                     "operatingMode": "confirm",
@@ -673,22 +1076,22 @@ class CodexRotationTests(unittest.TestCase):
             for stalled in (False, True):
                 with self.subTest(operating_mode=operating_mode, stalled=stalled):
                     self.write_state({"mode": "TARGET", "stalled": stalled})
-                    mode_file = self.directory / "mode.json"
+                    mode_file = self.directory / "codex-mode.json"
                     mode_file.write_text(
                         json.dumps({"operatingMode": operating_mode}), encoding="utf-8"
                     )
-                    state_bytes = (self.directory / "state.json").read_bytes()
+                    state_bytes = (self.directory / "codex-state.json").read_bytes()
                     mode_bytes = mode_file.read_bytes()
-                    rotation = fetch._read_codex_rotation()
+                    rotation = fetch._read_rotation("codex")
                     self.assertEqual(rotation["operatingMode"], operating_mode)
                     self.assertEqual(rotation["stalled"], stalled)
-                    self.assertEqual((self.directory / "state.json").read_bytes(), state_bytes)
+                    self.assertEqual((self.directory / "codex-state.json").read_bytes(), state_bytes)
                     self.assertEqual(mode_file.read_bytes(), mode_bytes)
 
     def test_missing_operating_mode_field_defaults_to_confirm(self) -> None:
         self.write_state({"mode": "FILL"})
-        (self.directory / "mode.json").write_text("{}", encoding="utf-8")
-        self.assertEqual(fetch._read_codex_rotation()["operatingMode"], "confirm")
+        (self.directory / "codex-mode.json").write_text("{}", encoding="utf-8")
+        self.assertEqual(fetch._read_rotation("codex")["operatingMode"], "confirm")
 
     def test_invalid_state_hides_rotation_instead_of_inventing_idle(self) -> None:
         for state in (
@@ -700,7 +1103,7 @@ class CodexRotationTests(unittest.TestCase):
         ):
             with self.subTest(state=state):
                 self.write_state(state)
-                self.assertIsNone(fetch._read_codex_rotation())
+                self.assertIsNone(fetch._read_rotation("codex"))
 
     def test_invalid_operating_mode_hides_rotation(self) -> None:
         self.write_state({"mode": "FILL"})
@@ -710,24 +1113,24 @@ class CodexRotationTests(unittest.TestCase):
             {"operatingMode": "AUTO"}, {"operatingMode": "unknown"},
         ):
             with self.subTest(config=config):
-                (self.directory / "mode.json").write_text(json.dumps(config), encoding="utf-8")
-                self.assertIsNone(fetch._read_codex_rotation())
+                (self.directory / "codex-mode.json").write_text(json.dumps(config), encoding="utf-8")
+                self.assertIsNone(fetch._read_rotation("codex"))
 
     def test_corrupt_or_unreadable_files_hide_rotation(self) -> None:
-        for filename in ("state.json", "mode.json"):
+        for filename in ("codex-state.json", "codex-mode.json"):
             for contents in (b"{", b"\xff"):
                 with self.subTest(filename=filename, contents=contents):
                     self.write_state({"mode": "FILL"})
                     path = self.directory / filename
                     path.write_bytes(contents)
-                    self.assertIsNone(fetch._read_codex_rotation())
+                    self.assertIsNone(fetch._read_rotation("codex"))
                     path.unlink()
             with self.subTest(filename=filename, contents="directory"):
                 self.write_state({"mode": "FILL"})
                 path = self.directory / filename
                 path.unlink(missing_ok=True)
                 path.mkdir()
-                self.assertIsNone(fetch._read_codex_rotation())
+                self.assertIsNone(fetch._read_rotation("codex"))
                 path.rmdir()
 
     def test_account_availability_uses_owned_keys_only(self) -> None:
@@ -741,14 +1144,14 @@ class CodexRotationTests(unittest.TestCase):
             ],
         }
         self.write_state(state)
-        self.assertEqual(fetch._read_codex_rotation()["accountAvailability"], {
+        self.assertEqual(fetch._read_rotation("codex")["accountAvailability"], {
             "a@example.com": "open",
             "b@example.com": "blocked",
             "c@example.com": "blocked",
         })
         state["owned"] = {}
         self.write_state(state)
-        self.assertEqual(fetch._read_codex_rotation()["accountAvailability"], {
+        self.assertEqual(fetch._read_rotation("codex")["accountAvailability"], {
             "a@example.com": "open",
             "b@example.com": "open",
             "c@example.com": "open",
@@ -777,7 +1180,7 @@ class CodexRotationTests(unittest.TestCase):
         ):
             with self.subTest(fields=fields):
                 self.write_state({"mode": "FILL", **fields})
-                rotation = fetch._read_codex_rotation()
+                rotation = fetch._read_rotation("codex")
                 self.assertEqual(rotation["mode"], "FILL")
                 self.assertNotIn("accountAvailability", rotation)
 
@@ -814,13 +1217,121 @@ class CodexRotationTests(unittest.TestCase):
         self.assertNotIn("accountAvailability", snapshot()["codexRotation"])
         self.write_state({"mode": "BURN"})
         self.assertNotIn("accountAvailability", snapshot()["codexRotation"])
-        (self.directory / "state.json").unlink()
+        (self.directory / "codex-state.json").unlink()
         result = snapshot()
         self.assertIsNone(result["codexRotation"])
         self.assertEqual(
             [record["accountEmail"] for record in result["providers"]],
             ["a@example.com", "b@example.com"],
         )
+
+
+class ClaudeRotationTests(unittest.TestCase):
+    """omp-sub-rotate's Meridian rotation: `closed` keyed by Meridian profile id."""
+
+    def setUp(self) -> None:
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        home = mock.patch.dict(fetch.os.environ, {
+            "HOME": directory.name,
+            "XDG_STATE_HOME": str(Path(directory.name) / ".local" / "state"),
+        })
+        home.start()
+        self.addCleanup(home.stop)
+        self.directory = Path(directory.name) / ".omp" / "agent" / "sub-rotate"
+        self.emails = {"work": "a@example.com", "home": "b@example.com"}
+
+    def write_state(self, state: object) -> None:
+        self.directory.mkdir(parents=True, exist_ok=True)
+        (self.directory / "meridian-state.json").write_text(json.dumps(state), encoding="utf-8")
+
+    def test_without_state_file_nothing_is_shown(self) -> None:
+        self.assertIsNone(fetch._read_rotation("claude", self.emails))
+        # The Codex rotation's files say nothing about Claude.
+        self.directory.mkdir(parents=True)
+        (self.directory / "codex-state.json").write_text('{"mode":"FILL"}', encoding="utf-8")
+        (self.directory / "meridian-mode.json").write_text('{"operatingMode":"auto"}', encoding="utf-8")
+        self.assertIsNone(fetch._read_rotation("claude", self.emails))
+
+    def test_closed_profiles_map_to_emails(self) -> None:
+        accounts = [{"id": "work"}, {"id": "home"}]
+        self.write_state({"mode": "NO-BANK", "closed": {"home": {"until": 1}}, "accounts": accounts})
+        self.assertEqual(fetch._read_rotation("claude", self.emails), {
+            "mode": "NO-BANK",
+            "description": "No banked resets; accounts stop 95%.",
+            "operatingMode": "confirm",
+            "stalled": False,
+            "accountAvailability": {"a@example.com": "open", "b@example.com": "blocked"},
+        })
+        (self.directory / "meridian-mode.json").write_text('{"operatingMode":"auto"}', encoding="utf-8")
+        self.write_state({"mode": "TARGET", "stalled": True, "closed": {}, "accounts": accounts})
+        rotation = fetch._read_rotation("claude", self.emails)
+        self.assertEqual(rotation["operatingMode"], "auto")
+        self.assertTrue(rotation["stalled"])
+        self.assertEqual(rotation["accountAvailability"],
+                         {"a@example.com": "open", "b@example.com": "open"})
+
+    def test_profile_without_known_email_hides_availability(self) -> None:
+        for accounts, emails in (
+            ([{"id": "work"}, {"id": "other"}], self.emails),
+            ([{"id": "work"}, {"id": "home"}], {"work": "a@example.com", "home": "a@example.com"}),
+            ([{"id": "work"}, {"id": "work"}], self.emails),
+            ([{"id": 3}], self.emails),
+            ([{"id": "work"}], None),
+        ):
+            with self.subTest(accounts=accounts, emails=emails):
+                self.write_state({"mode": "FILL", "closed": {}, "accounts": accounts})
+                rotation = fetch._read_rotation("claude", emails)
+                self.assertEqual(rotation["mode"], "FILL")
+                self.assertNotIn("accountAvailability", rotation)
+
+    def test_snapshot_reads_meridian_profile_emails(self) -> None:
+        self.write_state({"mode": "FILL", "closed": {"work": {}}, "accounts": [{"id": "work"}]})
+
+        def snapshot(providers: str) -> dict:
+            output = io.StringIO()
+            with (
+                mock.patch.object(fetch, "_fetch_provider", return_value=[
+                    {"id": "claude", "ok": True, "accountEmail": "a@example.com"},
+                ]),
+                mock.patch.object(fetch._Meridian, "profiles", return_value=[
+                    ({"id": "work", "email": "a@example.com"}, {}),
+                ]),
+                mock.patch.object(fetch, "_cli_version", return_value=None),
+                mock.patch("sys.stdout", output),
+            ):
+                self.assertEqual(fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", providers]), 0)
+            return json.loads(output.getvalue())
+
+        result = snapshot("claude")
+        self.assertEqual(result["claudeRotation"]["accountAvailability"], {"a@example.com": "blocked"})
+        self.assertIsNone(result["codexRotation"])
+        self.assertIsNone(snapshot("codex")["claudeRotation"])
+        (self.directory / "meridian-state.json").unlink()
+        self.assertIsNone(snapshot("claude")["claudeRotation"])
+
+    def test_cache_only_read_tracks_state_file_offline(self) -> None:
+        home = Path(fetch.os.environ["HOME"])
+        login = home / ".config" / "meridian" / "work"
+        login.mkdir(parents=True)
+        (login / ".claude.json").write_text(
+            json.dumps({"oauthAccount": {"emailAddress": "a@example.com"}}), encoding="utf-8")
+        (home / ".config" / "meridian" / "profiles.json").write_text(
+            json.dumps([{"id": "work", "claudeConfigDir": str(login)}]), encoding="utf-8")
+        self.write_state({"mode": "FILL", "closed": {"work": {}}, "accounts": [{"id": "work"}]})
+
+        def cached() -> dict:
+            output = io.StringIO()
+            with (
+                mock.patch.object(fetch._Meridian, "snapshot", side_effect=AssertionError("network")),
+                mock.patch("sys.stdout", output),
+            ):
+                fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "claude", "--cache-only"])
+            return json.loads(output.getvalue())
+
+        self.assertEqual(cached()["claudeRotation"]["accountAvailability"], {"a@example.com": "blocked"})
+        (self.directory / "meridian-state.json").unlink()
+        self.assertIsNone(cached()["claudeRotation"])
 
 
 class SessionWindowClampTests(unittest.TestCase):

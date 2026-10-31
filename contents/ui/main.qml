@@ -40,6 +40,7 @@ PlasmoidItem {
         providers: [],
         fatal: null,
         forecast: null,
+        claudeRotation: null,
         codexRotation: null,
         cliVersion: null
     })
@@ -102,7 +103,7 @@ PlasmoidItem {
         root.backendGeneration++
         root.snapshot = {
             updatedAt: "", providers: [], fatal: null, forecast: null,
-            codexRotation: null, cliVersion: null
+            claudeRotation: null, codexRotation: null, cliVersion: null
         }
         root.usageNotificationState = {}
         root.ompModeNotificationState = null
@@ -128,6 +129,9 @@ PlasmoidItem {
         return ids
     }
     onEnabledProvidersChanged: {
+        if (root.enabledProviders.indexOf("claude") < 0) {
+            root.snapshot = Object.assign({}, root.snapshot, { claudeRotation: null })
+        }
         if (root.enabledProviders.indexOf("codex") < 0) {
             root.snapshot = Object.assign({}, root.snapshot, { codexRotation: null })
             root.ompModeNotificationState = Notifications.ompMode(
@@ -189,12 +193,15 @@ PlasmoidItem {
         // Spacer row beneath the app title.
         html += '<tr><td colspan="3" style="font-size: 6px">&nbsp;</td></tr>'
         var anyData = false
+        // One Claude account keeps the bare provider name; several are told
+        // apart by email, as Codex accounts always are.
+        var claudeAccounts = arr.filter(function(r) { return r && r.id === "claude" }).length
         for (var i = 0; i < arr.length; i++) {
             var rec = arr[i]
             var allowedSlots = root._tooltipSlots[rec.id]
             if (!allowedSlots) continue
             var name = labels[rec.id] || rec.id
-            if (rec.id === "codex" && rec.accountEmail) {
+            if (rec.accountEmail && (rec.id === "codex" || (rec.id === "claude" && claudeAccounts > 1))) {
                 var account = root.accountDisplayName(rec)
                     .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
                 name += " · " + account
@@ -322,6 +329,7 @@ PlasmoidItem {
                 var error = parsed.fatal ? parsed.fatal.message || "fetch failed"
                     : exitCode !== 0 ? stderr || "fetch failed (exit " + exitCode + ")" : ""
                 var fresh = kind === "fresh" && !error && parsed.cacheOnly !== true
+                if (!fresh || root.enabledProviders.indexOf("claude") < 0) parsed.claudeRotation = null
                 if (!fresh || root.enabledProviders.indexOf("codex") < 0) parsed.codexRotation = null
                 // The helper owns credential and cache-age validation, including empty results.
                 root.snapshot = parsed
@@ -338,7 +346,7 @@ PlasmoidItem {
                 if (kind !== "recovery-cache") root.lastError = err.message
                 root.snapshot = {
                     updatedAt: "", providers: [], fatal: null, forecast: null,
-                    codexRotation: null, cliVersion: null
+                    claudeRotation: null, codexRotation: null, cliVersion: null
                 }
                 root.ompModeNotificationState = Notifications.ompMode(
                     root.ompModeNotificationState, null, false).state
@@ -815,6 +823,7 @@ PlasmoidItem {
                 providers: [],
                 fatal: null,
                 forecast: null,
+                claudeRotation: null,
                 codexRotation: null,
                 cliVersion: null
             }
@@ -1101,12 +1110,21 @@ PlasmoidItem {
         return Usage.projectedPercent(win, now)
     }
 
-    // Codex plan allowance relative to Plus. Pro carries 20× the Plus usage
-    // limits; any other or missing plan counts as one Plus allowance.
+    // Plan allowance in the provider's base plan: Codex counts Plus-sized
+    // allowances (Pro carries 20× Plus); Claude counts Pro-sized ones, with
+    // the fetch helper's tier-based `planWeight` (Max 5x and 5x Team seats
+    // 5, Max 20x 20). Any other or missing plan is one allowance.
     readonly property var _codexPlanWeight: ({ plus: 1, pro: 20 })
+    readonly property var _allowanceUnit: ({ codex: "Plus", claude: "Pro" })
 
-    // Pooled 5h/7d window stats across Codex accounts, recomputed per UI
-    // clock tick. Each account contributes its plan weight in Plus-sized
+    function planWeight(rec) {
+        if (rec.id === "codex")
+            return root._codexPlanWeight[String(rec.loginMethod || "").toLowerCase()] || 1
+        return typeof rec.planWeight === "number" && rec.planWeight > 0 ? rec.planWeight : 1
+    }
+
+    // Pooled 5h/7d window stats across one provider's accounts, recomputed per UI
+    // clock tick. Each account contributes its plan weight in base-plan-sized
     // allowances: the fill is the used share of the combined allowance and
     // the pace mark is the weighted mean elapsed share, i.e. where even
     // consumption on every account would sit now. An account whose window
@@ -1139,7 +1157,7 @@ PlasmoidItem {
         }
     }
 
-    // The Codex accounts' windows of one length with their plan weights, or
+    // One provider's account windows of one length with their plan weights, or
     // null when fewer than two report it. Clock-independent so the popup
     // keeps stable row delegates; ProviderSection applies compositeStats on
     // each tick.
@@ -1152,12 +1170,12 @@ PlasmoidItem {
                 : records[i].secondary && records[i].secondary.windowMinutes === windowMinutes
                     ? records[i].secondary : null
             if (!w || w.usedPercent === undefined || w.usedPercent === null) continue
-            var weight = root._codexPlanWeight[String(records[i].loginMethod || "").toLowerCase()] || 1
+            var weight = root.planWeight(records[i])
             var u = Math.max(0, Math.min(100, w.usedPercent))
             windows.push({ usedPercent: u, resetsAt: w.resetsAt, startsAt: w.startsAt, weight: weight })
             used += weight * u
             total += weight
-            // Pooled recent consumption in the same Plus-weighted units as
+            // Pooled recent consumption in the same plan-weighted units as
             // the fill; an account without history contributes nothing.
             if (w.recent) {
                 consumed += weight * w.recent.consumedPercent
@@ -1169,26 +1187,38 @@ PlasmoidItem {
             usedPercent: used / total,
             windowMinutes: windowMinutes,
             compositeWindows: windows,
+            allowanceUnit: root._allowanceUnit[records[0].id] || "",
             recent: hours > 0 ? { hours: hours, consumedPercent: consumed / total } : null
         }
     }
 
-    function codexCompositeRecord() {
-        var show5h = Plasmoid.configuration.showComposite5h === true
-        var show7d = Plasmoid.configuration.showComposite7d !== false
+    // The combined record above a grouped Codex or Claude card, from two or
+    // more accounts with usage. Any account on last-known usage makes the
+    // pool last-known too, dated by its oldest reading: no pace, no alerts.
+    function compositeRecord(providerId) {
+        if (!root._allowanceUnit[providerId]) return null
+        var claude = providerId === "claude"
+        var config = Plasmoid.configuration
+        var show5h = (claude ? config.showClaudeComposite5h : config.showComposite5h) === true
+        var show7d = (claude ? config.showClaudeComposite7d : config.showComposite7d) !== false
         if (!show5h && !show7d) return null
         var records = (root.snapshot.providers || []).filter(function(rec) {
-            return rec && rec.id === "codex" && rec.ok
+            return rec && rec.id === providerId && rec.ok
         })
         if (records.length < 2) return null
-        if (records.some(function(record) { return record.stale === true })) return null
         var primary = show5h ? _compositeWindow(records, 300) : null
         var secondary = show7d ? _compositeWindow(records, 10080) : null
         if (!primary && !secondary) return null
+        var stale = records.filter(function(record) { return record.stale === true })
+        var oldest = stale.map(function(record) { return record.cachedAt || record.updatedAt })
+            .filter(function(at) { return !!at }).sort()[0] || null
         return {
-            id: "codex",
+            id: providerId,
             ok: true,
             composite: true,
+            stale: stale.length > 0,
+            cachedAt: oldest,
+            refreshError: "",
             accountCount: records.length,
             primary: primary,
             secondary: secondary,
@@ -1201,11 +1231,18 @@ PlasmoidItem {
         return Usage.windowLabel(providerId, slot, rec, extraTitle) || slot
     }
 
+    // omp's rotation status for Claude (Meridian profiles) or Codex, or null.
+    function providerRotation(providerId) {
+        if (providerId === "claude") return root.snapshot.claudeRotation || null
+        if (providerId === "codex") return root.snapshot.codexRotation || null
+        return null
+    }
+
     function accountAvailabilityIndicator(rec) {
         var email = rec.accountEmail || ""
-        if (rec.id !== "codex" || !email) return ""
-        var rotation = root.snapshot.codexRotation
-        var availability = rotation && rotation.accountAvailability
+        var rotation = root.providerRotation(rec.id)
+        if (!email || !rotation) return ""
+        var availability = rotation.accountAvailability
             ? rotation.accountAvailability[email] : ""
         if (availability === "open") return "🟢"
         if (availability === "blocked") return "🔒"

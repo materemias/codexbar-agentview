@@ -262,8 +262,8 @@ Item {
                         : "No providers enabled. Open Settings to enable some."
                 }
 
-                // One card per provider; consecutive Codex accounts share a
-                // card under one header.
+                // One card per provider; consecutive Codex accounts, and
+                // several Claude accounts, share a card under one header.
                 Repeater {
                     model: {
                         var out = []
@@ -271,7 +271,8 @@ Item {
                         for (var i = 0; i < providers.length; i++) {
                             var p = providers[i]
                             var last = out[out.length - 1]
-                            if (p && p.id === "codex" && last && last.id === "codex") {
+                            if (p && (p.id === "codex" || p.id === "claude")
+                                    && last && last.id === p.id) {
                                 last.records.push(p)
                             } else {
                                 out.push({ id: p ? p.id : "", records: [p] })
@@ -283,33 +284,38 @@ Item {
                         id: providerCard
                         required property var modelData
                         readonly property bool isCodex: modelData.id === "codex"
+                        // Codex always renders as a group; Claude only with
+                        // several accounts, so one account keeps its own header.
+                        readonly property bool grouped: isCodex
+                            || (modelData.id === "claude" && modelData.records.length > 1)
                         Layout.topMargin: 2
                         contentMargins: 6
                         bodySpacing: Kirigami.Units.smallSpacing
 
-                        // Codex group header: one provider title for all
-                        // accounts, with the omp rotation mode as a chip whose
-                        // tooltip carries the rule description.
+                        // Group header: one provider title for all accounts.
+                        // Claude and Codex add the omp rotation mode as a chip
+                        // whose tooltip carries the rule description.
                         RowLayout {
-                            id: codexHeader
-                            readonly property var rotationState: root.snapshot.codexRotation
+                            id: groupHeader
+                            readonly property var rotationState:
+                                root.providerRotation(providerCard.modelData.id)
                             readonly property bool stalled: !!rotationState && rotationState.stalled === true
                             readonly property color stateColor: stalled
                                 ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.disabledTextColor
-                            visible: providerCard.isCodex
+                            visible: providerCard.grouped
                             Layout.fillWidth: true
                             Layout.minimumHeight: Kirigami.Units.iconSizes.smallMedium
                             spacing: Kirigami.Units.smallSpacing
 
                             Kirigami.Icon {
-                                source: Qt.resolvedUrl("../icons/codex.svg")
+                                source: Qt.resolvedUrl("../icons/" + providerCard.modelData.id + ".svg")
                                 implicitWidth: Kirigami.Units.iconSizes.smallMedium
                                 implicitHeight: Kirigami.Units.iconSizes.smallMedium
                                 Layout.alignment: Qt.AlignVCenter
                                 smooth: true
                             }
                             PC3.Label {
-                                text: root.providerDisplayName("codex")
+                                text: root.providerDisplayName(providerCard.modelData.id)
                                 font.weight: Font.DemiBold
                                 font.pixelSize: Kirigami.Theme.defaultFont.pixelSize * 1.02
                                 font.letterSpacing: 0.8
@@ -318,13 +324,13 @@ Item {
                             Item { Layout.fillWidth: true }
 
                             RowLayout {
-                                visible: !!codexHeader.rotationState
+                                visible: !!groupHeader.rotationState
                                 spacing: Kirigami.Units.smallSpacing
                                 Layout.alignment: Qt.AlignVCenter
 
                                 PC3.Label {
-                                    text: codexHeader.rotationState
-                                        ? "omp · " + codexHeader.rotationState.operatingMode : ""
+                                    text: groupHeader.rotationState
+                                        ? "omp · " + groupHeader.rotationState.operatingMode : ""
                                     font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                                     opacity: 0.6
                                 }
@@ -332,17 +338,17 @@ Item {
                                     implicitWidth: rotationModeLabel.implicitWidth + Kirigami.Units.smallSpacing * 2
                                     implicitHeight: rotationModeLabel.implicitHeight + 2
                                     radius: height / 2
-                                    color: Qt.rgba(codexHeader.stateColor.r, codexHeader.stateColor.g,
-                                        codexHeader.stateColor.b, 0.18)
+                                    color: Qt.rgba(groupHeader.stateColor.r, groupHeader.stateColor.g,
+                                        groupHeader.stateColor.b, 0.18)
                                     border.width: 1
-                                    border.color: codexHeader.stateColor
+                                    border.color: groupHeader.stateColor
 
                                     PC3.Label {
                                         id: rotationModeLabel
                                         anchors.centerIn: parent
-                                        text: codexHeader.stalled ? "STALLED"
-                                            : codexHeader.rotationState ? codexHeader.rotationState.mode : ""
-                                        color: codexHeader.stateColor
+                                        text: groupHeader.stalled ? "STALLED"
+                                            : groupHeader.rotationState ? groupHeader.rotationState.mode : ""
+                                        color: groupHeader.stateColor
                                         font.weight: Font.DemiBold
                                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize - 2
                                     }
@@ -350,20 +356,21 @@ Item {
 
                                 HoverHandler { id: rotationHover }
                                 PC3.ToolTip {
-                                    visible: rotationHover.hovered && !!codexHeader.rotationState
+                                    visible: rotationHover.hovered && !!groupHeader.rotationState
                                     delay: 350
-                                    text: !codexHeader.rotationState ? ""
-                                        : "omp Codex rotation (" + codexHeader.rotationState.mode + "): "
-                                          + codexHeader.rotationState.description
-                                          + (codexHeader.stalled ? "\nSTALLED: all accounts closed" : "")
+                                    text: !groupHeader.rotationState ? ""
+                                        : "omp " + root.providerDisplayName(providerCard.modelData.id)
+                                          + " rotation (" + groupHeader.rotationState.mode + "): "
+                                          + groupHeader.rotationState.description
+                                          + (groupHeader.stalled ? "\nSTALLED: all accounts closed" : "")
                                 }
                             }
                         }
 
                         ProviderSection {
                             id: compositeSection
-                            readonly property var compositeRecord: providerCard.isCodex
-                                ? root.codexCompositeRecord() : null
+                            readonly property var compositeRecord: providerCard.grouped
+                                ? root.compositeRecord(providerCard.modelData.id) : null
                             Layout.fillWidth: true
                             visible: !!compositeRecord
                             record: compositeRecord || ({})
@@ -378,11 +385,11 @@ Item {
                                 Layout.fillWidth: true
                                 spacing: Kirigami.Units.smallSpacing
 
-                                // Accounts inside the Codex card get a faint
+                                // Accounts inside a grouped card get a faint
                                 // divider above them.
                                 Kirigami.Separator {
                                     Layout.fillWidth: true
-                                    visible: providerCard.isCodex
+                                    visible: providerCard.grouped
                                         && (parent.index > 0 || compositeSection.visible)
                                     Layout.topMargin: Kirigami.Units.smallSpacing / 2
                                     opacity: 0.2
@@ -391,7 +398,7 @@ Item {
                                 ProviderSection {
                                     Layout.fillWidth: true
                                     record: parent.modelData
-                                    subheading: providerCard.isCodex
+                                    subheading: providerCard.grouped
                                     forecast: showForecast ? root.snapshot.forecast : null
                                     showForecast: root.codexForecastEnabled
                                         && providerCard.isCodex

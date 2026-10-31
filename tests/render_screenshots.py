@@ -36,9 +36,13 @@ def window(percent, minutes, remaining_hours, recent=None):
 
 def fixture():
     providers = [
-        {"id": "claude", "ok": True, "loginMethod": "Max", "primary": window(28, 300, 2, 9),
-         "secondary": window(39, 10080, 80, 13),
+        {"id": "claude", "ok": True, "accountEmail": "work@example.com", "loginMethod": "Claude Team",
+         "planWeight": 1, "accountCount": 2,
+         "primary": window(28, 300, 2, 9), "secondary": window(39, 10080, 80, 13),
          "extraRateWindows": [{"id": "claude-design", "title": "Design", "window": window(14, 10080, 80)}]},
+        {"id": "claude", "ok": True, "accountEmail": "home@example.com", "loginMethod": "Claude Max 5x",
+         "planWeight": 5, "accountCount": 2,
+         "primary": window(54, 300, 3, 17), "secondary": window(61, 10080, 30, 8)},
         {"id": "codex", "ok": True, "accountEmail": "studio@example.com", "loginMethod": "Pro",
          "accountCount": 3, "primary": window(35, 300, 1.5, 4), "secondary": window(42, 10080, 72, 11)},
         {"id": "codex", "ok": True, "accountEmail": "lab@example.com", "loginMethod": "Plus",
@@ -97,7 +101,7 @@ def fixture():
 HELPERS = """colorFor relativeMs _monthDay _absoluteTime _forecastTimeLeft
 _forecastPercent codexForecastState formatCodexForecast formatCodexForecastIncident
 formatCodexForecastAlert formatResetCredits formatReset
-windowSpanMs compositeStats _compositeWindow codexCompositeRecord
+windowSpanMs planWeight compositeStats _compositeWindow compositeRecord
 windowLabel accountAvailabilityIndicator providerDisplayName agentStateColor cwdLabel ageFrom
 historyLaunchAllowed launchHost canTeleport modelTint""".split()
 
@@ -111,7 +115,7 @@ def display_helpers(names=HELPERS):
         if not match:
             raise RuntimeError(f"Display helper missing: {name}")
         functions.append(match.group(0))
-    for name in ("forecastLikelyPercent", "_codexPlanWeight", "historyLaunchCooldownMs"):
+    for name in ("forecastLikelyPercent", "_codexPlanWeight", "_allowanceUnit", "historyLaunchCooldownMs"):
         match = re.search(r"^    readonly property [^\n]+ " + re.escape(name) + r": [^\n]+", source, re.M)
         if not match:
             raise RuntimeError(f"Display constant missing: {name}")
@@ -242,7 +246,8 @@ def drop_png_dpi(path):
     path.write_bytes(bytes(out))
 
 
-PLASMOID = ' property var configuration: ({showAgents: true, showAgentPrompts: true, showComposite5h: false, showComposite7d: true})\n'
+PLASMOID = (' property var configuration: ({showAgents: true, showAgentPrompts: true, showComposite5h: false,'
+            ' showComposite7d: true, showClaudeComposite5h: true, showClaudeComposite7d: true})\n')
 
 
 def prepare(output, plasmoid=PLASMOID):

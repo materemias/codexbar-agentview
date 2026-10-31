@@ -116,7 +116,8 @@ def film_fixture():
 PLASMOID = (
     " property int formFactor: 2\n"  # PlasmaCore.Types.Horizontal: a horizontal panel
     " property var configuration: ({showAgents: true, showAgentPrompts: true, showComposite5h: false,"
-    " showComposite7d: true, trayIconSize: 24, compactStyle: 0, showAgentStateDots: true, agentBlockedBadge: true,"
+    " showComposite7d: true, showClaudeComposite5h: true, showClaudeComposite7d: true,"
+    " trayIconSize: 24, compactStyle: 0, showAgentStateDots: true, agentBlockedBadge: true,"
     " showAgentTopicInPanel: false,"
     ' trayIndicators: ["claude:primary", "codex:primary", "zai:primary", "opencodego:primary"]})\n'
 )

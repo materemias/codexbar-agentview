@@ -97,8 +97,8 @@ Item {
                 win.pace = -1
                 win.projected = -1
             }
-            // Legacy "codex:<slot>" keys expand to per-account windows; honour
-            // the flag on either form.
+            // Legacy "codex:<slot>" / "claude:<slot>" keys expand to
+            // per-account windows; honour the flag on either form.
             var gated = compact.overPaceOnly.indexOf(key) >= 0
                 || compact.overPaceOnly.indexOf(pid + ":" + slot) >= 0
             if (gated && win.projected <= 100) return
@@ -109,11 +109,11 @@ Item {
             var key = String(keys[k])
             var parts = key.split(":")
             var pid = parts[0]
-            if (pid === "codex" && parts.length === 2) {
-                var codexRecords = byId.codex || []
+            if ((pid === "codex" || pid === "claude") && parts.length === 2) {
+                var accountRecords = byId[pid] || []
                 var expanded = false
-                for (var ai = 0; ai < codexRecords.length; ai++) {
-                    var email = codexRecords[ai].accountEmail
+                for (var ai = 0; ai < accountRecords.length; ai++) {
+                    var email = accountRecords[ai].accountEmail
                     if (!email) continue
                     addWindow(pid, encodeURIComponent(String(email)), parts[1],
                               pid + ":" + encodeURIComponent(String(email)) + ":" + parts[1])

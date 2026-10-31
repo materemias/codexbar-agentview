@@ -10,6 +10,8 @@ KCM.SimpleKCM {
     property bool cfg_showCodexResetForecast: true
     property bool cfg_showComposite5h: false
     property bool cfg_showComposite7d: true
+    property bool cfg_showClaudeComposite5h: true
+    property bool cfg_showClaudeComposite7d: true
     property bool cfg_showRecentUsage: true
     property bool cfg_enableZai: true
     property bool cfg_enableOpenCodeGo: true
@@ -47,6 +49,19 @@ KCM.SimpleKCM {
         }
 
         RowLayout {
+            Kirigami.FormData.label: "Claude combined bars:"
+            QQC2.CheckBox {
+                text: "5h"
+                checked: cfg_showClaudeComposite5h
+                onToggled: cfg_showClaudeComposite5h = checked
+            }
+            QQC2.CheckBox {
+                text: "7d"
+                checked: cfg_showClaudeComposite7d
+                onToggled: cfg_showClaudeComposite7d = checked
+            }
+        }
+        RowLayout {
             Kirigami.FormData.label: "Codex combined bars:"
             QQC2.CheckBox {
                 text: "5h"
@@ -60,7 +75,7 @@ KCM.SimpleKCM {
             }
         }
         QQC2.Label {
-            text: "With two or more Codex accounts, a combined bar above the per-account sections pools their allowances, weighting Pro as 20× Plus."
+            text: "With two or more accounts, a combined bar above the per-account sections pools their allowances: Claude weighs Max 5x (and 5x Team seats) as 5× Pro and Max 20x as 20×, Codex weighs Pro as 20× Plus."
             wrapMode: Text.WordWrap
             Layout.fillWidth: true
             opacity: 0.55

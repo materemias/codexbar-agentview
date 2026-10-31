@@ -82,6 +82,8 @@ local DEFAULTS = {
 	forecast = true,
 	composite5h = false,
 	composite7d = true,
+	claudeComposite5h = true,
+	claudeComposite7d = true,
 	recentUsage = true,
 	includeUntracked = true,
 	includeNonTern = false,
@@ -513,7 +515,8 @@ local function resetCredits(credits: any, now: number): string
 	return text
 end
 
--- Pooled windows across Codex accounts, in Plus-sized allowances (main.qml compositeStats).
+-- Pooled windows across one provider's accounts, in base-plan-sized allowances
+-- (main.qml compositeStats): Codex in Plus, Claude in Pro via the fetch's planWeight.
 local function composite(records: { any }, minutes: number, now: number): any
 	local windows = {}
 	local consumed, hours = 0, 0
@@ -527,7 +530,9 @@ local function composite(records: { any }, minutes: number, now: number): any
 			end
 		end
 		if w then
-			local weight = CODEX_PLAN_WEIGHT[string.lower(str(r.loginMethod))] or 1
+			local weight = if str(r.id) == "codex"
+				then CODEX_PLAN_WEIGHT[string.lower(str(r.loginMethod))] or 1
+				else math.max(1, tonumber(val(r.planWeight)) or 1)
 			table.insert(windows, { w = w, weight = weight })
 			local recent = val(w.recent)
 			if type(recent) == "table" then
@@ -558,6 +563,7 @@ local function composite(records: { any }, minutes: number, now: number): any
 	end
 	return {
 		windowMinutes = minutes,
+		unit = if records[1] and str(records[1].id) == "claude" then "Pro" else "Plus",
 		usedPercent = used / total,
 		pacePct = if paced then elapsed / total else -1,
 		total = total,
@@ -619,10 +625,13 @@ local function windowRow(key: string, label: string, w: any, now: number, stale:
 	end
 
 	local meta: { any } = {}
-	if not stale then
+	if stale and pool then
+		-- A last-known pool keeps its allowance count, not its reset or pace.
+		table.insert(meta, ui.span(string.format("%.1f of %d %s allowances left", pool.remaining, pool.total, pool.unit), "muted"))
+	elseif not stale then
 		local reset
 		if pool then
-			reset = string.format("%.1f of %d Plus allowances left", pool.remaining, pool.total)
+			reset = string.format("%.1f of %d %s allowances left", pool.remaining, pool.total, pool.unit)
 			if pool.nextReset then
 				reset ..= " · next reset " .. absoluteTime(pool.nextReset, now) .. " (" .. span(pool.nextReset - now) .. ")"
 			end
@@ -837,8 +846,8 @@ local function cardOf(id: string, head: { any }, body: { Node }, worst: string?,
 	return withp(card, { key = "p-" .. id, role = "codexbar." .. (PROVIDER_ICONS[id] or "gauge"), tone = tone })
 end
 
-local function rotationIndicator(snap: any, email: string): string
-	local rotation = val(snap.codexRotation)
+local function rotationIndicator(snap: any, id: string, email: string): string
+	local rotation = val(if id == "claude" then snap.claudeRotation elseif id == "codex" then snap.codexRotation else nil)
 	local availability = if type(rotation) == "table" and type(val(rotation.accountAvailability)) == "table"
 		then val(rotation.accountAvailability[email]) else nil
 	return if availability == "open" then "🟢 " elseif availability == "blocked" then "🔒 " else ""
@@ -861,7 +870,8 @@ local function providerCards(snap: any, now: number): { Node }
 			continue
 		end
 		local name = PROVIDER_NAMES[id] or id
-		if id == "codex" and #recs > 1 then
+		-- Codex, and Claude with several accounts, render one card with a section per account.
+		if (id == "codex" or id == "claude") and #recs > 1 then
 			local body: { Node } = {}
 			local worst: string? = nil
 			local okRecs, anyStale = {}, false
@@ -871,22 +881,22 @@ local function providerCards(snap: any, now: number): { Node }
 				end
 				anyStale = anyStale or val(r.stale) == true
 			end
-			if not anyStale then
-				for _, spec in { { 300, "composite5h", "all 5h" }, { 10080, "composite7d", "all 7d" } } do
-					if setting(spec[2]) then
-						local pool = composite(okRecs, spec[1], now)
-						if pool then
-							local node, lvl = windowRow("pool" .. spec[1], spec[3], pool, now, false, pool, "")
-							table.insert(body, node)
-							worst = worse(worst, lvl)
-						end
+			-- Any account on last-known usage makes the pool last-known too.
+			local keys = if id == "claude" then { "claudeComposite5h", "claudeComposite7d" } else { "composite5h", "composite7d" }
+			for _, spec in { { 300, keys[1], "all 5h" }, { 10080, keys[2], "all 7d" } } do
+				if setting(spec[2]) then
+					local pool = composite(okRecs, spec[1], now)
+					if pool then
+						local node, lvl = windowRow("pool" .. spec[1], spec[3], pool, now, anyStale, pool, "")
+						table.insert(body, node)
+						worst = worse(worst, lvl)
 					end
 				end
 			end
 			for i, r in recs do
 				local email = str(r.accountEmail)
 				local head: { any } = {
-					ui.span(rotationIndicator(snap, email) .. (if email ~= "" then email else "account " .. i), "strong"),
+					ui.span(rotationIndicator(snap, id, email) .. (if email ~= "" then email else "account " .. i), "strong"),
 					ui.span("  " .. str(r.loginMethod), "muted"),
 				}
 				local rows: { Node } = {}
@@ -905,7 +915,7 @@ local function providerCards(snap: any, now: number): { Node }
 				end
 				table.insert(body, withp(ui.section(head, rows), { key = "acct-" .. nodeKey(email ~= "" and email or tostring(i)) }))
 			end
-			if setting("forecast") then
+			if id == "codex" and setting("forecast") then
 				for _, n in forecastNodes(val(snap.forecast), now) do
 					table.insert(body, n)
 				end
@@ -1145,10 +1155,11 @@ local function adoptCache(data: any)
 			rec.stale = false
 		end
 	end
-	-- The cache keeps no forecast, rotation or CLI version; carry the last fetch's.
+	-- The cache keeps no forecast or CLI version; carry the last fetch's. Rotation
+	-- is read fresh from omp's state files even on a cache read, so it is not carried.
 	local previous = store.usage
 	if type(previous) == "table" then
-		for _, k in { "forecast", "codexRotation", "cliVersion" } do
+		for _, k in { "forecast", "cliVersion" } do
 			if val(data[k]) == nil then
 				data[k] = val(previous[k])
 			end
@@ -2255,9 +2266,13 @@ local SETTINGS_ROWS: { any } = {
 		hint = "Show the cached reset forecast. Enabling it does not fetch immediately." },
 	{ id = "recentUsage", page = "usage", section = "Details", label = "Recent consumption",
 		hint = "Show the last hour's 5h consumption and last day's weekly consumption." },
-	{ id = "composite5h", page = "usage", section = "Codex accounts", label = "Combined 5h window",
+	{ id = "claudeComposite5h", page = "usage", section = "Several accounts", label = "Claude combined 5h window",
+		hint = "Show a plan-weighted total across current Claude accounts." },
+	{ id = "claudeComposite7d", page = "usage", section = "Several accounts", label = "Claude combined weekly window",
+		hint = "Show a plan-weighted total across current Claude accounts." },
+	{ id = "composite5h", page = "usage", section = "Several accounts", label = "Codex combined 5h window",
 		hint = "Show a plan-weighted total across current Codex accounts." },
-	{ id = "composite7d", page = "usage", section = "Codex accounts", label = "Combined weekly window",
+	{ id = "composite7d", page = "usage", section = "Several accounts", label = "Codex combined weekly window",
 		hint = "Show a plan-weighted total across current Codex accounts." },
 }
 for _, provider in PROVIDER_ORDER do

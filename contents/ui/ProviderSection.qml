@@ -9,9 +9,9 @@ ColumnLayout {
     property var forecast: null
     property bool showForecast: false
     readonly property bool stale: !!(record && record.stale)
-    // Codex renders as one group under a shared header (FullRepresentation):
-    // each account, and the combined pool, gets a compact sub-heading
-    // instead of the full provider header.
+    // Codex, and Claude with several accounts, render as one group under a
+    // shared header (FullRepresentation): each account, and the combined Codex
+    // pool, gets a compact sub-heading instead of the full provider header.
     property bool subheading: false
     spacing: 4
 
@@ -206,7 +206,7 @@ ColumnLayout {
             required property int index
             readonly property var rec: modelData.rec
             // Composite (pooled) windows are recomputed per clock tick from the
-            // accounts' raw windows and describe the pool in Plus-sized
+            // accounts' raw windows and describe the pool in base-plan-sized
             // allowances: "12.4 of 41 Plus allowances left · next reset …".
             readonly property bool isComposite: !!rec.compositeWindows
             readonly property var pool: isComposite
@@ -216,10 +216,12 @@ ColumnLayout {
             readonly property color tint: section.stale ? Kirigami.Theme.disabledTextColor
                 : root.colorFor(pct, paceSettled ? pacePct : -1)
             readonly property string resetText: {
-                if (section.stale) return ""
-                if (!isComposite) return root.formatReset(rec, root.nowMs)
-                var reset = pool.resetsAt ? root.formatReset({ resetsAt: pool.resetsAt }, root.nowMs) : ""
-                var line = pool.remaining.toFixed(1) + " of " + pool.total + " Plus allowances left"
+                if (!isComposite) return section.stale ? "" : root.formatReset(rec, root.nowMs)
+                // A last-known pool keeps its allowance count, not its reset.
+                var line = pool.remaining.toFixed(1) + " of " + pool.total + " "
+                    + rec.allowanceUnit + " allowances left"
+                var reset = pool.resetsAt && !section.stale
+                    ? root.formatReset({ resetsAt: pool.resetsAt }, root.nowMs) : ""
                 return reset.length > 0 ? line + " · next reset " + reset : line
             }
             // Codex and Claude "saved reset" credits ride on the weekly row's

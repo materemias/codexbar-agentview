@@ -351,7 +351,10 @@ class Take:
             return r
 
         records = {
-            "claude": [record("claude", plan="Max", primary=(28, 300, 2, 9), secondary=(39, 10080, 80, 13), extra=(14, 10080, 80))],
+            "claude": [
+                {**record("claude", "work@example.com", "Claude Team", primary=(28, 300, 2, 9), secondary=(39, 10080, 80, 13), extra=(14, 10080, 80)), "planWeight": 1},
+                {**record("claude", "home@example.com", "Claude Max 5x", primary=(54, 300, 3, 17), secondary=(61, 10080, 30, 8)), "planWeight": 5},
+            ],
             "codex": [
                 record("codex", "studio@example.com", "Pro", primary=(35, 300, 1.5, 4), secondary=(42, 10080, 72, 11)),
                 record("codex", "lab@example.com", "Plus", primary=(68, 300, 2, 21), secondary=(76, 10080, 48, 18)),

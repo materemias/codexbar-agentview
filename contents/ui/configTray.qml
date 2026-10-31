@@ -14,22 +14,21 @@ Item {
     property int cfg_trayIconSize: 22
     property string cfg_cliPath: "/usr/bin/codexbar"
 
-    property var codexAccounts: []
-    property bool codexLoading: true
-    property string codexError: ""
+    // Accounts with an email, per provider, from the last saved usage.
+    property var accounts: ({ claude: [], codex: [] })
+    property bool accountsLoading: true
+    property string accountsError: ""
     property bool initialized: false
     property string activeCommand: ""
     property string activeCliPath: ""
     readonly property string cliPath: Command.cliPath(cfg_cliPath)
     onCliPathChanged: {
         if (!initialized) return
-        codexAccounts = []
-        codexError = ""
-        codexLoading = true
-        loadCodexAccounts()
+        accounts = { claude: [], codex: [] }
+        accountsError = ""
+        accountsLoading = true
+        loadAccounts()
     }
-    readonly property bool codexReady:
-        !codexLoading && codexError.length === 0 && codexAccounts.length > 0
     readonly property string fetchScriptPath: Command.localPath(
         Qt.resolvedUrl("../scripts/codexbar_fetch.py"))
     implicitWidth: Kirigami.Units.gridUnit * 22
@@ -84,168 +83,243 @@ Item {
         }
     }
 
-    function _codexWindowLabel(id, fallback) {
-        if (id === "codex-base-model-inference" || id === "gpt-reserve") {
-            return "Reserve 7d"
+    // Per-account meters for the providers that can have several accounts:
+    // one block per account with its own keys `<provider>:<encoded email>:<window>`.
+    // Without known accounts the provider falls back to legacy
+    // `<provider>:<window>` keys, which cover every account.
+    component AccountMeters: ColumnLayout {
+        id: meters
+        property string providerId
+        readonly property bool ready: root._ready(providerId)
+        spacing: ready ? Kirigami.Units.smallSpacing : 0
+
+        Repeater {
+            model: meters.ready ? [] : root._fallbackWindows(meters.providerId)
+            delegate: MeterCheck {
+                id: fallbackWindow
+                required property var modelData
+                key: meters.providerId + ":" + fallbackWindow.modelData.id
+                text: fallbackWindow.modelData.text
+                isOn: root._allChecked(meters.providerId, fallbackWindow.modelData.id)
+                setOn: function (on) {
+                    root._toggleAll(meters.providerId, fallbackWindow.modelData.id, on)
+                }
+            }
         }
-        return fallback || id
+
+        Repeater {
+            model: meters.ready ? root.accounts[meters.providerId] : []
+            delegate: ColumnLayout {
+                id: accountGroup
+                required property var modelData
+                spacing: 0
+
+                QQC2.Label {
+                    text: accountGroup.modelData.accountEmail
+                        + (accountGroup.modelData.loginMethod
+                           ? " · " + accountGroup.modelData.loginMethod : "")
+                    font.weight: Font.DemiBold
+                    opacity: 0.8
+                }
+
+                Repeater {
+                    model: root._accountWindows(accountGroup.modelData)
+                    delegate: MeterCheck {
+                        id: accountWindow
+                        required property var modelData
+                        key: root._accountKey(accountGroup.modelData, accountWindow.modelData.id)
+                        text: accountWindow.modelData.text
+                        isOn: root._accountChecked(
+                            accountGroup.modelData, accountWindow.modelData.id)
+                        setOn: function (on) {
+                            root._toggleAccount(
+                                accountGroup.modelData, accountWindow.modelData.id, on)
+                        }
+                    }
+                }
+            }
+        }
     }
 
-    function _codexWindows(account) {
+    readonly property var _windowLabels: ({
+        claude: {
+            "primary": "5h session",
+            "secondary": "7d weekly (all models)",
+            "tertiary": "7d weekly (Sonnet)",
+            "claude-design": "Claude Design",
+            "claude-routines": "Daily Routines"
+        },
+        codex: {
+            "primary": "5h session",
+            "secondary": "7d weekly",
+            "tertiary": "Additional limit",
+            "codex-base-model-inference": "Reserve 7d",
+            "gpt-reserve": "Reserve 7d"
+        }
+    })
+    // Windows offered when no account is known.
+    readonly property var _fallbackSlots: ({
+        claude: ["primary", "secondary", "tertiary", "claude-design", "claude-routines"],
+        codex: ["primary", "secondary"]
+    })
+
+    function _windowLabel(providerId, id, fallback) {
+        var labels = _windowLabels[providerId] || {}
+        return labels[id] || fallback || id
+    }
+
+    function _ready(providerId) {
+        return !accountsLoading && accountsError.length === 0
+            && (accounts[providerId] || []).length > 0
+    }
+
+    function _accountWindows(account) {
         var rows = []
-        var slots = [
-            { id: "primary", text: "5h session" },
-            { id: "secondary", text: "7d weekly" },
-            { id: "tertiary", text: "Additional limit" }
-        ]
+        var slots = ["primary", "secondary", "tertiary"]
         for (var i = 0; i < slots.length; i++) {
-            var window = account[slots[i].id]
+            var window = account[slots[i]]
             if (window && window.usedPercent !== undefined && window.usedPercent !== null) {
-                rows.push(slots[i])
+                rows.push({ id: slots[i], text: _windowLabel(account.id, slots[i]) })
             }
         }
         var extras = account.extraRateWindows || []
         for (var e = 0; e < extras.length; e++) {
             if (!extras[e] || !extras[e].id || !extras[e].window) continue
-            rows.push({ id: extras[e].id, text: _codexWindowLabel(extras[e].id, extras[e].title) })
+            rows.push({ id: extras[e].id, text: _windowLabel(account.id, extras[e].id, extras[e].title) })
         }
         return rows
     }
 
-    function _codexKey(account, slot) {
-        return "codex:" + encodeURIComponent(String(account.accountEmail)) + ":" + slot
+    function _accountKey(account, slot) {
+        return account.id + ":" + encodeURIComponent(String(account.accountEmail)) + ":" + slot
     }
 
-    function _codexChecked(account, slot) {
-        return _has(_codexKey(account, slot)) || _has("codex:" + slot)
+    function _accountChecked(account, slot) {
+        return _has(_accountKey(account, slot)) || _has(account.id + ":" + slot)
     }
-    function _fallbackCodexWindows() {
-        var rows = [
-            { id: "primary", text: "5h session" },
-            { id: "secondary", text: "7d weekly" }
-        ]
-        var seen = { primary: true, secondary: true }
+
+    // The slot of a `<provider>:<window>` or `<provider>:<account>:<window>`
+    // key of `providerId`, else "".
+    function _keySlot(providerId, key) {
+        var parts = String(key).split(":")
+        if (parts[0] !== providerId || parts.length < 2) return ""
+        return parts.length > 2 ? parts.slice(2).join(":") : parts[1]
+    }
+
+    function _fallbackWindows(providerId) {
+        var rows = []
+        var seen = {}
+        var base = _fallbackSlots[providerId] || []
+        for (var b = 0; b < base.length; b++) {
+            rows.push({ id: base[b], text: _windowLabel(providerId, base[b]) })
+            seen[base[b]] = true
+        }
         var configured = cfg_trayIndicators || []
         for (var i = 0; i < configured.length; i++) {
-            var parts = String(configured[i]).split(":")
-            if (parts[0] !== "codex" || parts.length < 2) continue
-            var slot = parts.length > 2 ? parts.slice(2).join(":") : parts[1]
+            var slot = _keySlot(providerId, configured[i])
             if (!slot || seen[slot]) continue
-            rows.push({
-                id: slot,
-                text: _codexWindowLabel(slot, slot)
-            })
+            rows.push({ id: slot, text: _windowLabel(providerId, slot) })
             seen[slot] = true
         }
         return rows
     }
 
-    function _codexAllChecked(slot) {
+    function _allChecked(providerId, slot) {
         var configured = cfg_trayIndicators || []
         for (var i = 0; i < configured.length; i++) {
-            var parts = String(configured[i]).split(":")
-            if (parts[0] !== "codex") continue
-            var configuredSlot = parts.length > 2
-                ? parts.slice(2).join(":") : parts[1]
-            if (configuredSlot === slot) return true
+            if (_keySlot(providerId, configured[i]) === slot) return true
         }
         return false
     }
 
-    function _toggleCodexAll(slot, on) {
+    function _toggleAll(providerId, slot, on) {
         var current = cfg_trayIndicators ? cfg_trayIndicators.slice() : []
         for (var i = current.length - 1; i >= 0; i--) {
-            var parts = String(current[i]).split(":")
-            if (parts[0] !== "codex") continue
-            var configuredSlot = parts.length > 2
-                ? parts.slice(2).join(":") : parts[1]
-            if (configuredSlot === slot) current.splice(i, 1)
+            if (_keySlot(providerId, current[i]) === slot) current.splice(i, 1)
         }
-        if (on) current.push("codex:" + slot)
+        if (on) current.push(providerId + ":" + slot)
         cfg_trayIndicators = current
     }
 
-
-    function _toggleCodex(account, slot, on) {
+    // A legacy all-accounts key turns into one key per account that has the
+    // window before the toggled account changes.
+    function _toggleAccount(account, slot, on) {
         var current = cfg_trayIndicators ? cfg_trayIndicators.slice() : []
-        var legacy = "codex:" + slot
-        var legacyIndex = current.indexOf(legacy)
+        var legacyIndex = current.indexOf(account.id + ":" + slot)
         if (legacyIndex >= 0) {
             current.splice(legacyIndex, 1)
-            for (var i = 0; i < codexAccounts.length; i++) {
-                var windows = _codexWindows(codexAccounts[i])
+            var siblings = accounts[account.id] || []
+            for (var i = 0; i < siblings.length; i++) {
+                var windows = _accountWindows(siblings[i])
                 for (var w = 0; w < windows.length; w++) {
                     if (windows[w].id !== slot) continue
-                    var migrated = _codexKey(codexAccounts[i], slot)
+                    var migrated = _accountKey(siblings[i], slot)
                     if (current.indexOf(migrated) < 0) current.push(migrated)
                     break
                 }
             }
         }
-        var key = _codexKey(account, slot)
+        var key = _accountKey(account, slot)
         var index = current.indexOf(key)
         if (on && index < 0) current.push(key)
         if (!on && index >= 0) current.splice(index, 1)
         cfg_trayIndicators = current
     }
 
+    // Accounts come from the last saved usage: reading it runs no CLI and no
+    // OAuth call, so opening this page never starts a fetch.
     Process.CommandRunner {
-        id: codexRunner
+        id: accountsRunner
         onFinished: function(command, exitCode, standardOutput, standardError) {
             if (command !== root.activeCommand) return
             root.activeCommand = ""
             if (root.activeCliPath !== root.cliPath) {
-                root.loadCodexAccounts()
+                root.loadAccounts()
                 return
             }
-            root.codexLoading = false
+            root.accountsLoading = false
             var stdout = standardOutput.trim()
             if (!stdout) {
-                root.codexAccounts = []
-                root.codexError = (standardError || "No Codex account data").trim()
+                root.accounts = { claude: [], codex: [] }
+                root.accountsError = (standardError || "No account data").trim()
                 return
             }
             try {
                 var parsed = JSON.parse(stdout)
                 if (parsed.fatal) {
-                    root.codexAccounts = []
-                    root.codexError = parsed.fatal.message || "Could not fetch Codex accounts"
+                    root.accounts = { claude: [], codex: [] }
+                    root.accountsError = parsed.fatal.message || "Could not read accounts"
                     return
                 }
-                var records = (parsed.providers || []).filter(function(record) {
-                    return record && record.id === "codex"
-                })
-                root.codexAccounts = records.filter(function(record) {
-                    return record.ok && record.accountEmail
-                })
-                var failed = records.filter(function(record) { return !record.ok })
-                if (failed.length > 0) {
-                    var error = failed[0].error || {}
-                    root.codexError = error.message || "Some Codex accounts could not be loaded"
-                } else {
-                    root.codexError = root.codexAccounts.length > 0
-                        ? "" : "No Codex accounts found"
+                var found = { claude: [], codex: [] }
+                var providers = parsed.providers || []
+                for (var i = 0; i < providers.length; i++) {
+                    var record = providers[i]
+                    if (record && found[record.id] && record.ok && record.accountEmail)
+                        found[record.id].push(record)
                 }
+                root.accounts = found
+                root.accountsError = ""
             } catch (err) {
-                root.codexAccounts = []
-                root.codexError = "Could not read Codex accounts: " + err.message
+                root.accounts = { claude: [], codex: [] }
+                root.accountsError = "Could not read accounts: " + err.message
             }
         }
     }
 
-    function loadCodexAccounts() {
+    function loadAccounts() {
         if (root.activeCommand) return
-        root.codexLoading = true
+        root.accountsLoading = true
         root.activeCliPath = root.cliPath
         root.activeCommand = "python3 " + Command.shellQuote(root.fetchScriptPath)
             + " --cli-path " + Command.shellQuote(root.activeCliPath)
-            + " --providers codex --timeout 30"
-        codexRunner.run(root.activeCommand)
+            + " --providers claude,codex --cache-only"
+        accountsRunner.run(root.activeCommand)
     }
 
     Component.onCompleted: {
         root.initialized = true
-        root.loadCodexAccounts()
+        root.loadAccounts()
     }
 
     QQC2.ScrollView {
@@ -266,81 +340,22 @@ Item {
                 font.pixelSize: Kirigami.Theme.smallFont.pixelSize
             }
 
-            MeterCheck {
+            AccountMeters {
                 Kirigami.FormData.label: "Claude:"
-                key: "claude:primary"
-                text: "5h session"
+                providerId: "claude"
             }
-            MeterCheck { key: "claude:secondary"; text: "7d weekly (all models)" }
-            MeterCheck { key: "claude:tertiary"; text: "7d weekly (Sonnet)" }
-            MeterCheck { key: "claude:claude-design"; text: "Claude Design" }
-            MeterCheck { key: "claude:claude-routines"; text: "Daily Routines" }
-            ColumnLayout {
+            AccountMeters {
                 Kirigami.FormData.label: "Codex:"
-                visible: !root.codexReady
-                spacing: 0
-
-                Repeater {
-                    model: root._fallbackCodexWindows()
-                    delegate: MeterCheck {
-                        id: fallbackWindow
-                        required property var modelData
-                        key: "codex:" + fallbackWindow.modelData.id
-                        text: fallbackWindow.modelData.text
-                        isOn: root._codexAllChecked(fallbackWindow.modelData.id)
-                        setOn: function (on) {
-                            root._toggleCodexAll(fallbackWindow.modelData.id, on)
-                        }
-                    }
-                }
-            }
-
-            ColumnLayout {
-                Kirigami.FormData.label: "Codex:"
-                visible: root.codexReady
-                spacing: Kirigami.Units.smallSpacing
-
-                Repeater {
-                    model: root.codexAccounts
-                    delegate: ColumnLayout {
-                        id: accountGroup
-                        required property var modelData
-                        spacing: 0
-
-                        QQC2.Label {
-                            text: accountGroup.modelData.accountEmail
-                                + (accountGroup.modelData.loginMethod
-                                   ? " · " + accountGroup.modelData.loginMethod : "")
-                            font.weight: Font.DemiBold
-                            opacity: 0.8
-                        }
-
-                        Repeater {
-                            model: root._codexWindows(accountGroup.modelData)
-                            delegate: MeterCheck {
-                                id: accountWindow
-                                required property var modelData
-                                key: root._codexKey(accountGroup.modelData, accountWindow.modelData.id)
-                                text: accountWindow.modelData.text
-                                isOn: root._codexChecked(
-                                    accountGroup.modelData, accountWindow.modelData.id)
-                                setOn: function (on) {
-                                    root._toggleCodex(
-                                        accountGroup.modelData, accountWindow.modelData.id, on)
-                                }
-                            }
-                        }
-                    }
-                }
+                providerId: "codex"
             }
 
             QQC2.Label {
-                Kirigami.FormData.label: "Codex status:"
-                visible: root.codexLoading || root.codexError.length > 0
-                text: root.codexLoading ? "Loading accounts…" : root.codexError
-                color: root.codexError.length > 0
+                Kirigami.FormData.label: "Accounts:"
+                visible: root.accountsLoading || root.accountsError.length > 0
+                text: root.accountsLoading ? "Loading accounts…" : root.accountsError
+                color: root.accountsError.length > 0
                     ? Kirigami.Theme.negativeTextColor : Kirigami.Theme.textColor
-                opacity: root.codexError.length > 0 ? 1.0 : 0.6
+                opacity: root.accountsError.length > 0 ? 1.0 : 0.6
             }
             MeterCheck {
                 Kirigami.FormData.label: "z.ai:"

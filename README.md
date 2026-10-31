@@ -82,7 +82,8 @@ for it.
 | KDE Plasma 6 with KWin | Required | | The widget |
 | [Tern](https://stencil.so/tern) | | Required | The extension |
 | Python 3.10+ | Required | Required | The shared helpers |
-| [`codexbar`](https://github.com/steipete/CodexBar) CLI | Required | Required | Usage. Agents and History work without it |
+| [`codexbar`](https://github.com/steipete/CodexBar) CLI | Required | Required | Usage. Agents and History work without it; with Meridian, so do Claude and Codex seats |
+| [Meridian](https://github.com/rynfar/meridian) | Optional | Optional | Claude accounts and ChatGPT seats read from its usage poll |
 | CMake 3.21+, C++17 compiler, Qt 6 QML headers | Required | | Building the widget (Arch: `base-devel cmake qt6-declarative`) |
 | `qdbus6` | Optional | | Click to focus and desktop switching |
 | kitty or Tern | Optional | Optional | Launch and Restore all; with both, Teleport to Tern |
@@ -167,10 +168,19 @@ System Settings → Shortcuts → KWin, or Tern never sees the key.
   87% orange and 94% red.
 - **Several Codex accounts.** One card, one row per account, and a combined
   bar that pools them in Plus allowances (Pro counts as 20).
+- **Several Claude accounts.** One card with a row per account, email and
+  plan (Claude Team, Claude Max 5x), one for each Meridian profile, and
+  combined 5h and 7d bars that pool them in Pro allowances (Max 5x and Team
+  seats on the 5x tier count as 5, Max 20x as 20).
 - **Recent usage.** 7d bars highlight what the last 24 hours used, 5h bars the
   last hour, e.g. `13% in last 24h`.
 - **Saved resets.** Claude and Codex show unused reset credits and when the
   soonest expires.
+- **omp rotation.** When omp's `sub-rotate` extension rotates Claude
+  (Meridian profiles) or Codex accounts, the card header shows its operating
+  mode and rule (`omp · auto FILL`), and each account is marked 🟢 open or
+  🔒 closed. Read from `~/.omp/agent/sub-rotate/{meridian,codex}-state.json`;
+  without a state file nothing is shown.
 - **Codex reset forecast** from [codex-reset.com](https://codex-reset.com):
   announced, likely with a chance, or unknown with how long it has been.
 - **Last known.** When a refresh fails, the last reading stays, muted and
@@ -210,6 +220,12 @@ appear only once a window is projected to run out. Coloured dots count
 working, blocked and idle agents. The popup opens on Agents when one is
 blocked and on History when sessions wait to be restored.
 
+With several Claude or Codex accounts, the tray settings list each account
+with its own windows. A meter picked before the accounts were known (saved as
+`claude:primary`) shows every account's window until you change one account,
+which turns it into one meter per account
+(`claude:<email>:primary`).
+
 ### Tern specifics
 
 The dashboard opens to the right of your rightmost pane and closes when you
@@ -226,8 +242,8 @@ supports on Linux are usually easy to add.
 
 | Provider | Auth | Shows |
 | --- | --- | --- |
-| Claude | OAuth (`~/.claude/.credentials.json`) | 5h and 7d, plus Claude Design and Daily Routines |
-| Codex | OAuth (`~/.codex/auth.json`) | 5h and weekly per account, plus Reserve 7d |
+| Claude | OAuth: Meridian profiles, else `~/.claude` | 5h and 7d per account, plus Claude Design and Daily Routines |
+| Codex | OAuth (`~/.codex/auth.json`), plus Meridian's ChatGPT seats | 5h and weekly per account, plus Reserve 7d |
 | z.ai | `ZAI_API_KEY` | 5h and monthly |
 | OpenCode Go | `apiKey` in config | 5h, 7d and monthly |
 | OpenRouter | `apiKey` in config | Balance; a bar when the key has a limit |
@@ -273,11 +289,53 @@ Then `chmod 600 ~/.codexbar/config.json`.
 
 - **More Codex accounts.** Log in to a separate home with
   `CODEX_HOME=~/.codex-pro codex login` and list it in `codexProfileHomePaths`.
+  A running Meridian's ChatGPT seats are added too (see [Meridian](#meridian)).
+- **More Claude accounts** come from Meridian profiles, in this order:
+  1. A running Meridian's local API (`127.0.0.1:$MERIDIAN_PORT`, default
+     3456). It already polls Anthropic's usage endpoint, which rate-limits
+     per access token, so the widget reads usage from Meridian. Meridian 1.87
+     and later also list saved resets; with an older one the widget asks
+     Anthropic for them at most once an hour per account.
+  2. If Meridian is not answering, the CLI runs once per login directory in
+     `~/.config/meridian/profiles.json`, with `CLAUDE_CONFIG_DIR` set to it.
+  3. Without profiles, the single login in `~/.claude`, or
+     `CLAUDE_CONFIG_DIR` when set.
 - **OpenRouter** needs a management key; a plain inference key gets HTTP 403
   on the credits endpoint.
 - **TypeSafe** (CLI 0.64.0+) has no API. On Linux, copy the `Cookie:` header
   of a signed-in billing page request from your browser's dev tools. Paste a
   fresh one when the row says the session expired.
+
+## Meridian
+
+[Meridian](https://github.com/rynfar/meridian) is optional. Every Claude fact
+the widget shows (accounts, usage, saved resets, email and plan) comes from a
+running Meridian first, then from the login directory, and only then from
+Anthropic or the `codexbar` CLI. Meridian already polls Anthropic's usage
+endpoint, which rate-limits per access token, so reading its copy keeps the
+widget from competing with it.
+
+Set `MERIDIAN_PORT` (default 3456) and, when Meridian requires one,
+`MERIDIAN_API_KEY` in the environment Plasma or Tern starts with.
+
+| Meridian | `codexbar` CLI | Claude | Codex | Other providers |
+| --- | --- | --- | --- | --- |
+| Running | Installed | From Meridian | CLI accounts plus Meridian's ChatGPT seats; the CLI's reading wins for an account both know, since it carries Reserve and saved resets | From the CLI |
+| Running | Missing | From Meridian | Meridian's ChatGPT seats | "CLI not found" |
+| Stopped | Installed | The CLI once per login directory | From the CLI | From the CLI |
+| Stopped | Missing | Last-known usage, with one error naming both | Last-known usage | Last-known usage |
+
+### Compatibility
+
+| Meridian | What the widget reads from it |
+| --- | --- |
+| 1.87.0+ | Everything below, plus saved resets (`bankedResets`): the widget makes no Anthropic call for Claude |
+| 1.83.0 – 1.86.x | Claude profiles with usage, email and plan, and ChatGPT seats (added in 1.83.0) as Codex accounts. Saved resets come from Anthropic, at most once an hour per account |
+| Older | Untested. Claude profiles may work; a field Meridian does not send comes from the login directory |
+
+Tested live with 1.85.0; ChatGPT seats are tested only against Meridian's
+documented response shape. A Meridian without profiles serves the local
+`~/.claude` login, which the widget shows as one account.
 
 ## Settings
 

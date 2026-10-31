@@ -12,13 +12,18 @@ Usage:
 
 With --forecast-url it also attaches a `forecast` object describing when the next
 OpenAI usage-limit reset is expected (data from codex-reset.com).
+Claude yields one record per login: a running Meridian's profiles with the
+usage it already polls; else the CLI once per Meridian profile directory
+(~/.config/meridian/profiles.json), else CLAUDE_CONFIG_DIR or ~/.claude.
+Codex adds a running Meridian's ChatGPT seats to the CLI's accounts. Meridian
+is optional, and a missing CLI is fatal only when Meridian served nothing.
 Successful normalized usage is kept privately for 24 hours. --cache-only reads
 it without executing the CLI; refresh failures retain matching accounts with
 stale, cachedAt, and refreshError fields. The same file keeps a run-length
 usage history per 7d and 5h window, reported as `recent` consumption over the
 last 24 hours and 1 hour respectively.
 
-Every fetch that runs the CLI stamps a shared claim. With --min-interval N a
+Every refresh stamps a shared claim. With --min-interval N a
 fetch that finds a claim younger than N seconds returns the --cache-only result
 instead, so pollers in several processes do not refresh the same usage twice.
 Our files live in the state directory from state_paths; the CLI's own
@@ -38,6 +43,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -70,13 +76,28 @@ PROVIDER_FALLBACK_SOURCES: dict[str, list[str]] = {
     "opencodego": ["local"],
 }
 
-CODEX_ROTATION_DESCRIPTIONS = {
-    "FILL": "Pros share traffic, stop at 85%.",
-    "TARGET": "One Pro drains to 100%, redeems.",
-    "EXPIRY-BURN": "Burn accounts whose resets expire soon.",
-    "BURN": "Global reset announced; Pros stop 95%.",
-    "NO-BANK": "No banked resets; Pros stop 95%.",
-    "IDLE": "No Pro accounts logged in.",
+# omp-sub-rotate keeps one state and one operating-mode file per rotation in
+# this directory: `codex` rotates the Codex accounts, `meridian` the Claude
+# profiles behind Meridian.
+OMP_SUB_ROTATE_DIR = "~/.omp/agent/sub-rotate"
+OMP_ROTATIONS = {"codex": "codex", "claude": "meridian"}
+ROTATION_DESCRIPTIONS = {
+    "codex": {
+        "FILL": "Pros share traffic, stop at 85%.",
+        "TARGET": "One Pro drains to 100%, redeems.",
+        "EXPIRY-BURN": "Burn accounts whose resets expire soon.",
+        "BURN": "Global reset announced; Pros stop 95%.",
+        "NO-BANK": "No banked resets; Pros stop 95%.",
+        "IDLE": "No Pro accounts logged in.",
+    },
+    "claude": {
+        "FILL": "Accounts share traffic, stop at 95%.",
+        "TARGET": "One account drains to 100%, redeems.",
+        "EXPIRY-BURN": "Burn accounts whose resets expire soon.",
+        "BURN": "Global reset announced; accounts stop 95%.",
+        "NO-BANK": "No banked resets; accounts stop 95%.",
+        "IDLE": "No Claude accounts behind Meridian.",
+    },
 }
 
 
@@ -88,42 +109,58 @@ def _state_file(name: str) -> str:
     return str(state_paths.state_dir() / name)
 
 
-def _codex_rotation_accounts(state: dict) -> dict:
-    """Match unambiguous account labels to omp's owned-key block list."""
-    owned = state.get("owned")
+def _rotation_accounts(provider: str, state: dict, emails: dict) -> dict:
+    """Email → open/blocked for every rotated account, or {} when any is ambiguous.
+
+    Codex keys its block list (`owned`) by credential id and labels each
+    account with its email; Meridian keys `closed` by profile id, whose email
+    comes from Meridian's profile list.
+    """
+    blocked = state.get("owned" if provider == "codex" else "closed")
     accounts = state.get("accounts")
     if (
-        not isinstance(owned, dict)
-        or any(not re.fullmatch(r"0|[1-9][0-9]*", key) for key in owned)
+        not isinstance(blocked, dict)
+        or provider == "codex" and any(not re.fullmatch(r"0|[1-9][0-9]*", key) for key in blocked)
         or not isinstance(accounts, list)
     ):
         return {}
     availability = {}
-    credential_ids = set()
+    keys = set()
     for account in accounts:
         if not isinstance(account, dict):
             return {}
-        credential_id = account.get("credentialId")
-        label = account.get("label")
+        if provider == "codex":
+            key, label = account.get("credentialId"), account.get("label")
+            if type(key) is not int or key < 0:
+                return {}
+            key = str(key)
+        else:
+            key = account.get("id")
+            if not isinstance(key, str) or not key:
+                return {}
+            label = emails.get(key)
         if (
-            type(credential_id) is not int
-            or credential_id < 0
-            or not isinstance(label, str)
+            not isinstance(label, str)
             or not label.strip()
             or label in availability
-            or credential_id in credential_ids
+            or key in keys
         ):
             return {}
-        credential_ids.add(credential_id)
-        availability[label] = "blocked" if str(credential_id) in owned else "open"
+        keys.add(key)
+        availability[label] = "blocked" if key in blocked else "open"
     return availability
 
 
-def _read_codex_rotation() -> dict | None:
-    """Read omp's rotation status without changing its state or mode."""
-    directory = _expand("~/.omp/agent/codex-rotation")
+def _read_rotation(provider: str, emails: dict | None = None) -> dict | None:
+    """Read omp's rotation status for `provider` without changing its state or mode.
+
+    No state file means omp does not rotate this provider: nothing is shown.
+    """
+    name = OMP_ROTATIONS[provider]
+    descriptions = ROTATION_DESCRIPTIONS[provider]
+    directory = _expand(OMP_SUB_ROTATE_DIR)
     try:
-        with open(os.path.join(directory, "state.json"), encoding="utf-8") as stream:
+        with open(os.path.join(directory, f"{name}-state.json"), encoding="utf-8") as stream:
             state = json.load(stream)
         if not isinstance(state, dict):
             return None
@@ -131,12 +168,12 @@ def _read_codex_rotation() -> dict | None:
         stalled = state.get("stalled", False)
         if (
             not isinstance(mode, str)
-            or mode not in CODEX_ROTATION_DESCRIPTIONS
+            or mode not in descriptions
             or not isinstance(stalled, bool)
         ):
             return None
         try:
-            with open(os.path.join(directory, "mode.json"), encoding="utf-8") as stream:
+            with open(os.path.join(directory, f"{name}-mode.json"), encoding="utf-8") as stream:
                 config = json.load(stream)
         except FileNotFoundError:
             config = {}
@@ -149,11 +186,11 @@ def _read_codex_rotation() -> dict | None:
         return None
     result = {
         "mode": mode,
-        "description": CODEX_ROTATION_DESCRIPTIONS[mode],
+        "description": descriptions[mode],
         "operatingMode": operating_mode,
         "stalled": stalled,
     }
-    accounts = _codex_rotation_accounts(state)
+    accounts = _rotation_accounts(provider, state, emails or {})
     if accounts:
         result["accountAvailability"] = accounts
     return result
@@ -224,31 +261,172 @@ def _reset_credits(usage: dict) -> dict | None:
 # usage endpoint. The CodexBar CLI (0.64.1) drops the block, so it is read
 # directly. The server only answers for Claude Code's client identity; any
 # other User-Agent gets `ineligible_reason: "surface"` and no grants.
-CLAUDE_CREDENTIALS_PATH = "~/.claude/.credentials.json"
 CLAUDE_RESET_URL = "https://api.anthropic.com/api/oauth/usage?cedar_ember=1&skip_spend=1"
+CLAUDE_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 CLAUDE_RESET_USER_AGENT = "claude-cli/2.1.280 (external, cli)"
 CLAUDE_RESET_TIMEOUT = 8.0
 
+# Meridian (github.com/rynfar/meridian) serves its Claude profiles and the
+# usage it polls for them on its local proxy port. `/v1/usage/quota/all` waits
+# up to 5 s for ChatGPT seats, so a shorter timeout would drop to the CLI.
+MERIDIAN_DEFAULT_PORT = 3456
+MERIDIAN_TIMEOUT = 10.0
 
-def _claude_reset_credits(status, now: _dt.datetime) -> dict | None:
-    """Usable Claude reset grants in the Codex `resetCredits` shape.
 
-    Counts `resets_left` of every grant that is not paused and whose
-    `starts_at`..`ends_at` window contains now. None when ineligible.
+def _claude_default_dir() -> str:
+    return _expand(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
+
+
+def _meridian_profile_dirs() -> list[tuple[str, str]]:
+    """(profile id, login directory) per Meridian profile on disk, in Meridian's order.
+
+    Meridian keeps one refreshed Claude Code login per profile in
+    `profiles.json`, ordered by `settings.json` `profileOrder`.
     """
-    if not isinstance(status, dict) or status.get("eligible") is not True:
+    root = os.path.join(_expand(os.environ.get("XDG_CONFIG_HOME") or "~/.config"), "meridian")
+
+    def load(name):
+        try:
+            with open(os.path.join(root, name), encoding="utf-8") as fh:
+                return json.load(fh)
+        except (OSError, ValueError):
+            return None
+
+    profiles = load("profiles.json")
+    settings = load("settings.json")
+    order = settings.get("profileOrder") if isinstance(settings, dict) else None
+    order = [name for name in order if isinstance(name, str)] if isinstance(order, list) else []
+    found = []
+    for profile in profiles if isinstance(profiles, list) else []:
+        if not isinstance(profile, dict):
+            continue
+        name, directory = profile.get("id"), profile.get("claudeConfigDir")
+        if isinstance(name, str) and isinstance(directory, str) and os.path.isdir(_expand(directory)):
+            found.append((order.index(name) if name in order else len(order), name, _expand(directory)))
+    found.sort(key=lambda item: item[0])
+    return [(name, directory) for _, name, directory in found]
+
+
+def _claude_config_dirs() -> list[str]:
+    """Claude accounts as config directories: Meridian's profiles, else the local one.
+
+    The CodexBar CLI reads one Claude login per run (`CLAUDE_CONFIG_DIR`); its
+    token accounts hold static access tokens that are never refreshed.
+    """
+    dirs = list(dict.fromkeys(directory for _, directory in _meridian_profile_dirs()))
+    return dirs or [_claude_default_dir()]
+
+
+def _meridian_profile_emails(meridian: "_Meridian | None") -> dict[str, str]:
+    """Profile id → email: a running Meridian's, else the one its login saved.
+
+    Local files only when `meridian` is None, so a cache-only read stays offline.
+    """
+    emails = {}
+    for name, directory in _meridian_profile_dirs():
+        email = _claude_local_account(directory)[1]
+        if email:
+            emails[name] = email
+    for profile, _ in meridian.profiles("claude") if meridian is not None else []:
+        email = profile.get("email")
+        if isinstance(email, str) and email.strip():
+            emails[profile["id"]] = email.strip()
+    return emails
+
+
+def _rotations(providers: list[str], meridian: "_Meridian | None") -> dict:
+    """omp's rotation status per enabled provider; None where omp writes none."""
+    return {
+        "claudeRotation": _read_rotation("claude", _meridian_profile_emails(meridian))
+        if "claude" in providers else None,
+        "codexRotation": _read_rotation("codex") if "codex" in providers else None,
+    }
+
+
+def _claude_local_account(config_dir: str) -> tuple[str | None, str | None]:
+    """(accountUuid, email) Claude Code saved for this login, when it did."""
+    paths = [os.path.join(config_dir, ".claude.json")]
+    if config_dir == _expand("~/.claude"):
+        paths.append(_expand("~/.claude.json"))
+    for path in paths:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                account = json.load(fh).get("oauthAccount")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if not isinstance(account, dict):
+            continue
+        uuid, email = account.get("accountUuid"), account.get("emailAddress")
+        if isinstance(email, str) and email.strip():
+            return (uuid if isinstance(uuid, str) else None), email.strip()
+    return None, None
+
+
+def _claude_oauth(config_dir: str) -> dict:
+    """The login's saved `claudeAiOauth` block, or {}."""
+    try:
+        with open(os.path.join(config_dir, ".credentials.json"), encoding="utf-8") as fh:
+            oauth = json.load(fh).get("claudeAiOauth")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return oauth if isinstance(oauth, dict) else {}
+
+
+def _claude_access_token(config_dir: str) -> str | None:
+    """The login's unexpired OAuth access token, or None."""
+    oauth = _claude_oauth(config_dir)
+    token = oauth.get("accessToken")
+    if not isinstance(token, str) or not token:
         return None
-    grants = status.get("grants")
+    expires_ms = _as_float(oauth.get("expiresAt"))
+    if expires_ms is not None and expires_ms <= time.time() * 1000:
+        return None
+    return token
+
+
+def _claude_plan_weight(tier) -> int:
+    """Usage allowance in Pro-sized units, from the rate-limit tier.
+
+    `default_claude_max_5x` / `_20x` carry 5× / 20× Pro's limits, Team
+    seats included; any other tier counts as one Pro allowance.
+    """
+    multiplier = re.search(r"max_(\d+)x", str(tier or ""))
+    return int(multiplier.group(1)) if multiplier else 1
+
+
+def _claude_oauth_get(url: str, token: str, timeout: float) -> dict | None:
+    body = _read_http_body(url, timeout, {
+        "Authorization": f"Bearer {token}",
+        "anthropic-beta": "oauth-2025-04-20",
+        "User-Agent": CLAUDE_RESET_USER_AGENT,
+    })
+    data = json.loads(body.decode("utf-8", "replace"))
+    return data if isinstance(data, dict) else None
+
+
+def _claude_profile_email(token: str, timeout: float) -> str | None:
+    """Best effort: the login's email from Anthropic's OAuth profile endpoint."""
+    try:
+        account = (_claude_oauth_get(CLAUDE_PROFILE_URL, token, timeout) or {}).get("account")
+    except Exception:  # noqa: BLE001 - identity is optional
+        return None
+    email = account.get("email") if isinstance(account, dict) else None
+    return email.strip() if isinstance(email, str) and email.strip() else None
+
+
+def _usable_reset_credits(grants, now: _dt.datetime) -> dict:
+    """Sum (resets_left, starts, ends, paused, usable) grants in the Codex `resetCredits` shape.
+
+    Counts grants that are not paused, not flagged unusable, and whose
+    starts..ends window contains now; the soonest end is the one to spend first.
+    """
     soonest: _dt.datetime | None = None
     count = 0
-    for grant in grants if isinstance(grants, list) else []:
-        if not isinstance(grant, dict) or grant.get("paused") is True:
+    for left, starts, ends, paused, usable in grants:
+        if paused is True or usable is False:
             continue
-        left = grant.get("resets_left")
         if isinstance(left, bool) or not isinstance(left, int) or left < 1:
             continue
-        starts = _parse_iso(grant.get("starts_at"))
-        ends = _parse_iso(grant.get("ends_at"))
         if (starts is not None and starts > now) or (ends is not None and ends <= now):
             continue
         count += left
@@ -260,31 +438,101 @@ def _claude_reset_credits(status, now: _dt.datetime) -> dict | None:
     }
 
 
-def _fetch_claude_reset_credits(timeout: float) -> dict | None:
-    """Best effort: missing or expired credentials, or any failure, yield None."""
+def _claude_reset_credits(status, now: _dt.datetime) -> dict | None:
+    """Usable grants of Anthropic's `cedar_ember` block. None when ineligible."""
+    if not isinstance(status, dict) or status.get("eligible") is not True:
+        return None
+    grants = status.get("grants")
+    return _usable_reset_credits((
+        (g.get("resets_left"), _parse_iso(g.get("starts_at")), _parse_iso(g.get("ends_at")),
+         g.get("paused"), None)
+        for g in (grants if isinstance(grants, list) else []) if isinstance(g, dict)
+    ), now)
+
+
+def _meridian_reset_credits(banked, now: _dt.datetime) -> dict | None:
+    """Usable grants of a Meridian profile's `bankedResets`. None when ineligible or unknown."""
+    if not isinstance(banked, dict) or banked.get("eligible") is not True:
+        return None
+
+    def at(ms):
+        value = _as_float(ms)
+        return _dt.datetime.fromtimestamp(value / 1000, _dt.timezone.utc) if value else None
+
+    grants = banked.get("grants")
+    return _usable_reset_credits((
+        (g.get("resetsLeft"), at(g.get("startsAt")), at(g.get("expiresAt")),
+         g.get("paused"), g.get("usableNow"))
+        for g in (grants if isinstance(grants, list) else []) if isinstance(g, dict)
+    ), now)
+
+
+def _fetch_claude_reset_credits(token: str, timeout: float) -> tuple[bool, dict | None]:
+    """(answered, credits). Best effort: any failure is (False, None)."""
     try:
-        with open(_expand(CLAUDE_CREDENTIALS_PATH), encoding="utf-8") as fh:
-            oauth = json.load(fh).get("claudeAiOauth") or {}
-        token = oauth.get("accessToken")
-        expires_ms = _as_float(oauth.get("expiresAt"))
-        if not isinstance(token, str) or not token:
-            return None
-        if expires_ms is not None and expires_ms <= time.time() * 1000:
-            return None
-        body = _read_http_body(CLAUDE_RESET_URL, timeout, {
-            "Authorization": f"Bearer {token}",
-            "anthropic-beta": "oauth-2025-04-20",
-            "User-Agent": CLAUDE_RESET_USER_AGENT,
-        })
-        data = json.loads(body.decode("utf-8", "replace"))
-        if not isinstance(data, dict):
-            return None
-        return _claude_reset_credits(
+        data = _claude_oauth_get(CLAUDE_RESET_URL, token, timeout)
+        if data is None:
+            return False, None
+        return True, _claude_reset_credits(
             data.get("cedar_ember"), _dt.datetime.now(_dt.timezone.utc)
         )
     except Exception:  # noqa: BLE001 - the endpoint cannot break usage
-        return None
+        return False, None
 
+
+CLAUDE_RESET_CACHE_NAME = "claude_reset_credits.json"
+# Saved resets change rarely, and their endpoint is Anthropic's usage endpoint,
+# which rate-limits per access token: every extra call eats into the budget
+# Meridian needs for the usage readings themselves. Meridian 1.87+ lists them
+# itself; this path serves older Meridian and the CLI.
+CLAUDE_RESET_TTL = 3600
+_claude_reset_lock = threading.Lock()
+
+
+def _claude_reset_credits_for(email: str | None, token: str | None, may_fetch: bool) -> dict | None:
+    """The account's saved resets, asking Anthropic at most once per CLAUDE_RESET_TTL.
+
+    A failed ask also starts the wait and keeps the last answer. Without an
+    email there is no cache key, so the endpoint is asked every time.
+    """
+    key = (email or "").strip().casefold()
+    path = _state_file(CLAUDE_RESET_CACHE_NAME)
+
+    def load() -> dict:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    entry = load().get(key) if key else None
+    entry = entry if isinstance(entry, dict) else None
+    cached = entry.get("credits") if entry and isinstance(entry.get("credits"), dict) else None
+    at = _as_float(entry.get("at")) if entry else None
+    if at is not None and 0 <= time.time() - at < CLAUDE_RESET_TTL:
+        return cached
+    if not (may_fetch and token):
+        return cached
+    answered, credits = _fetch_claude_reset_credits(token, CLAUDE_RESET_TIMEOUT)
+    if not answered:
+        credits = cached
+    if key:
+        with _claude_reset_lock:
+            data = load()
+            data[key] = {"at": time.time(), "credits": credits}
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=os.path.dirname(path),
+                    prefix=".claude_reset-", delete=False,
+                ) as fh:
+                    os.fchmod(fh.fileno(), 0o600)
+                    json.dump(data, fh)
+                os.replace(fh.name, path)
+            except OSError:
+                pass
+    return credits
 
 
 # Providers whose weekly reset also clears the 5h session window. Codex resets
@@ -413,7 +661,9 @@ def _normalize_record(provider: str, record: dict) -> dict:
     }
 
 
-def _run_cli(cli: str, provider: str, source: str | None, timeout: float) -> list[dict]:
+def _run_cli(
+    cli: str, provider: str, source: str | None, timeout: float, env: dict | None = None,
+) -> list[dict]:
     """Invoke `codexbar usage` and normalize every returned account."""
     cmd = [cli, "usage", "--json", "--provider", provider]
     if provider == "codex":
@@ -422,7 +672,7 @@ def _run_cli(cli: str, provider: str, source: str | None, timeout: float) -> lis
         cmd += ["--source", source]
     try:
         proc = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=timeout, check=False
+            cmd, capture_output=True, text=True, timeout=timeout, check=False, env=env,
         )
     except FileNotFoundError:
         return [_result_error(provider, "cli_missing", f"CLI not found at {cli}")]
@@ -457,21 +707,386 @@ def _run_cli(cli: str, provider: str, source: str | None, timeout: float) -> lis
     return results
 
 
-def _fetch_provider(cli: str, provider: str, timeout: float) -> list[dict]:
-    primary_source = PROVIDER_SOURCE.get(provider)
-    results = _run_cli(cli, provider, primary_source, timeout)
+def _fetch_sources(cli: str, provider: str, timeout: float, env: dict | None = None) -> list[dict]:
+    results = _run_cli(cli, provider, PROVIDER_SOURCE.get(provider), timeout, env)
     if not any(result.get("ok") for result in results):
         for fallback in PROVIDER_FALLBACK_SOURCES.get(provider, []):
-            retries = _run_cli(cli, provider, fallback, timeout)
+            retries = _run_cli(cli, provider, fallback, timeout, env)
             if any(retry.get("ok") for retry in retries):
                 results = retries
                 break
-    if provider == "claude" and any(result.get("ok") for result in results):
-        credits = _fetch_claude_reset_credits(CLAUDE_RESET_TIMEOUT)
-        for result in results:
-            if result.get("ok"):
-                result["resetCredits"] = credits
     return results
+
+
+class _ClaudeLogin:
+    """Every fact about one Claude login, from the first source that has it.
+
+    Meridian's profile and usage entry come first, the login directory
+    (`.claude.json`, `.credentials.json`) next, and Anthropic is asked only
+    for what neither knows. The Meridian and the CLI path both read accounts
+    through this class, so neither can skip a source or reorder them.
+    """
+
+    def __init__(self, directory, profile: dict | None = None, usage: dict | None = None) -> None:
+        self.directory = _expand(directory) if isinstance(directory, str) and directory else None
+        self.profile = profile or {}
+        self.usage = usage or {}
+
+    def _field(self, key: str) -> str | None:
+        oauth = _claude_oauth(self.directory) if self.directory else {}
+        for value in (self.profile.get(key), oauth.get(key)):
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return None
+
+    def token(self) -> str | None:
+        return _claude_access_token(self.directory) if self.directory else None
+
+    def email(self, reported: str | None = None) -> str | None:
+        """Meridian's, else the CLI-reported, else the saved, else Anthropic's."""
+        for value in (self.profile.get("email"), reported):
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        saved = _claude_local_account(self.directory)[1] if self.directory else None
+        if saved:
+            return saved
+        token = self.token()
+        return _claude_profile_email(token, CLAUDE_RESET_TIMEOUT) if token else None
+
+    def plan(self, reported: str | None = None) -> str | None:
+        """Meridian's plan, else the CLI-reported one, else the saved login's."""
+        if reported and not self.profile.get("subscriptionType"):
+            return reported
+        return _claude_plan(self._field("subscriptionType"), self._field("rateLimitTier")) or reported
+
+    def weight(self) -> int:
+        return _claude_plan_weight(self._field("rateLimitTier"))
+
+    def reset_credits(self, email: str | None, may_fetch: bool) -> dict | None:
+        """Meridian 1.87+'s `bankedResets`, else Anthropic at most hourly."""
+        if "bankedResets" in self.usage:
+            return _meridian_reset_credits(
+                self.usage["bankedResets"], _dt.datetime.now(_dt.timezone.utc))
+        return _claude_reset_credits_for(email, self.token(), may_fetch)
+
+
+def _fetch_claude_account(cli: str, config_dir: str, timeout: float) -> list[dict]:
+    """One Claude login. Every record carries the login's email when it is known,
+    so a failed refresh keeps that account's last-known usage."""
+    env = None
+    if config_dir != _claude_default_dir():
+        env = {**os.environ, "CLAUDE_CONFIG_DIR": config_dir}
+    results = _fetch_sources(cli, "claude", timeout, env)
+    login = _ClaudeLogin(config_dir)
+    email = login.email(next((r["accountEmail"] for r in results if r.get("accountEmail")), None))
+    ok = any(result.get("ok") for result in results)
+    credits = login.reset_credits(email, True) if ok else None
+    weight = login.weight()
+    for result in results:
+        if email and not result.get("accountEmail"):
+            result["accountEmail"] = email
+        result["loginMethod"] = login.plan(result.get("loginMethod"))
+        result["planWeight"] = weight
+        if result.get("ok"):
+            result["resetCredits"] = credits
+    return results
+
+
+def _claude_plan(subscription, tier) -> str | None:
+    """Plan label in the CLI's form: "Claude Team", "Claude Max 5x"."""
+    name = {"max": "Max", "pro": "Pro", "team": "Team", "enterprise": "Enterprise"}.get(
+        str(subscription or "").lower())
+    if name is None:
+        return None
+    multiplier = re.search(r"max_(\d+x)", str(tier or ""))
+    if name == "Max" and multiplier:
+        name += " " + multiplier.group(1)
+    return "Claude " + name
+
+
+def _meridian_get(path: str) -> dict:
+    port = os.environ.get("MERIDIAN_PORT") or str(MERIDIAN_DEFAULT_PORT)
+    key = os.environ.get("MERIDIAN_API_KEY")
+    body = _read_http_body(
+        f"http://127.0.0.1:{port}{path}", MERIDIAN_TIMEOUT, {"x-api-key": key} if key else None)
+    data = json.loads(body.decode("utf-8", "replace"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Meridian {path}: not an object")
+    return data
+
+
+class _Meridian:
+    """One read of a running Meridian per refresh, shared by Claude and Codex.
+
+    Meridian is optional: when it does not answer, `snapshot()` is None and
+    each provider falls back to the CodexBar CLI.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._read = False
+        self._snapshot: tuple[dict, dict] | None = None
+
+    def snapshot(self) -> tuple[dict, dict] | None:
+        with self._lock:
+            if not self._read:
+                self._read = True
+                try:
+                    self._snapshot = (_meridian_get("/profiles/list"),
+                                      _meridian_get("/v1/usage/quota/all"))
+                except Exception:  # noqa: BLE001 - Meridian is optional
+                    self._snapshot = None
+            return self._snapshot
+
+    def profiles(self, provider: str) -> list[tuple[dict, dict]]:
+        """(profile, usage) per Claude profile or ChatGPT seat, in Meridian's order."""
+        snapshot = self.snapshot()
+        if snapshot is None:
+            return []
+        listed, quota = snapshot
+        raw_usage = quota.get("profiles")
+        usage = {
+            entry.get("id"): entry for entry in (raw_usage if isinstance(raw_usage, list) else [])
+            if isinstance(entry, dict)
+        }
+        order = listed.get("profileOrder")
+        order = [name for name in order if isinstance(name, str)] if isinstance(order, list) else []
+        raw_profiles = listed.get("profiles")
+        wanted = (lambda kind: kind.startswith("claude")) if provider == "claude" \
+            else (lambda kind: kind == "chatgpt")
+        profiles = [
+            profile for profile in (raw_profiles if isinstance(raw_profiles, list) else [])
+            if isinstance(profile, dict) and isinstance(profile.get("id"), str)
+            and wanted(str(profile.get("type", "")))
+        ]
+        if provider == "claude" and not profiles and isinstance(usage.get("default"), dict):
+            # Without configured profiles Meridian serves the local login as `default`.
+            profiles = [{"id": "default", "type": "claude-max", "credentialDir": _claude_default_dir()}]
+        profiles.sort(key=lambda p: order.index(p["id"]) if p["id"] in order else len(order))
+        return [(profile, usage.get(profile["id"]) or {}) for profile in profiles]
+
+
+def _meridian_window(window: dict, minutes: int) -> dict | None:
+    used = _as_float(window.get("utilization"))
+    if used is None:
+        return None
+    resets = _as_float(window.get("resetsAt"))
+    return {
+        "usedPercent": round(used * 100, 1),
+        "windowMinutes": minutes,
+        "resetsAt": _dt.datetime.fromtimestamp(resets / 1000, _dt.timezone.utc).isoformat()
+        if resets else None,
+    }
+
+
+def _meridian_claude_account(profile: dict, usage: dict) -> list[dict]:
+    """One Meridian profile as a CLI-shaped record, through `_normalize_record`.
+
+    Window types follow Anthropic's OAuth usage keys, mapped like the CLI:
+    Sonnet weekly is the tertiary window, Cowork is Daily Routines, other
+    model weeklies are scoped extras, and Design (omelette) and app limits
+    are not shown.
+    """
+    login = _ClaudeLogin(profile.get("credentialDir"), profile, usage)
+    email = login.email()
+    identity = {"accountEmail": email, "loginMethod": login.plan()}
+    raw_windows = usage.get("windows")
+    windows = {
+        window["type"]: window for window in (raw_windows if isinstance(raw_windows, list) else [])
+        if isinstance(window, dict) and isinstance(window.get("type"), str)
+    }
+    if not windows:
+        return [_meridian_unavailable("claude", usage, identity)]
+    extras = []
+    for kind, window in windows.items():
+        scope = kind.removeprefix("seven_day_")
+        if kind in ("five_hour", "seven_day", "seven_day_sonnet") or scope == kind \
+                or scope in ("omelette", "oauth_apps"):
+            continue
+        converted = _meridian_window(window, 10080)
+        if converted is None:
+            continue
+        if scope == "cowork":
+            extras.append({"id": "claude-routines", "title": "Daily Routines", "window": converted})
+        else:
+            extras.append({
+                "id": f"claude-weekly-scoped-{scope}",
+                "title": scope.replace("_", " ").capitalize() + " only",
+                "window": converted,
+            })
+    fetched = _as_float(usage.get("fetchedAt"))
+    record = _normalize_record("claude", {"usage": {
+        **identity,
+        "primary": _meridian_window(windows.get("five_hour") or {}, 300),
+        "secondary": _meridian_window(windows.get("seven_day") or {}, 10080),
+        "tertiary": _meridian_window(windows.get("seven_day_sonnet") or {}, 10080),
+        "extraRateWindows": extras,
+        "updatedAt": _dt.datetime.fromtimestamp(fetched / 1000, _dt.timezone.utc).isoformat()
+        if fetched else None,
+    }})
+    record["planWeight"] = login.weight()
+    # A rate-limited login gets no extra call; the last answer stands.
+    record["resetCredits"] = login.reset_credits(email, usage.get("stale") is not True)
+    return [_meridian_stale(record, usage)]
+
+
+def _meridian_unavailable(provider: str, usage: dict, identity: dict) -> dict:
+    failure = usage.get("failure")
+    reason = (failure.get("reason") if isinstance(failure, dict) else None) or usage.get("error")
+    message = f"Meridian has no usage for this account ({reason or 'not fetched yet'})"
+    return _normalize_record(provider, {
+        "error": {"kind": "meridian", "message": message}, "usage": identity,
+    })
+
+
+def _meridian_stale(record: dict, usage: dict) -> dict:
+    if usage.get("stale") is not True:
+        return record
+    # Meridian's last poll failed; this is its earlier reading.
+    failure = usage.get("failure")
+    reason = failure.get("reason") if isinstance(failure, dict) else None
+    record = _last_known(record, f"Meridian refresh failed ({reason or 'unknown'})")
+    record["cachedAt"] = record.get("updatedAt")
+    return record
+
+
+_MERIDIAN_WINDOW_UNITS = {"m": 1, "h": 60, "d": 1440}
+
+
+def _meridian_window_minutes(kind: str) -> int | None:
+    """Width of a ChatGPT seat window: `five_hour`, `seven_day`, or a label like `30d`."""
+    if kind == "five_hour":
+        return 300
+    if kind == "seven_day":
+        return 10080
+    match = re.fullmatch(r"(\d+)([mhd])", kind)
+    return int(match.group(1)) * _MERIDIAN_WINDOW_UNITS[match.group(2)] if match else None
+
+
+def _meridian_seat_resets(resets) -> dict | None:
+    """A seat's saved resets (`{available, expiresAt: [ms|null]}`) in the `resetCredits` shape."""
+    if not isinstance(resets, dict):
+        return None
+    count = resets.get("available")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return None
+    expiries = resets.get("expiresAt")
+    soonest = min((
+        ms for ms in (_as_float(value) for value in (expiries if isinstance(expiries, list) else []))
+        if ms
+    ), default=None)
+    return {
+        "count": count,
+        "soonestExpiresAt": _dt.datetime.fromtimestamp(soonest / 1000, _dt.timezone.utc).isoformat()
+        if soonest else None,
+    }
+
+
+def _meridian_codex_account(profile: dict, usage: dict) -> dict:
+    """One Meridian ChatGPT seat as a Codex record.
+
+    Seat windows are named by width, not position: a 5h window is primary,
+    the weekly one secondary, and a plan with only a wider one (Free's 30d)
+    shows that as its secondary.
+    """
+    email = profile.get("email") if isinstance(profile.get("email"), str) else None
+    plan = profile.get("subscriptionType")
+    identity = {"accountEmail": email, "loginMethod": plan if isinstance(plan, str) else None}
+    raw_windows = usage.get("windows")
+    windows = sorted((
+        (minutes, window) for window in (raw_windows if isinstance(raw_windows, list) else [])
+        if isinstance(window, dict) and isinstance(window.get("type"), str)
+        and (minutes := _meridian_window_minutes(window["type"])) is not None
+    ), key=lambda item: item[0])
+    if not windows:
+        return _meridian_unavailable("codex", usage, identity)
+    slots: dict[str, dict | None] = {"primary": None, "secondary": None}
+    extras = []
+    for minutes, window in windows:
+        converted = _meridian_window(window, minutes)
+        if converted is None:
+            continue
+        slot = "primary" if minutes < 1440 else "secondary"
+        if slots[slot] is None:
+            slots[slot] = converted
+        else:
+            extras.append({"id": f"codex-meridian-{window['type']}",
+                           "title": window["type"], "window": converted})
+    fetched = _as_float(usage.get("fetchedAt"))
+    record = _normalize_record("codex", {"usage": {
+        **identity,
+        **slots,
+        "extraRateWindows": extras,
+        "updatedAt": _dt.datetime.fromtimestamp(fetched / 1000, _dt.timezone.utc).isoformat()
+        if fetched else None,
+    }})
+    record["resetCredits"] = _meridian_seat_resets(profile.get("resets"))
+    return _meridian_stale(record, usage)
+
+
+def _fetch_claude(cli: str, timeout: float, meridian: _Meridian) -> list[dict]:
+    """Every Claude login, one record per account, fetched in parallel.
+
+    A running Meridian already polls each profile's usage, and Anthropic's
+    usage endpoint rate-limits per access token: reading Meridian's copy keeps
+    this widget from starving Meridian's routing data, and the reverse.
+    Without Meridian every login directory goes through the CLI.
+    """
+    served = meridian.profiles("claude")
+    if served:
+        jobs = [lambda p=profile, u=usage: _meridian_claude_account(p, u) for profile, usage in served]
+    else:
+        jobs, uuids = [], set()
+        for config_dir in _claude_config_dirs():
+            uuid = _claude_local_account(config_dir)[0]
+            if uuid and uuid in uuids:
+                continue
+            uuids.add(uuid)
+            jobs.append(lambda d=config_dir: _fetch_claude_account(cli, d, timeout))
+    with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+        per_login = list(pool.map(lambda job: job(), jobs))
+    return _one_record_per_account(record for records in per_login for record in records)
+
+
+def _one_record_per_account(records) -> list[dict]:
+    """The first record per email, in order; every email-less record stays."""
+    results, emails = [], set()
+    for record in records:
+        email = (record.get("accountEmail") or "").strip().casefold()
+        if email and email in emails:
+            continue
+        emails.add(email)
+        results.append(record)
+    for record in results:
+        record["accountCount"] = len(results)
+    return results
+
+
+def _fetch_codex(cli: str, timeout: float, meridian: _Meridian) -> list[dict]:
+    """Codex accounts from the CLI, plus every ChatGPT seat Meridian serves.
+
+    The CLI's reading of an account wins: it carries Reserve and saved-reset
+    detail. A seat fills in what the CLI cannot read, and with seats a missing
+    CLI is no error, since Meridian is then the Codex source.
+    """
+    cli_records = _fetch_sources(cli, "codex", timeout)
+    seats = [_meridian_codex_account(profile, usage) for profile, usage in meridian.profiles("codex")]
+    if not seats:
+        return cli_records
+    cli_records = [record for record in cli_records if record.get("ok")
+                   or (record.get("error") or {}).get("code") != "cli_missing"]
+    ok, failed = (lambda r: r.get("ok")), (lambda r: not r.get("ok"))
+    return _one_record_per_account(
+        [*filter(ok, cli_records), *filter(ok, seats), *filter(failed, cli_records), *filter(failed, seats)])
+
+
+def _fetch_provider(cli: str, provider: str, timeout: float, meridian: _Meridian | None = None) -> list[dict]:
+    meridian = meridian or _Meridian()
+    if provider == "claude":
+        return _fetch_claude(cli, timeout, meridian)
+    if provider == "codex":
+        return _fetch_codex(cli, timeout, meridian)
+    return _fetch_sources(cli, provider, timeout)
 
 
 def _cli_version(cli: str, timeout: float = 5.0) -> str | None:
@@ -556,6 +1171,10 @@ HISTORY_GAP_SECONDS = 15 * 60
 HISTORY_CYCLE_SHIFT_SECONDS = 10 * 60
 HISTORY_RESET_DROP_PERCENT = 0.5
 USAGE_CREDENTIAL_ENV = {
+    # Claude and Codex accounts can come from Meridian: another instance or
+    # key is another roster.
+    "claude": ("MERIDIAN_PORT", "MERIDIAN_API_KEY"),
+    "codex": ("MERIDIAN_PORT", "MERIDIAN_API_KEY"),
     "zai": ("ZAI_API_KEY",),
     "opencodego": ("OPENCODE_API_KEY",),
     "openrouter": ("OPENROUTER_API_KEY", "OPENROUTER_MANAGEMENT_API_KEY"),
@@ -611,8 +1230,9 @@ def _usage_cache_scopes(cli: str, providers: list[str]) -> dict[str, str]:
                     homes.extend(path for path in paths if isinstance(path, str))
             auth_paths = [os.path.join(_expand(home), "auth.json") for home in homes]
         elif provider == "claude":
-            home = os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude"
-            auth_paths = [os.path.join(_expand(home), ".credentials.json")]
+            auth_paths = [
+                os.path.join(directory, ".credentials.json") for directory in _claude_config_dirs()
+            ]
         elif provider == "opencodego":
             auth_paths = [_expand("~/.local/share/opencode/auth.json")]
         elif provider == "kilo":
@@ -671,6 +1291,17 @@ def _cached_usage_record(record: object, now: _dt.datetime) -> dict | None:
         if value is not None and not isinstance(value, str):
             return None
         result[key] = value
+    weight = record.get("planWeight")
+    if weight is not None:
+        if type(weight) is not int or weight < 1:
+            return None
+        result["planWeight"] = weight
+    # A last-known reading keeps why it is last-known, so a cache read cannot
+    # pass it off as current (Tern adopts recent error-free cache as live).
+    refresh_error = record.get("refreshError")
+    if record.get("stale") is True and isinstance(refresh_error, str) and refresh_error:
+        result["stale"] = True
+        result["refreshError"] = refresh_error
 
     def window(value):
         if not isinstance(value, dict):
@@ -963,6 +1594,10 @@ def _merge_usage_results(results: list[dict], cached: list[dict], now: _dt.datet
     else:
         merged = []
         for record in results:
+            if record.get("ok") and record.get("stale") is True:
+                # The source itself served a last-known reading.
+                merged.append(record)
+                continue
             if record.get("ok"):
                 fresh = {key: value for key, value in record.items()
                          if key not in ("stale", "cachedAt", "refreshError")}
@@ -1374,39 +2009,37 @@ def main(argv: list[str]) -> int:
     now = _dt.datetime.now(_dt.timezone.utc)
     scopes = _usage_cache_scopes(cli, providers)
     cached = _usage_cache_read(scopes, now)
-    restored = [_last_known(record) for p in providers for record in cached.get(p, [])]
+    restored = [
+        _last_known(record, record.get("refreshError", ""))
+        for p in providers for record in cached.get(p, [])
+    ]
     out = {
         "updatedAt": max((r["updatedAt"] for r in restored), default=None),
         "providers": restored,
         "fatal": None,
         "forecast": None,
-        "codexRotation": None,
+        # Local files only: a cache read still drops a status omp no longer writes.
+        **_rotations(providers, None),
         "cliVersion": None,
     }
     cli_missing = not (os.path.isfile(cli) and os.access(cli, os.X_OK)) and not shutil.which(cli)
-    cache_only = args.cache_only or (not cli_missing and not _claim_fetch(args.min_interval))
-    if cache_only or cli_missing:
-        _attach_recent_usage(restored, _usage_history_entries(_usage_cache_payload(), now), now)
+    cache_only = args.cache_only or not _claim_fetch(args.min_interval)
     if cache_only:
+        _attach_recent_usage(restored, _usage_history_entries(_usage_cache_payload(), now), now)
         out["cacheOnly"] = True
         json.dump(out, sys.stdout)
         sys.stdout.write("\n")
         return 0
-    if cli_missing:
-        message = f"codexbar CLI not found or not executable: {cli}"
-        out["fatal"] = {"code": "cli_missing", "message": message}
-        out["providers"] = [_last_known(record, message) for record in restored]
-        json.dump(out, sys.stdout)
-        sys.stdout.write("\n")
-        return 0
 
+    # Without the CLI, a running Meridian still serves Claude and ChatGPT seats.
+    meridian = _Meridian()
     results: list[dict] = []
     forecast_future = None
     with ThreadPoolExecutor(
         max_workers=max(1, len(providers) + int(bool(args.forecast_url)))
     ) as pool:
         futures = {
-            pool.submit(_fetch_provider, cli, p, args.timeout): p for p in providers
+            pool.submit(_fetch_provider, cli, p, args.timeout, meridian): p for p in providers
         }
         if args.forecast_url:
             forecast_future = pool.submit(
@@ -1418,6 +2051,7 @@ def main(argv: list[str]) -> int:
             except Exception as exc:  # noqa: BLE001 - isolate provider failures
                 provider = futures[fut]
                 results.append(_result_error(provider, "provider", str(exc)))
+    served = any(record.get("ok") for record in results)
 
     forecast = None
     if forecast_future is not None:
@@ -1456,9 +2090,14 @@ def main(argv: list[str]) -> int:
         "providers": results,
         "fatal": None,
         "forecast": forecast,
-        "codexRotation": _read_codex_rotation() if "codex" in providers else None,
+        **_rotations(providers, meridian),
         "cliVersion": _cli_version(cli),
     }
+    if cli_missing and not served:
+        message = f"codexbar CLI not found or not executable: {cli}"
+        if {"claude", "codex"} & set(providers) and meridian.snapshot() is None:
+            message += "; Meridian is not running either"
+        out["fatal"] = {"code": "cli_missing", "message": message}
     json.dump(out, sys.stdout)
     sys.stdout.write("\n")
     return 0
