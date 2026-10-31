@@ -49,7 +49,6 @@ if tern.kv.get("settings") == nil then
 	end
 end
 local FORECAST_URL = "https://codex-reset.com/api/forecast"
-local PANE_TAG = 2 ^ 44 -- the window API cuts pane ids to their low 44 bits
 
 local TICK_MS = 500
 local AGENTS_STALE_MS = 15000 -- the applet sweeps every 5 s
@@ -1272,8 +1271,7 @@ local function applyGoto()
 		return
 	end
 	for pane, b in blocks do
-		-- The window may only know the low 44 bits of the id.
-		if pane % PANE_TAG == target % PANE_TAG then
+		if pane == target then
 			b.tab = g.tab
 			b.sel = nil
 			b.cx:render()
@@ -1517,7 +1515,7 @@ local function focusedKey(list: { any }): string?
 	local hit = nil
 	for _, r in list do
 		local own = tonumber(val(r.ternPane))
-		if own and own % PANE_TAG == pane % PANE_TAG then
+		if own == pane then
 			if hit then
 				return nil
 			end

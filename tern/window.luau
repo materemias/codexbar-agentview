@@ -1,69 +1,21 @@
 -- Window half of the CodexBar AgentView plugin: status-line segments, palette commands,
 -- and the pane you came from, which the dashboard marks with a ring.
 --
--- The host half publishes `summary` (status-line data), `open` (live blocks)
--- and `settingsRequest` (dashboard settings button) through `tern.kv`; this
--- half answers with `goto` (switch a dashboard tab) and `focus` (the last
--- focused pane that is not a CodexBar AgentView block).
+-- The host half publishes `summary` (status-line data) and `settingsRequest`
+-- (dashboard settings button) through `tern.kv`; this half answers with `goto`
+-- (switch a dashboard tab) and `focus` (the last focused pane that is not a
+-- CodexBar AgentView block).
 --
--- Pane ids: after a daemon upgrade in place, ids reach 2^44 and beyond, and the
--- window API cuts them to their low 44 bits. Panes are matched on those bits,
--- and actions on a dashboard go through the `tern` CLI, which takes full ids.
+-- `tern.kv` and `tern.process` belong to the machine each half runs on: a window
+-- attached to a remote host runs this half on its own machine, beside another
+-- daemon. Layout work therefore goes through the window API only.
 
 local KIND = "codexbar-agentview.dashboard"
 local SETTINGS_KIND = "codexbar-agentview.settings"
-local PANE_TAG = 2 ^ 44
-local HOME = tern.getenv("HOME") or ""
-local function ternPath(): string
-	local localBin = HOME .. "/.local/bin/tern"
-	if HOME ~= "" and tern.fs.exists(localBin) then
-		return localBin
-	end
-	if tern.runtime.os == "macos" then
-		for dir in string.gmatch(tern.getenv("PATH") or "", "[^:]+") do
-			local p = dir .. "/tern"
-			if tern.fs.exists(p) then
-				return p
-			end
-		end
-		for _, p in {
-			HOME .. "/Applications/Tern.app/Contents/MacOS/tern",
-			"/Applications/Tern.app/Contents/MacOS/tern",
-			"/opt/homebrew/bin/tern",
-			"/usr/local/bin/tern",
-		} do
-			if tern.fs.exists(p) then
-				return p
-			end
-		end
-	end
-	return "tern"
-end
-
-local TERN = ternPath()
-
-local function cli(args: { string }, done: ((ProcessResult, WindowCx?) -> ())?, timeout: number?): boolean
-	local argv = { TERN }
-	for _, a in args do
-		table.insert(argv, a)
-	end
-	local ok, err = pcall(tern.process.run, argv, { timeout_ms = timeout or 5000 }, function(res, cx)
-		if res.status ~= 0 then
-			tern.log.warn("codexbar: tern " .. table.concat(args, " ") .. " failed", string.match(res.stderr, "[^\n]+") or res.status)
-		end
-		if done then
-			done(res, cx)
-		end
-	end)
-	if not ok then
-		tern.log.warn("codexbar: cannot run tern", err)
-	end
-	return ok
-end
 
 local function paneInfo(cx: WindowCx, pane: number): PaneInfo?
 	for _, p in cx.session:panes() do
-		if p.pane % PANE_TAG == pane % PANE_TAG then
+		if p.pane == pane then
 			return p
 		end
 	end
@@ -72,37 +24,17 @@ end
 
 -- The dashboard this window opened, with the layout from before it opened.
 type Popup = {
-	pane: number, tab: number?, full: number?, snap: LayoutSnapshot,
+	pane: number, tab: number?, snap: LayoutSnapshot,
 	deadline: number, tries: number, restoring: boolean, placing: boolean,
+	equalized: boolean, moves: number, targets: { [number]: boolean },
 }
 local opened: Popup? = nil
 
--- The full pane id of a CodexBar AgentView block, when the host published it; the window
--- API only sees the low 44 bits and can't act on panes above that.
-local function fullId(pane: number): number?
-	if opened and opened.full and opened.pane % PANE_TAG == pane % PANE_TAG then
-		return opened.full
-	end
-	local open = tern.kv.get("open")
-	for _, e in (if type(open) == "table" then open else {}) do
-		local id = tonumber(e.pane)
-		if id and id % PANE_TAG == pane % PANE_TAG then
-			return id
-		end
-	end
-	return nil
-end
-
 local function closePane(cx: WindowCx, pane: number)
-	if opened and opened.pane % PANE_TAG == pane % PANE_TAG then
+	if opened and opened.pane == pane then
 		opened.placing = false
 	end
-	local full = fullId(pane)
-	if full then
-		cli({ "close", string.format("%d", full) })
-	else
-		cx.layout:close(pane)
-	end
+	cx.layout:close(pane)
 end
 
 -- The dashboard to act on in this window (the focused one, else the first) and
@@ -123,70 +55,40 @@ end
 
 type Placement = { target: number?, rightmost: boolean, tiles: number }
 
--- Resolve the host-published full id, not the original focused or shown tab.
--- Split ratios give each tiled pane's normalized left/top bounds.
-local function placement(stdout: string, full: number, tab: number): Placement?
-	local function validId(id: any): boolean
-		return type(id) == "number" and id > 0 and id < 2 ^ 53 and id % 1 == 0
-	end
-	assert(validId(full) and validId(tab), "Invalid CodexBar AgentView pane or tab id")
-	local data = tern.json.decode(stdout)
-	assert(type(data) == "table" and type(data.sessions) == "table", "Invalid Tern session list")
-	local found = nil
-	for _, s in data.sessions do
-		assert(type(s) == "table" and type(s.tabs) == "table", "Invalid Tern tabs")
-		for _, t in s.tabs do
-			assert(type(t) == "table" and validId(t.id), "Invalid Tern tab id")
-			assert(type(t.blocks) == "table", "Invalid Tern block list")
-			for _, b in t.blocks do
-				assert(type(b) == "table" and validId(b.id), "Invalid Tern block id")
-				if b.id == full then
-					assert(not found, "Ambiguous CodexBar AgentView dashboard id")
-					found = t
-				end
-			end
-		end
-	end
-	if not found then
+-- Split ratios give each tiled pane's normalized left/top bounds; nil while the
+-- pane is not in the tab's tree yet.
+local function placement(cx: WindowCx, pane: number, tab: number): Placement?
+	local layout = cx.session:layout(tab)
+	if not layout then
 		return nil
-	end
-	assert(found.id % PANE_TAG == tab % PANE_TAG, "CodexBar AgentView dashboard belongs to a different tab")
-	local blocks, seen = {}, {}
-	for _, b in found.blocks do
-		assert(not blocks[b.id], "Duplicate Tern block id")
-		blocks[b.id] = true
 	end
 	local popupX, target = nil, nil
 	local targetX, targetY = -1, -1
 	local epsilon = 1e-6
 	local tiles = 0
-	local function walk(n: any, x: number, y: number, w: number, h: number)
-		assert(type(n) == "table", "Invalid Tern split tree")
-		if n.Leaf ~= nil then
-			assert(n.Split == nil and validId(n.Leaf) and blocks[n.Leaf] and not seen[n.Leaf], "Invalid Tern split leaf")
-			seen[n.Leaf] = true
+	local function walk(n: TabTree, x: number, y: number, w: number, h: number)
+		if n.pane ~= nil then
 			tiles += 1
-			if n.Leaf == full then
+			if n.pane == pane then
 				popupX = x
 			elseif x > targetX + epsilon or (math.abs(x - targetX) <= epsilon and y > targetY) then
-				target, targetX, targetY = n.Leaf, x, y
+				target, targetX, targetY = n.pane, x, y
 			end
-		else
-			local split = n.Split
-			assert(type(split) == "table" and (split.axis == "Row" or split.axis == "Column"), "Invalid Tern split axis")
-			local ratio = split.ratio
-			assert(type(ratio) == "number" and ratio >= 0 and ratio <= 1, "Invalid Tern split ratio")
-			if split.axis == "Row" then
-				walk(split.a, x, y, w * ratio, h)
-				walk(split.b, x + w * ratio, y, w * (1 - ratio), h)
+		elseif n[1] and n[2] then
+			local ratio = n.ratio or 0.5
+			if n.split == "right" then
+				walk(n[1], x, y, w * ratio, h)
+				walk(n[2], x + w * ratio, y, w * (1 - ratio), h)
 			else
-				walk(split.a, x, y, w, h * ratio)
-				walk(split.b, x, y + h * ratio, w, h * (1 - ratio))
+				walk(n[1], x, y, w, h * ratio)
+				walk(n[2], x, y + h * ratio, w, h * (1 - ratio))
 			end
 		end
 	end
-	walk(found.splits, 0, 0, 1, 1)
-	assert(popupX ~= nil, "CodexBar AgentView dashboard is not tiled")
+	walk(layout.root, 0, 0, 1, 1)
+	if popupX == nil then
+		return nil
+	end
 	return { target = target, rightmost = popupX >= targetX - epsilon, tiles = tiles }
 end
 
@@ -196,7 +98,7 @@ local function placementActive(cx: WindowCx, o: Popup): boolean
 	end
 	local focused = cx.session:focused()
 	local info = paneInfo(cx, o.pane)
-	if not focused or focused % PANE_TAG ~= o.pane % PANE_TAG
+	if focused ~= o.pane
 		or (info and (info.block ~= KIND or (o.tab ~= nil and info.tab ~= o.tab)))
 		or (not info and o.tab ~= nil) then
 		o.placing = false
@@ -214,119 +116,56 @@ local function placementFailed(cx: WindowCx, o: Popup, err: string)
 	closePane(cx, o.pane)
 end
 
+-- Moves the dashboard right of the rightmost tile until it is the rightmost
+-- itself, then equalizes the tab. Layout changes land on a later tick, so each
+-- step re-reads the tree on the next timer.
 local function placeDashboard(cx: WindowCx, o: Popup)
 	if not placementActive(cx, o) then
 		return
 	end
-	local function retry(current: WindowCx)
-		local remaining = o.deadline - tern.now()
-		if remaining <= 0 then
-			placementFailed(current, o, "Timed out waiting for CodexBar AgentView dashboard registration")
-			return
-		end
-		tern.timer(math.min(50, remaining), function(cx2)
+	if tern.now() >= o.deadline then
+		placementFailed(cx, o, "Timed out placing the CodexBar AgentView dashboard")
+		return
+	end
+	local function again()
+		tern.timer(50, function(cx2)
 			if cx2 then
 				placeDashboard(cx2, o)
 			end
 		end)
 	end
-	local remaining = o.deadline - tern.now()
-	if remaining <= 0 then
-		placementFailed(cx, o, "Timed out waiting for CodexBar AgentView dashboard registration")
+	local tab = o.tab
+	local layout = if tab then placement(cx, o.pane, tab) else nil
+	if not tab or not layout then
+		again()
 		return
 	end
-	-- Wait for the daemon-published full id before querying its layout.
-	local full = fullId(o.pane)
-	if not full or not o.tab then
-		retry(cx)
+	if layout.rightmost then
+		-- Equalizing can change which stacked row has the rightmost leaf.
+		if o.equalized then
+			o.placing = false
+		else
+			cx:action("equalize")
+			o.equalized = true
+			again()
+		end
 		return
 	end
-	o.full = full
-	local ok = cli({ "ls", "--json" }, function(res, cx2)
-		if not cx2 or not placementActive(cx2, o) then
-			return
-		end
-		if res.status ~= 0 then
-			local err = if tern.now() >= o.deadline then "Timed out waiting for CodexBar AgentView dashboard registration" else "Could not read the Tern layout"
-			placementFailed(cx2, o, err)
-			return
-		end
-		local parsed, result = pcall(placement, res.stdout, full, o.tab)
-		if not parsed then
-			placementFailed(cx2, o, tostring(result))
-			return
-		end
-		if not result then
-			retry(cx2)
-			return
-		end
-		local targets = {}
-		local movesLeft = result.tiles - 1
-		local function position(current: WindowCx, layout: Placement)
-			if not placementActive(current, o) then
-				return
-			end
-			local function equalizeAndVerify(nextCx: WindowCx)
-				if not placementActive(nextCx, o) then
-					return
-				end
-				-- Equalization can change which stacked row has the rightmost leaf.
-				nextCx:action("equalize")
-				local checking = cli({ "ls", "--json" }, function(final, cx3)
-					if not cx3 or not placementActive(cx3, o) then
-						return
-					end
-					if final.status ~= 0 then
-						placementFailed(cx3, o, "Could not verify the Tern layout")
-						return
-					end
-					local valid, placed = pcall(placement, final.stdout, full, o.tab)
-					if not valid then
-						placementFailed(cx3, o, tostring(placed))
-					elseif not placed then
-						placementFailed(cx3, o, "CodexBar AgentView dashboard disappeared from its tab")
-					elseif placed.rightmost then
-						o.placing = false
-					else
-						position(cx3, placed)
-					end
-				end)
-				if not checking then
-					placementFailed(nextCx, o, "Could not start the Tern layout verification")
-				end
-			end
-			if layout.rightmost then
-				equalizeAndVerify(current)
-				return
-			end
-			local target = layout.target :: number
-			-- Removing and reinserting only this leaf preserves the underlying tree.
-			-- A repeated target cannot progress; new targets are bounded by its size.
-			if targets[target] or movesLeft <= 0 then
-				placementFailed(current, o, "CodexBar AgentView dashboard placement did not progress")
-				return
-			end
-			targets[target] = true
-			movesLeft -= 1
-			local moved = cli({ "move", string.format("%d", full), "right-of", string.format("%d", target) }, function(movedResult, cx3)
-				if not cx3 or not placementActive(cx3, o) then
-					return
-				end
-				if movedResult.status ~= 0 then
-					placementFailed(cx3, o, "Could not move the CodexBar AgentView dashboard")
-					return
-				end
-				equalizeAndVerify(cx3)
-			end)
-			if not moved then
-				placementFailed(current, o, "Could not start the Tern move command")
-			end
-		end
-		position(cx2, result)
-	end, math.max(1, math.ceil(remaining)))
-	if not ok then
-		placementFailed(cx, o, "Could not start the Tern layout query")
+	local target = layout.target :: number
+	-- Moving only this leaf preserves the rest of the tree. A repeated target
+	-- cannot progress; new targets are bounded by the tile count.
+	if o.targets[target] or o.moves >= layout.tiles - 1 then
+		placementFailed(cx, o, "CodexBar AgentView dashboard placement did not progress")
+		return
 	end
+	o.targets[target] = true
+	o.moves += 1
+	if not cx.layout:move(o.pane, target, "right") then
+		placementFailed(cx, o, "Could not move the CodexBar AgentView dashboard")
+		return
+	end
+	o.equalized = false
+	again()
 end
 
 -- Opens the dashboard on `tab`; on the shown, focused tab it closes it, like a popup.
@@ -340,6 +179,7 @@ local function toggle(cx: WindowCx, tab: string)
 			local o: Popup = {
 				pane = pane, snap = snap, deadline = tern.now() + 3000,
 				tries = 0, restoring = false, placing = true,
+				equalized = false, moves = 0, targets = {},
 			}
 			opened = o
 			tern.timer(0, function(cx2)
@@ -354,14 +194,9 @@ local function toggle(cx: WindowCx, tab: string)
 		closePane(cx, info.pane)
 		return
 	end
-	local full = fullId(info.pane)
-	tern.kv.set("goto", { pane = full or info.pane, tab = tab, seq = tern.now() })
+	tern.kv.set("goto", { pane = info.pane, tab = tab, seq = tern.now() })
 	if not info.focused then
-		if full then
-			cli({ "focus", string.format("%d", full) })
-		else
-			cx.layout:focus(info.pane)
-		end
+		cx.layout:focus(info.pane)
 	end
 end
 
@@ -369,12 +204,7 @@ end
 local function openSettings(cx: WindowCx)
 	for _, p in cx.session:panes() do
 		if p.block == SETTINGS_KIND then
-			local full = fullId(p.pane)
-			if full then
-				cli({ "focus", string.format("%d", full) })
-			else
-				cx.layout:focus(p.pane)
-			end
+			cx.layout:focus(p.pane)
 			return
 		end
 	end
@@ -466,7 +296,7 @@ local function inTrees(cx: WindowCx, pane: number): boolean
 			return false
 		end
 		local p = n.pane
-		if type(p) == "number" and p % PANE_TAG == pane % PANE_TAG then
+		if type(p) == "number" and p == pane then
 			return true
 		end
 		return walk(n[1]) or walk(n[2])
@@ -518,7 +348,7 @@ end
 
 tern.on("pane_closed", function(ev, _cx)
 	local o = opened
-	if o and ev.pane % PANE_TAG == o.pane % PANE_TAG then
+	if o and ev.pane == o.pane then
 		o.placing = false
 		tern.timer(50, function(cx)
 			if cx then

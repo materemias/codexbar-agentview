@@ -14,6 +14,7 @@
 
 ### Fixes
 
+- The Tern dashboard opens in a window attached to a remote host instead of closing after three seconds with "Could not place CodexBar AgentView dashboard".
 - The Codex rotation mode and account markers follow omp's current `sub-rotate` extension instead of a stale file from the retired `codex-rotation` one.
 
 ### Docs
