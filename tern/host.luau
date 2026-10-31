@@ -66,6 +66,7 @@ local PROVIDER_NAMES = {
 }
 local PROVIDER_ICONS = { claude = "app-claude", codex = "app-codex" }
 local AGENT_ICONS = { claude = "app-claude", codex = "app-codex", omp = "app-omp", pi = "pi-mark" }
+local AGENT_NAMES = { claude = "Claude Code", codex = "Codex", omp = "omp", pi = "pi" }
 local CODEX_PLAN_WEIGHT = { plus = 1, pro = 20 }
 local TABS = { "usage", "agents", "history" }
 local TAB_NAMES = { usage = "Usage", agents = "Agents", history = "History" }
@@ -317,8 +318,9 @@ local function withp(n: Node, props: { [string]: any }): Node
 	return n
 end
 
-local function button(text: string, act: string, tone: string?): Node
-	return ui.el("button", { class = "cb-btn" .. (if tone then " " .. tone else ""), text = text, actions = { click = act } })
+-- A row-sized native button; `props` adds variant, keys, busy, disabled or a tooltip.
+local function button(text: string, act: string, props: { [string]: any }?): Node
+	return withp(ui.button(text, { key = act, size = "sm", actions = { click = act } }), props or {})
 end
 
 -- Store: one per daemon, shared by every open dashboard -----------------------
@@ -1474,12 +1476,20 @@ end
 
 -- Agents and History lists ---------------------------------------------------
 
-local function turnNodes(turns: any): { Node }
+-- The recent turns as a chat: the user's on the right, the agent's and its tool calls under its name.
+local function turnNodes(r: any): { Node }
 	local out: { Node } = {}
-	for i, t in val(turns) or {} do
-		local tools = t.kind == "tools"
-		local cls = if t.role == "user" then "cb-turn cb-user" elseif tools then "cb-turn cb-tools" else "cb-turn cb-asst"
-		table.insert(out, ui.el("div", { class = cls, key = "t" .. i, text = (if tools then "⚙ " else "") .. oneLine(t.text) }))
+	local prev = nil
+	for i, t in val(r.recent) or {} do
+		local user = t.role == "user"
+		local body = if t.kind == "tools" then ui.text({ ui.span("⚙ " .. oneLine(t.text), "muted") }) else ui.text({ ui.span(oneLine(t.text)) })
+		table.insert(out, ui.node("message", {
+			key = "t" .. i,
+			side = if user then "end" else "start",
+			author = if user then nil else AGENT_NAMES[str(r.provider)] or str(r.provider),
+			continued = prev ~= nil and prev == user,
+		}, { body }))
+		prev = user
 	end
 	return out
 end
@@ -1655,42 +1665,49 @@ local function peekNode(b: Block, r: any, history: boolean): Node
 	local kids: { Node } = {}
 	local recap = str(r.recap)
 	if recap ~= "" then
-		table.insert(kids, ui.el("div", { class = "cb-recap", text = (if val(r.recapStale) == true then "Earlier: " else "") .. recap }))
+		table.insert(kids, withp(ui.text({ ui.span((if val(r.recapStale) == true then "Earlier: " else "") .. recap, "muted") }), { key = "recap" }))
 	end
 	if history then
 		local where = { ui.span(shortPath(r.cwd), "path"), ui.span("  " .. str(r.host), "muted") }
-		table.insert(kids, ui.text(where))
+		table.insert(kids, withp(ui.text(where), { key = "where" }))
 	end
+	local key = recordKey(r)
 	local buttons: { Node } = {}
 	if history then
 		if LAUNCH_HOSTS[str(r.host)] and str(r.resumeCommand) ~= "" then
-			local busy = b.launched[recordKey(r)] and os.time() - b.launched[recordKey(r)] < 60
-			table.insert(buttons, button(if busy then "Launching…" else "Launch", "launch", "accent"))
+			local busy = b.launched[key] ~= nil and os.time() - b.launched[key] < 60
+			table.insert(buttons, button("Launch", "launch", { variant = "primary", keys = { "enter" }, busy = busy }))
 		end
 		if str(r.resumeCommand) ~= "" then
-			table.insert(buttons, button("Copy resume command", "copy_resume"))
+			table.insert(buttons, button("Copy resume command", "copy_resume", { icon = "copy" }))
 		end
-		table.insert(buttons, button("Dismiss", "dismiss"))
+		table.insert(buttons, button("Dismiss", "dismiss", { keys = { "del" } }))
 	else
-		table.insert(buttons, button("Focus", "focus", "accent"))
+		table.insert(buttons, button("Focus", "focus", { variant = "primary", keys = { "enter" } }))
 		local ternInstalled = type(store.agents) == "table" and val(store.agents.ternInstalled) == true
 		if ternInstalled and r.host == "kitty" and str(r.resumeCommand) ~= "" then
-			local idle = r.state == "idle"
-			table.insert(buttons, withp(button(if b.busy == recordKey(r) then "Teleporting…" else "Teleport to Tern", "teleport"),
-				if idle then {} else { title = "Only idle sessions can move", class = "cb-btn off" }))
+			table.insert(buttons, button("Teleport to Tern", "teleport", {
+				icon = "tern",
+				busy = b.busy == key,
+				disabled = if r.state == "idle" then false else "Only idle sessions can move",
+			}))
 		end
 		if str(r.resumeCommand) ~= "" then
-			table.insert(buttons, button("Copy resume command", "copy_resume"))
+			table.insert(buttons, button("Copy resume command", "copy_resume", { icon = "copy" }))
 		end
 	end
-	table.insert(buttons, button(if b.peek then "Hide conversation" else "Conversation", "peek"))
-	table.insert(kids, ui.el("div", { class = "cb-actions", key = "actions" }, buttons))
+	table.insert(buttons, button(if b.peek then "Hide conversation" else "Conversation", "peek", { icon = "message", keys = { "space" }, on = b.peek }))
+	table.insert(kids, withp(ui.row(buttons), { key = "actions", wrap = true }))
 	if b.peek then
-		for _, n in turnNodes(r.recent) do
-			table.insert(kids, n)
+		local turns = turnNodes(r)
+		if #turns > 0 then
+			table.insert(kids, ui.node("scroll", { key = "conv", role = "codexbar.conv", stick = "end", max = { h = "16lines" } }, turns))
+		else
+			table.insert(kids, ui.node("empty", { key = "conv", variant = "inline", icon = "message", title = "No recent turns" }))
 		end
 	end
-	return ui.el("div", { class = "cb-peek", key = "peek" }, kids)
+	-- Keyed by the session, so each conversation keeps its own scroll position.
+	return withp(ui.col(kids), { key = "peek-" .. key, role = "codexbar.peek", gap = "sm" })
 end
 
 local function agentItem(b: Block, r: any, focused: boolean, now: number, q: string): Node
@@ -1740,15 +1757,30 @@ local function groupHead(key: string, spans: { any }, buttons: { Node }?): Node
 	return withp(ui.row(kids), { key = key, role = "codexbar.group" })
 end
 
-local function listView(b: Block, children: { Node }, empty: string): Node
+local function listView(b: Block, children: { Node }, empty: Node): Node
+	if #children == 0 then
+		return withp(empty, { key = "list" }) -- the list's key: empty, loading and rows take turns in one place
+	end
 	local sel = selected(b)
 	return ui.node("list", {
 		key = "list",
 		selected = if sel then LIST_PATH .. sel.key else nil,
 		filter = b.filter,
-		empty = { ui.span(empty, "muted") },
 		max = LIST_MAX,
 	}, children)
+end
+
+-- An inline empty state; `act` adds its one quiet button.
+local function emptyNode(icon: string, title: string, text: string?, act: { [string]: any }?): Node
+	local kids: { Node } = {}
+	if act then
+		table.insert(kids, button(act.text, act.act, { variant = "quiet", keys = act.keys }))
+	end
+	return ui.node("empty", { variant = "inline", frame = true, icon = icon, title = title, text = text }, kids)
+end
+
+local function noMatch(b: Block, what: string): Node
+	return emptyNode("search", "No " .. what .. " matches “" .. b.filter .. "”", nil, { text = "Clear", act = "clear", keys = { "esc" } })
 end
 
 local function agentsView(b: Block, now: number): Node
@@ -1768,9 +1800,9 @@ local function agentsView(b: Block, now: number): Node
 		end
 	end
 	local hidden = if b.filter == "" and setting("hideOld") then oldCount() else 0
-	local empty = if b.filter ~= "" then "No session matches “" .. b.filter .. "”."
-		elseif hidden > 0 then "All " .. hidden .. " sessions are older than a day."
-		else "No coding agents are running."
+	local empty = if b.filter ~= "" then noMatch(b, "session")
+		elseif hidden > 0 then emptyNode("eye-off", "All " .. hidden .. " sessions are older than a day", nil, { text = "Show them", act = "hide_old", keys = { "tab" } })
+		else emptyNode("terminal", "No coding agents are running", "Sessions show up here as they start.")
 	return listView(b, kids, empty)
 end
 
@@ -1788,8 +1820,8 @@ local function historyView(b: Block, now: number): Node
 	end
 	if #reboot > 0 then
 		table.insert(kids, groupHead("h-reboot", { ui.span("Interrupted by restart", "strong"), ui.span("  " .. #reboot, "muted") }, {
-			button("Restore all", "restore_all", "accent"),
-			button("Dismiss all", "dismiss_all"),
+			button("Restore all", "restore_all", { icon = "repeat" }),
+			button("Dismiss all", "dismiss_all", { variant = "quiet" }),
 		}))
 		for _, r in reboot do
 			add(r)
@@ -1801,7 +1833,8 @@ local function historyView(b: Block, now: number): Node
 			add(r)
 		end
 	end
-	local empty = if b.filter ~= "" then "No closed session matches “" .. b.filter .. "”." else "No closed sessions yet."
+	local empty = if b.filter ~= "" then noMatch(b, "closed session")
+		else emptyNode("history", "No closed sessions yet", "Sessions you close show up here.")
 	return listView(b, kids, empty)
 end
 
@@ -1809,23 +1842,26 @@ local function key(text: string): Span
 	return ui.span(text, "key")
 end
 
+local function seg(k: string, text: string, props: { [string]: any }?, kids: { Node }?): Node
+	return withp(ui.node("seg", { key = k, text = text }, kids), props or {})
+end
+
 local function dockView(b: Block, now: number): Node
-	local status: { any } = {}
+	local segs: { Node } = {}
 	local hints: { any } = { key("←"), key("→"), ui.span(" tabs   ", "dim") }
 	if b.tab == "usage" then
 		local snap = store.usage
-		if store.fetching and #setting("providers") > 0 then
-			table.insert(status, ui.span("Refreshing… ", "muted"))
-		end
 		local at = math.max(store.usageAt, measuredAt(snap))
-		if at > 0 then
-			table.insert(status, ui.span("Updated " .. absoluteTime(at, now), "muted"))
+		if store.fetching and #setting("providers") > 0 then
+			table.insert(segs, seg("fetch", "Refreshing…", { priority = 2 }, { ui.node("spinner", { style = "dots" }) }))
+		elseif at > 0 then
+			table.insert(segs, seg("at", "Updated " .. absoluteTime(at, now), { icon = "clock", priority = 2 }))
+		end
+		if store.usageError and store.usage then -- without a snapshot the error fills the page instead
+			table.insert(segs, seg("err", store.usageError, { icon = "warn", tone = "error", priority = 3, min = { w = "20ch" } }))
 		end
 		if type(snap) == "table" and str(snap.cliVersion) ~= "" then
-			table.insert(status, ui.span(" · codexbar " .. str(snap.cliVersion), "muted"))
-		end
-		if store.usageError then
-			table.insert(status, ui.span("  " .. store.usageError, "error"))
+			table.insert(segs, seg("cli", "codexbar " .. str(snap.cliVersion), { side = "right", priority = 1 }))
 		end
 		for _, n in { key("r"), ui.span(" refresh   ", "dim"), key("esc"), ui.span(" close", "dim") } do
 			table.insert(hints, n)
@@ -1836,18 +1872,19 @@ local function dockView(b: Block, now: number): Node
 			c[str(a.state)] = (c[str(a.state)] or 0) + 1
 		end
 		if b.tab == "agents" then
-			table.insert(status, ui.span("● " .. c.working .. " working   ", "success"))
-			table.insert(status, ui.span("◆ " .. c.blocked .. " blocked   ", if c.blocked > 0 then "error" else "muted"))
-			table.insert(status, ui.span("○ " .. c.idle .. " idle", "muted"))
+			table.insert(segs, seg("working", c.working .. " working", { icon = "activity", tone = if c.working > 0 then "success" else "muted", priority = 4 }))
+			table.insert(segs, seg("blocked", c.blocked .. " blocked", { icon = "warn", tone = if c.blocked > 0 then "error" else "muted", priority = 5 }))
+			table.insert(segs, seg("idle", c.idle .. " idle", { icon = "pause", tone = "muted", priority = 2 }))
 			if c.untracked > 0 then
-				table.insert(status, ui.span("   ● " .. c.untracked .. " untracked", "info"))
+				table.insert(segs, seg("untracked", c.untracked .. " untracked", { icon = "help", tone = "info", priority = 1 }))
 			end
 		else
 			local reboot, exited = historyRows("")
-			table.insert(status, ui.span(#reboot .. " to restore · " .. #exited .. " recently closed", "muted"))
+			table.insert(segs, seg("reboot", #reboot .. " to restore", { icon = "repeat", tone = if #reboot > 0 then "warning" else "muted", priority = 3 }))
+			table.insert(segs, seg("exited", #exited .. " recently closed", { icon = "history", tone = "muted", priority = 2 }))
 		end
 		if store.scanning then
-			table.insert(status, ui.span("   scanning…", "dim"))
+			table.insert(segs, seg("scan", "Scanning", { side = "right", priority = 1 }, { ui.node("spinner", { style = "dots" }) }))
 		end
 		for _, n in {
 			key("↑"), key("↓"), ui.span(" select   ", "dim"),
@@ -1866,51 +1903,50 @@ local function dockView(b: Block, now: number): Node
 		table.insert(hints, key("esc"))
 		table.insert(hints, ui.span(if b.filter ~= "" then " clear" else " close", "dim"))
 	end
-	return ui.col({ ui.lines({ ui.text(status), ui.text(hints) }) })
+	table.insert(segs, seg("settings", "Settings", { icon = "gear", side = "right", priority = 6, actions = { click = "settings" } }))
+	return ui.col({
+		ui.node("status", { key = "status", transparent = true }, segs),
+		withp(ui.text(hints), { key = "keys" }),
+	})
 end
 
--- Tern's `tabs` kind draws with no height in 0.4.5, so the strip is plain elements styled like it.
 local function tabsNode(b: Block): Node
 	local reboot, exited = historyRows("")
-	local counts = {
-		usage = "",
-		agents = tostring(#liveAgents()),
-		history = tostring(#reboot + #exited),
-	}
-	local tabs: { Node } = {}
+	local counts = { agents = #liveAgents(), history = #reboot + #exited }
+	local items = {}
 	for _, id in TABS do
-		local kids: { Node } = { ui.el("span", { text = TAB_NAMES[id] }) }
-		if counts[id] ~= "" then
-			table.insert(kids, ui.el("span", {
-				class = "cb-count" .. (if id == "history" and #reboot > 0 then " warn" else ""),
-				text = counts[id],
-			}))
+		local label: { any } = { ui.span(TAB_NAMES[id]) }
+		if counts[id] then
+			table.insert(label, ui.span(" " .. counts[id], if id == "history" and #reboot > 0 then "warning" else "muted"))
 		end
-		table.insert(tabs, ui.el("button", {
-			key = id,
-			class = "cb-tab" .. (if b.tab == id then " on" else ""),
-			actions = { click = "tab=" .. id },
-		}, kids))
+		table.insert(items, { id = id, label = label })
 	end
+	return ui.node("tabs", { key = "tabs", items = items, active = b.tab })
+end
+
+-- The filter field; on Agents its attached eye hides or shows sessions older than a day.
+local function filterNode(b: Block): Node
+	local buttons = nil
 	if b.tab == "agents" then
 		local hide = setting("hideOld")
 		local n = if hide then oldCount() else 0
-		local tip = (if hide then "Show " .. n .. " sessions older than a day" else "Hide sessions older than a day") .. " (Tab)"
-		local kids: { Node } = { ui.el("span", { class = "cb-eye", text = "\u{f441}" }) }
-		if n > 0 then
-			table.insert(kids, ui.el("span", { class = "cb-count", text = tostring(n) }))
-		end
-		table.insert(tabs, ui.el("button", {
-			key = "old", class = "cb-tab cb-old" .. (if hide then " on" else ""), title = tip,
-			attrs = { ["aria-label"] = tip, ["aria-pressed"] = if hide then "true" else "false" },
-			actions = { click = "hide_old" },
-		}, kids))
+		local tip = if hide then "Show " .. n .. " sessions older than a day (Tab)" else "Hide sessions older than a day (Tab)"
+		buttons = { {
+			act = "hide_old",
+			icon = if hide then "eye-off" else "eye",
+			text = if n > 0 then n .. " hidden" else nil,
+			title = tip,
+		} }
 	end
-	table.insert(tabs, ui.el("button", {
-		key = "settings", class = "cb-tab cb-settings", text = "⚙", title = "Settings",
-		attrs = { ["aria-label"] = "Settings" }, actions = { click = "settings" },
-	}))
-	return ui.el("div", { key = "tabs", class = "cb-tabs", attrs = { role = "tablist" } }, tabs)
+	return ui.node("input", {
+		key = "filter",
+		text = b.filter,
+		cursor = #b.filter,
+		placeholder = "Type to filter by title, prompt, folder, provider or model",
+		icon = "search",
+		clear = true,
+		buttons = buttons,
+	})
 end
 
 -- Actions -------------------------------------------------------------------
@@ -2060,6 +2096,9 @@ local function act(b: Block, name: string)
 		dismiss(b, (historyRows(string.lower(b.filter))))
 	elseif name == "peek" then
 		b.peek = not b.peek
+	elseif name == "clear" then -- the filter's × and the no-match Clear button
+		b.filter = ""
+		b.sel = nil
 	elseif row then
 		if name == "focus" then
 			focusRecord(b, row.record)
@@ -2120,26 +2159,24 @@ tern.block.define("dashboard", {
 		local main: { Node } = { tabsNode(b) }
 		if b.tab == "usage" then
 			if #setting("providers") == 0 then
-				table.insert(main, ui.text({ ui.span("Usage providers are disabled. Enable them in Settings.", "muted") }))
+				table.insert(main, ui.node("empty", { key = "state", icon = "gauge", title = "Usage providers are off", text = "Turn providers on in Settings." }, {
+					button("Open settings", "settings", { size = "md", icon = "gear" }),
+				}))
 			elseif store.usage then
 				for _, card in providerCards(store.usage, now) do
 					table.insert(main, card)
 				end
 			elseif store.usageError then
-				table.insert(main, ui.text({ ui.span(store.usageError, "error") }))
+				table.insert(main, ui.node("empty", { key = "state", tone = "error", title = "Usage unavailable", text = store.usageError }, {
+					button("Retry", "refresh", { size = "md", icon = "repeat", keys = { "r" } }),
+				}))
 			else
-				table.insert(main, ui.progress(nil, "Reading usage…"))
+				table.insert(main, ui.node("skeleton", { key = "state", shape = "rows", rows = 4, aria = "Reading usage" }))
 			end
 		else
-			table.insert(main, ui.node("input", {
-				key = "filter",
-				text = b.filter,
-				cursor = #b.filter,
-				placeholder = "Type to filter by title, prompt, folder, provider or model",
-				prompt = { ui.span("⌕ ", "muted") },
-			}))
+			table.insert(main, filterNode(b))
 			if not store.agents then
-				table.insert(main, ui.progress(nil, "Scanning agents…"))
+				table.insert(main, ui.node("skeleton", { key = "list", shape = "rows", rows = 8, aria = "Scanning agents" }))
 			elseif b.tab == "agents" then
 				table.insert(main, agentsView(b, now * 1000))
 			else
@@ -2222,8 +2259,8 @@ tern.block.define("dashboard", {
 	end,
 
 	event = function(b: Block, ev: UiEvent, cx: BlockCx)
-		if ev.ev == "action" and ev.act == "tab" and table.find(TABS, ev.value) then
-			b.tab = ev.value
+		if ev.ev == "select" and type(ev.item) == "string" and table.find(TABS, ev.item) then
+			b.tab = ev.item
 			b.sel = nil
 		elseif (ev.ev == "select" or ev.ev == "activate") and type(ev.item) == "string" then
 			if string.sub(ev.item, 1, #LIST_PATH) == LIST_PATH then

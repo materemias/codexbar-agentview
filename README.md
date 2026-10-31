@@ -80,7 +80,7 @@ for it.
 | Requirement | Plasma | Tern | Enables |
 | --- | :---: | :---: | --- |
 | KDE Plasma 6 with KWin | Required | | The widget |
-| [Tern](https://stencil.so/tern) | | Required | The extension |
+| [Tern](https://stencil.so/tern) 0.9.9 or later | | Required | The extension |
 | Python 3.10+ | Required | Required | The shared helpers |
 | [`codexbar`](https://github.com/steipete/CodexBar) CLI | Required | Required | Usage. Agents and History work without it; with Meridian, so do Claude and Codex seats |
 | [Meridian](https://github.com/rynfar/meridian) | Optional | Optional | Claude accounts and ChatGPT seats read from its usage poll |
@@ -200,7 +200,8 @@ System Settings → Shortcuts → KWin, or Tern never sees the key.
 - **Focus.** Plasma switches desktop and raises the terminal. Tern shows the
   pane, a kitty window or a T3 Code thread.
 - **Teleport to Tern.** Moves an idle kitty session into a new Tern tab.
-- **Hide old sessions** idle for over a day with `Tab` or the eye switch.
+- **Hide old sessions** idle for over a day with `Tab` or the eye switch
+  (in Tern, the eye at the end of the filter field).
   Working and blocked sessions always stay.
 - **Desktop badges** and a ring on the session in the window you last focused.
 
@@ -231,9 +232,10 @@ which turns it into one meter per account
 The dashboard opens to the right of your rightmost pane and closes when you
 focus anything else, putting the layout back as it was. Palette commands
 `CodexBar AgentView: Agents`, `Usage`, `History` and `Settings` cover what the
-keys do not. Settings opens a native tab with search; **Include non-Tern
-agents** (off by default) adds kitty, VS Code and other hosts. Desktop
-notifications and the panel are Plasma-only.
+keys do not. Settings, also at the right of the dashboard's status bar,
+opens a native tab with search; **Include non-Tern agents** (off by default)
+adds kitty, VS Code and other hosts. Desktop notifications and the panel are
+Plasma-only.
 
 ## Supported providers
 

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Breaking
+
+- The Tern extension needs Tern 0.9.9 or later; update Tern before relinking.
+
 ### Features
 
 - Several Claude accounts, one per Meridian profile, shown under one Claude header with per-account tray meters and combined 5h and 7d bars pooled in Pro allowances, like Codex accounts, each switchable on its own. Usage and saved resets come from Meridian when it runs (saved resets need Meridian 1.87 or later), so the widget no longer competes with it for Anthropic's usage rate limit; otherwise saved resets are asked at most once an hour per account.
@@ -11,6 +15,7 @@
 - Meridian instances that need `MERIDIAN_API_KEY`, or run without profiles, are read too.
 - A Claude account's email and plan come from Meridian too, falling back to the login directory when Meridian leaves them out.
 - The Claude card shows omp's Meridian rotation mode and marks each account open or closed, like Codex.
+- The Tern dashboard is drawn with Tern's native elements: tabs, buttons with key hints, a framed chat view of the conversation, a status bar with Settings, empty and loading states, and the old-session eye inside the filter field.
 
 ### Fixes
 

@@ -613,9 +613,12 @@ class Take:
         # blocked session asks, and the settings tab's search and results.
         status = (760, 410, 740, 270)
         dash = (700, 40, 800, 430)
+        # The dashboard's lower part, where its status bar holds Settings.
+        dash_foot = (700, 270, 800, 430)
         asked = (0, 0, 900, 370)
         settings = (20, 40, 1260, 480)
-        cog = r"cb-tab\.cb-settings$"
+        # The status bar's Settings segment, its only clickable one.
+        cog = r"sf-st-r>div\.sf\.sf-seg\.sf-act$"
         exited = min(HISTORY, key=lambda s: s["ago"])["id"]
 
         self.tern("focus", str(self.tabs["atlas"]))
@@ -656,7 +659,8 @@ class Take:
 
             self.caption("Settings", "Every option, one search away.")
             x, y, w, h = self.find(cog)
-            self.pointer = (x + w / 2 - 180, y + h / 2 + 170)
+            self.cut(dash_foot)
+            self.pointer = (x + w / 2 - 180, y + h / 2 - 170)
             self.glide(x + w / 2, y + h / 2, 600)
             time.sleep(0.25)
             self.click()
