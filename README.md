@@ -212,7 +212,11 @@ System Settings → Shortcuts → KWin, or Tern never sees the key.
   back one by one: kitty sessions on their saved desktop, Tern sessions as
   tabs.
 - **Recently closed.** The last 100 sessions that exited since boot, each with
-  **Launch** and a copyable resume command.
+  **Launch** and a copyable resume command. omp sessions that closed while
+  nothing watched, or before you installed this, come from omp's prompt history
+  (`~/.omp/agent/history.db`) while their transcript and folder exist and no
+  omp process runs them; they launch in Tern when it is installed, else kitty.
+  A dismissed session stays gone until you use it again.
 
 ### Panel (Plasma)
 

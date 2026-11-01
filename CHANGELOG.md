@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Features
+
+- History lists omp sessions that closed while the widget wasn't watching, or before it was installed, read from omp's prompt history.
+
 ## 0.2.0 (2026-10-31)
 
 ### Breaking

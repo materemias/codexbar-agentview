@@ -28,6 +28,22 @@ assert SPEC is not None and SPEC.loader is not None
 agents = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(agents)
 
+_HOME: tempfile.TemporaryDirectory | None = None
+_HOME_PATCH: mock._patch | None = None
+
+
+def setUpModule() -> None:
+    # Sweeps read omp's prompt history; keep the user's out of every test.
+    global _HOME, _HOME_PATCH
+    _HOME = tempfile.TemporaryDirectory()
+    _HOME_PATCH = mock.patch.object(agents.Path, "home", return_value=Path(_HOME.name))
+    _HOME_PATCH.start()
+
+
+def tearDownModule() -> None:
+    _HOME_PATCH.stop()
+    _HOME.cleanup()
+
 
 HISTORY_FIELDS = {
     "provider",
@@ -232,7 +248,7 @@ class SnapshotMergeTests(unittest.TestCase):
 
         self.assertEqual(
             set(snapshot),
-            {"bootId", "updatedAt", "counts", "agents", "history", "ternInstalled"},
+            {"bootId", "updatedAt", "counts", "agents", "history", "ternInstalled", "ompBackfill"},
         )
         self.assertEqual(snapshot["bootId"], "boot-b")
         self.assertEqual(snapshot["agents"], [])
@@ -1134,6 +1150,172 @@ class OmpRecapTests(unittest.TestCase):
             row = json.loads(saved.read_text())["history"][0]
         self.assertEqual(row["recap"], "")
         self.assertEqual(row["recent"][0]["ts"], 500_000_000)
+
+
+class OmpBackfillTests(unittest.TestCase):
+    def _home(self, directory: str, sessions: dict[str, tuple]) -> Path:
+        """omp files for sessions {id: (cwd, last prompt seconds[, answer seconds])}."""
+        home = Path(directory)
+        agent = home / ".omp" / "agent"
+        agent.mkdir(parents=True)
+        con = sqlite3.connect(agent / "history.db")
+        con.execute("CREATE TABLE history (id INTEGER PRIMARY KEY, prompt TEXT UNIQUE,"
+                    " created_at INTEGER, cwd TEXT, session_id TEXT)")
+        con.execute("CREATE TABLE session_titles (session_id TEXT PRIMARY KEY, title TEXT)")
+        def stamp(seconds: int) -> str:
+            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace("+00:00", "Z")
+
+        for sid, (cwd, created_at, *answered) in sessions.items():
+            con.execute("INSERT INTO history (prompt, created_at, cwd, session_id)"
+                        " VALUES (?, ?, ?, ?)", (f"prompt {sid}", created_at, cwd, sid))
+            con.execute("INSERT INTO session_titles VALUES (?, ?)", (sid, f"title {sid}"))
+            slug = agent / "sessions" / f"-{sid}"
+            slug.mkdir(parents=True)
+            lines = [
+                {"type": "session", "id": sid, "cwd": cwd},
+                {"type": "message", "timestamp": stamp(created_at),
+                 "message": {"role": "user", "content": f"prompt {sid}"}},
+            ] + [
+                {"type": "message", "timestamp": stamp(at),
+                 "message": {"role": "assistant", "content": "done", "stopReason": "stop"}}
+                for at in answered
+            ]
+            rollout = slug / f"2026_{sid}.jsonl"
+            rollout.write_text("".join(json.dumps(line) + "\n" for line in lines))
+            # omp last wrote the transcript at its last turn.
+            last = max([created_at, *answered])
+            os.utime(rollout, (last, last))
+        con.commit()
+        con.close()
+        return home
+
+    def _sweep(self, home: Path, saved: Path, records: list[dict], limit: int = 100,
+               processes: dict[int, tuple] | None = None) -> dict:
+        """`processes`: running omp pid → (transcript it holds or "", cwd,
+        whether it is a background service[, whether it holds the transcript
+        directly rather than through an advisor sidecar])."""
+        processes = processes or {}
+        with (mock.patch.object(agents.Path, "home", return_value=home),
+              mock.patch.object(agents, "_read_boot_id", return_value="boot-a"),
+              mock.patch.object(agents, "tern_bin", return_value="/usr/bin/tern"),
+              mock.patch.object(agents, "_build_records", return_value=records),
+              mock.patch.object(agents, "_pgrep", side_effect=lambda _name, services=False:
+                                [pid for pid, p in processes.items() if p[2] == services]),
+              mock.patch.object(agents, "_open_jsonl_under",
+                                side_effect=lambda pid, *_n: (processes[pid][0], (
+                                    processes[pid] + (bool(processes[pid][0]),))[3])),
+              mock.patch.object(agents, "_cwd_of", side_effect=lambda pid: processes[pid][1])):
+            payload, _ = agents._locked_sweep(aggregate_path=saved, history_limit=limit)
+        return payload
+
+    def test_unseen_ended_sessions_are_added_unless_live_known_or_gone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / "work"
+            work.mkdir()
+            home = self._home(directory, {
+                "found": (str(work), 300), "live": (str(work), 400),
+                "known": (str(work), 500), "gone-dir": (str(work / "deleted"), 600),
+            })
+            saved = home / "agents.json"
+            saved.write_text(json.dumps({"bootId": "boot-a", "agents": [], "history": [
+                history("omp", "known", closedBy="exit", lastSeenAt=1),
+            ]}))
+            payload = self._sweep(home, saved, [active("omp", "live")])
+        rows = {r["sessionId"]: r for r in payload["history"]}
+        self.assertEqual(set(rows), {"found", "known"})
+        found = rows["found"]
+        self.assertEqual(found["closedBy"], "exit")
+        self.assertEqual(found["host"], "tern")
+        self.assertEqual(found["lastSeenAt"], 300_000)
+        self.assertEqual(found["windowTitle"], "title found")
+        self.assertEqual(found["lastPrompt"], "prompt found")
+        self.assertEqual(
+            found["resumeCommand"],
+            f"{shlex.join(['cd', '--', str(work)])} && omp --resume found",
+        )
+        # Our own row wins over omp's prompt history.
+        self.assertEqual(rows["known"]["lastSeenAt"], 1)
+
+    def test_dismissed_rows_stay_gone_and_older_sessions_do_not_refill(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / "work"
+            work.mkdir()
+            home = self._home(directory, {
+                "a": (str(work), 100), "b": (str(work), 200), "c": (str(work), 300),
+            })
+            saved = home / "agents.json"
+            first = self._sweep(home, saved, [], limit=2)
+            self.assertEqual([r["sessionId"] for r in first["history"]], ["c", "b"])
+            agents._dismiss_history({("omp", "c"), ("omp", "b")}, saved)
+            second = self._sweep(home, saved, [], limit=2)
+        self.assertEqual(second["history"], [])
+
+    def test_dismissed_session_returns_once_it_is_used_again(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / "work"
+            work.mkdir()
+            home = self._home(directory, {"a": (str(work), 100)})
+            saved = home / "agents.json"
+            self.assertEqual([r["sessionId"] for r in self._sweep(home, saved, [])["history"]], ["a"])
+            agents._dismiss_history({("omp", "a"), ("omp", "never-listed")}, saved)
+            self.assertEqual(self._sweep(home, saved, [])["history"], [])
+            self.assertEqual(set(json.loads(saved.read_text())["ompBackfill"]["skip"]), {"a"})
+            # Resumed and closed while nothing watched.
+            rollout = next((home / ".omp/agent/sessions").glob("*/*_a.jsonl"))
+            with rollout.open("a") as out:
+                out.write(json.dumps({"type": "message", "timestamp": "1970-01-01T00:08:20Z",
+                                      "message": {"role": "user", "content": "again"}}) + "\n")
+            os.utime(rollout, (500, 500))
+            rows = self._sweep(home, saved, [])["history"]
+        self.assertEqual([(r["sessionId"], r["lastSeenAt"]) for r in rows], [("a", 500_000)])
+
+    def test_sessions_a_running_omp_process_owns_are_not_added(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work, other = Path(directory) / "work", Path(directory) / "other"
+            work.mkdir()
+            other.mkdir()
+            home = self._home(directory, {
+                "held": (str(work), 100), "unresolved": (str(other), 200), "ended": (str(work), 300),
+            })
+            held = next((home / ".omp/agent/sessions").glob("*/*_held.jsonl"))
+            # Running in a host the sweep does not list, and one whose own
+            # session could not be resolved: it reaches only another
+            # session's transcript through a sidecar. Neither is in `agents`.
+            # An omp worker in the same folder holds no session and blocks nothing.
+            processes = {
+                7: (str(held), str(work), False), 8: (str(held), str(other), False, False),
+                9: ("", str(work), True),
+            }
+            rows = self._sweep(home, home / "agents.json", [], processes=processes)["history"]
+        self.assertEqual([r["sessionId"] for r in rows], ["ended"])
+
+    def test_session_prompted_long_before_the_floor_but_active_after_it_is_added(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / "work"
+            work.mkdir()
+            # Its last prompt is two days older than its final answer.
+            home = self._home(directory, {"late": (str(work), 100, 172_900)})
+            saved = home / "agents.json"
+            saved.write_text(json.dumps({
+                "bootId": "boot-a", "agents": [],
+                "history": [history("omp", "kept", closedBy="exit", lastSeenAt=150_000_000)],
+                "ompBackfill": {"floor": 150_000_000, "skip": {}},
+            }))
+            payload = self._sweep(home, saved, [], limit=1)
+        self.assertEqual(
+            [(r["sessionId"], r["lastSeenAt"]) for r in payload["history"]],
+            [("late", 172_900_000)],
+        )
+        self.assertEqual(payload["ompBackfill"]["floor"], 172_900_000)
+
+    def test_missing_or_foreign_history_db_adds_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            saved = home / "agents.json"
+            self.assertEqual(self._sweep(home, saved, [])["history"], [])
+            (home / ".omp" / "agent").mkdir(parents=True)
+            (home / ".omp" / "agent" / "history.db").write_text("not sqlite")
+            self.assertEqual(self._sweep(home, saved, [])["history"], [])
 
 
 class TernHostTests(unittest.TestCase):

@@ -27,6 +27,7 @@ import hashlib
 import contextlib
 import math
 import fcntl
+import heapq
 import json
 import os
 import shlex
@@ -963,7 +964,7 @@ def _opencode_info(pid: int) -> dict:
     cwd = _cwd_of(pid)
     peek: list = []
     try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.5)
+        con = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=0.5)
         try:
             row = con.execute(
                 "SELECT id, directory, title, time_updated FROM session "
@@ -1442,7 +1443,7 @@ def _attach_omp_recaps(
     if not db.is_file():
         return
     try:
-        con = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=0.5)
+        con = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=0.5)
         try:
             # Oldest first, so the newest recap of each session wins; `id`
             # orders recaps written within one second.
@@ -1835,6 +1836,7 @@ def _merge_snapshot(
         "history": rebooted + exited,
         # Live kitty rows offer a move to Tern only when it is installed.
         "ternInstalled": bool(tern_bin()),
+        "ompBackfill": _omp_backfill_state(previous.get("ompBackfill")),
     }
 
 
@@ -1851,6 +1853,7 @@ def _aggregate(
     payload = _merge_snapshot(
         records, previous, boot_id, int(time.time() * 1000), history_limit
     )
+    _backfill_omp_history(payload, history_limit)
     _backfill_history_recaps(payload["history"])
     return payload
 
@@ -1870,10 +1873,7 @@ def _backfill_history_recaps(history: list[dict]) -> None:
             if rollouts is None:
                 # One listing serves every row, since rows whose rollout is
                 # gone stay undated and come back on every sweep.
-                rollouts = {
-                    path.stem.rpartition("_")[2]: str(path)
-                    for path in (Path.home() / ".omp" / "agent" / "sessions").glob("*/*_*.jsonl")
-                }
+                rollouts = _omp_rollouts()
             rollout = rollouts.get(row["sessionId"])
             if rollout:
                 row["recent"] = _history_turns(_transcript_info(rollout, "pi")["recent"])
@@ -1882,6 +1882,186 @@ def _backfill_history_recaps(history: list[dict]) -> None:
         if any("ts" in turn for turn in row["recent"]):
             backfill.append(row)
     _attach_omp_recaps(backfill)
+
+
+def _omp_rollouts() -> dict[str, str]:
+    """Map omp session ids to their transcript paths."""
+    return {
+        path.stem.rpartition("_")[2]: str(path)
+        for path in (Path.home() / ".omp" / "agent" / "sessions").glob("*/*_*.jsonl")
+    }
+
+
+def _mtime_ms(path: str) -> int:
+    try:
+        return os.stat(path).st_mtime_ns // 1_000_000
+    except OSError:
+        return 0
+
+
+def _omp_backfill_state(value: object) -> dict:
+    """`floor`: the oldest exit a full history kept; backfill adds nothing
+    at or below it, so dismissing rows does not pull older sessions in.
+    `skip`: omp session id → the activity time backfill last turned it
+    away at, or the user dismissed it at. It comes back only once its
+    transcript changes after that time."""
+    value = value if isinstance(value, dict) else {}
+    floor = value.get("floor")
+    skip = value.get("skip")
+    return {
+        "floor": floor if type(floor) is int and floor > 0 else 0,
+        "skip": {
+            sid: at for sid, at in skip.items()
+            if isinstance(sid, str) and 0 < len(sid) <= 256 and type(at) is int and at > 0
+        } if isinstance(skip, dict) else {},
+    }
+
+
+def _omp_prompt_sessions(db: Path) -> dict[str, tuple[int, str]]:
+    """Session id → (last prompt time in ms, title) for every omp session in
+    omp's prompt history.
+
+    That table holds interactive sessions only: print-mode runs, evals and
+    subagents write none. A prompt typed again moves to the newer session,
+    so a session whose every prompt was later repeated is missing. An
+    unreadable database yields nothing."""
+    if not db.is_file():
+        return {}
+    try:
+        con = sqlite3.connect(db.as_uri() + "?mode=ro", uri=True, timeout=0.5)
+        try:
+            rows = con.execute(
+                "SELECT session_id, MAX(created_at) FROM history"
+                " WHERE session_id IS NOT NULL AND session_id != ''"
+                " GROUP BY session_id"
+            ).fetchall()
+            try:
+                titles = {
+                    sid: title[:4096] for sid, title in con.execute(
+                        "SELECT session_id, title FROM session_titles"
+                    ) if isinstance(title, str)
+                }
+            except sqlite3.Error:
+                titles = {}
+        finally:
+            con.close()
+    except sqlite3.Error:
+        return {}
+    return {
+        sid: (created_at * 1000, titles.get(sid, ""))
+        for sid, created_at in rows
+        if isinstance(sid, str) and len(sid) <= 256 and type(created_at) is int
+    }
+
+
+def _live_omp_transcripts() -> tuple[set[str], set[str]]:
+    """Transcripts that running omp processes hold open, and the folders of
+    interactive omp processes that hold none. Covers processes the sweep
+    does not list: no terminal host, or a session it could not resolve.
+    Background omp (workers, rpc) counts only by the transcript it holds:
+    its workers run in a session's folder without being one."""
+    held: set[str] = set()
+    unresolved: set[str] = set()
+    for services in (False, True):
+        for pid in _pgrep("omp", services=services):
+            rollout, direct = _open_jsonl_under(pid, "/.omp/agent/sessions/")
+            if rollout:
+                held.add(os.path.realpath(rollout))
+            # A rollout reached only through a sidecar may be another
+            # process's session, so this one's own may still be unknown.
+            if not direct and not services and (cwd := _cwd_of(pid)):
+                unresolved.add(cwd)
+    return held, unresolved
+
+
+def _backfill_omp_history(
+    payload: dict, history_limit: int = HISTORY_LIMIT, db: Path | None = None
+) -> None:
+    """Add omp sessions that ended while no sweep watched them, or before
+    CodexBar AgentView ran, from omp's own prompt history.
+
+    A session qualifies while its transcript and folder exist and no omp
+    process runs it. Rows already in history win. Candidates rank by
+    transcript mtime, which no turn in it can postdate, so the newest
+    `history_limit` are found without reading older transcripts."""
+    state = payload["ompBackfill"]
+    floor, skip = state["floor"], state["skip"]
+    sessions = _omp_prompt_sessions(db or Path.home() / ".omp" / "agent" / "history.db")
+    if sessions:
+        # Entries at or below the floor can no longer pass it anyway.
+        state["skip"] = skip = {
+            sid: at for sid, at in skip.items() if sid in sessions and at > floor
+        }
+    known = {
+        key[1] for key in map(_record_key, payload["agents"] + payload["history"])
+        if key is not None and key[0] == "omp"
+    }
+    history = payload["history"]
+    exited = [r for r in history if r["closedBy"] == "exit"]
+    # The `history_limit` newest exits so far; a candidate that cannot beat
+    # the oldest of them once there are that many is not read.
+    kept = heapq.nlargest(history_limit, (r["lastSeenAt"] for r in exited))
+    heapq.heapify(kept)
+    candidates = []
+    rollouts = _omp_rollouts() if any(sid not in known for sid in sessions) else {}
+    for sid, (prompt_ms, title) in sessions.items():
+        rollout = rollouts.get(sid)
+        if sid in known or not rollout:
+            continue
+        bound = max(_mtime_ms(rollout), prompt_ms)
+        if bound > floor and bound > skip.get(sid, 0):
+            candidates.append((bound, sid, rollout, prompt_ms, title))
+    candidates.sort(reverse=True)
+    added: dict[str, dict] = {}
+    bounds: dict[str, int] = {}
+    live: tuple[set[str], set[str]] | None = None
+    host = "tern" if payload.get("ternInstalled") else "kitty"
+    for bound, sid, rollout, prompt_ms, title in candidates:
+        if len(kept) >= history_limit and bound <= kept[0]:
+            break
+        info = _transcript_info(rollout, "pi")
+        cwd = info["cwd"]
+        recent = _history_turns(info["recent"])
+        last_seen = max([prompt_ms, *(turn.get("ts", 0) for turn in recent)])
+        if (info["sessionId"] != sid or not cwd or not Path(cwd).is_dir()
+                or last_seen <= floor):
+            skip[sid] = bound
+            continue
+        if live is None:
+            live = _live_omp_transcripts()
+        # Still running: it reaches history when a sweep sees it end.
+        if os.path.realpath(rollout) in live[0] or cwd in live[1]:
+            continue
+        state_name = info["state"]
+        added[sid] = _history_record({
+            "provider": "omp",
+            "sessionId": sid,
+            "cwd": cwd,
+            "windowTitle": info["windowTitle"] or title,
+            "lastPrompt": info["lastPrompt"],
+            # Resumes open where omp usually runs: Tern when installed.
+            "host": host,
+            "lastState": state_name if state_name in ("working", "blocked", "idle") else "idle",
+            "lastSeenAt": last_seen,
+            "model": info["model"],
+            "resumeCommand": _resume_command("omp", sid, cwd, True),
+            "closedBy": "exit",
+            "recent": recent,
+        }, active=False)
+        bounds[sid] = bound
+        heapq.heappush(kept, last_seen)
+        if len(kept) > history_limit:
+            heapq.heappop(kept)
+    if added:
+        exited = sorted(
+            exited + list(added.values()), key=lambda r: r["lastSeenAt"], reverse=True
+        )[:history_limit]
+        payload["history"] = [r for r in history if r["closedBy"] == "reboot"] + exited
+        # Rows the limit cut stay out until their transcript changes.
+        for sid in added.keys() - {r["sessionId"] for r in exited}:
+            skip[sid] = bounds[sid]
+    if len(exited) >= history_limit:
+        state["floor"] = max(floor, min(r["lastSeenAt"] for r in exited))
 
 
 def _write_aggregate(payload: dict, path: Path = AGGREGATE_PATH) -> None:
@@ -1974,11 +2154,22 @@ def _dismiss_history(
     with _aggregate_lock(aggregate_path):
         payload = _load_payload(aggregate_path)
         kept = [r for r in payload["history"] if _record_key(r) not in keys]
-        removed = len(payload["history"]) - len(kept)
-        if removed:
+        gone = [r for r in payload["history"] if _record_key(r) in keys]
+        if gone:
             payload["history"] = kept
+            # omp's prompt history would bring a dismissed omp session back;
+            # it stays out until its transcript changes.
+            state = _omp_backfill_state(payload.get("ompBackfill"))
+            omp_gone = [r for r in gone if r["provider"] == "omp"]
+            rollouts = _omp_rollouts() if omp_gone else {}
+            for r in omp_gone:
+                seen = r.get("lastSeenAt")
+                seen = seen if type(seen) is int else 0
+                rollout = rollouts.get(r["sessionId"])
+                state["skip"][r["sessionId"]] = max(seen, _mtime_ms(rollout) if rollout else 0, 1)
+            payload["ompBackfill"] = state
             _write_aggregate(payload, aggregate_path)
-        return removed
+        return len(gone)
 
 
 def _parse_session_keys(value: str | None) -> set[tuple[str, str]]:
@@ -2030,6 +2221,7 @@ def _locked_sweep(
                 records, previous, boot_id, int(time.time() * 1000), history_limit
             )
             # Inside the cache window, so rollouts it parses stay cached.
+            _backfill_omp_history(payload, history_limit)
             _backfill_history_recaps(payload["history"])
             _TRANSCRIPT_CACHE = {key: value for key, value in _TRANSCRIPT_CACHE.items()
                                  if key in _CACHE_ACTIVE}
