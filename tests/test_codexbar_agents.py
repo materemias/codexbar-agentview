@@ -759,6 +759,8 @@ class ResumeAndIdentityTests(unittest.TestCase):
                                       set(pool) if server == 77 else set()),
                     mock.patch.object(agents, "_open_jsonl_under", return_value=("", False)),
                     mock.patch.object(agents, "_argv_of", side_effect=lambda p: argv[p]),
+                    # The fake pids have no ancestry; real /proc must not leak in.
+                    mock.patch.object(agents, "_ppid_of", return_value=1),
                     mock.patch.object(agents, "_cwd_of", return_value="/work"),
                     mock.patch.object(agents, "_start_ms", return_value=start),
                     mock.patch.object(agents, "_transcript_info", side_effect=lambda path, _p: {
