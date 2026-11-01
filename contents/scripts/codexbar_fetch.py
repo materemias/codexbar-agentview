@@ -271,6 +271,9 @@ CLAUDE_RESET_TIMEOUT = 8.0
 # up to 5 s for ChatGPT seats, so a shorter timeout would drop to the CLI.
 MERIDIAN_DEFAULT_PORT = 3456
 MERIDIAN_TIMEOUT = 10.0
+# Meridian retries a failed usage poll on its own (60 s after a 429). One
+# failure on a reading younger than this is not reported as a refresh error.
+MERIDIAN_QUIET_STALE_SECONDS = 600
 
 
 def _claude_default_dir() -> str:
@@ -944,8 +947,13 @@ def _meridian_stale(record: dict, usage: dict) -> dict:
         return record
     # Meridian's last poll failed; this is its earlier reading.
     failure = usage.get("failure")
-    reason = failure.get("reason") if isinstance(failure, dict) else None
-    record = _last_known(record, f"Meridian refresh failed ({reason or 'unknown'})")
+    failure = failure if isinstance(failure, dict) else {}
+    fetched = _as_float(usage.get("fetchedAt"))
+    failures = failure.get("consecutiveFailures")
+    one_off = isinstance(failures, int) and failures < 2 and fetched is not None \
+        and time.time() - fetched / 1000 < MERIDIAN_QUIET_STALE_SECONDS
+    reason = failure.get("reason")
+    record = _last_known(record, "" if one_off else f"Meridian refresh failed ({reason or 'unknown'})")
     record["cachedAt"] = record.get("updatedAt")
     return record
 

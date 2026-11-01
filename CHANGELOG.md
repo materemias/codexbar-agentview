@@ -6,6 +6,10 @@
 
 - History lists omp sessions that closed while the widget wasn't watching, or before it was installed, read from omp's prompt history.
 
+### Fixes
+
+- A single failed Meridian usage poll on a recent reading no longer shows "Refresh failed" on the Claude account; the error appears once Meridian fails again or the reading is 10 minutes old.
+
 ## 0.2.0 (2026-10-31)
 
 ### Breaking

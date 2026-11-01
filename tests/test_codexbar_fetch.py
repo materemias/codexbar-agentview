@@ -487,15 +487,14 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
             ("local@example.com", "Claude Max 20x", 20, 30))
         self.assertEqual(keys, ["secret", "secret"])
 
-    def test_meridian_stale_reading_stays_last_known_in_the_snapshot(self) -> None:
-        measured = int(time.time() * 1000) - 600_000
+    def meridian_stale_record(self, age_ms: int, failure: dict) -> dict:
+        measured = int(time.time() * 1000) - age_ms
         responses = {
             "/profiles/list": {"profiles": [
                 {"id": "team", "type": "claude-max", "email": "team@example.com",
                  "subscriptionType": "team"}]},
             "/v1/usage/quota/all": {"profiles": [
-                {"id": "team", "fetchedAt": measured, "stale": True,
-                 "failure": {"reason": "rate_limited"},
+                {"id": "team", "fetchedAt": measured, "stale": True, "failure": failure,
                  "windows": [{"type": "five_hour", "utilization": 0.4, "resetsAt": None}]}]},
         }
         output = io.StringIO()
@@ -511,9 +510,26 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
         [record] = json.loads(output.getvalue())["providers"]
         self.assertTrue(record["ok"])
         self.assertTrue(record["stale"])
-        self.assertIn("rate_limited", record["refreshError"])
         self.assertEqual(fetch._parse_iso(record["cachedAt"]).timestamp(), measured / 1000)
         self.assertEqual(record["primary"]["usedPercent"], 40)
+        return record
+
+    def test_meridian_repeated_failure_reports_the_refresh_error(self) -> None:
+        record = self.meridian_stale_record(
+            60_000, {"reason": "rate_limited", "consecutiveFailures": 2})
+        self.assertIn("rate_limited", record["refreshError"])
+
+    def test_meridian_one_off_failure_on_an_old_reading_reports_the_refresh_error(self) -> None:
+        record = self.meridian_stale_record(
+            (fetch.MERIDIAN_QUIET_STALE_SECONDS + 60) * 1000,
+            {"reason": "rate_limited", "consecutiveFailures": 1})
+        self.assertIn("rate_limited", record["refreshError"])
+
+    def test_meridian_one_off_failure_on_a_recent_reading_stays_quiet(self) -> None:
+        # Meridian retries after its own backoff; one 429 is not news.
+        record = self.meridian_stale_record(
+            60_000, {"reason": "rate_limited", "consecutiveFailures": 1})
+        self.assertEqual(record["refreshError"], "")
 
 
 class UsageCacheTests(IsolatedUsageTestCase):
