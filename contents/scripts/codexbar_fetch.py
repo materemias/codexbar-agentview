@@ -955,6 +955,7 @@ def _meridian_stale(record: dict, usage: dict) -> dict:
     reason = failure.get("reason")
     record = _last_known(record, "" if one_off else f"Meridian refresh failed ({reason or 'unknown'})")
     record["cachedAt"] = record.get("updatedAt")
+    record["sourceStale"] = True
     return record
 
 
@@ -1306,10 +1307,15 @@ def _cached_usage_record(record: object, now: _dt.datetime) -> dict | None:
         result["planWeight"] = weight
     # A last-known reading keeps why it is last-known, so a cache read cannot
     # pass it off as current (Tern adopts recent error-free cache as live).
+    # `sourceStale` marks a reading the source served late without an error.
     refresh_error = record.get("refreshError")
-    if record.get("stale") is True and isinstance(refresh_error, str) and refresh_error:
+    source_stale = record.get("sourceStale") is True
+    if record.get("stale") is True and isinstance(refresh_error, str) \
+            and (refresh_error or source_stale):
         result["stale"] = True
         result["refreshError"] = refresh_error
+        if source_stale:
+            result["sourceStale"] = True
 
     def window(value):
         if not isinstance(value, dict):

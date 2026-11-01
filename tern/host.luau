@@ -1148,11 +1148,13 @@ end
 
 -- `--cache-only` marks every record last-known. A record measured recently
 -- (normally by the applet), without a refresh error, is current: show it live.
+-- A reading the source itself served late (`sourceStale`) stays last-known.
 local function adoptCache(data: any)
 	local now = os.time()
 	for _, rec in val(data.providers) or {} do
 		local at = epoch(val(rec.cachedAt))
-		if val(rec.stale) == true and str(rec.refreshError) == "" and at and now - at <= staleAfter() + 30 then
+		if val(rec.stale) == true and val(rec.sourceStale) ~= true and str(rec.refreshError) == ""
+			and at and now - at <= staleAfter() + 30 then
 			rec.stale = false
 		end
 	end

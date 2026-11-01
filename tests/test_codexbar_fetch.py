@@ -589,6 +589,16 @@ class UsageCacheTests(IsolatedUsageTestCase):
         restored = self.snapshot(providers="claude", cache_only=True)["providers"]
         self.assertEqual([r.get("planWeight") for r in restored], [5, None])
 
+    def test_cache_read_keeps_a_quiet_source_late_reading_last_known(self) -> None:
+        # A one-off Meridian failure carries no error text but is still late.
+        late = fetch._meridian_stale(self.record("claude"), {
+            "stale": True, "fetchedAt": time.time() * 1000,
+            "failure": {"reason": "rate_limited", "consecutiveFailures": 1}})
+        self.snapshot([late], providers="claude")
+        restored = self.snapshot(providers="claude", cache_only=True)["providers"][0]
+        self.assertEqual((restored["stale"], restored["refreshError"], restored["sourceStale"]),
+                         (True, "", True))
+
     def test_cache_read_keeps_a_source_reported_stale_reading_last_known(self) -> None:
         # Meridian can serve a recent reading whose own poll then failed.
         stale = fetch._last_known(self.record("claude"), "Meridian refresh failed (rate_limited)")
