@@ -334,6 +334,7 @@ local store = {
 	fetching = false,
 	cacheReadAt = 0,
 	cacheSpawnAt = 0,
+	cacheSeq = 0,
 	cacheInputs = "",
 	cachePaths = {} :: { string },
 	usageGeneration = 0,
@@ -1257,6 +1258,8 @@ local function readUsageCache(allowFetch: boolean?, reclassify: boolean?, inputs
 	end
 	store.cacheInputs = inputs or usageInputs()
 	store.cacheSpawnAt = os.time()
+	store.cacheSeq += 1
+	local seq = store.cacheSeq
 	local generation = store.usageGeneration
 	local previous = store.usage
 	local args = providerArgs()
@@ -1266,7 +1269,9 @@ local function readUsageCache(allowFetch: boolean?, reclassify: boolean?, inputs
 			return
 		end
 		local okj, data = pcall(tern.json.decode, res.stdout)
-		local inputs = if okj and type(data) == "table" then val(data.inputs) else nil
+		-- Reads overlap when one is slow; an earlier one answers older files.
+		local latest = seq == store.cacheSeq
+		local inputs = if latest and okj and type(data) == "table" then val(data.inputs) else nil
 		if type(inputs) == "table" then
 			local paths = {}
 			for _, path in inputs do
@@ -1277,12 +1282,40 @@ local function readUsageCache(allowFetch: boolean?, reclassify: boolean?, inputs
 			-- A changed list fails the next check once, which rereads against it.
 			store.cachePaths = paths
 		end
-		if (not store.fetching or allowFetch == false) and res.status == 0 and okj and type(data) == "table"
+		local usable = res.status == 0 and okj and type(data) == "table"
+		local cacheShown = type(store.usage) == "table" and val(store.usage.cacheOnly) == true
+		local replaced = false
+		if usable and (not store.fetching or allowFetch == false)
 			and ((allowFetch == false and not reclassify) or not store.usage or measuredAt(data) > measuredAt(store.usage)
-				or (reclassify and store.usage == previous and measuredAt(data) == measuredAt(store.usage))) then
+				or (reclassify and store.usage == previous and measuredAt(data) == measuredAt(store.usage))
+				-- One cache read replaces another without a newer measurement: omp's
+				-- rotation and the accounts the logins and the 24 h limit allow change
+				-- on their own.
+				or (allowFetch ~= false and cacheShown and latest)) then
 			adoptCache(data)
+		elseif latest and usable and not store.fetching and type(store.usage) == "table" then
+			-- A newer fetch's reading stays, but omp's rotation is local and
+			-- current, and an account whose login changed since is gone.
+			store.usage.claudeRotation = data.claudeRotation
+			store.usage.codexRotation = data.codexRotation
+			local scopes = val(data.scopes)
+			local records = val(store.usage.providers)
+			if type(scopes) == "table" and type(records) == "table" then
+				local kept = {}
+				for _, rec in records do
+					local scope = val(rec.sourceScope)
+					local current = val(scopes[str(rec.id)])
+					if type(scope) ~= "string" or type(current) ~= "string" or scope == current then
+						table.insert(kept, rec)
+					end
+				end
+				-- A Claude token refresh changes its login file just like a
+				-- switch does; a fetch brings the account back either way.
+				replaced = #kept < #records
+				store.usage.providers = kept
+			end
 		end
-		if allowFetch ~= false and os.time() - math.max(store.usageAt, measuredAt(store.usage)) >= staleAfter() then
+		if allowFetch ~= false and (replaced or os.time() - math.max(store.usageAt, measuredAt(store.usage)) >= staleAfter()) then
 			fetchUsage(true)
 		end
 		publishSummary()

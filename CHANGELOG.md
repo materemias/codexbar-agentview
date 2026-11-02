@@ -12,6 +12,7 @@
 - The widget, its agent sweep and the Tern extension use far less CPU: the sweep takes a quarter of the time, the popup redraws only the session rows that changed, and Tern rereads usage only after it changed or once a minute.
 - omp sessions that Tern resumed by file path show their own title and state again, instead of another session's from the same folder.
 - Launching a closed omp session from History works again in folders where other omp sessions are running; it still refuses a session a running omp has worked in.
+- The Tern extension shows omp rotation-mode changes and drops an account whose login changed within 10 seconds, instead of keeping them until its next usage fetch.
 
 ## 0.2.0 (2026-10-31)
 

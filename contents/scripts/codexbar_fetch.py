@@ -2078,6 +2078,9 @@ def main(argv: list[str]) -> int:
         _attach_recent_usage(restored, _usage_history_entries(_usage_cache_payload(), now), now)
         out["cacheOnly"] = True
         out["inputs"] = _cache_inputs(providers)
+        # The login fingerprints records carry as `sourceScope`, so a poller
+        # showing a fetch's records can drop those of a login since replaced.
+        out["scopes"] = scopes
         json.dump(out, sys.stdout)
         sys.stdout.write("\n")
         return 0
