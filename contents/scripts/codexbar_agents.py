@@ -30,6 +30,7 @@ import fcntl
 import heapq
 import json
 import os
+import re
 import shlex
 import shutil
 import sqlite3
@@ -2068,14 +2069,20 @@ def _claude_rollouts() -> dict[str, str]:
 
 
 def _live_omp_sessions() -> tuple[set[str], set[str]]:
-    """Session ids running omp processes hold open, and the folders of
-    interactive omp processes whose own session is unknown. Covers
-    processes the sweep does not list: no terminal host, or a session it
-    could not resolve. Background omp (workers, rpc) counts only by the
-    transcript it holds: its workers run in a session's folder without
+    """Session ids running omp processes may be writing, and the folders
+    of interactive omp processes that give no clue which. Covers processes
+    the sweep does not list: no terminal host, or a session it could not
+    resolve.
+
+    omp closes its transcript between writes, and argv names only the
+    session it started in: `/resume` switches without changing it. Its own
+    log names each session it works in, so every session there counts as
+    held, along with the one argv resumes. Background omp (workers, rpc)
+    counts only by those: its workers run in a session's folder without
     being one."""
     held: set[str] = set()
     unresolved: set[str] = set()
+    logs = _omp_log_files()
     for services in (False, True):
         for pid in _pgrep("omp", services=services):
             rollout, direct = _open_jsonl_under(pid, "/.omp/agent/sessions/")
@@ -2083,9 +2090,69 @@ def _live_omp_sessions() -> tuple[set[str], set[str]]:
                 held.add(Path(rollout).stem.rpartition("_")[2])
             # A rollout reached only through a sidecar may be another
             # process's session, so this one's own may still be unknown.
-            if not direct and not services and (cwd := _cwd_of(pid)):
+            if direct:
+                continue
+            clues = _omp_logged_sessions(pid, logs.get(pid, []))
+            if resumed := _resume_arg(pid, "--resume"):
+                clues.add(resumed)
+            held |= clues
+            if not clues and not services and (cwd := _cwd_of(pid)):
                 unresolved.add(cwd)
     return held, unresolved
+
+
+def _omp_log_files() -> dict[int, list[str]]:
+    """omp's log files by pid. omp logs a day per file, `omp.<date>.<pid>.log`."""
+    files: dict[int, list[str]] = {}
+    directory = Path.home() / ".omp" / "logs"
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return files
+    for name in names:
+        parts = name.split(".")
+        if len(parts) == 4 and parts[0] == "omp" and parts[3] == "log" and parts[2].isdigit():
+            files.setdefault(int(parts[2]), []).append(str(directory / name))
+    return files
+
+
+_LOGGED_SESSION = re.compile(rb'"sessionId":\s*"([0-9a-f-]{36})"')
+
+
+def _omp_logged_sessions(pid: int, paths: list[str]) -> set[str]:
+    """Session ids omp process `pid`'s log files name. omp only appends to
+    them, so a sweep reads each from where the last one stopped. Files
+    dated before the process started belong to an earlier one with its pid."""
+    started = _start_ms(pid) if paths else 0
+    if not started:
+        return set()
+    # File dates may be UTC or local time; a day's margin covers both.
+    first = time.strftime("%Y-%m-%d", time.gmtime(started / 1000 - 86400))
+    ids: set[str] = set()
+    for path in sorted(p for p in paths if Path(p).name.split(".")[1] >= first):
+        key = "omp-log:" + path
+        if _CACHE_ACTIVE is not None:
+            _CACHE_ACTIVE.add(key)
+        cached = _TRANSCRIPT_CACHE.get(key)
+        try:
+            with open(path, "rb") as log:
+                stat = os.fstat(log.fileno())
+                offset, found = 0, set()
+                if (isinstance(cached, dict) and cached.get("inode") == stat.st_ino
+                        and isinstance(cached.get("offset"), int)
+                        and 0 <= cached["offset"] <= stat.st_size
+                        and isinstance(cached.get("ids"), list)):
+                    offset, found = cached["offset"], set(cached["ids"])
+                log.seek(offset)
+                data = log.read()
+        except OSError:
+            continue
+        # A line still being written is read again next time.
+        end = data.rfind(b"\n") + 1
+        found.update(m.decode() for m in _LOGGED_SESSION.findall(data, 0, end))
+        _TRANSCRIPT_CACHE[key] = {"inode": stat.st_ino, "offset": offset + end, "ids": sorted(found)}
+        ids |= found
+    return ids
 
 
 def _live_claude_sessions() -> tuple[set[str], set[str]]:

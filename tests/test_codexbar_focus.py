@@ -99,6 +99,9 @@ class LaunchTests(unittest.TestCase):
                                   [] if services else [77]),
                 mock.patch.object(focus.agents, "_open_jsonl_under", return_value=(held, bool(held))),
                 mock.patch.object(focus.agents, "_cwd_of", return_value=cwd),
+                # Off the real /proc and ~/.omp/logs: no argv or log names a session.
+                mock.patch.object(focus.agents, "_argv_of", return_value=["omp"]),
+                mock.patch.object(focus.agents, "_omp_log_files", return_value={}),
             ):
                 code, popen, *_rest, stderr = self.launch({"agents": [], "history": [entry()]})
             self.assertEqual(code, 5)

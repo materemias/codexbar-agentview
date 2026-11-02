@@ -760,6 +760,38 @@ class ResumeAndIdentityTests(unittest.TestCase):
         self.assertEqual(info["sessionId"], "01a0-resumed")
         self.assertTrue(info["identityExact"])
 
+    def test_omp_without_its_transcript_open_holds_every_session_its_log_names(self) -> None:
+        started = 1_790_000_000_000
+        day = datetime.fromtimestamp(started / 1000, timezone.utc).strftime("%Y-%m-%d")
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            logs = home / ".omp" / "logs"
+            logs.mkdir(parents=True)
+            switched = "01a0aaaa-0000-7000-8000-000000000001"
+            # Its own log names the session it /resume'd into later.
+            (logs / f"omp.{day}.42.log").write_text(
+                json.dumps({"message": "Usage fetch queued", "sessionId": switched}) + "\n")
+            # An earlier process with pid 43 named a session months ago.
+            (logs / "omp.2026-01-01.43.log").write_text(
+                json.dumps({"sessionId": "01a0bbbb-0000-7000-8000-000000000002"}) + "\n")
+            # Logging, but no session named yet: no clue which one it is in.
+            (logs / f"omp.{day}.44.log").write_text(json.dumps({"message": "startup"}) + "\n")
+            # A headless omp resuming a session between writes.
+            argv = {42: ["omp", "--resume", "01a0-started"], 43: ["omp"], 44: ["omp"],
+                    50: ["omp", "--mode", "rpc", "--resume", "01a0-headless"]}
+            with (
+                mock.patch.object(agents.Path, "home", return_value=home),
+                mock.patch.object(agents, "_pgrep",
+                                  side_effect=lambda _n, services=False: [50] if services else [42, 43, 44]),
+                mock.patch.object(agents, "_open_jsonl_under", return_value=("", False)),
+                mock.patch.object(agents, "_start_ms", return_value=started),
+                mock.patch.object(agents, "_argv_of", side_effect=lambda pid: argv[pid]),
+                mock.patch.object(agents, "_cwd_of", side_effect=lambda pid: f"/work{pid}"),
+            ):
+                held, unresolved = agents._live_omp_sessions()
+        self.assertEqual(held, {switched, "01a0-started", "01a0-headless"})
+        self.assertEqual(unresolved, {"/work43", "/work44"})
+
     def test_codex_tuis_match_threads_loaded_by_shared_app_server(self) -> None:
         start = 1_790_000_000_000
         with tempfile.TemporaryDirectory() as directory:
