@@ -1024,11 +1024,11 @@ class T3CodeTests(unittest.TestCase):
         )
 
     def test_pgrep_keeps_t3_sessions_interactive(self) -> None:
-        out = subprocess.CompletedProcess([], 0, stdout="10\n11\n12\n")
         a, b, c, d = self._patch()
-        with a, b, c, d, mock.patch.object(agents.subprocess, "run", return_value=out):
-            self.assertEqual(agents._pgrep("claude"), [10, 12])
+        with a, b, c, d, mock.patch.object(agents, "_all_pids", return_value=list(self.COMM)):
+            self.assertEqual(agents._pgrep("claude"), [10])
             self.assertEqual(agents._pgrep("claude", services=True), [11])
+            self.assertEqual(agents._pgrep("codex"), [12])
 
     def test_host_walk_stops_at_t3_not_code_in_args(self) -> None:
         a, b, c, d = self._patch()
@@ -1056,14 +1056,14 @@ class T3CodeTests(unittest.TestCase):
             return (argv.get(pid, [""])[0]
                     + (" (deleted)" if pid == 7 else ""))
 
-        out = subprocess.CompletedProcess([], 0, stdout="20\n21\n")
         with mock.patch.object(agents, "_comm_of", side_effect=lambda p: comm.get(p, "")), \
                 mock.patch.object(agents, "_ppid_of", side_effect=lambda p: ppid.get(p, 0)), \
                 mock.patch.object(agents, "_argv_of", side_effect=lambda p: argv.get(p, [])), \
                 mock.patch.object(agents, "_exe_of", side_effect=executable), \
                 mock.patch.object(agents, "t3_window_pids", return_value=[4]), \
-                mock.patch.object(agents.subprocess, "run", return_value=out):
-            self.assertEqual(agents._pgrep("claude"), [20, 21])
+                mock.patch.object(agents, "_all_pids", return_value=list(comm)):
+            self.assertEqual(agents._pgrep("claude"), [20])
+            self.assertEqual(agents._pgrep("codex"), [21])
             self.assertEqual(agents._parent_walk_for_host(20), ("t3code", [20, 7, 4]))
 
 
@@ -1484,7 +1484,7 @@ class PersistenceTests(unittest.TestCase):
             before = path.read_bytes()
 
             with mock.patch.object(
-                agents.json, "dump", side_effect=OSError("synthetic write failure")
+                agents.os, "fsync", side_effect=OSError("synthetic write failure")
             ):
                 with self.assertRaisesRegex(OSError, "synthetic write failure"):
                     agents._write_aggregate({"version": "new"}, path)

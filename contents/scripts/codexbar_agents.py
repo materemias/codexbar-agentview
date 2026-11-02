@@ -362,10 +362,11 @@ def tern_bin() -> str:
 
 def tern_window_pids() -> list[int]:
     """Pids of running Tern windows: `tern` processes other than its
-    session daemon."""
+    session daemon. Tern's binary is `tern` on every platform, so its name
+    finds them."""
     return [
-        pid for pid in _all_pids()
-        if _host_of(pid) == "tern" and _argv_of(pid)[1:2] != ["daemon"]
+        pid for pid in _process_names().get("tern", ())
+        if _argv_of(pid)[1:2] != ["daemon"]
     ]
 
 
@@ -429,22 +430,38 @@ def _under_t3(pid: int) -> bool:
     return False
 
 
+# Process name → pids while a `_process_snapshot` is open, else None.
+_PROC_NAMES: dict[str, list[int]] | None = None
+
+
+def _process_names() -> dict[str, list[int]]:
+    """Process name → ascending pids, the names `pgrep -x` matches."""
+    if _PROC_NAMES is not None:
+        return _PROC_NAMES
+    names: dict[str, list[int]] = {}
+    for pid in sorted(_all_pids()):
+        names.setdefault(_comm_of(pid), []).append(pid)
+    return names
+
+
+@contextlib.contextmanager
+def _process_snapshot():
+    """Answer every name lookup inside from one process-table scan; a
+    sweep looks up several names, and each scan reads every process."""
+    global _PROC_NAMES
+    outer = _PROC_NAMES
+    _PROC_NAMES = _process_names()
+    try:
+        yield
+    finally:
+        _PROC_NAMES = outer
+
+
 def _pgrep(name: str, services: bool = False) -> list[int]:
     """Interactive processes named `name`, or with `services` only the
     background ones (app servers, daemons) that the scan otherwise skips."""
-    try:
-        proc = subprocess.run(
-            ["pgrep", "-x", name],
-            capture_output=True, text=True, timeout=2.0, check=False,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return []
     out: list[int] = []
-    for ln in (proc.stdout or "").splitlines():
-        pid_s = ln.strip()
-        if not pid_s.isdigit():
-            continue
-        pid = int(pid_s)
+    for pid in _process_names().get(name, ()):
         service = _is_service_argv(_argv_of(pid)) and not _under_t3(pid)
         if service != services:
             continue
@@ -2065,7 +2082,12 @@ def _backfill_omp_history(
 
 
 def _write_aggregate(payload: dict, path: Path = AGGREGATE_PATH) -> None:
-    path = Path(path)
+    # json.dumps encodes in C; json.dump streams through the pure-Python encoder.
+    _write_file(Path(path), json.dumps(payload, separators=(",", ":")), durable=True)
+
+
+def _write_file(path: Path, text: str, durable: bool) -> None:
+    """Replace `path` atomically; `durable` also fsyncs it and its folder."""
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary: Path | None = None
     try:
@@ -2079,17 +2101,19 @@ def _write_aggregate(payload: dict, path: Path = AGGREGATE_PATH) -> None:
         ) as output:
             temporary = Path(output.name)
             os.fchmod(output.fileno(), 0o600)
-            json.dump(payload, output, separators=(",", ":"))
-            output.flush()
-            os.fsync(output.fileno())
+            output.write(text)
+            if durable:
+                output.flush()
+                os.fsync(output.fileno())
         os.replace(temporary, path)
-        directory_fd = os.open(
-            path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-        )
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        if durable:
+            directory_fd = os.open(
+                path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     finally:
         if temporary is not None:
             try:
@@ -2206,26 +2230,33 @@ def _locked_sweep(
             return previous, False
         global _TRANSCRIPT_CACHE, _CACHE_ACTIVE
         cache_path = aggregate_path.with_suffix(".parsers.json")
+        cache_text = ""
         try:
-            saved = json.loads(cache_path.read_text())
+            cache_text = cache_path.read_text()
+            saved = json.loads(cache_text)
             entries = saved.get("entries") if isinstance(saved, dict) and saved.get("version") == _CACHE_VERSION else None
             _TRANSCRIPT_CACHE = entries if isinstance(entries, dict) else {}
         except (OSError, ValueError, UnicodeError):
             _TRANSCRIPT_CACHE = {}
         _CACHE_ACTIVE = set()
         try:
-            records = _build_records()
-            if not _confirmed_boot_change(previous, boot_id):
-                records = _apply_desktop_map(records, desktop_map or {})
-            payload = _merge_snapshot(
-                records, previous, boot_id, int(time.time() * 1000), history_limit
-            )
-            # Inside the cache window, so rollouts it parses stay cached.
-            _backfill_omp_history(payload, history_limit)
-            _backfill_history_recaps(payload["history"])
+            with _process_snapshot():
+                records = _build_records()
+                if not _confirmed_boot_change(previous, boot_id):
+                    records = _apply_desktop_map(records, desktop_map or {})
+                payload = _merge_snapshot(
+                    records, previous, boot_id, int(time.time() * 1000), history_limit
+                )
+                # Inside the cache window, so rollouts it parses stay cached.
+                _backfill_omp_history(payload, history_limit)
+                _backfill_history_recaps(payload["history"])
             _TRANSCRIPT_CACHE = {key: value for key, value in _TRANSCRIPT_CACHE.items()
                                  if key in _CACHE_ACTIVE}
-            _write_aggregate({"version": _CACHE_VERSION, "entries": _TRANSCRIPT_CACHE}, cache_path)
+            text = json.dumps({"version": _CACHE_VERSION, "entries": _TRANSCRIPT_CACHE},
+                              separators=(",", ":"))
+            # A lost or torn cache only costs a full reparse, so it skips fsync.
+            if text != cache_text:
+                _write_file(cache_path, text, durable=False)
         finally:
             _CACHE_ACTIVE = None
         _write_aggregate(payload, aggregate_path)
