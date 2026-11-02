@@ -9,6 +9,7 @@
 ### Fixes
 
 - A single failed Meridian usage poll on a recent reading no longer shows "Refresh failed" on the Claude account; the error appears once Meridian fails again or the reading is 10 minutes old.
+- omp sessions that Tern resumed by file path show their own title and state again, instead of another session's from the same folder.
 
 ## 0.2.0 (2026-10-31)
 

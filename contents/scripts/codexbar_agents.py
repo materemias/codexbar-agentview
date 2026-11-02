@@ -1165,13 +1165,16 @@ def _session_dir_of(pid: int) -> str:
 
 
 def _flag_value(argv: list[str], flag: str) -> str:
-    """The session id given to `flag` in `argv`, or ""."""
+    """The session id given to `flag` in `argv`, or "". omp's --resume
+    also takes a transcript path, `<time>_<id>.jsonl`."""
     value = ""
     for i, a in enumerate(argv):
         if a == flag and i + 1 < len(argv):
             value = argv[i + 1]
         elif a.startswith(flag + "="):
             value = a.split("=", 1)[1]
+    if value.endswith(".jsonl"):
+        value = Path(value).stem.rpartition("_")[2]
     ok = (
         value and len(value) <= 256 and not value.startswith("-")
         and all(c.isalnum() or c == "-" for c in value)

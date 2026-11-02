@@ -738,6 +738,28 @@ class ResumeAndIdentityTests(unittest.TestCase):
         self.assertEqual(info["sessionId"], "01a0-resumed")
         self.assertTrue(info["identityExact"])
 
+    def test_omp_resumed_by_transcript_path_is_named_by_argv(self) -> None:
+        # Tern resumes omp by transcript path; omp closes the file between
+        # writes, and the folder lookup would pick another session.
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            slug = home / ".omp" / "agent" / "sessions" / "-work"
+            slug.mkdir(parents=True)
+            resumed = slug / "2026-09-28T10-00-00-000Z_01a0-resumed.jsonl"
+            resumed.write_text(json.dumps({"type": "session", "id": "01a0-resumed", "cwd": "/work"}) + "\n")
+            other = slug / "2026-09-28T11-00-00-000Z_01a0-other.jsonl"
+            other.write_text(json.dumps({"type": "session", "id": "01a0-other", "cwd": "/work"}) + "\n")
+            with (
+                mock.patch.object(agents.Path, "home", return_value=home),
+                mock.patch.object(agents, "_open_jsonl_under", return_value=("", False)),
+                mock.patch.object(agents, "_argv_of", return_value=["omp", "--resume", str(resumed)]),
+                mock.patch.object(agents, "_find_pi_rollout", return_value=str(other)),
+                mock.patch.object(agents, "_cwd_of", return_value="/work"),
+            ):
+                info = agents._pi_info(42)
+        self.assertEqual(info["sessionId"], "01a0-resumed")
+        self.assertTrue(info["identityExact"])
+
     def test_codex_tuis_match_threads_loaded_by_shared_app_server(self) -> None:
         start = 1_790_000_000_000
         with tempfile.TemporaryDirectory() as directory:
