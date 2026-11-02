@@ -12,6 +12,13 @@ ColumnLayout {
     readonly property var snap: root.agentSnapshot
     readonly property var counts: snap && snap.counts ? snap.counts : ({})
     readonly property var list: snap && Array.isArray(snap.agents) ? snap.agents : []
+    readonly property var recordsByKey: {
+        var out = {}
+        for (var i = 0; i < list.length; i++) {
+            if (list[i]) out[agentKey(list[i])] = list[i]
+        }
+        return out
+    }
     readonly property bool hasSomething: (counts.total || 0) > 0
     readonly property bool showPrompts: Plasmoid.configuration.showAgentPrompts === true
     // Header eye switch: hide sessions in their state for over a day.
@@ -515,17 +522,21 @@ ColumnLayout {
     // Folder-grouped session rows. Each group is a card: a small
     // uppercase folder header followed by its session rows.
     Repeater {
-        model: agents.groups
+        // Folder names and session keys, not records: a Repeater rebuilds
+        // every delegate when its model's content changes, and records
+        // change on every turn. Rows look their record up by key instead.
+        model: agents.groups.map(function(g) { return g.folder })
         delegate: SectionCard {
             id: groupItem
-            required property var modelData
-            title: groupItem.modelData.folder
-            visible: groupItem.modelData.sessions.some(function(s) {
+            required property int index
+            readonly property var group: agents.groups[index] || { folder: "", sessions: [] }
+            title: groupItem.group.folder
+            visible: groupItem.group.sessions.some(function(s) {
                 return agents.recordShown(s)
             })
 
             Repeater {
-                model: groupItem.modelData.sessions
+                model: groupItem.group.sessions.map(agents.agentKey)
                 delegate: sessionRow
             }
         }
@@ -538,16 +549,18 @@ ColumnLayout {
         Item {
             id: rowItem
             Layout.fillWidth: true
-            required property var modelData
-            visible: agents.recordShown(modelData)
+            // The session key; `record` follows the latest snapshot.
+            required property string modelData
+            readonly property var record: agents.recordsByKey[modelData] || ({})
+            visible: agents.recordShown(record)
 
             implicitHeight: rowCol.implicitHeight + 4
-            readonly property string sessionKey: agents.agentKey(modelData)
+            readonly property string sessionKey: modelData
             readonly property bool peekOpen: sessionKey !== ""
                 && sessionKey === agents.peekKey
 
-            readonly property var filterSnippets: agents.filterSnippets(modelData,
-                agents.shownFields([[agents.labelField(modelData), taskText],
+            readonly property var filterSnippets: agents.filterSnippets(record,
+                agents.shownFields([[agents.labelField(record), taskText],
                     ["model", modelText]]))
 
             // Row + optional peek panel stacked. The panel grows inside the
@@ -597,8 +610,8 @@ ColumnLayout {
                     }
 
                     Kirigami.Icon {
-                        source: rowItem.modelData.provider
-                            ? Qt.resolvedUrl("../icons/" + rowItem.modelData.provider + ".svg")
+                        source: rowItem.record.provider
+                            ? Qt.resolvedUrl("../icons/" + rowItem.record.provider + ".svg")
                             : ""
                         implicitWidth: Kirigami.Units.iconSizes.small
                         implicitHeight: Kirigami.Units.iconSizes.small
@@ -617,9 +630,9 @@ ColumnLayout {
 
                     PC3.Label {
                         id: modelText
-                        text: agents.highlighted(agents._modelName(rowItem.modelData.model))
+                        text: agents.highlighted(agents._modelName(rowItem.record.model))
                         textFormat: agents.filterText ? Text.StyledText : Text.PlainText
-                        color: root.modelTint(rowItem.modelData.model)
+                        color: root.modelTint(rowItem.record.model)
                         opacity: 0.85
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         elide: Text.ElideMiddle
@@ -629,7 +642,7 @@ ColumnLayout {
                     }
 
                     PC3.Label {
-                        text: rowItem.modelData.host || ""
+                        text: rowItem.record.host || ""
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         opacity: 0.55
                         elide: Text.ElideRight
@@ -638,8 +651,8 @@ ColumnLayout {
                     }
 
                     PC3.Label {
-                        text: root.ageFrom(rowItem.modelData.stateChangedAt, root.nowMs)
-                        opacity: agents.ageOpacity(rowItem.modelData.stateChangedAt)
+                        text: root.ageFrom(rowItem.record.stateChangedAt, root.nowMs)
+                        opacity: agents.ageOpacity(rowItem.record.stateChangedAt)
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         font.weight: opacity === 1 ? Font.DemiBold : Font.Normal
                         horizontalAlignment: Text.AlignRight
@@ -699,13 +712,13 @@ ColumnLayout {
                 // Claude when you return to one); "Earlier:" marks one that
                 // turns have since followed.
                 PC3.Label {
-                    visible: !!rowItem.modelData.recap && rowItem.selected
+                    visible: !!rowItem.record.recap && rowItem.selected
                     Layout.fillWidth: true
                     Layout.leftMargin: 26
                     Layout.rightMargin: 4
                     Layout.bottomMargin: 2
-                    text: (rowItem.modelData.recapStale ? "Earlier: " : "")
-                        + (rowItem.modelData.recap || "")
+                    text: (rowItem.record.recapStale ? "Earlier: " : "")
+                        + (rowItem.record.recap || "")
                     textFormat: Text.PlainText
                     wrapMode: Text.WordWrap
                     maximumLineCount: 3
@@ -785,8 +798,8 @@ ColumnLayout {
 
                         PC3.Label {
                             Layout.fillWidth: true
-                            text: (rowItem.modelData.cwd || "").replace(/^\/home\/[^\/]+/, "~")
-                                + (rowItem.modelData.host ? "  ·  " + rowItem.modelData.host : "")
+                            text: (rowItem.record.cwd || "").replace(/^\/home\/[^\/]+/, "~")
+                                + (rowItem.record.host ? "  ·  " + rowItem.record.host : "")
                             textFormat: Text.PlainText
                             font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                             opacity: 0.5
@@ -794,12 +807,12 @@ ColumnLayout {
                         }
 
                         Repeater {
-                            model: rowItem.modelData.recent || []
+                            model: rowItem.record.recent || []
                             delegate: TurnBubble {}
                         }
 
                         PC3.Label {
-                            visible: ((rowItem.modelData.recent || []).length === 0)
+                            visible: ((rowItem.record.recent || []).length === 0)
                             text: "no messages captured yet"
                             textFormat: Text.PlainText
                             font.pixelSize: Kirigami.Theme.smallFont.pixelSize
@@ -823,7 +836,7 @@ ColumnLayout {
             // five minutes. Drives the "just finished" green background wash.
             readonly property real _idleFreshness: {
                 if (rowItem.state !== "idle") return 0
-                var since = rowItem.modelData.stateChangedAt || 0
+                var since = rowItem.record.stateChangedAt || 0
                 if (!since) return 0
                 var age = root.nowMs - since
                 return age >= 300000 ? 0 : (300000 - age) / 300000
@@ -871,16 +884,16 @@ ColumnLayout {
                 Behavior on opacity { NumberAnimation { duration: 120 } }
             }
 
-            readonly property string state: modelData.state || "idle"
+            readonly property string state: record.state || "idle"
             readonly property color tint: root.agentStateColor(state)
             // Desktop badge data for this row, or null when the host
             // window didn't resolve against Plasma's task list.
-            readonly property var desktopInfo: root.desktopInfoFor(modelData)
+            readonly property var desktopInfo: root.desktopInfoFor(record)
             // Prefer the agent-generated session title. Only fall through
             // to the raw user prompt when the user has opted into showing
             // it (otherwise the row just shows the provider name).
             readonly property string taskLabel:
-                modelData[agents.labelField(modelData)] || "agent"
+                record[agents.labelField(record)] || "agent"
 
             // "Just finished" highlight: true while the existing freshness
             // value remains above zero.
@@ -888,8 +901,8 @@ ColumnLayout {
 
             // Idle for over a day: the row content is dimmed.
             readonly property bool staleIdle: state === "idle"
-                && (modelData.stateChangedAt || 0) > 0
-                && root.nowMs - modelData.stateChangedAt >= 86400000
+                && (record.stateChangedAt || 0) > 0
+                && root.nowMs - record.stateChangedAt >= 86400000
 
             MouseArea {
                 id: rowMouse
@@ -903,9 +916,9 @@ ColumnLayout {
                 cursorShape: Qt.PointingHandCursor
                 acceptedButtons: Qt.LeftButton
                 onClicked: {
-                    if (!rowItem.modelData.sessionId) return
+                    if (!rowItem.record.sessionId) return
                     Qt.openUrlExternally(
-                        "codexbar-agentview://focus/" + rowItem.modelData.sessionId
+                        "codexbar-agentview://focus/" + rowItem.record.sessionId
                     )
                 }
             }
@@ -933,14 +946,14 @@ ColumnLayout {
                     PC3.ToolButton {
                         id: teleportButton
                         readonly property bool idle: rowItem.state === "idle"
-                        visible: root.canTeleport(rowItem.modelData)
+                        visible: root.canTeleport(rowItem.record)
                         enabled: !root.teleports[rowItem.sessionKey]
                         opacity: idle ? 1 : 0.4
                         icon.name: "tab-new"
                         implicitWidth: Kirigami.Units.iconSizes.smallMedium + 6
                         implicitHeight: Kirigami.Units.iconSizes.smallMedium + 6
                         padding: 1
-                        onClicked: root.teleportAgent(rowItem.modelData)
+                        onClicked: root.teleportAgent(rowItem.record)
                         PC3.ToolTip.visible: hovered
                         PC3.ToolTip.text: idle
                             ? "Teleport to a new Tern tab (closes this kitty window)"
@@ -965,9 +978,9 @@ ColumnLayout {
             }
 
             PC3.ToolTip.visible: rowMouse.containsMouse
-                && (rowItem.modelData.cwd || "").length > 0
-            PC3.ToolTip.text: (rowItem.modelData.cwd || "")
-                + (rowItem.modelData.host ? "  (" + rowItem.modelData.host + ")" : "")
+                && (rowItem.record.cwd || "").length > 0
+            PC3.ToolTip.text: (rowItem.record.cwd || "")
+                + (rowItem.record.host ? "  (" + rowItem.record.host + ")" : "")
                 + "\nclick to focus · peek button or Space for recent messages"
             PC3.ToolTip.delay: 600
         }

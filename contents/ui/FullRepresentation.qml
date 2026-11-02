@@ -27,10 +27,7 @@ Item {
         if (!s || !s.counts) return 0
         return s.counts.total || 0
     }
-    readonly property var historyList: {
-        var s = root.agentSnapshot
-        return s && Array.isArray(s.history) ? s.history : []
-    }
+    readonly property var historyList: root.agentHistory
     readonly property int rebootCount: historyList.filter(function(r) {
         return r && r.closedBy === "reboot"
     }).length

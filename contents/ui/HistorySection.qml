@@ -15,10 +15,7 @@ ColumnLayout {
     // AgentsSection owns the type-to-filter query and name helpers.
     required property var agentsView
 
-    readonly property var records: {
-        var s = root.agentSnapshot
-        return s && Array.isArray(s.history) ? s.history : []
-    }
+    readonly property var records: root.agentHistory
     // Render models ignore the filter: typing toggles row visibility
     // instead of rebuilding every delegate on each keystroke. `rebooted`,
     // `exited` and `filtered` hold the matching rows for selection, counts

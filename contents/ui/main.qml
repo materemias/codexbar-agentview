@@ -44,12 +44,17 @@ PlasmoidItem {
         codexRotation: null,
         cliVersion: null
     })
+    // Live sessions and ended ones (agentHistory) are replaced only when
+    // their content changes: a new array rebuilds every row delegate, and
+    // each sweep rewrites agents.json while History rarely changes.
     property var agentSnapshot: ({
         updatedAt: "",
         counts: { working: 0, blocked: 0, idle: 0, untracked: 0, total: 0 },
-        agents: [],
-        history: []
+        agents: []
     })
+    property var agentHistory: []
+    property string _agentSnapshotKey: ""
+    property string _agentHistoryKey: ""
     property bool loading: false
     property bool agentsLoading: false
     property bool aggregatorLoading: false
@@ -526,11 +531,10 @@ PlasmoidItem {
             hide[JSON.stringify([r.provider, r.sessionId])] = true
         }
         if (pairs.length === 0) return
-        var snap = Object.assign({}, root.agentSnapshot)
-        snap.history = (snap.history || []).filter(function(r) {
+        root.agentHistory = root.agentHistory.filter(function(r) {
             return !hide[JSON.stringify([r.provider, r.sessionId])]
         })
-        root.agentSnapshot = snap
+        root._agentHistoryKey = ""
         dismissRunner.run("python3 " + Command.shellQuote(root.aggregatorScriptPath)
             + " --dismiss " + Command.shellQuote(encodeURIComponent(JSON.stringify(pairs))))
     }
@@ -769,7 +773,8 @@ PlasmoidItem {
             }
             try {
                 var parsed = JSON.parse(text)
-                if (!Array.isArray(parsed.history)) parsed.history = []
+                var history = Array.isArray(parsed.history) ? parsed.history : []
+                delete parsed.history
                 var transition = Notifications.agents(root.agentNotificationState,
                     Array.isArray(parsed.agents) ? parsed.agents : [], root.agentNotificationsEnabled)
                 root.agentNotificationState = transition.state
@@ -779,7 +784,7 @@ PlasmoidItem {
                     return a && (root.includeUntrackedAgents || a.state !== "untracked")
                 })
                 if (!root.includeUntrackedAgents) {
-                    parsed.history = parsed.history.filter(function(r) {
+                    history = history.filter(function(r) {
                         if (!r) return false
                         var sid = String(r.sessionId || "")
                         var prefix = "untracked-" + String(r.provider || "") + "-"
@@ -796,7 +801,19 @@ PlasmoidItem {
                         parsed.counts[state]++
                     }
                 }
-                root.agentSnapshot = parsed
+                var historyKey = JSON.stringify(history)
+                if (historyKey !== root._agentHistoryKey) {
+                    root._agentHistoryKey = historyKey
+                    root.agentHistory = history
+                }
+                // Every sweep restamps updatedAt, which no view shows.
+                var snapshotKey = JSON.stringify(parsed, function(key, value) {
+                    return key === "updatedAt" ? undefined : value
+                })
+                if (snapshotKey !== root._agentSnapshotKey) {
+                    root._agentSnapshotKey = snapshotKey
+                    root.agentSnapshot = parsed
+                }
                 root.agentsError = ""
             } catch (err) {
                 root.agentsError = "parse error: " + err.message
@@ -810,9 +827,11 @@ PlasmoidItem {
         root.agentSnapshot = {
             updatedAt: "",
             counts: { working: 0, blocked: 0, idle: 0, untracked: 0, total: 0 },
-            agents: [],
-            history: []
+            agents: []
         }
+        root.agentHistory = []
+        root._agentSnapshotKey = ""
+        root._agentHistoryKey = ""
     }
 
     function refresh() {
