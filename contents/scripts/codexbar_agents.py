@@ -39,6 +39,7 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, NamedTuple
 from urllib.parse import unquote
 
 import state_paths
@@ -110,7 +111,8 @@ _MODEL_MAX_CHARS = 160
 # Loaded and saved only while the aggregate writer owns its flock.
 _TRANSCRIPT_CACHE: dict = {}
 _CACHE_ACTIVE: set[str] | None = None
-_CACHE_VERSION = 1
+# 2: Claude transcripts record their session id, folder and state.
+_CACHE_VERSION = 2
 
 
 # ---------------------------------------------------------------------------
@@ -638,6 +640,19 @@ def _parse_record(provider: str, state: dict, rec: dict) -> None:
                     tool = tool or _text(part.get("name"))
         if role == "assistant":
             state["model"] = _record_model(rec) or state["model"]
+        if not rec.get("isSidechain"):
+            state["sessionId"] = _session_id(rec.get("sessionId")) or state["sessionId"]
+            # The first record's folder is the project the transcript is
+            # filed under; later ones follow `cd` in shell mode.
+            state["cwd"] = state["cwd"] or _text(rec.get("cwd"))[:4096]
+            if role == "assistant":
+                state["state"] = "working" if inner.get("stop_reason") == "tool_use" else "idle"
+            # Slash-command output, interrupts and other meta records leave
+            # the turn as it was; a tool result or a typed prompt starts one.
+            elif not rec.get("isMeta") and (_is_real_user_prompt(text) or (
+                    isinstance(content, list) and any(
+                        isinstance(p, dict) and p.get("type") == "tool_result" for p in content))):
+                state["state"] = "working"
     elif provider == "codex":
         if t in ("session_meta", "turn_context"):
             state["model"] = _record_model(rec, payload) or state["model"]
@@ -809,19 +824,23 @@ def _claude_slug(cwd: str) -> str:
     return "".join(("-" if c in "/_." else c) for c in cwd) if cwd else ""
 
 
+def _claude_state(pid: int) -> dict:
+    """The state file a running Claude Code keeps in ~/.claude/sessions,
+    or {} when it has none."""
+    try:
+        rec = json.loads((Path.home() / ".claude" / "sessions" / f"{pid}.json").read_text())
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return rec if isinstance(rec, dict) else {}
+
+
 def _claude_info(pid: int) -> dict:
     info = {
         "sessionId": "", "cwd": "", "windowTitle": "", "lastPrompt": "",
         "state": "working", "identityExact": False, "model": "",
     }
-    state_file = Path.home() / ".claude" / "sessions" / f"{pid}.json"
-    if not state_file.is_file():
-        return info
-    try:
-        rec = json.loads(state_file.read_text())
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return info
-    if not isinstance(rec, dict):
+    rec = _claude_state(pid)
+    if not rec:
         return info
     sid = _session_id(rec.get("sessionId"))
     cwd = _text(rec.get("cwd")) or _cwd_of(pid)
@@ -1853,7 +1872,7 @@ def _merge_snapshot(
         "history": rebooted + exited,
         # Live kitty rows offer a move to Tern only when it is installed.
         "ternInstalled": bool(tern_bin()),
-        "ompBackfill": _omp_backfill_state(previous.get("ompBackfill")),
+        "backfill": _saved_backfill(previous),
     }
 
 
@@ -1870,7 +1889,7 @@ def _aggregate(
     payload = _merge_snapshot(
         records, previous, boot_id, int(time.time() * 1000), history_limit
     )
-    _backfill_omp_history(payload, history_limit)
+    _backfill_history(payload, history_limit)
     _backfill_history_recaps(payload["history"])
     return payload
 
@@ -1916,25 +1935,40 @@ def _mtime_ms(path: str) -> int:
         return 0
 
 
-def _omp_backfill_state(value: object) -> dict:
+def _saved_backfill(payload: dict) -> dict:
+    """The payload's backfill state. Before Claude Code joined backfill,
+    omp's state alone was saved under `ompBackfill`."""
+    value = payload.get("backfill")
+    legacy = payload.get("ompBackfill")
+    if value is None and isinstance(legacy, dict):
+        value = {"floor": legacy.get("floor"), "skip": {"omp": legacy.get("skip")}}
+    return _backfill_state(value)
+
+
+def _backfill_state(value: object) -> dict:
     """`floor`: the oldest exit a full history kept; backfill adds nothing
     at or below it, so dismissing rows does not pull older sessions in.
-    `skip`: omp session id → the activity time backfill last turned it
-    away at, or the user dismissed it at. It comes back only once its
+    `skip`: provider → session id → the activity time backfill last turned
+    it away at, or the user dismissed it at. It comes back only once its
     transcript changes after that time."""
     value = value if isinstance(value, dict) else {}
     floor = value.get("floor")
     skip = value.get("skip")
+    skip = skip if isinstance(skip, dict) else {}
     return {
         "floor": floor if type(floor) is int and floor > 0 else 0,
         "skip": {
-            sid: at for sid, at in skip.items()
-            if isinstance(sid, str) and 0 < len(sid) <= 256 and type(at) is int and at > 0
-        } if isinstance(skip, dict) else {},
+            provider: {
+                sid: at for sid, at in ids.items()
+                if isinstance(sid, str) and 0 < len(sid) <= 256 and type(at) is int and at > 0
+            }
+            for provider, ids in skip.items()
+            if provider in _BACKFILL_SOURCES and isinstance(ids, dict)
+        },
     }
 
 
-def _omp_prompt_sessions(db: Path) -> dict[str, tuple[int, str]]:
+def _omp_prompt_sessions() -> dict[str, tuple[int, str]]:
     """Session id → (last prompt time in ms, title) for every omp session in
     omp's prompt history.
 
@@ -1942,6 +1976,7 @@ def _omp_prompt_sessions(db: Path) -> dict[str, tuple[int, str]]:
     subagents write none. A prompt typed again moves to the newer session,
     so a session whose every prompt was later repeated is missing. An
     unreadable database yields nothing."""
+    db = Path.home() / ".omp" / "agent" / "history.db"
     if not db.is_file():
         return {}
     try:
@@ -1971,19 +2006,78 @@ def _omp_prompt_sessions(db: Path) -> dict[str, tuple[int, str]]:
     }
 
 
-def _live_omp_transcripts() -> tuple[set[str], set[str]]:
-    """Transcripts that running omp processes hold open, and the folders of
-    interactive omp processes that hold none. Covers processes the sweep
-    does not list: no terminal host, or a session it could not resolve.
-    Background omp (workers, rpc) counts only by the transcript it holds:
-    its workers run in a session's folder without being one."""
+def _claude_prompt_sessions() -> dict[str, tuple[int, str]]:
+    """Session id → (last prompt time in ms, "") for every Claude Code
+    session in `~/.claude/history.jsonl`, the prompt history behind its
+    up-arrow. Only interactive sessions write it: `claude -p` and SDK runs,
+    Meridian's included, do not. Titles come from the transcript.
+
+    Claude Code only appends to it, so a sweep parses only the lines added
+    since the last one; the index lives in the parser cache."""
+    path = Path.home() / ".claude" / "history.jsonl"
+    key = "claude-history:" + str(path)
+    if _CACHE_ACTIVE is not None:
+        _CACHE_ACTIVE.add(key)
+    cached = _TRANSCRIPT_CACHE.get(key)
+    try:
+        with open(path, "rb") as source:
+            stat = os.fstat(source.fileno())
+            offset, latest = 0, {}
+            if (isinstance(cached, dict) and cached.get("inode") == stat.st_ino
+                    and isinstance(cached.get("offset"), int)
+                    and 0 <= cached["offset"] <= stat.st_size
+                    and isinstance(cached.get("sessions"), dict)):
+                offset, latest = cached["offset"], cached["sessions"]
+            source.seek(offset)
+            data = source.read()
+    except OSError:
+        return {}
+    # A line still being written is read again next time.
+    end = data.rfind(b"\n") + 1
+    for line in data[:end].splitlines():
+        try:
+            rec = json.loads(line)
+        except (ValueError, UnicodeError):
+            continue
+        if not isinstance(rec, dict):
+            continue
+        sid, at = rec.get("sessionId"), rec.get("timestamp")
+        if (isinstance(sid, str) and 0 < len(sid) <= 256 and type(at) is int
+                and at > latest.get(sid, 0)):
+            latest[sid] = at
+    _TRANSCRIPT_CACHE[key] = {"inode": stat.st_ino, "offset": offset + end, "sessions": latest}
+    return {
+        sid: (at, "") for sid, at in latest.items()
+        if isinstance(sid, str) and type(at) is int
+    }
+
+
+def _claude_rollouts() -> dict[str, str]:
+    """Map Claude Code session ids to their transcript paths. Subagent
+    transcripts sit a level deeper and are not matched. When two project
+    folders hold one id, the newer transcript is the one in use."""
+    rollouts: dict[str, str] = {}
+    for path in (Path.home() / ".claude" / "projects").glob("*/*.jsonl"):
+        other = rollouts.get(path.stem)
+        if other is None or _mtime_ms(str(path)) > _mtime_ms(other):
+            rollouts[path.stem] = str(path)
+    return rollouts
+
+
+def _live_omp_sessions() -> tuple[set[str], set[str]]:
+    """Session ids running omp processes hold open, and the folders of
+    interactive omp processes whose own session is unknown. Covers
+    processes the sweep does not list: no terminal host, or a session it
+    could not resolve. Background omp (workers, rpc) counts only by the
+    transcript it holds: its workers run in a session's folder without
+    being one."""
     held: set[str] = set()
     unresolved: set[str] = set()
     for services in (False, True):
         for pid in _pgrep("omp", services=services):
             rollout, direct = _open_jsonl_under(pid, "/.omp/agent/sessions/")
             if rollout:
-                held.add(os.path.realpath(rollout))
+                held.add(Path(rollout).stem.rpartition("_")[2])
             # A rollout reached only through a sidecar may be another
             # process's session, so this one's own may still be unknown.
             if not direct and not services and (cwd := _cwd_of(pid)):
@@ -1991,92 +2085,135 @@ def _live_omp_transcripts() -> tuple[set[str], set[str]]:
     return held, unresolved
 
 
-def _backfill_omp_history(
-    payload: dict, history_limit: int = HISTORY_LIMIT, db: Path | None = None
-) -> None:
-    """Add omp sessions that ended while no sweep watched them, or before
-    CodexBar AgentView ran, from omp's own prompt history.
+def _live_claude_sessions() -> tuple[set[str], set[str]]:
+    """Session ids running Claude Code processes write, and the folders
+    whose session a running one writes without saying which.
 
-    A session qualifies while its transcript and folder exist and no omp
+    Each names its own in its state file. Without one, an interactive or
+    T3 process may still name it by `--resume`/`--session-id`; a headless
+    one (`-p`, SDK) resumes a typed session only that way, or continues the
+    folder's latest with `--continue`. Other headless processes start a
+    fresh session, which prompt history never lists, so they block nothing."""
+    held: set[str] = set()
+    unresolved: set[str] = set()
+    for services in (False, True):
+        for pid in _pgrep("claude", services=services):
+            sid = _session_id(_claude_state(pid).get("sessionId"))
+            argv = [] if sid else _argv_of(pid)
+            for flag in ("--resume", "-r", "--session-id"):
+                sid = sid or _flag_value(argv, flag)
+            if sid:
+                held.add(sid)
+            elif (not services or "--continue" in argv or "-c" in argv) and (cwd := _cwd_of(pid)):
+                unresolved.add(cwd)
+    return held, unresolved
+
+
+class _BackfillSource(NamedTuple):
+    sessions: Callable[[], dict[str, tuple[int, str]]]
+    rollouts: Callable[[], dict[str, str]]
+    parser: str
+    live: Callable[[], tuple[set[str], set[str]]]
+
+
+# Providers whose own prompt history lists their interactive sessions.
+_BACKFILL_SOURCES = {
+    "claude": _BackfillSource(
+        _claude_prompt_sessions, _claude_rollouts, "claude", _live_claude_sessions,
+    ),
+    "omp": _BackfillSource(_omp_prompt_sessions, _omp_rollouts, "pi", _live_omp_sessions),
+}
+
+
+def _backfill_history(payload: dict, history_limit: int = HISTORY_LIMIT) -> None:
+    """Add sessions that ended while no sweep watched them, or before
+    CodexBar AgentView ran, from each provider's own prompt history.
+
+    A session qualifies while its transcript and folder exist and no
     process runs it. Rows already in history win. Candidates rank by
     transcript mtime, which no turn in it can postdate, so the newest
     `history_limit` are found without reading older transcripts."""
-    state = payload["ompBackfill"]
-    floor, skip = state["floor"], state["skip"]
-    sessions = _omp_prompt_sessions(db or Path.home() / ".omp" / "agent" / "history.db")
-    if sessions:
-        # Entries at or below the floor can no longer pass it anyway.
-        state["skip"] = skip = {
-            sid: at for sid, at in skip.items() if sid in sessions and at > floor
-        }
+    state = payload["backfill"]
+    floor = state["floor"]
     known = {
-        key[1] for key in map(_record_key, payload["agents"] + payload["history"])
-        if key is not None and key[0] == "omp"
+        key for key in map(_record_key, payload["agents"] + payload["history"])
+        if key is not None
     }
+    candidates = []
+    for provider, source in _BACKFILL_SOURCES.items():
+        sessions = source.sessions()
+        skip = state["skip"].get(provider, {})
+        if sessions:
+            # Entries at or below the floor can no longer pass it anyway.
+            skip = {sid: at for sid, at in skip.items() if sid in sessions and at > floor}
+        state["skip"][provider] = skip
+        fresh = [sid for sid in sessions if (provider, sid) not in known]
+        rollouts = source.rollouts() if fresh else {}
+        for sid in fresh:
+            rollout = rollouts.get(sid)
+            if not rollout:
+                continue
+            prompt_ms, title = sessions[sid]
+            bound = max(_mtime_ms(rollout), prompt_ms)
+            if bound > floor and bound > skip.get(sid, 0):
+                candidates.append((bound, provider, sid, rollout, prompt_ms, title))
+    candidates.sort(reverse=True)
     history = payload["history"]
     exited = [r for r in history if r["closedBy"] == "exit"]
     # The `history_limit` newest exits so far; a candidate that cannot beat
     # the oldest of them once there are that many is not read.
     kept = heapq.nlargest(history_limit, (r["lastSeenAt"] for r in exited))
     heapq.heapify(kept)
-    candidates = []
-    rollouts = _omp_rollouts() if any(sid not in known for sid in sessions) else {}
-    for sid, (prompt_ms, title) in sessions.items():
-        rollout = rollouts.get(sid)
-        if sid in known or not rollout:
-            continue
-        bound = max(_mtime_ms(rollout), prompt_ms)
-        if bound > floor and bound > skip.get(sid, 0):
-            candidates.append((bound, sid, rollout, prompt_ms, title))
-    candidates.sort(reverse=True)
-    added: dict[str, dict] = {}
-    bounds: dict[str, int] = {}
-    live: tuple[set[str], set[str]] | None = None
+    added: dict[tuple[str, str], tuple[dict, int]] = {}
+    live: dict[str, tuple[set[str], set[str]]] = {}
     host = "tern" if payload.get("ternInstalled") else "kitty"
-    for bound, sid, rollout, prompt_ms, title in candidates:
+    for bound, provider, sid, rollout, prompt_ms, title in candidates:
         if len(kept) >= history_limit and bound <= kept[0]:
             break
-        info = _transcript_info(rollout, "pi")
+        source = _BACKFILL_SOURCES[provider]
+        info = _transcript_info(rollout, source.parser)
         cwd = info["cwd"]
         recent = _history_turns(info["recent"])
         last_seen = max([prompt_ms, *(turn.get("ts", 0) for turn in recent)])
         if (info["sessionId"] != sid or not cwd or not Path(cwd).is_dir()
                 or last_seen <= floor):
-            skip[sid] = bound
+            state["skip"][provider][sid] = bound
             continue
-        if live is None:
-            live = _live_omp_transcripts()
+        if provider not in live:
+            live[provider] = source.live()
         # Still running: it reaches history when a sweep sees it end.
-        if os.path.realpath(rollout) in live[0] or cwd in live[1]:
+        if sid in live[provider][0] or cwd in live[provider][1]:
             continue
         state_name = info["state"]
-        added[sid] = _history_record({
-            "provider": "omp",
+        added[(provider, sid)] = (_history_record({
+            "provider": provider,
             "sessionId": sid,
             "cwd": cwd,
             "windowTitle": info["windowTitle"] or title,
             "lastPrompt": info["lastPrompt"],
-            # Resumes open where omp usually runs: Tern when installed.
+            # Resumes open in Tern when it is installed.
             "host": host,
             "lastState": state_name if state_name in ("working", "blocked", "idle") else "idle",
             "lastSeenAt": last_seen,
             "model": info["model"],
-            "resumeCommand": _resume_command("omp", sid, cwd, True),
+            "resumeCommand": _resume_command(provider, sid, cwd, True),
             "closedBy": "exit",
             "recent": recent,
-        }, active=False)
-        bounds[sid] = bound
+            "recap": info["recap"],
+            "recapStale": info["recapStale"],
+        }, active=False), bound)
         heapq.heappush(kept, last_seen)
         if len(kept) > history_limit:
             heapq.heappop(kept)
     if added:
         exited = sorted(
-            exited + list(added.values()), key=lambda r: r["lastSeenAt"], reverse=True
+            exited + [row for row, _bound in added.values()],
+            key=lambda r: r["lastSeenAt"], reverse=True,
         )[:history_limit]
         payload["history"] = [r for r in history if r["closedBy"] == "reboot"] + exited
         # Rows the limit cut stay out until their transcript changes.
-        for sid in added.keys() - {r["sessionId"] for r in exited}:
-            skip[sid] = bounds[sid]
+        for key in added.keys() - {_record_key(r) for r in exited}:
+            state["skip"][key[0]][key[1]] = added[key][1]
     if len(exited) >= history_limit:
         state["floor"] = max(floor, min(r["lastSeenAt"] for r in exited))
 
@@ -2181,17 +2318,24 @@ def _dismiss_history(
         gone = [r for r in payload["history"] if _record_key(r) in keys]
         if gone:
             payload["history"] = kept
-            # omp's prompt history would bring a dismissed omp session back;
-            # it stays out until its transcript changes.
-            state = _omp_backfill_state(payload.get("ompBackfill"))
-            omp_gone = [r for r in gone if r["provider"] == "omp"]
-            rollouts = _omp_rollouts() if omp_gone else {}
-            for r in omp_gone:
+            # A source's prompt history would bring a dismissed session
+            # back; it stays out until its transcript changes.
+            state = _saved_backfill(payload)
+            rollouts: dict[str, dict[str, str]] = {}
+            for r in gone:
+                source = _BACKFILL_SOURCES.get(r["provider"])
+                if source is None:
+                    continue
+                if r["provider"] not in rollouts:
+                    rollouts[r["provider"]] = source.rollouts()
                 seen = r.get("lastSeenAt")
                 seen = seen if type(seen) is int else 0
-                rollout = rollouts.get(r["sessionId"])
-                state["skip"][r["sessionId"]] = max(seen, _mtime_ms(rollout) if rollout else 0, 1)
-            payload["ompBackfill"] = state
+                rollout = rollouts[r["provider"]].get(r["sessionId"])
+                state["skip"].setdefault(r["provider"], {})[r["sessionId"]] = max(
+                    seen, _mtime_ms(rollout) if rollout else 0, 1
+                )
+            payload["backfill"] = state
+            payload.pop("ompBackfill", None)
             _write_aggregate(payload, aggregate_path)
         return len(gone)
 
@@ -2248,7 +2392,7 @@ def _locked_sweep(
                     records, previous, boot_id, int(time.time() * 1000), history_limit
                 )
                 # Inside the cache window, so rollouts it parses stay cached.
-                _backfill_omp_history(payload, history_limit)
+                _backfill_history(payload, history_limit)
                 _backfill_history_recaps(payload["history"])
             _TRANSCRIPT_CACHE = {key: value for key, value in _TRANSCRIPT_CACHE.items()
                                  if key in _CACHE_ACTIVE}

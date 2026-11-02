@@ -394,6 +394,21 @@ def launch(provider: str, session_id: str) -> int:
         sys.stderr.write("codexbar_focus: no history record for session\n")
         return 2
     cwd = record.get("cwd") if isinstance(record.get("cwd"), str) else ""
+    source = agents._BACKFILL_SOURCES.get(provider)
+    if source is not None:
+        # The saved list misses processes the sweep doesn't show: headless
+        # resumes, hosts it doesn't know, or one that started since. One
+        # writing a session it can't name may be writing this one.
+        with agents._process_snapshot():
+            held, unresolved = source.live()
+        if session_id in held:
+            sys.stderr.write("codexbar_focus: session is already running\n")
+            return 5
+        if cwd in unresolved:
+            sys.stderr.write(
+                f"codexbar_focus: a running {provider} in {cwd} may be writing this session\n"
+            )
+            return 5
     command = record.get("resumeCommand")
     if not command or command != agents._resume_command(
         provider, session_id, cwd, True, record.get("codexHome")

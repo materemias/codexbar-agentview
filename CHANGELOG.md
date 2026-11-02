@@ -4,7 +4,7 @@
 
 ### Features
 
-- History lists omp sessions that closed while the widget wasn't watching, or before it was installed, read from omp's prompt history.
+- History lists omp and Claude Code sessions that closed while the widget wasn't watching, or before it was installed, read from their prompt history.
 
 ### Fixes
 

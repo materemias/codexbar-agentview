@@ -14,6 +14,17 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "contents" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import codexbar_focus as focus  # noqa: E402
 
+_PGREP = mock.patch.object(focus.agents, "_pgrep", return_value=[])
+
+
+def setUpModule() -> None:
+    # launch() looks for processes writing the session; keep the real ones out.
+    _PGREP.start()
+
+
+def tearDownModule() -> None:
+    _PGREP.stop()
+
 
 def entry(**changes: object) -> dict:
     record = {
@@ -74,6 +85,25 @@ class LaunchTests(unittest.TestCase):
             ):
                 code = focus.launch("omp", "sid-1")
         return code, popen, place, switch, stderr.getvalue()
+
+    def test_session_a_process_outside_the_saved_list_may_write_is_refused(self) -> None:
+        # A headless resume, or a host the sweep doesn't list: one holds the
+        # transcript open, the other holds none in the record's folder.
+        for held, cwd, message in (
+            ("/s/-work/2026_sid-1.jsonl", "/elsewhere", "already running"),
+            ("", "/work/project", "may be writing this session"),
+        ):
+            with (
+                self.subTest(message),
+                mock.patch.object(focus.agents, "_pgrep", side_effect=lambda _n, services=False:
+                                  [] if services else [77]),
+                mock.patch.object(focus.agents, "_open_jsonl_under", return_value=(held, bool(held))),
+                mock.patch.object(focus.agents, "_cwd_of", return_value=cwd),
+            ):
+                code, popen, *_rest, stderr = self.launch({"agents": [], "history": [entry()]})
+            self.assertEqual(code, 5)
+            popen.assert_not_called()
+            self.assertIn(message, stderr)
 
     def test_verified_kitty_record_switches_desktop_then_launches_in_scope(self) -> None:
         code, popen, place, switch, _ = self.launch({"agents": [], "history": [entry()]})

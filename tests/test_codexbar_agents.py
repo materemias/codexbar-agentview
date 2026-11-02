@@ -248,7 +248,7 @@ class SnapshotMergeTests(unittest.TestCase):
 
         self.assertEqual(
             set(snapshot),
-            {"bootId", "updatedAt", "counts", "agents", "history", "ternInstalled", "ompBackfill"},
+            {"bootId", "updatedAt", "counts", "agents", "history", "ternInstalled", "backfill"},
         )
         self.assertEqual(snapshot["bootId"], "boot-b")
         self.assertEqual(snapshot["agents"], [])
@@ -1152,7 +1152,7 @@ class OmpRecapTests(unittest.TestCase):
         self.assertEqual(row["recent"][0]["ts"], 500_000_000)
 
 
-class OmpBackfillTests(unittest.TestCase):
+class HistoryBackfillTests(unittest.TestCase):
     def _home(self, directory: str, sessions: dict[str, tuple]) -> Path:
         """omp files for sessions {id: (cwd, last prompt seconds[, answer seconds])}."""
         home = Path(directory)
@@ -1189,22 +1189,70 @@ class OmpBackfillTests(unittest.TestCase):
         con.close()
         return home
 
+    def _claude(self, home: Path, sessions: dict[str, tuple], typed: set[str] | None = None) -> None:
+        """Claude Code files for sessions {id: (cwd, prompt seconds, answer
+        seconds)}; `typed` (default all) are the ones history.jsonl lists."""
+        def stamp(seconds: int) -> str:
+            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace("+00:00", "Z")
+
+        typed = set(sessions) if typed is None else typed
+        history_lines = []
+        for sid, (cwd, prompted, answered) in sessions.items():
+            if sid in typed:
+                history_lines.append({"display": f"ask {sid}", "timestamp": prompted * 1000,
+                                      "project": cwd, "sessionId": sid})
+            slug = home / ".claude" / "projects" / agents._claude_slug(cwd)
+            slug.mkdir(parents=True, exist_ok=True)
+            lines = [
+                {"type": "user", "sessionId": sid, "cwd": cwd, "timestamp": stamp(prompted),
+                 "message": {"role": "user", "content": f"ask {sid}"}},
+                {"type": "assistant", "sessionId": sid, "cwd": cwd, "timestamp": stamp(answered),
+                 "message": {"role": "assistant", "model": "claude-x", "stop_reason": "end_turn",
+                             "content": [{"type": "text", "text": "answered"}]}},
+                {"type": "ai-title", "aiTitle": f"Claude {sid}", "sessionId": sid},
+                # A `cd` in shell mode, then `/exit`: neither changes the
+                # session's folder or ends its turn.
+                {"type": "user", "isMeta": True, "sessionId": sid, "cwd": f"{cwd}/gone-subdir",
+                 "timestamp": stamp(answered),
+                 "message": {"role": "user", "content": "<local-command-stdout>Bye</local-command-stdout>"}},
+            ]
+            rollout = slug / f"{sid}.jsonl"
+            rollout.write_text("".join(json.dumps(line) + "\n" for line in lines))
+            os.utime(rollout, (answered, answered))
+        (home / ".claude" / "history.jsonl").write_text(
+            "".join(json.dumps(line) + "\n" for line in history_lines) + "{torn\n"
+        )
+
     def _sweep(self, home: Path, saved: Path, records: list[dict], limit: int = 100,
-               processes: dict[int, tuple] | None = None) -> dict:
+               processes: dict[int, tuple] | None = None,
+               claude: dict[int, tuple] | None = None) -> dict:
         """`processes`: running omp pid → (transcript it holds or "", cwd,
         whether it is a background service[, whether it holds the transcript
-        directly rather than through an advisor sidecar])."""
+        directly rather than through an advisor sidecar]). `claude`: running
+        Claude Code pid → (session id from its state file or "", cwd[,
+        headless argv])."""
         processes = processes or {}
+        claude = claude or {}
+
+        def pgrep(name: str, services: bool = False) -> list[int]:
+            if name == "claude":
+                return [pid for pid, p in claude.items() if (len(p) > 2) == services]
+            return [pid for pid, p in processes.items() if p[2] == services]
+
         with (mock.patch.object(agents.Path, "home", return_value=home),
               mock.patch.object(agents, "_read_boot_id", return_value="boot-a"),
               mock.patch.object(agents, "tern_bin", return_value="/usr/bin/tern"),
               mock.patch.object(agents, "_build_records", return_value=records),
-              mock.patch.object(agents, "_pgrep", side_effect=lambda _name, services=False:
-                                [pid for pid, p in processes.items() if p[2] == services]),
+              mock.patch.object(agents, "_pgrep", side_effect=pgrep),
               mock.patch.object(agents, "_open_jsonl_under",
                                 side_effect=lambda pid, *_n: (processes[pid][0], (
                                     processes[pid] + (bool(processes[pid][0]),))[3])),
-              mock.patch.object(agents, "_cwd_of", side_effect=lambda pid: processes[pid][1])):
+              mock.patch.object(agents, "_claude_state", side_effect=lambda pid: (
+                  {"sessionId": claude[pid][0]} if claude[pid][0] else {})),
+              mock.patch.object(agents, "_argv_of", side_effect=lambda pid: list(
+                  (claude.get(pid, ("", "")) + ((),))[2])),
+              mock.patch.object(agents, "_cwd_of", side_effect=lambda pid: (
+                  claude[pid][1] if pid in claude else processes[pid][1]))):
             payload, _ = agents._locked_sweep(aggregate_path=saved, history_limit=limit)
         return payload
 
@@ -1259,7 +1307,7 @@ class OmpBackfillTests(unittest.TestCase):
             self.assertEqual([r["sessionId"] for r in self._sweep(home, saved, [])["history"]], ["a"])
             agents._dismiss_history({("omp", "a"), ("omp", "never-listed")}, saved)
             self.assertEqual(self._sweep(home, saved, [])["history"], [])
-            self.assertEqual(set(json.loads(saved.read_text())["ompBackfill"]["skip"]), {"a"})
+            self.assertEqual(set(json.loads(saved.read_text())["backfill"]["skip"]["omp"]), {"a"})
             # Resumed and closed while nothing watched.
             rollout = next((home / ".omp/agent/sessions").glob("*/*_a.jsonl"))
             with rollout.open("a") as out:
@@ -1268,6 +1316,20 @@ class OmpBackfillTests(unittest.TestCase):
             os.utime(rollout, (500, 500))
             rows = self._sweep(home, saved, [])["history"]
         self.assertEqual([(r["sessionId"], r["lastSeenAt"]) for r in rows], [("a", 500_000)])
+
+    def test_dismissals_saved_before_claude_backfill_still_hold(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory) / "work"
+            work.mkdir()
+            home = self._home(directory, {"kept": (str(work), 100), "dismissed": (str(work), 200)})
+            saved = home / "agents.json"
+            saved.write_text(json.dumps({"bootId": "boot-a", "agents": [], "history": [],
+                                         "ompBackfill": {"floor": 50_000,
+                                                         "skip": {"dismissed": 200_000}}}))
+            payload = self._sweep(home, saved, [])
+        self.assertEqual([r["sessionId"] for r in payload["history"]], ["kept"])
+        self.assertEqual(payload["backfill"], {"floor": 50_000, "skip": {
+            "omp": {"dismissed": 200_000}, "claude": {}}})
 
     def test_sessions_a_running_omp_process_owns_are_not_added(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1299,14 +1361,54 @@ class OmpBackfillTests(unittest.TestCase):
             saved.write_text(json.dumps({
                 "bootId": "boot-a", "agents": [],
                 "history": [history("omp", "kept", closedBy="exit", lastSeenAt=150_000_000)],
-                "ompBackfill": {"floor": 150_000_000, "skip": {}},
+                "backfill": {"floor": 150_000_000, "skip": {}},
             }))
             payload = self._sweep(home, saved, [], limit=1)
         self.assertEqual(
             [(r["sessionId"], r["lastSeenAt"]) for r in payload["history"]],
             [("late", 172_900_000)],
         )
-        self.assertEqual(payload["ompBackfill"]["floor"], 172_900_000)
+        self.assertEqual(payload["backfill"]["floor"], 172_900_000)
+
+    def test_typed_claude_sessions_rank_with_omp_and_running_ones_stay_out(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work, other = Path(directory) / "work", Path(directory) / "other"
+            work.mkdir()
+            other.mkdir()
+            home = self._home(directory, {"omp-mid": (str(work), 300)})
+            self._claude(home, {
+                "newest": (str(work), 350, 400), "oldest": (str(work), 100, 200),
+                # Meridian and `claude -p` runs leave a transcript but no prompt.
+                "sdk": (str(work), 500, 600),
+                "running": (str(work), 500, 600), "unresolved": (str(other), 500, 600),
+                "headless": (str(work), 500, 600),
+            }, typed={"newest", "oldest", "running", "unresolved", "headless"})
+            saved = home / "agents.json"
+            claude = {
+                20: ("running", str(work)), 21: ("", str(other)),
+                # `claude -p --resume` writes a typed session with no state
+                # file; a daemon in the same folder writes none.
+                22: ("", str(work), ["claude", "-p", "--resume", "headless"]),
+                23: ("", str(work), ["claude", "daemon", "run"]),
+            }
+            rows = self._sweep(home, saved, [], claude=claude)["history"]
+            self.assertEqual(
+                [(r["provider"], r["sessionId"]) for r in rows],
+                [("claude", "newest"), ("omp", "omp-mid"), ("claude", "oldest")],
+            )
+            newest = rows[0]
+            self.assertEqual(newest["windowTitle"], "Claude newest")
+            self.assertEqual(newest["lastPrompt"], "ask newest")
+            self.assertEqual(newest["lastSeenAt"], 400_000)
+            self.assertEqual(newest["cwd"], str(work))
+            self.assertEqual(newest["lastState"], "idle")
+            self.assertEqual(
+                newest["resumeCommand"],
+                f"{shlex.join(['cd', '--', str(work)])} && claude --resume newest",
+            )
+            agents._dismiss_history({("claude", "newest")}, saved)
+            again = self._sweep(home, saved, [], claude=claude)["history"]
+        self.assertEqual([r["sessionId"] for r in again], ["omp-mid", "oldest"])
 
     def test_missing_or_foreign_history_db_adds_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
