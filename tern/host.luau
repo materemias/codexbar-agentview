@@ -53,6 +53,9 @@ local FORECAST_URL = "https://codex-reset.com/api/forecast"
 local TICK_MS = 500
 local AGENTS_STALE_MS = 15000 -- the applet sweeps every 5 s
 local CACHE_EVERY_S = 10
+-- Each cache read runs a Python helper, which costs the daemon about 0.1 s of
+-- CPU, so a read whose input files are unchanged is skipped for up to this long.
+local CACHE_FORCE_S = 60
 
 local PROVIDER_ORDER = { "claude", "codex", "zai", "opencodego", "openrouter", "kilo", "typesafe" }
 local PROVIDER_NAMES = {
@@ -330,6 +333,9 @@ local store = {
 	usageAt = 0,
 	fetching = false,
 	cacheReadAt = 0,
+	cacheSpawnAt = 0,
+	cacheInputs = "",
+	cachePaths = {} :: { string },
 	usageGeneration = 0,
 	usageError = nil :: string?,
 	agents = nil :: any,
@@ -1220,11 +1226,37 @@ local function fetchUsage(automatic: boolean?)
 	end)
 end
 
+-- FNV-1a, 32-bit; FNV's prime is 2^24 + 403, which keeps every product exact.
+local function fnv1a(s: string): number
+	local h = 2166136261
+	for i = 1, #s do
+		h = bit32.bxor(h, string.byte(s, i))
+		h = (bit32.lshift(h, 24) + h * 403) % 4294967296
+	end
+	return h
+end
+
+-- A digest of what a cache read depends on besides the clock, as its last
+-- answer listed it (codexbar_fetch.py's _cache_inputs): the cache, the CLI's
+-- config, the account logins, Meridian's profiles and omp's rotation files.
+-- Only the digest is kept, so login tokens don't stay in the daemon.
+local function usageInputs(): string
+	local parts = {}
+	for _, path in store.cachePaths do
+		local ok, raw = pcall(tern.fs.read, path, 4 * 1024 * 1024)
+		table.insert(parts, if ok then #raw .. ":" .. fnv1a(raw) else "-")
+	end
+	return table.concat(parts, ",")
+end
+
 -- A settings reread is cache-only, including when the cache is stale.
-local function readUsageCache(allowFetch: boolean?, reclassify: boolean?)
+-- `inputs` is a usageInputs() digest the caller already computed.
+local function readUsageCache(allowFetch: boolean?, reclassify: boolean?, inputs: string?)
 	if #setting("providers") == 0 then
 		return
 	end
+	store.cacheInputs = inputs or usageInputs()
+	store.cacheSpawnAt = os.time()
 	local generation = store.usageGeneration
 	local previous = store.usage
 	local args = providerArgs()
@@ -1234,6 +1266,17 @@ local function readUsageCache(allowFetch: boolean?, reclassify: boolean?)
 			return
 		end
 		local okj, data = pcall(tern.json.decode, res.stdout)
+		local inputs = if okj and type(data) == "table" then val(data.inputs) else nil
+		if type(inputs) == "table" then
+			local paths = {}
+			for _, path in inputs do
+				if type(path) == "string" then
+					table.insert(paths, path)
+				end
+			end
+			-- A changed list fails the next check once, which rereads against it.
+			store.cachePaths = paths
+		end
 		if (not store.fetching or allowFetch == false) and res.status == 0 and okj and type(data) == "table"
 			and ((allowFetch == false and not reclassify) or not store.usage or measuredAt(data) > measuredAt(store.usage)
 				or (reclassify and store.usage == previous and measuredAt(data) == measuredAt(store.usage))) then
@@ -1303,7 +1346,13 @@ local function tick()
 		local now = os.time()
 		if now - store.cacheReadAt >= CACHE_EVERY_S then
 			store.cacheReadAt = now
-			readUsageCache()
+			local inputs = if now - store.cacheSpawnAt >= CACHE_FORCE_S then nil else usageInputs()
+			if inputs == nil or inputs ~= store.cacheInputs then
+				readUsageCache(nil, nil, inputs)
+			elseif os.time() - math.max(store.usageAt, measuredAt(store.usage)) >= staleAfter() then
+				-- What the skipped read would have done after reading.
+				fetchUsage(true)
+			end
 		end
 		-- Ages and countdowns move once a minute.
 		if ticks % 120 == 0 then

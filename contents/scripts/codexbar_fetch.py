@@ -280,13 +280,17 @@ def _claude_default_dir() -> str:
     return _expand(os.environ.get("CLAUDE_CONFIG_DIR") or "~/.claude")
 
 
+def _meridian_config_dir() -> str:
+    return os.path.join(_expand(os.environ.get("XDG_CONFIG_HOME") or "~/.config"), "meridian")
+
+
 def _meridian_profile_dirs() -> list[tuple[str, str]]:
     """(profile id, login directory) per Meridian profile on disk, in Meridian's order.
 
     Meridian keeps one refreshed Claude Code login per profile in
     `profiles.json`, ordered by `settings.json` `profileOrder`.
     """
-    root = os.path.join(_expand(os.environ.get("XDG_CONFIG_HOME") or "~/.config"), "meridian")
+    root = _meridian_config_dir()
 
     def load(name):
         try:
@@ -1213,39 +1217,30 @@ def _usage_auth_input(provider: str, payload: dict, path: str) -> dict:
     return {"path": path, "credentials": payload}
 
 
-def _usage_cache_scopes(cli: str, providers: list[str]) -> dict[str, str]:
-    """Fingerprint local account inputs without storing credentials in the cache."""
+def _config_provider_entries() -> list[dict] | None:
+    """The provider entries of ~/.codexbar/config.json; [] without the file,
+    None when it is unreadable or malformed."""
     try:
         with open(_expand("~/.codexbar/config.json"), encoding="utf-8") as fh:
             config = json.load(fh)
     except FileNotFoundError:
-        config = {}
+        return []
     except (OSError, ValueError):
-        return {}
+        return None
     if not isinstance(config, dict) or not isinstance(config.get("providers", []), list):
+        return None
+    return [entry for entry in config.get("providers", []) if isinstance(entry, dict)]
+
+
+def _usage_cache_scopes(cli: str, providers: list[str]) -> dict[str, str]:
+    """Fingerprint local account inputs without storing credentials in the cache."""
+    config_entries = _config_provider_entries()
+    if config_entries is None:
         return {}
     scopes = {}
     for provider in providers:
-        entries = [
-            entry for entry in config.get("providers", [])
-            if isinstance(entry, dict) and entry.get("id") == provider
-        ]
-        auth_paths = []
-        if provider == "codex":
-            homes = [os.environ.get("CODEX_HOME") or "~/.codex"]
-            for entry in entries:
-                paths = entry.get("codexProfileHomePaths", [])
-                if isinstance(paths, list):
-                    homes.extend(path for path in paths if isinstance(path, str))
-            auth_paths = [os.path.join(_expand(home), "auth.json") for home in homes]
-        elif provider == "claude":
-            auth_paths = [
-                os.path.join(directory, ".credentials.json") for directory in _claude_config_dirs()
-            ]
-        elif provider == "opencodego":
-            auth_paths = [_expand("~/.local/share/opencode/auth.json")]
-        elif provider == "kilo":
-            auth_paths = [_expand("~/.local/share/kilo/auth.json")]
+        entries = [entry for entry in config_entries if entry.get("id") == provider]
+        auth_paths = _usage_auth_paths(provider, entries)
         inputs = {
             "cli": os.path.realpath(shutil.which(cli) or cli),
             "provider": provider,
@@ -1278,6 +1273,47 @@ def _usage_cache_scopes(cli: str, providers: list[str]) -> dict[str, str]:
         digest.update(json.dumps(sorted(auth_inputs)).encode())
         scopes[provider] = digest.hexdigest()
     return scopes
+
+
+def _usage_auth_paths(provider: str, entries: list[dict]) -> list[str]:
+    """The login files whose identity scopes `provider`'s cached usage."""
+    if provider == "codex":
+        homes = [os.environ.get("CODEX_HOME") or "~/.codex"]
+        for entry in entries:
+            paths = entry.get("codexProfileHomePaths", [])
+            if isinstance(paths, list):
+                homes.extend(path for path in paths if isinstance(path, str))
+        return [os.path.join(_expand(home), "auth.json") for home in homes]
+    if provider == "claude":
+        return [os.path.join(directory, ".credentials.json") for directory in _claude_config_dirs()]
+    if provider == "opencodego":
+        return [_expand("~/.local/share/opencode/auth.json")]
+    if provider == "kilo":
+        return [_expand("~/.local/share/kilo/auth.json")]
+    return []
+
+
+def _cache_inputs(providers: list[str]) -> list[str]:
+    """Files a --cache-only answer depends on, so a poller can skip rereads
+    while none changed: the cache, the CLI config, the logins that scope
+    each provider's usage, Meridian's profile list and omp's rotation files.
+    Time moves the answer too; pollers still reread now and then."""
+    entries = _config_provider_entries() or []
+    meridian = _meridian_config_dir()
+    paths = [
+        _state_file(USAGE_CACHE_NAME),
+        _expand("~/.codexbar/config.json"),
+        os.path.join(meridian, "profiles.json"),
+        os.path.join(meridian, "settings.json"),
+    ]
+    rotate = _expand(OMP_SUB_ROTATE_DIR)
+    for provider in providers:
+        paths.extend(_usage_auth_paths(provider, [e for e in entries if e.get("id") == provider]))
+        if provider in OMP_ROTATIONS:
+            name = OMP_ROTATIONS[provider]
+            paths.append(os.path.join(rotate, f"{name}-state.json"))
+            paths.append(os.path.join(rotate, f"{name}-mode.json"))
+    return list(dict.fromkeys(paths))
 
 
 def _cached_usage_record(record: object, now: _dt.datetime) -> dict | None:
@@ -2041,6 +2077,7 @@ def main(argv: list[str]) -> int:
     if cache_only:
         _attach_recent_usage(restored, _usage_history_entries(_usage_cache_payload(), now), now)
         out["cacheOnly"] = True
+        out["inputs"] = _cache_inputs(providers)
         json.dump(out, sys.stdout)
         sys.stdout.write("\n")
         return 0

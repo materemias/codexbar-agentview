@@ -9,6 +9,7 @@
 ### Fixes
 
 - A single failed Meridian usage poll on a recent reading no longer shows "Refresh failed" on the Claude account; the error appears once Meridian fails again or the reading is 10 minutes old.
+- The widget, its agent sweep and the Tern extension use far less CPU: the sweep takes a quarter of the time, the popup redraws only the session rows that changed, and Tern rereads usage only after it changed or once a minute.
 - omp sessions that Tern resumed by file path show their own title and state again, instead of another session's from the same folder.
 - Launching a closed omp session from History works again in folders where other omp sessions are running; it still refuses a session a running omp has worked in.
 
