@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Fixes
+
+- In the Tern extension, a slow usage-cache read that finishes late no longer replaces a newer one's result, such as bringing back an account whose login was replaced.
+
 ## 0.3.0 (2026-11-02)
 
 ### Features

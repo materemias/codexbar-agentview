@@ -1265,13 +1265,13 @@ local function readUsageCache(allowFetch: boolean?, reclassify: boolean?, inputs
 	local args = providerArgs()
 	table.insert(args, "--cache-only")
 	python("codexbar_fetch.py", args, 30000, function(res)
-		if generation ~= store.usageGeneration then
+		-- Reads overlap when one is slow, and an earlier one answers older
+		-- files, so only the latest read counts, whatever it measured.
+		if generation ~= store.usageGeneration or seq ~= store.cacheSeq then
 			return
 		end
 		local okj, data = pcall(tern.json.decode, res.stdout)
-		-- Reads overlap when one is slow; an earlier one answers older files.
-		local latest = seq == store.cacheSeq
-		local inputs = if latest and okj and type(data) == "table" then val(data.inputs) else nil
+		local inputs = if okj and type(data) == "table" then val(data.inputs) else nil
 		if type(inputs) == "table" then
 			local paths = {}
 			for _, path in inputs do
@@ -1291,9 +1291,9 @@ local function readUsageCache(allowFetch: boolean?, reclassify: boolean?, inputs
 				-- One cache read replaces another without a newer measurement: omp's
 				-- rotation and the accounts the logins and the 24 h limit allow change
 				-- on their own.
-				or (allowFetch ~= false and cacheShown and latest)) then
+				or (allowFetch ~= false and cacheShown)) then
 			adoptCache(data)
-		elseif latest and usable and not store.fetching and type(store.usage) == "table" then
+		elseif usable and not store.fetching and type(store.usage) == "table" then
 			-- A newer fetch's reading stays, but omp's rotation is local and
 			-- current, and an account whose login changed since is gone.
 			store.usage.claudeRotation = data.claudeRotation
