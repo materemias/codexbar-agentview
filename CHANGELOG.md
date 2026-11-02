@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0 (2026-11-02)
+
 ### Features
 
 - History lists omp and Claude Code sessions that closed while the widget wasn't watching, or before it was installed, read from their prompt history.
