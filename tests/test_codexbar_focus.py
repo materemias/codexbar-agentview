@@ -41,18 +41,26 @@ def entry(**changes: object) -> dict:
 
 
 class T3LinkTests(unittest.TestCase):
-    def test_link_maps_claude_and_codex_sessions_to_t3_threads(self) -> None:
+    def test_link_maps_native_sessions_to_t3_threads(self) -> None:
         import sqlite3
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "environment-id").write_text("env-1\n")
-            with sqlite3.connect(root / "state.sqlite") as db:
-                db.execute("CREATE TABLE provider_session_runtime"
-                           " (thread_id TEXT, last_seen_at TEXT, resume_cursor_json TEXT)")
-                db.executemany("INSERT INTO provider_session_runtime VALUES (?, ?, ?)", [
-                    ("t-claude", "2", json.dumps({"threadId": "t-claude", "resume": "claude-sid"})),
-                    ("t-codex", "1", json.dumps({"threadId": "codex-sid"})),
-                ])
+
+            def native(sid: str) -> str:
+                return json.dumps({"nativeThreadRef": {"nativeId": sid}})
+
+            with sqlite3.connect(root / "statev2.sqlite") as db:
+                db.execute("CREATE TABLE orchestration_v2_projection_provider_threads"
+                           " (thread_id TEXT, updated_at TEXT, payload_json TEXT)")
+                db.executemany(
+                    "INSERT INTO orchestration_v2_projection_provider_threads VALUES (?, ?, ?)", [
+                        ("t-old", "1", native("claude-sid")),
+                        ("t-claude", "2", native("claude-sid")),
+                        ("t-codex", "1", native("codex-sid")),
+                        (None, "3", native("codex-sid")),
+                        ("t-pending", "1", json.dumps({"nativeThreadRef": None})),
+                    ])
             db.close()
             with mock.patch.object(focus, "T3_DIR", root):
                 self.assertEqual(focus._t3_thread_link("claude-sid"), "t3code://threads/env-1/t-claude")

@@ -681,17 +681,17 @@ def launch_all(keys: set[tuple[str, str]]) -> int:
 
 def _t3_thread_link(session_id: str) -> str:
     """The t3code:// link of the T3 Code thread running a provider session.
-    T3 keeps the Claude session id as `resume` and the Codex thread id as
-    `threadId` in each thread's resume cursor."""
+    T3 Code 0.1 keeps the native Claude, Codex or ACP session id as
+    `nativeThreadRef.nativeId` on each of the thread's provider threads."""
     try:
         env = (T3_DIR / "environment-id").read_text().strip()
-        db = sqlite3.connect(f"file:{T3_DIR / 'state.sqlite'}?mode=ro", uri=True, timeout=1)
+        db = sqlite3.connect(f"file:{T3_DIR / 'statev2.sqlite'}?mode=ro", uri=True, timeout=1)
         try:
             row = db.execute(
-                "SELECT thread_id FROM provider_session_runtime"
-                " WHERE ? IN (json_extract(resume_cursor_json, '$.resume'),"
-                " json_extract(resume_cursor_json, '$.threadId'))"
-                " ORDER BY last_seen_at DESC LIMIT 1",
+                "SELECT thread_id FROM orchestration_v2_projection_provider_threads"
+                " WHERE json_extract(payload_json, '$.nativeThreadRef.nativeId') = ?"
+                " AND thread_id IS NOT NULL"
+                " ORDER BY updated_at DESC LIMIT 1",
                 (session_id,),
             ).fetchone()
         finally:
@@ -704,8 +704,8 @@ def _t3_thread_link(session_id: str) -> str:
 
 
 def _t3_open(session_id: str) -> bool:
-    """Ask T3 Code to show the thread. T3 Code 0.0.44 only raises its window
-    for this link; pingdotgg/t3code#9745 tracks opening the thread itself."""
+    """Ask T3 Code to show the thread; 0.1 opens it, earlier versions only
+    raise the window (pingdotgg/t3code#9745)."""
     link = _t3_thread_link(session_id)
     if not link:
         return False

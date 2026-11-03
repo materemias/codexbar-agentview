@@ -5,6 +5,7 @@
 ### Fixes
 
 - In the Tern extension, a slow usage-cache read that finishes late no longer replaces a newer one's result, such as bringing back an account whose login was replaced.
+- Focusing a session that runs in T3 Code 0.1 or later opens its thread instead of only raising the window.
 
 ## 0.3.0 (2026-11-02)
 

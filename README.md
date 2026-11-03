@@ -270,10 +270,8 @@ whose session cannot be identified is listed as untracked. Some sessions stay
 off the list on purpose: Claude Code's agent view tasks, which run under
 `claude daemon`, and omp or pi driven by another program (`--mode rpc`/`json`).
 
-T3 Code threads can be focused, but T3 Code 0.0.44 opens the window without
-the thread until
-[pingdotgg/t3code#9745](https://github.com/pingdotgg/t3code/issues/9745) is
-fixed.
+Focusing a T3 Code session opens its thread. This needs T3 Code 0.1 or later;
+older versions only raise the window.
 
 ## Provider credentials
 
