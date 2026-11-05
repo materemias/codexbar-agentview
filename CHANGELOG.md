@@ -11,7 +11,7 @@
 - In the Tern extension, a slow usage-cache read that finishes late no longer replaces a newer one's result, such as bringing back an account whose login was replaced.
 - Focusing a session that runs in T3 Code 0.1 or later opens its thread instead of only raising the window.
 - Initials and word starts in a filter match only neighbouring words, so a query no longer matches scattered letters across a long prompt.
-- The Tern extension highlights the matched words in each row and its detail line.
+- The Tern extension highlights the matched words in each row, and shows the matching prompt and messages under it in the conversation panel's style.
 - In the Tern extension, Space types into a filter in progress instead of opening the conversation.
 
 ## 0.3.0 (2026-11-02)

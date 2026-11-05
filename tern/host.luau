@@ -1597,13 +1597,13 @@ local function isContinuation(text: string, k: number): boolean
 end
 
 -- Spans around the `focus` hits (a window per word, overlapping windows merged, the text between them
--- elided), with every hit in `found` marked. The snippet line is clamped to two lines: a window starts just
--- before its match, and is short when the line holds several words or parts.
-local function excerpt(text: string, found: { Hit }, narrow: boolean, focus: { Hit }): { Span | string }
-	local after = if #focus == 1 and not narrow then 80 else 30
+-- elided), with every hit in `found` marked. Each part is clamped to two lines: a window starts just before
+-- its match, and is short when the part holds several words.
+local function excerpt(text: string, found: { Hit }, focus: { Hit }): { Span | string }
+	local after = if #focus == 1 then 120 else 40
 	local windows = {}
 	for _, h in focus do
-		local from = math.max(1, h.run[1] - 12)
+		local from = math.max(1, h.run[1] - 24)
 		local to = math.min(#text, h.run[#h.run] + after)
 		-- Keep cuts on UTF-8 boundaries.
 		while from > 1 and isContinuation(text, from) do
@@ -1692,12 +1692,12 @@ local function hasWords(found: { Hit }, of: { Hit }): boolean
 	return true
 end
 
--- Where every filter word matched beyond the row's label, as one snippet line: each matched field the
--- label doesn't show, then the turns holding words nothing before showed (else the first matching turn
--- when nothing else is shown). The prompt is left out when a chosen user turn repeats it with the same
--- words. With several parts, each excerpt is short so the later ones stay in view, and centers on the
--- words no earlier part (or the label) showed.
-local function filterSnippet(r: any, q: string): { Span | string }?
+-- Where every filter word matched beyond the row's label: each matched field the label doesn't show, then
+-- the turns holding words nothing before showed (else the first matching turn when nothing else is shown).
+-- The prompt is left out when a chosen user turn repeats it with the same words. Each part's excerpt
+-- centers on the words no earlier part (or the label) showed.
+type SnippetPart = { label: string?, user: boolean, tools: boolean, spans: { Span | string } }
+local function filterSnippet(r: any, q: string): { SnippetPart }?
 	local words = queryWords(q)
 	if #words == 0 then
 		return nil
@@ -1717,14 +1717,14 @@ local function filterSnippet(r: any, q: string): { Span | string }?
 				end
 			end
 			if f.name ~= shown then
-				table.insert(fields, { name = f.name, prefix = f.label .. ": ", text = text, found = found })
+				table.insert(fields, { name = f.name, label = f.label, text = text, found = found })
 			end
 		end
 	end
 	local turns = {}
 	for _, t in val(r.recent) or {} do
 		local text = oneLine(t.text)
-		table.insert(turns, { user = t.role == "user", text = text, found = hits(text, words, false), chosen = false })
+		table.insert(turns, { user = t.role == "user", tools = t.kind == "tools", text = text, found = hits(text, words, false), chosen = false })
 	end
 	local count = 0
 	for _, t in turns do
@@ -1761,23 +1761,19 @@ local function filterSnippet(r: any, q: string): { Span | string }?
 			end
 		end
 		if not repeated then
-			table.insert(parts, { prefix = f.prefix, text = f.text, found = f.found })
+			table.insert(parts, { label = f.label, user = false, tools = false, text = f.text, found = f.found })
 		end
 	end
 	for _, t in turns do
 		if t.chosen then
-			table.insert(parts, { prefix = if t.user then "> " else "· ", text = t.text, found = t.found })
+			table.insert(parts, { user = t.user, tools = t.tools, text = t.text, found = t.found })
 		end
 	end
 	if #parts == 0 then
 		return nil
 	end
-	local out: { Span | string } = {}
-	for i, p in parts do
-		if i > 1 then
-			table.insert(out, ui.span("  │  ", "dim"))
-		end
-		table.insert(out, p.prefix)
+	local out: { SnippetPart } = {}
+	for _, p in parts do
 		local fresh: { Hit } = {}
 		for _, h in p.found do
 			if not inView[h.word] then
@@ -1787,9 +1783,7 @@ local function filterSnippet(r: any, q: string): { Span | string }?
 		for _, h in p.found do
 			inView[h.word] = true
 		end
-		for _, s in excerpt(p.text, p.found, #parts > 1, if #fresh > 0 then fresh else p.found) do
-			table.insert(out, s)
-		end
+		table.insert(out, { label = p.label, user = p.user, tools = p.tools, spans = excerpt(p.text, p.found, if #fresh > 0 then fresh else p.found) })
 	end
 	return out
 end
@@ -2071,14 +2065,40 @@ local function historyItem(b: Block, r: any, now: number, q: string): Node
 	})
 end
 
--- The filter snippet under a row, on a line of its own: a row's detail gets no room beside a long title in
--- a split pane. Nil while not filtering or when nothing beyond the label matched.
+-- Where the row matched, under it in the conversation panel's look: matched fields as labelled lines, matched
+-- turns as messages. Nil while not filtering or when nothing beyond the label matched.
 local function snippetNode(r: any, q: string): Node?
-	local spans = filterSnippet(r, q)
-	if not spans then
+	local parts = filterSnippet(r, q)
+	if not parts then
 		return nil
 	end
-	return withp(ui.node("text", { spans = spans, lines = 2 }), { key = "snip-" .. recordKey(r), role = "codexbar.snippet" })
+	local kids: { Node } = {}
+	local prev = nil
+	for i, p in parts do
+		local spans: { Span | string } = {}
+		if p.label then
+			table.insert(spans, ui.span(p.label .. ": ", "muted"))
+		elseif p.tools then
+			table.insert(spans, ui.span("⚙ ", "muted"))
+		end
+		for _, s in p.spans do
+			table.insert(spans, s)
+		end
+		local body = ui.node("text", { spans = spans, lines = 2 })
+		if p.label then
+			table.insert(kids, withp(body, { key = "f" .. i }))
+			prev = nil
+		else
+			table.insert(kids, ui.node("message", {
+				key = "t" .. i,
+				side = if p.user then "end" else "start",
+				author = if p.user then nil else AGENT_NAMES[str(r.provider)] or str(r.provider),
+				continued = prev ~= nil and prev == p.user,
+			}, { body }))
+			prev = p.user
+		end
+	end
+	return withp(ui.col(kids), { key = "snip-" .. recordKey(r), role = "codexbar.snippet", gap = "sm" })
 end
 
 local function addRow(kids: { Node }, row: Node, r: any, q: string)
