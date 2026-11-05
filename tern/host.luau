@@ -1597,13 +1597,13 @@ local function isContinuation(text: string, k: number): boolean
 end
 
 -- Spans around the `focus` hits (a window per word, overlapping windows merged, the text between them
--- elided), with every hit in `found` marked. Each part is clamped to two lines: a window starts just before
--- its match, and is short when the part holds several words.
+-- elided), with every hit in `found` marked. Each part is clamped to two lines, so the windows share one
+-- budget: each starts just before its match and shrinks as the part holds more words.
 local function excerpt(text: string, found: { Hit }, focus: { Hit }): { Span | string }
-	local after = if #focus == 1 then 120 else 40
+	local before, after = math.floor(24 / #focus), math.floor(96 / #focus)
 	local windows = {}
 	for _, h in focus do
-		local from = math.max(1, h.run[1] - 24)
+		local from = math.max(1, h.run[1] - before)
 		local to = math.min(#text, h.run[#h.run] + after)
 		-- Keep cuts on UTF-8 boundaries.
 		while from > 1 and isContinuation(text, from) do
@@ -1646,17 +1646,31 @@ local function excerpt(text: string, found: { Hit }, focus: { Hit }): { Span | s
 end
 
 local function recordMatches(r: any, q: string): boolean
-	for _, w in queryWords(q) do
+	local words = queryWords(q)
+	if #words == 0 then
+		return true
+	end
+	local fields: { string } = {}
+	for _, f in FIELDS do
+		table.insert(fields, fieldText(r, f.name))
+	end
+	local turns: { string } = {}
+	for _, t in val(r.recent) or {} do
+		if t.kind ~= "tools" then
+			table.insert(turns, string.lower(oneLine(t.text)))
+		end
+	end
+	for _, w in words do
 		local ok = false
-		for _, f in FIELDS do
-			if matchPositions(fieldText(r, f.name), w, true) then
+		for _, text in fields do
+			if matchPositions(text, w, true) then
 				ok = true
 				break
 			end
 		end
 		if not ok then
-			for _, t in val(r.recent) or {} do
-				if t.kind ~= "tools" and string.find(string.lower(oneLine(t.text)), w, 1, true) then
+			for _, text in turns do
+				if string.find(text, w, 1, true) then
 					ok = true
 					break
 				end
@@ -1764,7 +1778,7 @@ local function filterSnippet(r: any, q: string): { SnippetPart }?
 			end
 		end
 		if not repeated then
-			table.insert(parts, { label = f.label, user = false, tools = false, text = f.text, found = f.found })
+			table.insert(parts, { label = f.label, user = false, text = f.text, found = f.found })
 		end
 	end
 	for _, t in turns do
@@ -2618,6 +2632,8 @@ tern.block.define("dashboard", {
 			b.sel = nil
 		elseif name == "paste" or name == "space" or (k.text and k.text ~= "" and string.byte(k.text) >= 32) then
 			b.filter ..= if name == "space" then " " else oneLine(k.text)
+			-- A filter never starts with whitespace, so `b.filter == ""` is the one test for "no query".
+			b.filter = (string.gsub(b.filter, "^%s+", ""))
 			b.sel = nil
 		else
 			return false

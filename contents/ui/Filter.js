@@ -32,11 +32,24 @@ function wordStart(text, k) {
     return c !== c.toLowerCase() && p !== p.toUpperCase()
 }
 
+// Lowercase text with the same length, so positions in it index `text`:
+// a character whose lowercase form is longer ("İ") is kept as it is.
+function lower(text) {
+    var hay = text.toLowerCase()
+    if (hay.length === text.length) return hay
+    var out = ""
+    for (var i = 0; i < text.length; i++) {
+        var c = text[i].toLowerCase()
+        out += c.length === 1 ? c : text[i]
+    }
+    return out
+}
+
 // Sorted positions of lowercase `word` in text, or null. `initials` allows
 // the consecutive-word-prefix form.
 function positions(text, word, initials) {
     if (!text || !word) return null
-    var hay = text.toLowerCase()
+    var hay = lower(text)
     var at = hay.indexOf(word)
     if (at !== -1) {
         var run = []
@@ -95,10 +108,11 @@ function flat(found) {
 
 // Whether every word matches one of `fields` (strings) or `turns` (strings).
 function matchesAll(fields, turns, ws) {
+    var low = turns.map(lower)
     for (var i = 0; i < ws.length; i++) {
         var ok = false
         for (var f = 0; !ok && f < fields.length; f++) ok = positions(fields[f], ws[i], true) !== null
-        for (var t = 0; !ok && t < turns.length; t++) ok = turns[t].toLowerCase().indexOf(ws[i]) !== -1
+        for (var t = 0; !ok && t < low.length; t++) ok = low[t].indexOf(ws[i]) !== -1
         if (!ok) return false
     }
     return true
@@ -127,11 +141,11 @@ function styled(text, positions, start, end) {
 
 // StyledText around the `focus` hits (a window per word, overlapping
 // windows merged, the text between them elided), every hit in `found`
-// highlighted. One word gets a wide window; with several, each window is
-// narrower so all of them fit the line.
+// highlighted. The line is clamped to two lines, so the windows share one
+// budget and shrink as the line holds more words.
 function excerpt(text, found, focus) {
-    var before = focus.length === 1 ? 60 : 24
-    var after = focus.length === 1 ? 100 : 40
+    var before = Math.floor(60 / focus.length)
+    var after = Math.floor(100 / focus.length)
     var spans = focus.map(function(h) {
         return [Math.max(0, h.run[0] - before),
             Math.min(text.length, h.run[h.run.length - 1] + 1 + after)]
@@ -154,14 +168,15 @@ function excerpt(text, found, focus) {
 // StyledText lines that show where every word matched, beyond what the row
 // already shows. `fields`: [{ name, label, text, shown }], `turns`:
 // [{ user, text }], whitespace collapsed. A line for each matched field the
-// row does not show, then the turns holding words nothing before showed,
-// topped up to two turns. The prompt line is dropped when a chosen user
-// turn repeats the prompt with the same words. Each line centers on the
-// words no shown field or earlier line showed.
+// row does not show, then the turns holding words nothing before showed
+// (else the first matching turn when nothing else is shown). The prompt
+// line is dropped when a chosen user turn repeats the prompt with the same
+// words. Each line centers on the words no shown field or earlier line
+// showed. tern/host.luau's filterSnippet follows the same rules.
 function snippets(fields, turns, ws) {
     if (!ws.length) return []
-    var seen = {}
-    var inView = {}
+    var seen = Object.create(null)
+    var inView = Object.create(null)
     var parts = []
     for (var i = 0; i < fields.length; i++) {
         var f = fields[i]
@@ -181,10 +196,14 @@ function snippets(fields, turns, ws) {
         chosen.push(a)
         for (var s = 0; s < h.length; s++) seen[h[s].word] = true
     }
-    for (var b = 0; b < turns.length && chosen.length < 2; b++) {
-        if (turnHits[b] && chosen.indexOf(b) === -1) chosen.push(b)
+    if (!chosen.length && !parts.length) {
+        for (var b = 0; b < turns.length; b++) {
+            if (turnHits[b]) {
+                chosen.push(b)
+                break
+            }
+        }
     }
-    chosen.sort(function(x, y) { return x - y })
     parts = parts.filter(function(p) {
         return p.name !== "lastPrompt" || !chosen.some(function(c) {
             var t = turns[c]

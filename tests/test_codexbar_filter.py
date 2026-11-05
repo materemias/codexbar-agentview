@@ -92,10 +92,15 @@ Item {
                 { user: false, text: "The loop waits for a 20 s gap between requests" },
             ]
             var lines = Filter.snippets(fields, turns, ws)
-            check(lines.length === 3, "prompt line and two turns: " + lines.length)
+            check(lines.length === 2, "prompt line and the gap turn only: " + lines.join(" / "))
             check(marked(lines[0]) === "ai", "prompt shows its word: " + lines[0])
-            check(lines.some(function(l) { return marked(l).indexOf("gap") !== -1 }),
-                "the only turn holding gap is chosen: " + lines.join(" / "))
+            check(marked(lines[1]).split("|").indexOf("gap") !== -1,
+                "the only turn holding gap is chosen: " + lines[1])
+
+            var proto = Filter.snippets([], [{ user: false, text: "alpha" },
+                { user: false, text: "constructor call" }], Filter.words("alpha constructor"))
+            check(proto.length === 2 && marked(proto[1]) === "constructor",
+                "a word named like an Object property still needs its turn: " + proto.join(" / "))
 
             var far = "ai" + " filler".repeat(80) + " gap"
             var one = Filter.snippets([{ name: "lastPrompt", label: "prompt", text: far, shown: false }],
