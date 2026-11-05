@@ -4,6 +4,7 @@ import QtQuick.Controls as QQC2
 import org.kde.plasma.plasmoid
 import org.kde.plasma.components as PC3
 import org.kde.kirigami as Kirigami
+import "Filter.js" as Filter
 
 ColumnLayout {
     id: agents
@@ -34,7 +35,7 @@ ColumnLayout {
     }
 
     function recordShown(a) {
-        if (filterText) return recordMatches(a)
+        if (filterWords.length) return recordMatches(a)
         return !!a && !(hideOld && isOld(a))
     }
 
@@ -97,13 +98,10 @@ ColumnLayout {
     // Type-to-filter: printable keys typed while the popup has focus
     // accumulate here (FullRepresentation forwards them). Empty = no filter.
     property string filterText: ""
+    readonly property var filterWords: Filter.words(filterText)
 
-    // Field matches: a substring anywhere, else a subsequence whose every
-    // run of matched characters starts a word ("cmh" finds "Check MCP
-    // history", "tern" skips "after thorough testing"). Recent turns use
-    // exact substring matching so unrelated prose cannot satisfy a query.
-    // Every match is shown: highlighted in a visible label, or as a line
-    // in the row's snippet panel.
+    // Matching rules are in Filter.js. Every match is shown: highlighted in
+    // a visible label, or as a line in the row's snippet panel.
     readonly property var _fields: [
         { name: "windowTitle", label: "title" },
         { name: "lastPrompt", label: "prompt" },
@@ -117,108 +115,31 @@ ColumnLayout {
         return String(value || "").replace(/\s+/g, " ")
     }
 
-    function _isWordChar(c) {
-        return c.toLowerCase() !== c.toUpperCase() || (c >= "0" && c <= "9")
-    }
-
-    function _wordStart(text, k) {
-        if (k === 0) return true
-        var p = text[k - 1], c = text[k]
-        if (!_isWordChar(p)) return true
-        // camelCase boundary
-        return c !== c.toLowerCase() && p !== p.toUpperCase()
-    }
-
-    // Sorted match positions of lowercase q in text, or null.
-    function _matchPositions(text, q) {
-        if (!text || !q) return null
-        var hay = text.toLowerCase()
-        var at = hay.indexOf(q)
-        if (at !== -1) {
-            var run = []
-            for (var r = 0; r < q.length; r++) run.push(at + r)
-            return run
-        }
-        // Each matched character continues the previous run or starts a
-        // word. Failed (start, queryIndex) states are memoized.
-        var failed = {}
-        var walk = function(from, j) {
-            if (j === q.length) return []
-            var key = from + ":" + j
-            if (failed[key]) return null
-            for (var k = from; k < hay.length; k++) {
-                if (hay[k] !== q[j]) continue
-                if (!((j > 0 && k === from) || agents._wordStart(text, k))) continue
-                var rest = walk(k + 1, j + 1)
-                if (rest) return [k].concat(rest)
-            }
-            failed[key] = true
-            return null
-        }
-        return walk(0, 0)
-    }
-
-    function _escape(s) {
-        return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    }
-
-    // StyledText for text[start, end) with the matched positions highlighted.
-    function _styled(text, positions, start, end) {
-        var hit = {}
-        for (var i = 0; i < positions.length; i++) hit[positions[i]] = true
-        var out = ""
-        var k = start
-        while (k < end) {
-            var on = hit[k] === true
-            var e = k
-            while (e < end && (hit[e] === true) === on) e++
-            var part = _escape(text.slice(k, e))
-            out += on ? "<b><font color=\"#ffb300\">" + part + "</font></b>" : part
-            k = e
-        }
-        return out
-    }
-
-    // Up to 60 characters before the first match and 100 after the last.
-    function _excerpt(text, positions) {
-        var start = Math.max(0, positions[0] - 60)
-        var end = Math.min(text.length, positions[positions.length - 1] + 101)
-        return (start > 0 ? "… " : "")
-            + _styled(text, positions, start, end)
-            + (end < text.length ? " …" : "")
+    function _turnTexts(record) {
+        return (record.recent || []).map(function(t) {
+            return String(t.text || "").replace(/\s+/g, " ")
+        })
     }
 
     function recordMatches(a) {
-        var q = filterText.toLowerCase()
-        if (!q) return true
+        if (!filterWords.length) return true
         if (!a) return false
-        for (var i = 0; i < _fields.length; i++) {
-            if (_matchPositions(_fieldText(a, _fields[i].name), q)) return true
-        }
-        var rec = a.recent || []
-        for (var j = 0; j < rec.length; j++) {
-            var t = (rec[j].text || "").replace(/\s+/g, " ")
-            if (t.toLowerCase().indexOf(q) !== -1) return true
-        }
-        return false
+        return Filter.matchesAll(_fields.map(function(f) { return _fieldText(a, f.name) }),
+            _turnTexts(a), filterWords)
     }
 
-    // A visible label: StyledText with the filter match highlighted while
+    // A visible label: StyledText with the filter matches highlighted while
     // a filter is active, otherwise the text unchanged (render PlainText).
-    // `excerpt` trims long wrapped text around the match so it stays in view.
-    function highlighted(text, excerpt) {
-        var q = filterText.toLowerCase()
+    function highlighted(text) {
         var t = String(text || "")
-        if (!q) return t
+        if (!filterText) return t
         var norm = t.replace(/\s+/g, " ")
-        var pos = _matchPositions(norm, q)
-        if (!pos) return _escape(norm)
-        return excerpt ? _excerpt(norm, pos) : _styled(norm, pos, 0, norm.length)
+        return Filter.styled(norm, Filter.flat(Filter.hits(norm, filterWords, true)), 0, norm.length)
     }
 
     function titleParts(text) {
         var t = String(text || "")
-        var q = filterText.toLowerCase()
+        var q = filterText.length > 0
         if (q) t = t.replace(/\s+/g, " ")
         var code = t.codePointAt(0)
         var privateUse = (code >= 0xe000 && code <= 0xf8ff)
@@ -229,11 +150,11 @@ ColumnLayout {
         if (privateUse) {
             while (labelStart < t.length && /\s/.test(t[labelStart])) labelStart++
         }
-        var positions = q ? (_matchPositions(t, q) || []) : null
+        var positions = q ? Filter.flat(Filter.hits(t, filterWords, true)) : null
         return {
             glyph: t.slice(0, iconEnd),
-            icon: q ? _styled(t, positions, 0, iconEnd) : t.slice(0, iconEnd),
-            label: q ? _styled(t, positions, labelStart, t.length) : t.slice(labelStart)
+            icon: q ? Filter.styled(t, positions, 0, iconEnd) : t.slice(0, iconEnd),
+            label: q ? Filter.styled(t, positions, labelStart, t.length) : t.slice(labelStart)
         }
     }
 
@@ -251,37 +172,18 @@ ColumnLayout {
             .map(function(e) { return e[0] })
     }
 
-    // While a filter is active: StyledText lines for every matched field
-    // the row does not show (names in `shown`), then up to two
-    // conversation lines containing the query. A prompt line is dropped
-    // when a matching user turn already repeats that prompt.
+    // While a filter is active: StyledText lines showing where every query
+    // word matched beyond the fields the row shows (names in `shown`).
     function filterSnippets(record, shown) {
-        var q = filterText.toLowerCase()
-        if (!q || !record) return []
-        var turns = []
+        if (!filterWords.length || !record) return []
         var rec = record.recent || []
-        for (var j = 0; j < rec.length && turns.length < 2; j++) {
-            var t = (rec[j].text || "").replace(/\s+/g, " ")
-            var idx = t.toLowerCase().indexOf(q)
-            if (idx === -1) continue
-            var run = []
-            for (var r = 0; r < q.length; r++) run.push(idx + r)
-            turns.push({ user: rec[j].role === "user", text: t,
-                line: (rec[j].role === "user" ? "> " : "· ") + _excerpt(t, run) })
-        }
-        var out = []
-        for (var i = 0; i < _fields.length; i++) {
-            var f = _fields[i]
-            if (shown.indexOf(f.name) !== -1) continue
-            var text = _fieldText(record, f.name)
-            var pos = _matchPositions(text, q)
-            if (!pos) continue
-            if (f.name === "lastPrompt" && turns.some(function(turn) {
-                return turn.user && turn.text.slice(0, 100) === text.slice(0, 100)
-            })) continue
-            out.push(f.label + ": " + _excerpt(text, pos))
-        }
-        return out.concat(turns.map(function(turn) { return turn.line }))
+        var texts = _turnTexts(record)
+        return Filter.snippets(_fields.map(function(f) {
+            return { name: f.name, label: f.label, text: _fieldText(record, f.name),
+                shown: shown.indexOf(f.name) !== -1 }
+        }), texts.map(function(text, i) {
+            return { user: rec[i].role === "user", text: text }
+        }), filterWords)
     }
 
     // Model family for display and filtering: provider path and the

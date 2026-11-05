@@ -195,7 +195,10 @@ System Settings → Shortcuts → KWin, or Tern never sees the key.
   terminal and time in the current state. Working is a pulsing green dot,
   blocked on your input a red diamond, idle a grey ring.
 - **Filter by typing.** Title, prompt, folder, provider, model and recent
-  messages. Initials work too: `fmh` finds "Fix MCP history".
+  messages. Separate words with spaces: each must match somewhere, in any
+  order, and each match is highlighted. Word starts work too: `fmh` finds
+  "Fix MCP history" and `autor` finds "Auto-Research", but only across
+  neighbouring words.
 - **Peek** at the last eight turns, laid out like a chat, and the agent's
   latest recap (omp and Claude Code write them).
 - **Focus.** Plasma switches desktop and raises the terminal. Tern shows the

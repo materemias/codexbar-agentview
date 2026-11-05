@@ -1398,55 +1398,112 @@ local function tick()
 	tern.timer(TICK_MS, tick)
 end
 
--- Filtering (AgentsSection.qml) ---------------------------------------------
+-- Filtering (AgentsSection.qml, Filter.js) ----------------------------------
+-- A query is words separated by spaces, in any order. A session matches when every word matches one of
+-- its fields or recent turns. A word matches a field as a substring, else as prefixes of consecutive words
+-- ("cmh" finds "Check MCP history", "autor" finds "Auto-Research"); a turn only as a substring, so long
+-- prose cannot satisfy a short word by chance.
 
 local function isWordByte(b: number): boolean
 	return (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b >= 128
 end
 
+-- Whether byte k begins a word: after a non-word byte or at a camelCase boundary.
 local function wordStart(text: string, k: number): boolean
+	local c = string.byte(text, k)
+	if not c or not isWordByte(c) then
+		return false
+	end
 	if k == 1 then
 		return true
 	end
-	local p, c = string.byte(text, k - 1), string.byte(text, k)
+	local p = string.byte(text, k - 1)
 	if not isWordByte(p) then
 		return true
 	end
-	-- camelCase boundary
 	return c >= 65 and c <= 90 and p >= 97 and p <= 122
 end
 
--- Matched byte positions of lowercase `q` in `text`: a substring, else a
--- subsequence whose every run of matched characters starts a word.
-local function matchPositions(text: string, q: string): { number }?
-	if text == "" or q == "" then
+local lastQuery: string?, lastWords: { string } = nil, {}
+
+-- The query's distinct lowercase words; the last answer is kept, as every row asks for the same query.
+local function queryWords(q: string): { string }
+	if q ~= lastQuery then
+		local out = {}
+		for w in string.gmatch(string.lower(q), "%S+") do
+			if not table.find(out, w) then
+				table.insert(out, w)
+			end
+		end
+		lastQuery, lastWords = q, out
+	end
+	return lastWords
+end
+
+-- Matched byte positions of lowercase `word` in `text`, or nil; `initials` allows the
+-- consecutive-word-prefix form.
+local function matchPositions(text: string, word: string, initials: boolean): { number }?
+	if text == "" or word == "" then
 		return nil
 	end
 	local hay = string.lower(text)
-	local at = string.find(hay, q, 1, true)
+	local at = string.find(hay, word, 1, true)
 	if at then
 		local run = {}
-		for r = 0, #q - 1 do
+		for r = 0, #word - 1 do
 			table.insert(run, at + r)
 		end
 		return run
 	end
+	if not initials then
+		return nil
+	end
+	-- Each matched byte continues the run, or starts the word right after it; a word skipped in between
+	-- breaks the match. Failed (start, word index) states are memoized.
 	local failed: { [number]: boolean } = {}
 	local function walk(from: number, j: number): { number }?
-		if j > #q then
+		if j > #word then
 			return {}
 		end
-		local key = from * 256 + j
+		local key = from * (#word + 1) + j
 		if failed[key] then
 			return nil
 		end
-		local want = string.byte(q, j)
-		for k = from, #hay do
-			if string.byte(hay, k) == want and ((j > 1 and k == from) or wordStart(text, k)) then
+		local want = string.byte(word, j)
+		local function try(k: number): { number }?
+			if k <= #hay and string.byte(hay, k) == want then
 				local rest = walk(k + 1, j + 1)
 				if rest then
 					table.insert(rest, 1, k)
 					return rest
+				end
+			end
+			return nil
+		end
+		if j == 1 then
+			for k = 1, #hay do
+				if wordStart(text, k) then
+					local found = try(k)
+					if found then
+						return found
+					end
+				end
+			end
+		else
+			local found = try(from)
+			if found then
+				return found
+			end
+			-- The next word: the first to start at or after `from` (tried above when it starts there).
+			for k = from, #hay do
+				if wordStart(text, k) then
+					if k > from then
+						found = try(k)
+						if found then
+							return found
+						end
+					end
+					break
 				end
 			end
 		end
@@ -1454,6 +1511,52 @@ local function matchPositions(text: string, q: string): { number }?
 		return nil
 	end
 	return walk(1, 1)
+end
+
+type Hit = { word: string, run: { number } }
+
+-- The words that match `text`, each with its positions, or nil for none.
+local function hits(text: string, words: { string }, initials: boolean): { Hit }?
+	local out: { Hit } = {}
+	for _, w in words do
+		local run = matchPositions(text, w, initials)
+		if run then
+			table.insert(out, { word = w, run = run })
+		end
+	end
+	return if #out > 0 then out else nil
+end
+
+local function hitSet(found: { Hit }?): { [number]: boolean }
+	local set = {}
+	for _, h in found or {} do
+		for _, k in h.run do
+			set[k] = true
+		end
+	end
+	return set
+end
+
+-- Bytes `from`..`to` of `text` as spans, the hit bytes marked as a search match.
+local function marked(text: string, hit: { [number]: boolean }, from: number, to: number): { Span | string }
+	local out: { Span | string } = {}
+	local k = from
+	while k <= to do
+		local on = hit[k] == true
+		local e = k
+		while e < to and (hit[e + 1] == true) == on do
+			e += 1
+		end
+		local part = string.sub(text, k, e)
+		table.insert(out, if on then ui.span(part, "mark strong") else part)
+		k = e + 1
+	end
+	return out
+end
+
+-- `text` as spans, the bytes every filter word matched marked.
+local function highlighted(text: string, q: string): { Span | string }
+	return marked(text, hitSet(hits(text, queryWords(q), true)), 1, #text)
 end
 
 local function modelName(model: any): string
@@ -1488,35 +1591,82 @@ local function fieldText(r: any, name: string): string
 	return oneLine(if name == "model" then modelName(r.model) else r[name])
 end
 
-local function excerpt(text: string, positions: { number }): string
-	local first, last = positions[1], positions[#positions]
-	local from = math.max(1, first - 12) -- the detail column is narrow: keep the match in view
-	local to = math.min(#text, last + 80)
-	-- Keep cuts on UTF-8 boundaries.
-	while from > 1 and (string.byte(text, from) or 0) >= 128 and (string.byte(text, from) or 0) < 192 do
-		from -= 1
+local function isContinuation(text: string, k: number): boolean
+	local b = string.byte(text, k) or 0
+	return b >= 128 and b < 192
+end
+
+-- Spans around the `focus` hits (a window per word, overlapping windows merged, the text between them
+-- elided), with every hit in `found` marked. The detail column is narrow: a window starts just before its
+-- match, and is short when the line holds several words or parts.
+local function excerpt(text: string, found: { Hit }, narrow: boolean, focus: { Hit }): { Span | string }
+	local after = if #focus == 1 and not narrow then 80 else 30
+	local windows = {}
+	for _, h in focus do
+		local from = math.max(1, h.run[1] - 12)
+		local to = math.min(#text, h.run[#h.run] + after)
+		-- Keep cuts on UTF-8 boundaries.
+		while from > 1 and isContinuation(text, from) do
+			from -= 1
+		end
+		while to < #text and isContinuation(text, to + 1) do
+			to += 1
+		end
+		table.insert(windows, { from, to })
 	end
-	while to < #text and (string.byte(text, to + 1) or 0) >= 128 and (string.byte(text, to + 1) or 0) < 192 do
-		to += 1
+	table.sort(windows, function(a, b)
+		return a[1] < b[1]
+	end)
+	local merged = { windows[1] }
+	for i = 2, #windows do
+		local last = merged[#merged]
+		if windows[i][1] <= last[2] + 1 then
+			last[2] = math.max(last[2], windows[i][2])
+		else
+			table.insert(merged, windows[i])
+		end
 	end
-	return (if from > 1 then "… " else "") .. string.sub(text, from, to) .. (if to < #text then " …" else "")
+	local hit = hitSet(found)
+	local out: { Span | string } = {}
+	if merged[1][1] > 1 then
+		table.insert(out, "… ")
+	end
+	for i, w in merged do
+		if i > 1 then
+			table.insert(out, " … ")
+		end
+		for _, s in marked(text, hit, w[1], w[2]) do
+			table.insert(out, s)
+		end
+	end
+	if merged[#merged][2] < #text then
+		table.insert(out, " …")
+	end
+	return out
 end
 
 local function recordMatches(r: any, q: string): boolean
-	if q == "" then
-		return true
-	end
-	for _, f in FIELDS do
-		if matchPositions(fieldText(r, f.name), q) then
-			return true
+	for _, w in queryWords(q) do
+		local ok = false
+		for _, f in FIELDS do
+			if matchPositions(fieldText(r, f.name), w, true) then
+				ok = true
+				break
+			end
+		end
+		if not ok then
+			for _, t in val(r.recent) or {} do
+				if string.find(string.lower(oneLine(t.text)), w, 1, true) then
+					ok = true
+					break
+				end
+			end
+		end
+		if not ok then
+			return false
 		end
 	end
-	for _, t in val(r.recent) or {} do
-		if string.find(string.lower(oneLine(t.text)), q, 1, true) then
-			return true
-		end
-	end
-	return false
+	return true
 end
 
 local function labelField(r: any): string
@@ -1529,33 +1679,119 @@ local function labelField(r: any): string
 	return "provider"
 end
 
--- The first match the row's label doesn't show, as a detail line.
-local function filterSnippet(r: any, q: string): string?
-	if q == "" then
+local function hasWords(found: { Hit }, of: { Hit }): boolean
+	for _, x in of do
+		local ok = false
+		for _, y in found do
+			ok = ok or y.word == x.word
+		end
+		if not ok then
+			return false
+		end
+	end
+	return true
+end
+
+-- Where every filter word matched beyond the row's label, as one detail line: each matched field the
+-- label doesn't show, then the turns holding words nothing before showed (else the first matching turn
+-- when nothing else is shown). The prompt is left out when a chosen user turn repeats it with the same
+-- words. With several parts, each excerpt is short so the later ones stay in view, and centers on the
+-- words no earlier part (or the label) showed.
+local function filterSnippet(r: any, q: string): { Span | string }?
+	local words = queryWords(q)
+	if #words == 0 then
 		return nil
 	end
 	local shown = labelField(r)
+	local seen: { [string]: boolean } = {}
+	local inView: { [string]: boolean } = {} -- words the label, then each part so far, shows
+	local fields = {}
 	for _, f in FIELDS do
-		if f.name ~= shown then
-			local text = fieldText(r, f.name)
-			local pos = matchPositions(text, q)
-			if pos then
-				return f.label .. ": " .. excerpt(text, pos)
+		local text = fieldText(r, f.name)
+		local found = hits(text, words, true)
+		if found then
+			for _, h in found do
+				seen[h.word] = true
+				if f.name == shown then
+					inView[h.word] = true
+				end
+			end
+			if f.name ~= shown then
+				table.insert(fields, { name = f.name, prefix = f.label .. ": ", text = text, found = found })
 			end
 		end
 	end
+	local turns = {}
 	for _, t in val(r.recent) or {} do
 		local text = oneLine(t.text)
-		local at = string.find(string.lower(text), q, 1, true)
-		if at then
-			local run = {}
-			for i = 0, #q - 1 do
-				table.insert(run, at + i)
+		table.insert(turns, { user = t.role == "user", text = text, found = hits(text, words, false), chosen = false })
+	end
+	local count = 0
+	for _, t in turns do
+		if t.found then
+			local fresh = false
+			for _, h in t.found do
+				fresh = fresh or not seen[h.word]
 			end
-			return (if t.role == "user" then "> " else "· ") .. excerpt(text, run)
+			if fresh then
+				t.chosen = true
+				count += 1
+				for _, h in t.found do
+					seen[h.word] = true
+				end
+			end
 		end
 	end
-	return nil
+	if count == 0 and #fields == 0 then
+		for _, t in turns do
+			if t.found then
+				t.chosen = true
+				break
+			end
+		end
+	end
+	local parts = {}
+	for _, f in fields do
+		local repeated = false
+		if f.name == "lastPrompt" then
+			for _, t in turns do
+				if t.chosen and t.user and string.sub(t.text, 1, 100) == string.sub(f.text, 1, 100) and hasWords(t.found, f.found) then
+					repeated = true
+				end
+			end
+		end
+		if not repeated then
+			table.insert(parts, { prefix = f.prefix, text = f.text, found = f.found })
+		end
+	end
+	for _, t in turns do
+		if t.chosen then
+			table.insert(parts, { prefix = if t.user then "> " else "· ", text = t.text, found = t.found })
+		end
+	end
+	if #parts == 0 then
+		return nil
+	end
+	local out: { Span | string } = {}
+	for i, p in parts do
+		if i > 1 then
+			table.insert(out, ui.span("  │  ", "dim"))
+		end
+		table.insert(out, p.prefix)
+		local fresh: { Hit } = {}
+		for _, h in p.found do
+			if not inView[h.word] then
+				table.insert(fresh, h)
+			end
+		end
+		for _, h in p.found do
+			inView[h.word] = true
+		end
+		for _, s in excerpt(p.text, p.found, #parts > 1, if #fresh > 0 then fresh else p.found) do
+			table.insert(out, s)
+		end
+	end
+	return out
 end
 
 -- Agents and History lists ---------------------------------------------------
@@ -1642,7 +1878,7 @@ end
 local function agentRows(q: string): { { folder: string, rows: { any } } }
 	local groups: { [string]: { any } } = {}
 	local order: { string } = {}
-	local hideOld = q == "" and setting("hideOld")
+	local hideOld = #queryWords(q) == 0 and setting("hideOld")
 	local nowMs = os.time() * 1000
 	for _, a in liveAgents() do
 		if recordMatches(a, q) and not (hideOld and isOld(a, nowMs)) then
@@ -1797,11 +2033,14 @@ local function peekNode(b: Block, r: any, history: boolean): Node
 end
 
 local function agentItem(b: Block, r: any, focused: boolean, now: number, q: string): Node
-	local title = fieldText(r, labelField(r))
+	local label: { Span | string } = { stateGlyph(r, focused, now), " " }
+	for _, s in highlighted(fieldText(r, labelField(r)), q) do
+		table.insert(label, s)
+	end
 	local idleFor = now - (tonumber(val(r.stateChangedAt)) or now)
 	return ui.node("item", {
 		key = recordKey(r),
-		label = { stateGlyph(r, focused, now), " ", title },
+		label = label,
 		detail = filterSnippet(r, q) or "",
 		value = {
 			ui.span(pad(modelName(r.model), 15), vendorToken(r.model)),
@@ -1816,7 +2055,7 @@ local function agentItem(b: Block, r: any, focused: boolean, now: number, q: str
 end
 
 local function historyItem(b: Block, r: any, now: number, q: string): Node
-	local title = fieldText(r, labelField(r))
+	local title = highlighted(fieldText(r, labelField(r)), q)
 	local launchable = LAUNCH_HOSTS[str(r.host)] and str(r.resumeCommand) ~= ""
 	return ui.node("item", {
 		key = recordKey(r),
@@ -1848,10 +2087,10 @@ local function listView(b: Block, children: { Node }, empty: Node): Node
 		return withp(empty, { key = "list" }) -- the list's key: empty, loading and rows take turns in one place
 	end
 	local sel = selected(b)
+	-- No `filter` prop: Tern would mark its own fuzzy match of the whole query; the rows mark each word.
 	return ui.node("list", {
 		key = "list",
 		selected = if sel then LIST_PATH .. sel.key else nil,
-		filter = b.filter,
 		max = LIST_MAX,
 	}, children)
 end
