@@ -1656,7 +1656,7 @@ local function recordMatches(r: any, q: string): boolean
 		end
 		if not ok then
 			for _, t in val(r.recent) or {} do
-				if string.find(string.lower(oneLine(t.text)), w, 1, true) then
+				if t.kind ~= "tools" and string.find(string.lower(oneLine(t.text)), w, 1, true) then
 					ok = true
 					break
 				end
@@ -1695,8 +1695,9 @@ end
 -- Where every filter word matched beyond the row's label: each matched field the label doesn't show, then
 -- the turns holding words nothing before showed (else the first matching turn when nothing else is shown).
 -- The prompt is left out when a chosen user turn repeats it with the same words. Each part's excerpt
--- centers on the words no earlier part (or the label) showed.
-type SnippetPart = { label: string?, user: boolean, tools: boolean, spans: { Span | string } }
+-- centers on the words no earlier part (or the label) showed. Tool-call summaries are tool names, not
+-- conversation: a filter never matches them.
+type SnippetPart = { label: string?, user: boolean, spans: { Span | string } }
 local function filterSnippet(r: any, q: string): { SnippetPart }?
 	local words = queryWords(q)
 	if #words == 0 then
@@ -1723,8 +1724,10 @@ local function filterSnippet(r: any, q: string): { SnippetPart }?
 	end
 	local turns = {}
 	for _, t in val(r.recent) or {} do
-		local text = oneLine(t.text)
-		table.insert(turns, { user = t.role == "user", tools = t.kind == "tools", text = text, found = hits(text, words, false), chosen = false })
+		if t.kind ~= "tools" then
+			local text = oneLine(t.text)
+			table.insert(turns, { user = t.role == "user", text = text, found = hits(text, words, false), chosen = false })
+		end
 	end
 	local count = 0
 	for _, t in turns do
@@ -1766,7 +1769,7 @@ local function filterSnippet(r: any, q: string): { SnippetPart }?
 	end
 	for _, t in turns do
 		if t.chosen then
-			table.insert(parts, { user = t.user, tools = t.tools, text = t.text, found = t.found })
+			table.insert(parts, { user = t.user, text = t.text, found = t.found })
 		end
 	end
 	if #parts == 0 then
@@ -1783,7 +1786,7 @@ local function filterSnippet(r: any, q: string): { SnippetPart }?
 		for _, h in p.found do
 			inView[h.word] = true
 		end
-		table.insert(out, { label = p.label, user = p.user, tools = p.tools, spans = excerpt(p.text, p.found, if #fresh > 0 then fresh else p.found) })
+		table.insert(out, { label = p.label, user = p.user, spans = excerpt(p.text, p.found, if #fresh > 0 then fresh else p.found) })
 	end
 	return out
 end
@@ -2078,8 +2081,6 @@ local function snippetNode(r: any, q: string): Node?
 		local spans: { Span | string } = {}
 		if p.label then
 			table.insert(spans, ui.span(p.label .. ": ", "muted"))
-		elseif p.tools then
-			table.insert(spans, ui.span("⚙ ", "muted"))
 		end
 		for _, s in p.spans do
 			table.insert(spans, s)

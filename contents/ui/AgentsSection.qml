@@ -115,17 +115,20 @@ ColumnLayout {
         return String(value || "").replace(/\s+/g, " ")
     }
 
-    function _turnTexts(record) {
-        return (record.recent || []).map(function(t) {
-            return String(t.text || "").replace(/\s+/g, " ")
-        })
+    // The recent prose turns, whitespace collapsed. Tool-call summaries are
+    // tool names, not conversation, so a filter never matches them.
+    function _textTurns(record) {
+        return (record.recent || []).filter(function(t) { return t.kind !== "tools" })
+            .map(function(t) {
+                return { user: t.role === "user", text: String(t.text || "").replace(/\s+/g, " ") }
+            })
     }
 
     function recordMatches(a) {
         if (!filterWords.length) return true
         if (!a) return false
         return Filter.matchesAll(_fields.map(function(f) { return _fieldText(a, f.name) }),
-            _turnTexts(a), filterWords)
+            _textTurns(a).map(function(t) { return t.text }), filterWords)
     }
 
     // A visible label: StyledText with the filter matches highlighted while
@@ -176,14 +179,10 @@ ColumnLayout {
     // word matched beyond the fields the row shows (names in `shown`).
     function filterSnippets(record, shown) {
         if (!filterWords.length || !record) return []
-        var rec = record.recent || []
-        var texts = _turnTexts(record)
         return Filter.snippets(_fields.map(function(f) {
             return { name: f.name, label: f.label, text: _fieldText(record, f.name),
                 shown: shown.indexOf(f.name) !== -1 }
-        }), texts.map(function(text, i) {
-            return { user: rec[i].role === "user", text: text }
-        }), filterWords)
+        }), _textTurns(record), filterWords)
     }
 
     // Model family for display and filtering: provider path and the

@@ -12,6 +12,7 @@
 - Focusing a session that runs in T3 Code 0.1 or later opens its thread instead of only raising the window.
 - Initials and word starts in a filter match only neighbouring words, so a query no longer matches scattered letters across a long prompt.
 - The Tern extension highlights the matched words in each row, and shows the matching prompt and messages under it in the conversation panel's style.
+- Filters ignore tool-call summaries such as "bash, eval, read" and match only prompts and message text.
 - In the Tern extension, Space types into a filter in progress instead of opening the conversation.
 
 ## 0.3.0 (2026-11-02)
