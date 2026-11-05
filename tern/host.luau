@@ -1780,7 +1780,9 @@ local function peekNode(b: Block, r: any, history: boolean): Node
 			table.insert(buttons, button("Copy resume command", "copy_resume", { icon = "copy" }))
 		end
 	end
-	table.insert(buttons, button(if b.peek then "Hide conversation" else "Conversation", "peek", { icon = "message", keys = { "space" }, on = b.peek }))
+	-- Once a filter is being typed, space is a filter character, not the peek key.
+	local peekKeys = if b.filter == "" then { "space" } else nil
+	table.insert(buttons, button(if b.peek then "Hide conversation" else "Conversation", "peek", { icon = "message", keys = peekKeys, on = b.peek }))
 	table.insert(kids, withp(ui.row(buttons), { key = "actions", wrap = true }))
 	if b.peek then
 		local turns = turnNodes(r)
@@ -1973,9 +1975,12 @@ local function dockView(b: Block, now: number): Node
 		for _, n in {
 			key("↑"), key("↓"), ui.span(" select   ", "dim"),
 			key("⏎"), ui.span(if b.tab == "agents" then " focus   " else " launch   ", "dim"),
-			key("space"), ui.span(" conversation   ", "dim"),
 		} do
 			table.insert(hints, n)
+		end
+		if b.filter == "" then
+			table.insert(hints, key("space"))
+			table.insert(hints, ui.span(" conversation   ", "dim"))
 		end
 		if b.tab == "agents" then
 			table.insert(hints, key("tab"))
@@ -2320,7 +2325,8 @@ tern.block.define("dashboard", {
 			move(b, 0, 1)
 		elseif name == "end" then
 			move(b, 0, math.huge)
-		elseif name == "space" then
+		elseif name == "space" and b.filter == "" then
+			-- Space peeks only while no query is in progress; after that it is a filter character.
 			b.peek = not b.peek
 		elseif name == "enter" then
 			activate(b)
@@ -2333,8 +2339,8 @@ tern.block.define("dashboard", {
 			local cut = utf8.offset(b.filter, -1) or #b.filter
 			b.filter = string.sub(b.filter, 1, cut - 1)
 			b.sel = nil
-		elseif name == "paste" or (k.text and k.text ~= "" and string.byte(k.text) >= 32) then
-			b.filter ..= oneLine(k.text)
+		elseif name == "paste" or name == "space" or (k.text and k.text ~= "" and string.byte(k.text) >= 32) then
+			b.filter ..= if name == "space" then " " else oneLine(k.text)
 			b.sel = nil
 		else
 			return false

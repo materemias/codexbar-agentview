@@ -144,7 +144,7 @@ On macOS:
 | `Ctrl+Alt+A` / `Ctrl+Alt+U` | Toggle the dashboard on Agents / Usage | Tern |
 | `←` / `→` | Switch tabs | Both |
 | `↑` / `↓` | Select a row on Agents or History | Both |
-| `Space` | Peek at the selected session | Both |
+| `Space` | Peek at the selected session; while filtering, types a space | Both |
 | `Enter` | Agents: jump to the session. History: launch it | Both |
 | `Tab` | Hide or show sessions idle for over a day | Both |
 | `Delete` | Dismiss the selected History row | Tern |
