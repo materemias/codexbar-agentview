@@ -1597,8 +1597,8 @@ local function isContinuation(text: string, k: number): boolean
 end
 
 -- Spans around the `focus` hits (a window per word, overlapping windows merged, the text between them
--- elided), with every hit in `found` marked. The detail column is narrow: a window starts just before its
--- match, and is short when the line holds several words or parts.
+-- elided), with every hit in `found` marked. The snippet line is clamped to two lines: a window starts just
+-- before its match, and is short when the line holds several words or parts.
 local function excerpt(text: string, found: { Hit }, narrow: boolean, focus: { Hit }): { Span | string }
 	local after = if #focus == 1 and not narrow then 80 else 30
 	local windows = {}
@@ -1692,7 +1692,7 @@ local function hasWords(found: { Hit }, of: { Hit }): boolean
 	return true
 end
 
--- Where every filter word matched beyond the row's label, as one detail line: each matched field the
+-- Where every filter word matched beyond the row's label, as one snippet line: each matched field the
 -- label doesn't show, then the turns holding words nothing before showed (else the first matching turn
 -- when nothing else is shown). The prompt is left out when a chosen user turn repeats it with the same
 -- words. With several parts, each excerpt is short so the later ones stay in view, and centers on the
@@ -2041,7 +2041,6 @@ local function agentItem(b: Block, r: any, focused: boolean, now: number, q: str
 	return ui.node("item", {
 		key = recordKey(r),
 		label = label,
-		detail = filterSnippet(r, q) or "",
 		value = {
 			ui.span(pad(modelName(r.model), 15), vendorToken(r.model)),
 			ui.span(pad(str(r.host), 7), "muted"),
@@ -2060,7 +2059,7 @@ local function historyItem(b: Block, r: any, now: number, q: string): Node
 	return ui.node("item", {
 		key = recordKey(r),
 		label = title,
-		detail = filterSnippet(r, q) or cwdLabel(r.cwd),
+		detail = cwdLabel(r.cwd),
 		value = {
 			ui.span(pad(modelName(r.model), 14), vendorToken(r.model)),
 			ui.span(string.format("%4s ", ageFrom(r.lastSeenAt, now)), ageToken(r.lastSeenAt, now, 3600000, 86400000)),
@@ -2070,6 +2069,24 @@ local function historyItem(b: Block, r: any, now: number, q: string): Node
 		hint = if b.sel == recordKey(r) and launchable then { "enter" } else nil,
 		role = "codexbar.history",
 	})
+end
+
+-- The filter snippet under a row, on a line of its own: a row's detail gets no room beside a long title in
+-- a split pane. Nil while not filtering or when nothing beyond the label matched.
+local function snippetNode(r: any, q: string): Node?
+	local spans = filterSnippet(r, q)
+	if not spans then
+		return nil
+	end
+	return withp(ui.node("text", { spans = spans, lines = 2 }), { key = "snip-" .. recordKey(r), role = "codexbar.snippet" })
+end
+
+local function addRow(kids: { Node }, row: Node, r: any, q: string)
+	table.insert(kids, row)
+	local snip = snippetNode(r, q)
+	if snip then
+		table.insert(kids, snip)
+	end
 end
 
 local function groupHead(key: string, spans: { any }, buttons: { Node }?): Node
@@ -2118,7 +2135,7 @@ local function agentsView(b: Block, now: number): Node
 		table.insert(kids, groupHead("g-" .. nodeKey(g.folder), { ui.span(g.folder, "strong"), ui.span("  " .. #g.rows, "muted") }))
 		for _, r in g.rows do
 			local key = recordKey(r)
-			table.insert(kids, agentItem(b, r, key == focus, now, q))
+			addRow(kids, agentItem(b, r, key == focus, now, q), r, q)
 			if sel and sel.key == key then
 				table.insert(kids, peekNode(b, r, false))
 			end
@@ -2138,7 +2155,7 @@ local function historyView(b: Block, now: number): Node
 	local kids: { Node } = {}
 	local function add(r)
 		local key = recordKey(r)
-		table.insert(kids, historyItem(b, r, now, q))
+		addRow(kids, historyItem(b, r, now, q), r, q)
 		if sel and sel.key == key then
 			table.insert(kids, peekNode(b, r, true))
 		end

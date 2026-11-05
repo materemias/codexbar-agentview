@@ -82,6 +82,14 @@
 		color: #a78bfa;
 	}
 
+	/* While filtering: where the row matched, under its label, quieter than the row. */
+	[data-role='codexbar.snippet'] {
+		margin: -2px 0 3px 30px;
+		padding-left: 12px;
+		color: var(--sf-c-muted);
+		font-size: .92em;
+	}
+
 	/* The selected row's recap, buttons and conversation, indented under it. */
 	[data-role='codexbar.peek'] {
 		margin: 3px 0 8px 30px;
