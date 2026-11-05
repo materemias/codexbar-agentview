@@ -5,9 +5,15 @@
 ### Features
 
 - Filters take several words separated by spaces, in any order: a session matches when each word appears in its title, prompt, folder, provider, model or recent messages, and every matched word is highlighted.
+- Set sessions aside: `Ctrl+Alt+B` in Tern or `/wait` in omp parks a session with your own sentence and what it waits for (a time, a pull request's review, readiness, merge or release, a repo's next release, a command's output, the agent's turn, a shell job, a person, or "when I have time"). When the wait fires, the session gets its optional follow-up prompt, parked or not, and comes back to you. Review waits know Greptile, Macroscope, CodeRabbit, Codex, Copilot, Gemini, Cursor Bugbot, Sourcery and roboomp.
+- A Waiting tab in the Tern dashboard (`Ctrl+Alt+W`) groups set-aside sessions by who has the next step, with what happened since, the next step, the session's pull requests, Open (in its own tab) or Resume, +1 day and Done. "When I have time" pins the session in omp and lists every pinned one, closed ones included; Done unpins it.
+- An omp extension adds `/wait` (a set-aside menu, also on `Ctrl+Alt+B` outside Tern, plus one-line forms with completions and `/wait help`), a `waitingfor` agent tool and a row above the composer showing what the session waits for; install it with the Plasma Install button, the Tern palette command `Install omp extension` or `install_integration.py --omp-extension`.
+- A session card floats over any omp session in Tern (`Ctrl+Alt+I` or the Card buttons) with your sentence, folder, branch, model, pull requests with their state, waits, schedules and what happened since; it opens by itself the first time you focus a session whose wait fired. A status line segment and a yellow tab show sessions back on you.
+- The Plasma widget's new Settings → Agents → Tern integration switch marks set-aside sessions in Agents and counts the ones back on you beside the panel dots.
 
 ### Fixes
 
+- Codex and Claude accounts are always listed in alphabetical order by email, in the widget and in Tern, instead of switching places between refreshes.
 - In the Tern extension, a slow usage-cache read that finishes late no longer replaces a newer one's result, such as bringing back an account whose login was replaced.
 - Focusing a session that runs in T3 Code 0.1 or later opens its thread instead of only raising the window.
 - Initials and word starts in a filter match only neighbouring words, so a query no longer matches scattered letters across a long prompt.

@@ -589,6 +589,15 @@ class UsageCacheTests(IsolatedUsageTestCase):
         restored = self.snapshot(providers="claude", cache_only=True)["providers"]
         self.assertEqual([r.get("planWeight") for r in restored], [5, None])
 
+    def test_accounts_are_listed_by_email_on_fetch_and_cache_read(self) -> None:
+        records = [self.record(account="zed@example.com"), self.record(account="Bob@example.com"),
+                   self.record(account="amy@example.com")]
+        expected = ["amy@example.com", "Bob@example.com", "zed@example.com"]
+        fetched = self.snapshot(records)["providers"]
+        self.assertEqual([r["accountEmail"] for r in fetched], expected)
+        restored = self.snapshot(cache_only=True)["providers"]
+        self.assertEqual([r["accountEmail"] for r in restored], expected)
+
     def test_cache_read_keeps_a_quiet_source_late_reading_last_known(self) -> None:
         # A one-off Meridian failure carries no error text but is still late.
         late = fetch._meridian_stale(self.record("claude"), {

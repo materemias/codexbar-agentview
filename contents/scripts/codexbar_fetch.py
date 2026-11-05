@@ -1633,6 +1633,18 @@ def _last_known(record: dict, error: str = "") -> dict:
     return {**record, "stale": True, "refreshError": error}
 
 
+def _by_account(records: list[dict]) -> list[dict]:
+    """Records in email order, case-insensitive; records without one last.
+
+    The CLI, Meridian and the fetch threads return accounts in no stable
+    order, so every published roster goes through here.
+    """
+    def key(record):
+        email = (record.get("accountEmail") or "").strip().casefold()
+        return (not email, email)
+    return sorted(records, key=key)
+
+
 def _merge_usage_results(results: list[dict], cached: list[dict], now: _dt.datetime) -> list[dict]:
     """A returned account roster replaces the old one, except matching failures."""
     def account(record):
@@ -1661,6 +1673,7 @@ def _merge_usage_results(results: list[dict], cached: list[dict], now: _dt.datet
                 merged.append(_last_known(matches[0], message))
             else:
                 merged.append(record)
+    merged = _by_account(merged)
     for record in merged:
         record["accountCount"] = len(merged)
     return merged
@@ -2061,7 +2074,7 @@ def main(argv: list[str]) -> int:
     cached = _usage_cache_read(scopes, now)
     restored = [
         _last_known(record, record.get("refreshError", ""))
-        for p in providers for record in cached.get(p, [])
+        for p in providers for record in _by_account(cached.get(p, []))
     ]
     out = {
         "updatedAt": max((r["updatedAt"] for r in restored), default=None),
