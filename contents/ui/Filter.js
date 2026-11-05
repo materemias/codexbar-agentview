@@ -139,16 +139,25 @@ function styled(text, positions, start, end) {
     return out
 }
 
-// StyledText around the `focus` hits (a window per word, overlapping
-// windows merged, the text between them elided), every hit in `found`
-// highlighted. The line is clamped to two lines, so the windows share one
-// budget and shrink as the line holds more words.
+// StyledText around the `focus` hits (a window per contiguous piece of a
+// hit, so a long word between initials is cut; overlapping windows merged,
+// the text between them elided), every hit in `found` highlighted. The
+// line is clamped to two lines, so the windows share one budget and shrink
+// as the line holds more pieces.
 function excerpt(text, found, focus) {
-    var before = Math.floor(60 / focus.length)
-    var after = Math.floor(100 / focus.length)
-    var spans = focus.map(function(h) {
-        return [Math.max(0, h.run[0] - before),
-            Math.min(text.length, h.run[h.run.length - 1] + 1 + after)]
+    var pieces = []
+    focus.forEach(function(h) {
+        var start = h.run[0]
+        for (var i = 1; i <= h.run.length; i++) {
+            if (i < h.run.length && h.run[i] === h.run[i - 1] + 1) continue
+            pieces.push([start, h.run[i - 1]])
+            start = h.run[i]
+        }
+    })
+    var before = Math.floor(60 / pieces.length)
+    var after = Math.floor(100 / pieces.length)
+    var spans = pieces.map(function(p) {
+        return [Math.max(0, p[0] - before), Math.min(text.length, p[1] + 1 + after)]
     }).sort(function(a, b) { return a[0] - b[0] })
     var merged = [spans[0]]
     for (var i = 1; i < spans.length; i++) {

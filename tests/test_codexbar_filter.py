@@ -102,6 +102,13 @@ Item {
             check(proto.length === 2 && marked(proto[1]) === "constructor",
                 "a word named like an Object property still needs its turn: " + proto.join(" / "))
 
+            var long = "A" + "x".repeat(250) + " Beta Charlie"
+            var cut = Filter.snippets([{ name: "lastPrompt", label: "prompt", text: long, shown: false }],
+                [], Filter.words("abc"))
+            var plain = cut[0].replace(/<[^>]*>/g, "")
+            check(marked(cut[0]) === "A|B|C" && plain.length < 200 && plain.indexOf(" … ") !== -1,
+                "initials across a long word keep every letter in a short excerpt: " + plain)
+
             var far = "ai" + " filler".repeat(80) + " gap"
             var one = Filter.snippets([{ name: "lastPrompt", label: "prompt", text: far, shown: false }],
                 [], ws)

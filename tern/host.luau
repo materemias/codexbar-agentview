@@ -1596,15 +1596,26 @@ local function isContinuation(text: string, k: number): boolean
 	return b >= 128 and b < 192
 end
 
--- Spans around the `focus` hits (a window per word, overlapping windows merged, the text between them
--- elided), with every hit in `found` marked. Each part is clamped to two lines, so the windows share one
--- budget: each starts just before its match and shrinks as the part holds more words.
+-- Spans around the `focus` hits (a window per contiguous piece of a hit, so a long word between initials is
+-- cut; overlapping windows merged, the text between them elided), with every hit in `found` marked. Each
+-- part is clamped to two lines, so the windows share one budget: each starts just before its piece and
+-- shrinks as the part holds more pieces.
 local function excerpt(text: string, found: { Hit }, focus: { Hit }): { Span | string }
-	local before, after = math.floor(24 / #focus), math.floor(96 / #focus)
-	local windows = {}
+	local pieces: { { number } } = {}
 	for _, h in focus do
-		local from = math.max(1, h.run[1] - before)
-		local to = math.min(#text, h.run[#h.run] + after)
+		local start = h.run[1]
+		for i = 2, #h.run + 1 do
+			if i > #h.run or h.run[i] ~= h.run[i - 1] + 1 then
+				table.insert(pieces, { start, h.run[i - 1] })
+				start = h.run[i]
+			end
+		end
+	end
+	local before, after = math.floor(24 / #pieces), math.floor(96 / #pieces)
+	local windows = {}
+	for _, p in pieces do
+		local from = math.max(1, p[1] - before)
+		local to = math.min(#text, p[2] + after)
 		-- Keep cuts on UTF-8 boundaries.
 		while from > 1 and isContinuation(text, from) do
 			from -= 1
