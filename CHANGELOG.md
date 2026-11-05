@@ -14,6 +14,7 @@
 - The Tern extension highlights the matched words in each row, and shows the matching prompt and messages under it in the conversation panel's style.
 - Filters ignore tool-call summaries such as "bash, eval, read" and match only prompts and message text.
 - In the Tern extension, Space types into a filter in progress instead of opening the conversation.
+- In the Tern extension, clearing a filter keeps the selected session selected, as in the applet, so Esc then Space peeks at the session the filter found.
 
 ## 0.3.0 (2026-11-02)
 

@@ -2488,8 +2488,9 @@ local function act(b: Block, name: string)
 	elseif name == "peek" then
 		b.peek = not b.peek
 	elseif name == "clear" then -- the filter's × and the no-match Clear button
+		-- The selected row stays selected, so Esc then Space peeks at the session the filter found.
+		b.sel = if row then row.key else nil
 		b.filter = ""
-		b.sel = nil
 	elseif row then
 		if name == "focus" then
 			focusRecord(b, row.record)
@@ -2597,8 +2598,7 @@ tern.block.define("dashboard", {
 		end
 		if name == "escape" then
 			if b.filter ~= "" then
-				b.filter = ""
-				b.sel = nil
+				act(b, "clear")
 				return true
 			end
 			closeBlock(b)

@@ -150,7 +150,7 @@ On macOS:
 | `Delete` | Dismiss the selected History row | Tern |
 | `R` | Refresh (Usage tab) | Both |
 | Typing | Filter Agents and History | Both |
-| `Esc` | Clear the filter, then close | Both |
+| `Esc` | Clear the filter, keeping the selected session, then close | Both |
 
 KDE binds `Ctrl+Alt+A` to Activate Window Demanding Attention. Clear it in
 System Settings → Shortcuts → KWin, or Tern never sees the key.
