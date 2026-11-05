@@ -643,7 +643,10 @@ class Take:
             self.cut(dash)
             self.type("webhook")
             time.sleep(1.2)
+            # With a query typed, Space is part of it; Esc clears the query and keeps the selection.
             self.caption("Agents", "Peek at where it left off.")
+            self.key("Escape", "Esc")
+            time.sleep(0.7)
             self.key("Space", "Space")
             time.sleep(2.0)
             self.caption("Agents", "Jump straight to it.")
