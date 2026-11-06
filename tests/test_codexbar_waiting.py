@@ -1617,8 +1617,8 @@ class ViewTests(Case):
                 "session_id", "title", "cwd", "project", "live", "pane", "tern_session",
                 "agent_state", "extension", "resume_command", "note", "suggested_note",
                 "size", "set_aside_at", "pinned", "ball", "unseen", "status", "line", "composer_row",
-                "next_step", "recap", "due_at", "prompts_queued", "waits", "schedules",
-                "history", "prs",
+                "next_step", "waiting_for", "recap", "due_at", "prompts_queued", "waits",
+                "schedules", "history", "prs",
             },
         )
         self.assertEqual(seen["status"], "⏳ Retry · in 2h")
@@ -1654,6 +1654,9 @@ class ViewTests(Case):
 
     def test_sort_ball_then_due_then_set_aside(self) -> None:
         sids = [f"aaaa000{index}" for index in range(5)]
+        scheduled = "aaaa0006"
+        self.agents(scheduled)
+        self.write_schedule(scheduled, [{"id": 1, "prompt": "p", "dueAt": int(T0.timestamp() * 1000)}])
         self.add("--kind", "later", session=sids[0])
         self.add("--kind", "something", "--what", "x", session=sids[1])
         self.add("--kind", "job", "--pane", "51", session=sids[2])
@@ -1667,10 +1670,11 @@ class ViewTests(Case):
         view = self.run_cli("list")
         self.assertEqual(
             [item["session_id"] for item in view["sessions"]],
-            [fired, sids[4], sids[2], sids[3], sids[1], sids[0]],
+            [fired, sids[4], sids[2], sids[3], scheduled, sids[1], sids[0]],
         )
         self.assertEqual(
-            view["counts"], {"on_me": 1, "on_machine": 3, "on_someone": 1, "on_my_time": 1},
+            view["counts"],
+            {"on_me": 1, "on_machine": 3, "scheduled": 1, "on_someone": 1, "on_my_time": 1},
         )
 
     def test_counts_include_panes(self) -> None:
@@ -1751,9 +1755,22 @@ class ViewTests(Case):
         self.assertEqual(self.run_cli("list")["sessions"], [])
         self.agents(SID)
         seen = self.session()
-        self.assertEqual(seen["ball"], "on_machine")
+        self.assertEqual(seen["ball"], "scheduled")
+        self.assertEqual(self.run_cli("list")["counts"]["scheduled"], 1)
         self.assertEqual(seen["line"], "↻ every 90m · next 13:00")
         self.assertEqual(seen["composer_row"], "")
+
+    def test_a_wait_or_a_pin_keeps_its_ball_beside_schedules(self) -> None:
+        due = int((T0 + timedelta(hours=1)).timestamp() * 1000)
+        self.write_schedule(SID, [{"id": 1, "prompt": "check", "dueAt": due}])
+        self.agents(SID)
+        wait = self.add("--kind", "something", "--what", "x")["id"]
+        seen = self.session()
+        self.assertEqual((seen["ball"], len(seen["schedules"])), ("on_someone", 1))
+        self.run_cli("done", "--session", SID, "--wait", wait)
+        self.assertEqual(self.session()["ball"], "scheduled")
+        self.pin(SID)
+        self.assertEqual(self.session()["ball"], "on_my_time")
 
     def test_broken_schedule_file_means_no_jobs(self) -> None:
         folder = self.omp / "schedule"
@@ -2739,6 +2756,149 @@ class ArgvTests(Case):
         self.assertEqual(wait["condition"]["argv"][-1], "a|b")
         self.tick()
         self.assertEqual(marker.read_text(), "a|b")
+
+
+class MenuTests(Case):
+    def test_menu_prints_the_shipped_items(self) -> None:
+        items = self.run_cli("menu")["items"]
+        self.assertEqual(items, json.loads(waiting.MENU_PATH.read_text())["items"])
+        self.assertEqual(len({item["id"] for item in items}), len(items))
+        for item in items:
+            with self.subTest(item=item["id"]):
+                self.assertTrue(item["label"] and item["detail"])
+                self.assertLessEqual(set(item["targets"]), {"session", "pane"})
+
+    def test_a_broken_menu_file_is_an_error(self) -> None:
+        good = {"id": "a", "label": "A", "detail": "d", "targets": ["session"]}
+        path = self.root / "menu.json"
+        for text in (
+            "{",
+            json.dumps({"items": []}),
+            json.dumps([good]),
+            json.dumps({"items": [good, {**good, "label": "B"}]}),
+            json.dumps({"items": [{**good, "label": " "}]}),
+            json.dumps({"items": [{**good, "id": 3}]}),
+            json.dumps({"items": [{**good, "targets": ["session", "window"]}]}),
+            json.dumps({"items": [{**good, "targets": []}]}),
+            json.dumps({"items": [{**good, "command": ""}]}),
+            json.dumps({"items": [good, {**good, "id": " a"}]}),
+            json.dumps({"items": [{**good, "command": 7}]}),
+        ):
+            path.write_text(text)
+            with self.subTest(text=text), mock.patch.object(waiting, "MENU_PATH", path):
+                self.assertIn("menu file", self.run_cli("menu", expect=2)["error"])
+        missing = self.root / "missing.json"
+        with mock.patch.object(waiting, "MENU_PATH", missing):
+            self.run_cli("menu", expect=2)
+
+
+class WhatTests(Case):
+    def what(self, text: str, *argv: str, target: tuple[str, str] = ("--session", SID)) -> dict:
+        return self.run_cli("what", *target, "--text", text, *argv)
+
+    def test_what_creates_updates_and_clears(self) -> None:
+        wait = self.what("Reply from Dóra")["wait"]
+        self.assertEqual(
+            (wait["kind"], wait["label"], wait["summary"], wait["by"], wait["state"]),
+            ("something", "Reply from Dóra", "Reply from Dóra", "user", "waiting"),
+        )
+        self.assertEqual(self.session()["waiting_for"], "Reply from Dóra")
+        changed = self.what("Reply from Béla")["wait"]
+        self.assertEqual((changed["id"], changed["label"]), (wait["id"], "Reply from Béla"))
+        seen = self.session()
+        self.assertEqual((seen["waiting_for"], len(seen["waits"])), ("Reply from Béla", 1))
+        self.assertEqual(seen["history"][-1]["text"], "Waiting for: Reply from Béla")
+        answer = self.what("")
+        self.assertIsNone(answer["wait"])
+        self.assertEqual(answer["view"]["sessions"], [])
+        self.assertEqual(self.state()["sessions"][SID]["waits"][0]["state"], "done")
+
+    def test_clearing_leaves_other_waits(self) -> None:
+        timer = self.add("--kind", "time", "--in", "1h")["id"]
+        self.what("x")
+        self.what("  ")
+        seen = self.session()
+        self.assertEqual([wait["id"] for wait in seen["waits"]], [timer])
+        self.assertIsNone(seen["waiting_for"])
+
+    def test_clearing_nothing_changes_nothing(self) -> None:
+        answer = self.what("")
+        self.assertIsNone(answer["wait"])
+        self.assertEqual(answer["view"]["sessions"], [])
+
+    def test_park_only_when_asked(self) -> None:
+        self.agents(SID)
+        self.what("x")
+        self.assertEqual(self.state()["actions"], [])
+        self.what("y", "--park")
+        self.assertEqual([action["type"] for action in self.state()["actions"]], ["park"])
+        self.assertEqual(self.state()["actions"][0]["pane"], 40)
+
+    def test_add_something_twice_keeps_one(self) -> None:
+        first = self.add("--kind", "something", "--what", "x")
+        second = self.add("--kind", "something", "--what", "y", "--deadline-in", "1d")
+        self.assertEqual(second["id"], first["id"])
+        self.assertEqual(second["deadline"], (self.clock + timedelta(days=1)).isoformat())
+        seen = self.session()
+        self.assertEqual([wait["label"] for wait in seen["waits"]], ["y"])
+        self.assertEqual(seen["waiting_for"], "y")
+        self.assertIn("Waiting for: y", [entry["text"] for entry in seen["history"]])
+
+    def test_a_new_deadline_ends_overdue(self) -> None:
+        wait = self.add("--kind", "something", "--what", "x", "--deadline-in", "1h")["id"]
+        self.advance(hours=2)
+        self.tick()
+        self.assertEqual(self.wait_of(wait)["ball"], "on_me")
+        self.add("--kind", "something", "--what", "x", "--deadline-in", "1d")
+        self.assertEqual(self.wait_of(wait)["ball"], "on_someone")
+
+    def test_waiting_for_on_a_pane(self) -> None:
+        view = self.what("the build", target=("--pane", "51"))["view"]
+        self.assertEqual(view["panes"][0]["waiting_for"], "the build")
+        self.run_cli("add", "--pane", "52", "--kind", "job")
+        panes = {pane["pane"]: pane for pane in self.run_cli("list")["panes"]}
+        self.assertIsNone(panes[52]["waiting_for"])
+
+    def test_a_deadline_alone_keeps_the_label(self) -> None:
+        wait = self.add("--kind", "something", "--what", "x", "--label", "Dóra")["id"]
+        self.add("--kind", "something", "--what", "x", "--deadline-in", "2d")
+        seen = self.session()
+        self.assertEqual(self.wait_of(wait)["label"], "Dóra")
+        self.assertTrue(seen["history"][-1]["text"].startswith("Deadline moved to"))
+
+    def test_the_last_writer_owns_the_text(self) -> None:
+        self.what("x")
+        wait = self.add("--kind", "something", "--what", "y", "--by", "agent")
+        self.assertEqual((wait["label"], wait["by"]), ("y", "agent"))
+
+    def test_a_chained_step_is_no_status_yet(self) -> None:
+        timer = self.add("--kind", "time", "--in", "1h")["id"]
+        step = self.add("--kind", "something", "--what", "later on", "--after", timer)
+        self.assertEqual(step["state"], "pending")
+        self.assertIsNone(self.session()["waiting_for"])
+        now = self.what("now")["wait"]
+        self.assertNotEqual(now["id"], step["id"])
+        self.assertEqual(self.session()["waiting_for"], "now")
+        self.assertEqual(self.wait_of(step["id"])["label"], "later on")
+
+    def test_older_state_with_two_ends_with_one(self) -> None:
+        self.what("x")
+        state = self.state()
+        first = state["sessions"][SID]["waits"][0]
+        state["sessions"][SID]["waits"].append({
+            **first, "id": "w99", "label": "y", "condition": {"type": "something", "what": "y"},
+        })
+        (self.state_dir / "waiting.json").write_text(json.dumps(state))
+        self.what("z")
+        seen = self.session()
+        self.assertEqual(([wait["label"] for wait in seen["waits"]], seen["waiting_for"]), (["z"], "z"))
+        (self.state_dir / "waiting.json").write_text(json.dumps(state))
+        self.what("")
+        self.assertEqual(self.run_cli("list")["sessions"], [])
+
+    def test_needs_a_target_and_text(self) -> None:
+        self.run_cli("what", "--text", "x", expect=2)
+        self.run_cli("what", "--session", SID, expect=2)
 
 
 if __name__ == "__main__":

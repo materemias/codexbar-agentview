@@ -93,7 +93,8 @@ _XXH_P4 = 0x85EBCA77C2B2AE63
 _XXH_P5 = 0x27D4EB2F165667C5
 _U64 = (1 << 64) - 1
 
-BALLS = ("on_me", "on_machine", "on_someone", "on_my_time")
+# `scheduled`: a live session listed only for its /schedule jobs.
+BALLS = ("on_me", "on_machine", "scheduled", "on_someone", "on_my_time")
 BALL_RANK = {ball: rank for rank, ball in enumerate(BALLS)}
 SIZE_RANK = {"S": 0, "M": 1, "L": 2}
 PR_UNTIL = {
@@ -115,6 +116,9 @@ KIND_OPTIONS = {
     "later": {"size"},
 }
 FEATURE_MENU = "menu"
+# The set-aside items both menus show (the omp extension reads it too).
+MENU_PATH = Path(__file__).resolve().with_name("waiting_menu.json")
+MENU_TARGETS = ("session", "pane")
 
 REASON_CLOSED = "session closed: resume it to deliver the prompt"
 REASON_NO_EXTENSION = "omp extension not loaded"
@@ -1812,6 +1816,14 @@ def _next_step(views: list[dict]) -> str | None:
     return next((view["label"] for view in views if view["state"] == "pending"), None)
 
 
+def _waiting_for(views: list[dict]) -> str | None:
+    """The target's free-text status (see `_free_text_waits`)."""
+    return next((
+        view["condition"]["what"] for view in views
+        if view["kind"] == "something" and view["state"] != "pending"
+    ), None)
+
+
 def _history_view(record: dict | None) -> list[dict]:
     return record["history"][-HISTORY_SHOWN:] if record else []
 
@@ -1828,7 +1840,8 @@ def _session_view(
     if views:
         ball = min((view["ball"] for view in _active(views)), key=BALL_RANK.get)
     else:
-        ball = "on_my_time" if pinned else "on_machine"
+        # Listed only for its /schedule jobs: those run on their own.
+        ball = "on_my_time" if pinned else "scheduled" if schedules else "on_machine"
     status, line, composer_row = _headline(views, note, pinned, _schedule_text(schedules, now), now)
     dues = [view["due_at"] for view in _active(views) if view["due_at"]]
     return {
@@ -1845,6 +1858,7 @@ def _session_view(
         "pinned": pinned, "ball": ball, "unseen": bool(record and record["unseen"]),
         "status": status, "line": line, "composer_row": composer_row,
         "next_step": _next_step(views),
+        "waiting_for": _waiting_for(views),
         "recap": info["recap"],
         "due_at": min(dues, key=_stamp) if dues else None,
         "prompts_queued": _prompts_queued(record, now),
@@ -1863,6 +1877,7 @@ def _pane_view(record: dict, now: datetime) -> dict:
         "note": record["note"],
         "ball": min((view["ball"] for view in _active(views)), key=BALL_RANK.get),
         "status": status, "line": line, "waits": views,
+        "waiting_for": _waiting_for(views),
         "history": _history_view(record),
         "due_at": min(dues, key=_stamp) if dues else None,
         "set_aside_at": record["set_aside_at"],
@@ -2122,6 +2137,69 @@ def _attach_after(record: dict, wait: dict, after: str | None, now: datetime) ->
         _arm(wait, now)
 
 
+def _free_text_waits(record: dict | None) -> list[dict]:
+    """The target's free-text status: its started `something` wait. A pending
+    chain step isn't a status yet; state from before the one-per-target rule
+    may hold several."""
+    if record is None:
+        return []
+    return [
+        wait for wait in _open_waits(record)
+        if wait["kind"] == "something" and wait["state"] != "pending"
+    ]
+
+
+def _set_something(
+    state: dict, record: dict | None, what: str, label: str, by: str, now: datetime,
+) -> dict | None:
+    """New text for the target's free-text status; None when it has none. Extra
+    ones left from older state close, so one remains."""
+    waits = _free_text_waits(record)
+    if not waits:
+        return None
+    wait = waits[0]
+    for extra in waits[1:]:
+        _log(record, now, extra, f"Done: {extra['label']}")
+        _complete(state, record, extra, now)
+    if what != wait["condition"]["what"]:
+        wait["condition"]["what"] = what
+        label = label or what
+        _log(record, now, wait, f"Waiting for: {what}")
+    wait["label"] = label or wait["label"]
+    wait["by"] = by
+    _touch(wait)
+    return wait
+
+
+def _clear_something(state: dict, record: dict | None, now: datetime) -> None:
+    for wait in _free_text_waits(record):
+        _log(record, now, wait, f"Done: {wait['label']}")
+        _complete(state, record, wait, now)
+
+
+def _move_deadline(
+    record: dict, wait: dict, deadline: str | None, deadline_in_s: int | None, now: datetime,
+) -> None:
+    if deadline is None:
+        deadline = _iso(now + timedelta(seconds=deadline_in_s))
+    wait.update(deadline=deadline, deadline_in_s=None)
+    if wait["overdue"] and _stamp(deadline) > now.timestamp():
+        wait["overdue"] = False
+        if wait["reason"] == REASON_OVERDUE:
+            wait["reason"] = None
+    _log(record, now, wait, f"Deadline moved to {_clock(_parse_time(deadline), now)}")
+
+
+def _start_wait(
+    state: dict, record: dict, omp: Omp, now: datetime, after: str | None, **fields: object,
+) -> dict:
+    _begin(record, omp, now)
+    wait = _new_wait(state, now, **fields)
+    record["waits"].append(wait)
+    _attach_after(record, wait, after, now)
+    return wait
+
+
 def cmd_add(args: argparse.Namespace) -> dict:
     kind = args.kind
     agents = _read_agents()
@@ -2154,17 +2232,23 @@ def cmd_add(args: argparse.Namespace) -> dict:
         existed = _wait_in(record, args.after) if args.after else None
         if args.after and existed is None:
             raise BadInput(f"unknown wait: {args.after}")
-        after = None if record["closed_at"] is not None else args.after
-        _begin(record, facts.omp, now)
-        wait = _new_wait(
-            state, now, kind=kind, condition=condition, by=args.by,
-            label=_text(args.label) or _default_label(kind, condition),
-            deadline=deadline, deadline_in_s=deadline_in_s,
-            prompt=args.prompt or None, verify=verify, toast=not args.no_toast,
-            close_on_success=args.close_on_success,
-        )
-        record["waits"].append(wait)
-        _attach_after(record, wait, after, now)
+        # A target has one free-text status: another one replaces its text. A
+        # step chained with --after is no status yet, so it gets its own wait.
+        wait = None
+        if kind == "something" and not args.after:
+            wait = _set_something(state, record, condition["what"], _text(args.label), args.by, now)
+        if wait is not None:
+            if deadline is not None or deadline_in_s is not None:
+                _move_deadline(record, wait, deadline, deadline_in_s, now)
+        else:
+            after = None if record["closed_at"] is not None else args.after
+            wait = _start_wait(
+                state, record, facts.omp, now, after, kind=kind, condition=condition, by=args.by,
+                label=_text(args.label) or _default_label(kind, condition),
+                deadline=deadline, deadline_in_s=deadline_in_s,
+                prompt=args.prompt or None, verify=verify, toast=not args.no_toast,
+                close_on_success=args.close_on_success,
+            )
         _apply_note(record, args.note, args.by)
         if args.size:
             record["size"] = args.size
@@ -2241,6 +2325,33 @@ def cmd_note(args: argparse.Namespace) -> dict:
         return {}
 
     return _mutate(apply)
+
+
+def cmd_what(args: argparse.Namespace) -> dict:
+    """The target's free-text status: one `something` wait, set, changed, or
+    closed by empty text."""
+    session, pane = _target(args)
+    what = _text(args.text)
+    agents = _read_agents()
+    omp = Omp()
+
+    def apply(state: dict, now: datetime) -> dict:
+        record = _lookup(state, session, pane)
+        if not what:
+            _clear_something(state, record, now)
+            return {"wait": None}
+        wait = _set_something(state, record, what, "", "user", now)
+        if wait is None:
+            record = _ensure(state, session, pane)
+            wait = _start_wait(
+                state, record, omp, now, None, kind="something",
+                condition={"type": "something", "what": what}, by="user", label=what,
+            )
+        if args.park:
+            _park(state, record, agents, now)
+        return {"wait": _wait_view(wait, now)}
+
+    return _mutate(apply, agents=agents, omp=omp)
 
 
 def _target_wait(record: dict | None, wait_id: str) -> dict:
@@ -2604,6 +2715,43 @@ def cmd_card(args: argparse.Namespace) -> dict:
     }}
 
 
+def _load_menu(path: Path) -> list[dict]:
+    """The set-aside items, checked so neither menu draws a broken one."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise BadInput(f"menu file {path}: {error}") from error
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list) or not items:
+        raise BadInput(f"menu file {path}: needs a non-empty \"items\" list")
+    ids = set()
+    for number, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            raise BadInput(f"menu file {path}: item {number} is not an object")
+        problem = None
+        if not _text(item.get("id")) or item["id"] != item["id"].strip():
+            problem = "needs an id without surrounding spaces"
+        elif item["id"] in ids:
+            problem = f"repeats the id {item['id']!r}"
+        elif not _text(item.get("label")) or not _text(item.get("detail")):
+            problem = "needs a label and a detail"
+        elif any(key in item and not _text(item[key]) for key in ("command", "pane_detail")):
+            problem = "has an empty or non-text command or pane_detail"
+        elif not (
+            isinstance(item.get("targets"), list) and item["targets"]
+            and all(target in MENU_TARGETS for target in item["targets"])
+        ):
+            problem = f"needs targets from {', '.join(MENU_TARGETS)}"
+        if problem:
+            raise BadInput(f"menu file {path}: item {number} {problem}")
+        ids.add(item["id"])
+    return items
+
+
+def cmd_menu(args: argparse.Namespace) -> dict:
+    return {"ok": True, "items": _load_menu(MENU_PATH)}
+
+
 def cmd_list(args: argparse.Namespace) -> dict:
     return _build_view(_load_state(), _now(), _read_agents(), only=args.session)
 
@@ -2721,6 +2869,11 @@ def _parser() -> argparse.ArgumentParser:
     note.add_argument("--text")
     note.add_argument("--accept-suggested", action="store_true")
 
+    what = command("what", cmd_what)
+    _add_target(what)
+    what.add_argument("--text", required=True)
+    what.add_argument("--park", action="store_true")
+
     done = command("done", cmd_done)
     _add_target(done)
     done.add_argument("--wait")
@@ -2761,6 +2914,7 @@ def _parser() -> argparse.ArgumentParser:
 
     command("list", cmd_list).add_argument("--session", type=_session_arg)
     command("inventory", cmd_inventory)
+    command("menu", cmd_menu)
     return parser
 
 

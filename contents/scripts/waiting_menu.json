@@ -1,0 +1,12 @@
+{
+  "items": [
+    {"id": "time", "label": "Retry later", "command": "/wait 2d", "detail": "after a while or at a time", "targets": ["session", "pane"]},
+    {"id": "pr", "label": "GitHub PR", "command": "/wait gh pr", "detail": "until reviewed, ready, merged, released or new activity", "targets": ["session", "pane"]},
+    {"id": "babysit", "label": "Babysit a PR", "command": "/wait gh babysit", "detail": "bot review, the agent fixes, then ready and merged", "targets": ["session"]},
+    {"id": "release", "label": "GitHub release", "command": "/wait gh release", "detail": "a repo's next release", "targets": ["session", "pane"]},
+    {"id": "check", "label": "Command check", "command": "/wait check", "detail": "say what to check; the agent writes the command, code runs it", "pane_detail": "a command, run until it exits 0", "targets": ["session", "pane"]},
+    {"id": "for", "label": "Something else", "command": "/wait for", "detail": "anything, in your words; you mark it done", "targets": ["session", "pane"]},
+    {"id": "later", "label": "When I have time", "command": "/wait later", "detail": "pinned, no reminder; S, M or L", "targets": ["session"]},
+    {"id": "job", "label": "Job finishes", "detail": "the command in this pane", "targets": ["pane"]}
+  ]
+}
