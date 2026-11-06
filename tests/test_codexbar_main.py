@@ -17,7 +17,7 @@ PLUGIN = ROOT / "build/package/contents/ui/process"
 @unittest.skipUnless(Path(QML).is_file() and (PLUGIN / "libcodexbarprocess.so").is_file(),
                      "Build the native package and install the Qt 6 qml tool first")
 class MainLifecycleTest(unittest.TestCase):
-    def applet(self, scenario, helper_case=None):
+    def applet(self, scenario, helper_case=None, views=False):
         with tempfile.TemporaryDirectory(prefix="codexbar-main-") as directory:
             root = Path(directory)
 
@@ -31,8 +31,20 @@ class MainLifecycleTest(unittest.TestCase):
                 shutil.copy2(ROOT / "contents/ui" / name,
                              root / "ui" / ("Main.qml" if name == "main.qml" else name))
             (root / "ui/process").symlink_to(PLUGIN, target_is_directory=True)
-            for name in ("FullRepresentation", "CompactRepresentation"):
-                put(f"ui/{name}.qml", "import QtQuick\nItem { property bool tooltipHovered: false }\n")
+            if views:
+                # The real panel item and Agents rows, hosted in a bare popup.
+                (root / "icons").symlink_to(ROOT / "contents/icons", target_is_directory=True)
+                for name in ("CompactRepresentation.qml", "AgentsSection.qml", "SectionCard.qml",
+                             "AgentTitle.qml", "TurnBubble.qml", "Filter.js"):
+                    shutil.copy2(ROOT / "contents/ui" / name, root / "ui" / name)
+                put("ui/FullRepresentation.qml", "import QtQuick\nItem {\n"
+                    "property bool tooltipHovered: false\n"
+                    "AgentsSection { objectName: 'agentsSection'; width: 600 }\n}\n")
+            else:
+                for name in ("FullRepresentation", "CompactRepresentation"):
+                    put(f"ui/{name}.qml", "import QtQuick\nItem { property bool tooltipHovered: false }\n")
+            if helper_case and "waitingView" in helper_case:
+                put("state/codexbar-agentview/waiting_view.json", json.dumps(helper_case["waitingView"]))
             # Replace desktop integration only; root bindings, callbacks, reducers,
             # command construction, and native subprocess execution remain real.
             module = "imports/org/kde/plasma/plasmoid/"
@@ -145,6 +157,12 @@ Item {
     property int stage: 0
     property int ticks: 0
     property string oldCommand: ""
+    property var compact: null
+    property var rows: []
+    property var tip: null
+    property var section: null
+    property var popup: null
+    property int since: 0
     function check(condition, message) {
         if (!condition) throw new Error(message)
     }
@@ -172,6 +190,7 @@ Item {
             env = dict(os.environ, QT_QPA_PLATFORM="offscreen",
                        QT_FORCE_STDERR_LOGGING="1", QT_LOGGING_TO_CONSOLE="1",
                        QML_IMPORT_PATH=str(root / "imports"),
+                       QML_XHR_ALLOW_FILE_READ="1", XDG_STATE_HOME=str(root / "state"),
                        PATH=str(root / "bin") + os.pathsep + os.environ["PATH"])
             result = subprocess.run([QML, str(root / "test.qml")], env=env,
                                     capture_output=True, text=True, timeout=15)
@@ -485,6 +504,90 @@ Item {
                 console.log("PASS actual main focused session")
                 Qt.exit(0)
 ''')
+
+    def test_tern_integration_shows_waits_only_while_switched_on(self):
+        view = {"ok": True, "now": "2026-11-05T16:00:00+01:00",
+                "counts": {"on_me": 2, "on_machine": 1, "on_someone": 0, "on_my_time": 0},
+                "sessions": [
+                    {"session_id": "back", "ball": "on_me", "status": "● ⏳ PR#7 · 2d",
+                     "line": "● ⏳ PR#7 · Q&A <b>on</b> head · 2 days"},
+                    {"session_id": "away", "ball": "on_machine", "status": "⏳ 16:00",
+                     "line": "⏳ 16:00 · \"check the deploy\""}],
+                "panes": []}
+        self.applet('''
+                if (app.cacheRestoring || app.loading) return
+                function find(item, name, out) {
+                    out = out || []
+                    if (item.objectName === name) out.push(item)
+                    var kids = item.children || []
+                    for (var i = 0; i < kids.length; i++) find(kids[i], name, out)
+                    return out
+                }
+                function markers() {
+                    var out = {}
+                    find(fixture.popup, "waitingMarker").forEach(function(m) {
+                        if (m.visible) out[m.line] = m.text
+                    })
+                    return out
+                }
+                if (fixture.stage === 0) {
+                    app.agentSnapshot = { counts: { working: 0, blocked: 0, idle: 3, untracked: 0, total: 3 },
+                        agents: ["back", "away", "plain"].map(function(id) {
+                            return { provider: "omp", sessionId: id, state: "idle", cwd: "/w/" + id }
+                        }) }
+                    fixture.compact = app.compactRepresentation.createObject(fixture, { width: 400, height: 24 })
+                    fixture.popup = app.fullRepresentation.createObject(fixture, { width: 600, height: 400 })
+                    fixture.stage = 1
+                    fixture.since = fixture.ticks
+                } else if (fixture.stage === 1) {
+                    if (fixture.ticks - fixture.since < 25) return
+                    var count = find(fixture.compact, "waitingOnMeCount")[0]
+                    check(count && !count.visible, "switch off: no panel count")
+                    check(JSON.stringify(markers()) === "{}", "switch off: no row markers")
+                    check(app.waitingRequest === null && app._waitingViewKey === ""
+                        && app.waitingOnMeCount === 0, "switch off: no waiting view loaded")
+                    Plasmoid.configuration.ternIntegration = true
+                    fixture.stage = 2
+                } else if (fixture.stage === 2) {
+                    if (app.waitingOnMeCount === 0) return
+                    var shown = find(fixture.compact, "waitingOnMeCount")[0]
+                    check(shown.visible && shown.children[1].text === "2", "switch on: panel shows on_me")
+                    var marks = markers()
+                    var line = "● ⏳ PR#7 · Q&A <b>on</b> head · 2 days"
+                    check(marks[line] === "●", "on_me session gets ●")
+                    check(marks["⏳ 16:00 · \\"check the deploy\\""] === "⏳", "waiting session gets ⏳")
+                    check(Object.keys(marks).length === 2, "a session without a wait stays unmarked")
+                    var section = find(fixture.popup, "agentsSection")[0]
+                    var tip = section.data.filter(function(o) { return o.objectName === "rowTip" })[0]
+                    var rows = []
+                    ;(function walk(item) {
+                        if (item.waitingHoverText !== undefined) rows.push(item)
+                        ;(item.children || []).forEach(walk)
+                    })(fixture.popup)
+                    section.hoveredRow = rows.filter(function(r) { return r.waiting && r.waiting.onMe })[0]
+                    check(tip.textFormat === Text.PlainText
+                        && tip.text === line.replace("&", "&\\u200a") + "\\n/w/back"
+                            + "\\nclick to focus · peek button or Space for recent messages",
+                        "row tooltip leads with the line, as plain text with its ampersand: " + tip.text)
+                    section.hoveredRow = rows.filter(function(r) { return !r.waiting })[0]
+                    check(section.hoveredRow && tip.text === "",
+                        "a row without a wait keeps its attached cwd tooltip")
+                    section.hoveredRow = null
+                    fixture.rows = rows
+                    fixture.tip = tip
+                    fixture.section = section
+                    Plasmoid.configuration.ternIntegration = false
+                    fixture.stage = 3
+                } else {
+                    check(!find(fixture.compact, "waitingOnMeCount")[0].visible
+                        && JSON.stringify(markers()) === "{}", "switching off clears the markers")
+                    fixture.section.hoveredRow = fixture.rows[0]
+                    check(fixture.tip.text === "" && fixture.rows.every(function(r) { return !r.waiting }),
+                        "switch off: every row keeps its attached cwd tooltip")
+                    console.log("PASS actual main tern integration")
+                    Qt.exit(0)
+                }
+''', {"waitingView": view}, views=True)
 
 
 if __name__ == "__main__":

@@ -95,6 +95,21 @@ ColumnLayout {
     // Composite provider/session identity survives fresh JSON objects.
     property string peekKey: ""
 
+    // Rows with a waiting line get this tooltip, as plain text: the line is
+    // free text that the attached tooltip would read as markup, and whose
+    // ampersands it would eat as mnemonics (a hair space keeps them).
+    // Every other row keeps its attached cwd tooltip.
+    property Item hoveredRow: null
+    PC3.ToolTip {
+        objectName: "rowTip"
+        parent: agents.hoveredRow
+        text: agents.hoveredRow && agents.hoveredRow.waiting
+            ? agents.hoveredRow.waitingHoverText.replace(/&/g, "&\u200a") : ""
+        textFormat: Text.PlainText
+        visible: text.length > 0
+        delay: 600
+    }
+
     // Type-to-filter: printable keys typed while the popup has focus
     // accumulate here (FullRepresentation forwards them). Empty = no filter.
     property string filterText: ""
@@ -529,6 +544,23 @@ ColumnLayout {
                         Layout.alignment: Qt.AlignVCenter
                     }
 
+                    // Tern integration: ⏳ for a session set aside, ●
+                    // once its ball is back with you (the panel dot's
+                    // color). Its line is the first tooltip row.
+                    PC3.Label {
+                        objectName: "waitingMarker"
+                        readonly property string line: rowItem.waiting ? rowItem.waiting.line : ""
+                        readonly property bool onMe: !!rowItem.waiting && rowItem.waiting.onMe
+                        visible: !!rowItem.waiting
+                        text: onMe ? "●" : "⏳"
+                        textFormat: Text.PlainText
+                        color: onMe ? Kirigami.Theme.neutralTextColor : Kirigami.Theme.textColor
+                        opacity: onMe ? 1 : 0.7
+                        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                        Layout.alignment: Qt.AlignVCenter
+                        Accessible.name: line
+                    }
+
                     PC3.Label {
                         id: modelText
                         text: agents.highlighted(agents._modelName(rowItem.record.model))
@@ -786,6 +818,10 @@ ColumnLayout {
             }
 
             readonly property string state: record.state || "idle"
+            // { line, onMe } while Tern integration lists this session;
+            // tests/render_screenshots.py's host has no waitingBySession.
+            readonly property var waiting: record.sessionId
+                ? (root.waitingBySession || {})[record.sessionId] || null : null
             readonly property color tint: root.agentStateColor(state)
             // Desktop badge data for this row, or null when the host
             // window didn't resolve against Plasma's task list.
@@ -814,6 +850,10 @@ ColumnLayout {
                 anchors.top: parent.top
                 height: rowContent.implicitHeight + 6
                 hoverEnabled: true
+                onContainsMouseChanged: {
+                    if (containsMouse) agents.hoveredRow = rowItem
+                    else if (agents.hoveredRow === rowItem) agents.hoveredRow = null
+                }
                 cursorShape: Qt.PointingHandCursor
                 acceptedButtons: Qt.LeftButton
                 onClicked: {
@@ -878,11 +918,14 @@ ColumnLayout {
                 }
             }
 
-            PC3.ToolTip.visible: rowMouse.containsMouse
-                && (rowItem.record.cwd || "").length > 0
-            PC3.ToolTip.text: (rowItem.record.cwd || "")
-                + (rowItem.record.host ? "  (" + rowItem.record.host + ")" : "")
+            readonly property string cwdHoverText: (record.cwd || "")
+                + (record.host ? "  (" + record.host + ")" : "")
                 + "\nclick to focus · peek button or Space for recent messages"
+            readonly property string waitingHoverText: waiting
+                ? waiting.line + (record.cwd ? "\n" + cwdHoverText : "") : ""
+            PC3.ToolTip.visible: rowMouse.containsMouse && !waiting
+                && (record.cwd || "").length > 0
+            PC3.ToolTip.text: cwdHoverText
             PC3.ToolTip.delay: 600
         }
     }

@@ -146,5 +146,9 @@
             <label>Close the popup when focus moves away (click-to-focus briefly suppresses this so terminal jumps don't close it)</label>
             <default>true</default>
         </entry>
+        <entry name="ternIntegration" type="Bool">
+            <label>Show sessions set aside in Tern (waitingfor): a marker on their agent rows and, in the panel, how many are back with you</label>
+            <default>false</default>
+        </entry>
     </group>
 </kcfg>

@@ -75,10 +75,9 @@ PlasmoidItem {
 
     readonly property string scriptPath: Command.localPath(
         Qt.resolvedUrl("../scripts/codexbar_fetch.py"))
-    // QtCore's QML StandardPaths returns a QUrl, not a filesystem string.
-    // Keep its URL escaping intact for XHR.
-    readonly property string agentsFileUrl: StandardPaths.writableLocation(
-        StandardPaths.GenericStateLocation).toString().replace(/\/$/, "") + "/codexbar-agentview/agents.json"
+    readonly property var stateLocation: StandardPaths.writableLocation(
+        StandardPaths.GenericStateLocation)
+    readonly property string agentsFileUrl: Command.stateFileUrl(root.stateLocation, "agents.json")
     readonly property int agentsRefreshMs: Math.max(2, Plasmoid.configuration.agentsRefreshSeconds || 5) * 1000
     readonly property bool agentsEnabled: Plasmoid.configuration.showAgents !== false
         || Plasmoid.configuration.showAgentStateDots !== false
@@ -102,6 +101,25 @@ PlasmoidItem {
     readonly property bool includeUntrackedAgents:
         Plasmoid.configuration.includeUntrackedAgents !== false
     onIncludeUntrackedAgentsChanged: root.refreshAgents()
+
+    // Tern integration (waitingfor): codexbar_waiting.py rewrites
+    // waiting_view.json; the widget only reads it, on the agents cadence.
+    // Off, nothing is read and both values stay empty.
+    readonly property bool ternIntegration: Plasmoid.configuration.ternIntegration === true
+    readonly property string waitingViewFileUrl:
+        Command.stateFileUrl(root.stateLocation, "waiting_view.json")
+    property var waitingRequest: null
+    property string _waitingViewKey: ""
+    // sessionId → { line, onMe } for every session the view lists.
+    property var waitingBySession: ({})
+    property int waitingOnMeCount: 0
+    onTernIntegrationChanged: {
+        if (root.ternIntegration) return
+        var xhr = root.waitingRequest
+        root.waitingRequest = null
+        if (xhr) xhr.abort()
+        root.applyWaitingView(null)
+    }
     readonly property string cliPath: Command.cliPath(Plasmoid.configuration.cliPath)
     onCliPathChanged: {
         // A generation also rejects an old request after A → B → A.
@@ -834,6 +852,55 @@ PlasmoidItem {
         root._agentHistoryKey = ""
     }
 
+    function refreshWaitingView() {
+        if (!root.ternIntegration || root.waitingRequest) return
+        // Same QML_XHR_ALLOW_FILE_READ requirement as agents.json.
+        var xhr = new XMLHttpRequest()
+        root.waitingRequest = xhr
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE) return
+            if (root.waitingRequest !== xhr) return
+            root.waitingRequest = null
+            if (!root.ternIntegration) return
+            if (xhr.status !== 0 && xhr.status !== 200) return
+            // No file yet: nothing is waiting. The CLI replaces it
+            // atomically, so a parse error is a broken file; keep the
+            // last view rather than blinking the markers off.
+            var text = (xhr.responseText || "").trim()
+            if (text === "") {
+                root.applyWaitingView(null)
+                return
+            }
+            try {
+                root.applyWaitingView(JSON.parse(text))
+            } catch (err) {
+                console.warn("waiting_view.json: " + err.message)
+            }
+        }
+        xhr.open("GET", root.waitingViewFileUrl)
+        xhr.send()
+    }
+
+    // Replaced only on change: the CLI restamps `now` on every rewrite.
+    function applyWaitingView(view) {
+        var sessions = {}
+        var list = view && Array.isArray(view.sessions) ? view.sessions : []
+        for (var i = 0; i < list.length; i++) {
+            var s = list[i]
+            if (!s || !s.session_id) continue
+            sessions[String(s.session_id)] = {
+                line: String(s.line || s.status || ""),
+                onMe: s.ball === "on_me"
+            }
+        }
+        var onMe = view && view.counts ? Math.max(0, Math.floor(Number(view.counts.on_me) || 0)) : 0
+        var key = JSON.stringify([sessions, onMe])
+        if (key === root._waitingViewKey) return
+        root._waitingViewKey = key
+        root.waitingBySession = sessions
+        root.waitingOnMeCount = onMe
+    }
+
     function refresh() {
         if (root.cacheRestoring || root.loading) return
         if (root.enabledProviders.length === 0) {
@@ -895,6 +962,17 @@ PlasmoidItem {
             root.clearAgentSnapshot()
             root.agentsError = ""
         }
+    }
+
+    // Its own timer: the panel count also shows with every agents view off,
+    // when the scan timer above does not run.
+    Timer {
+        id: waitingViewPoll
+        interval: root.agentsRefreshMs
+        running: root.ternIntegration
+        repeat: true
+        triggeredOnStart: true
+        onTriggered: root.refreshWaitingView()
     }
 
     Component.onCompleted: {

@@ -406,6 +406,33 @@ Item {
             }
         }
 
+        // Tern integration: sessions set aside whose ball is back with
+        // you (waiting_view.json counts.on_me). A dot row like the stack's,
+        // in the color the Agents rows give their ● marker.
+        RowLayout {
+            id: waitingOnMe
+            objectName: "waitingOnMeCount"
+            readonly property real _scale: (Plasmoid.configuration.agentStateDotsScale || 100) / 100.0
+            visible: root.waitingOnMeCount > 0
+            spacing: 4
+            Layout.alignment: Qt.AlignVCenter
+            Layout.leftMargin: Kirigami.Units.smallSpacing
+
+            Rectangle {
+                readonly property int dotSize: Math.max(4, Math.floor(compact.ringSize * 0.38 * waitingOnMe._scale))
+                width: dotSize; height: dotSize; radius: dotSize / 2
+                color: Kirigami.Theme.neutralTextColor
+                Layout.alignment: Qt.AlignVCenter
+            }
+            PC3.Label {
+                text: root.waitingOnMeCount
+                color: Kirigami.Theme.neutralTextColor
+                font.pixelSize: Math.max(6, Math.floor(compact.ringSize * 0.42 * waitingOnMe._scale))
+                font.weight: Font.DemiBold
+                Layout.alignment: Qt.AlignVCenter
+            }
+        }
+
         // Featured-agent topic. Asterisk + dim grey text, capped width.
         // Shown only on horizontal panels (vertical/tray is too narrow).
         RowLayout {

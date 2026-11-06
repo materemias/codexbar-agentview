@@ -1,6 +1,7 @@
 import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
+import QtCore
 import org.kde.kirigami as Kirigami
 import "process" as Process
 import "Command.js" as Command
@@ -20,6 +21,11 @@ Item {
     property bool cfg_closePopupOnFocusLoss: true
     property bool cfg_showAgentTopicInPanel: false
     property int cfg_agentTopicMaxWidth: 260
+    property bool cfg_ternIntegration: false
+
+    // From agents.json, which the aggregator writes; read only.
+    property bool ternInstalled: false
+    property var ternRequest: null
 
     property string hookStatus: "checking…"
     property bool hookLoading: false
@@ -47,7 +53,34 @@ Item {
         hookRunner.run(cmd)
     }
 
-    Component.onCompleted: _runHookCommand("--status")
+    // Without QML_XHR_ALLOW_FILE_READ the request never completes and the
+    // hint stays generic.
+    function _readTernInstalled() {
+        var xhr = new XMLHttpRequest()
+        root.ternRequest = xhr
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE || root.ternRequest !== xhr) return
+            root.ternRequest = null
+            try {
+                root.ternInstalled = JSON.parse(xhr.responseText || "{}").ternInstalled === true
+            } catch (err) {
+                root.ternInstalled = false
+            }
+        }
+        xhr.open("GET", Command.stateFileUrl(
+            StandardPaths.writableLocation(StandardPaths.GenericStateLocation), "agents.json"))
+        xhr.send()
+    }
+
+    Component.onCompleted: {
+        _runHookCommand("--status")
+        _readTernInstalled()
+    }
+    Component.onDestruction: {
+        var xhr = root.ternRequest
+        root.ternRequest = null
+        if (xhr) xhr.abort()
+    }
 
     QQC2.ScrollView {
         id: scroller
@@ -220,6 +253,23 @@ Item {
 
             QQC2.Label {
                 text: "Installs the QML XHR env scripts (so plasmashell can read the agent state file) and registers codexbar-agentview:// for click-to-focus. Also cleans up legacy Claude Code hooks, the systemd unit, and the codexbar:// handler from earlier widget versions."
+                wrapMode: Text.WordWrap
+                Layout.fillWidth: true
+                opacity: 0.55
+                font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+            }
+
+            QQC2.CheckBox {
+                objectName: "ternIntegrationCheckBox"
+                text: "Tern integration"
+                checked: cfg_ternIntegration
+                onToggled: cfg_ternIntegration = checked
+            }
+
+            QQC2.Label {
+                text: root.ternInstalled && !cfg_ternIntegration
+                    ? "Tern was detected. Turn this on to show sessions you set aside in Tern (waitingfor)."
+                    : "Shows sessions you set aside in Tern (waitingfor)."
                 wrapMode: Text.WordWrap
                 Layout.fillWidth: true
                 opacity: 0.55
