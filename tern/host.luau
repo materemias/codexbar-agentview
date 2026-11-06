@@ -9,8 +9,9 @@
 --
 -- codexbar_waiting.py owns the sessions set aside. This half calls its `tick`,
 -- shows its view on the Waiting tab and publishes what the window half needs:
--- `waitingView`, the outbox `waitingActions`, `paneSessions`; the window half
--- answers with `waitingRequest` and `waitingPoke`.
+-- `waitingView`, the outbox `waitingActions`, `paneSessions`, the set-aside
+-- items `waitingMenu`; the window half answers with `waitingRequest` and
+-- `waitingPoke`.
 
 local ui = tern.ui
 
@@ -375,6 +376,8 @@ local store = {
 	waitingAgain = false,
 	waitingAt = 0, -- when the next timed tick is due
 	lastPoke = nil :: any,
+	menuRetryAt = nil :: number?, -- when a failed `menu` load runs again
+	loadMenu = nil :: (() -> ())?,
 }
 
 type Block = {
@@ -1657,6 +1660,10 @@ local function tick()
 			if not store.waitingTicking and readWaiting(WAITING_FILE) ~= store.waitingRaw then
 				waitingTick()
 			end
+			if store.menuRetryAt and os.time() >= store.menuRetryAt and store.loadMenu then
+				store.menuRetryAt = nil
+				store.loadMenu()
+			end
 		end
 		local poke = tern.kv.get("waitingPoke")
 		if poke ~= nil and poke ~= store.lastPoke then
@@ -2258,6 +2265,7 @@ local LAUNCH_HOSTS = { kitty = true, tern = true }
 local BALLS = {
 	{ id = "on_me", title = "On me" },
 	{ id = "on_machine", title = "Machine watching" },
+	{ id = "scheduled", title = "Scheduled" },
 	{ id = "on_someone", title = "Waiting on something" },
 	{ id = "on_my_time", title = "When I have time" },
 }
@@ -2276,19 +2284,21 @@ local function waitTitle(r: any): string
 	return if title ~= "" then title else "Pane " .. str(r.pane)
 end
 
--- What the row waits for: the first wait that is not a chain's later step.
+-- What the row waits for: the first wait that is not a chain's later step. A
+-- free-text wait has a line of its own (`waiting_for`), so it is skipped here.
 local function waitSummary(r: any): string
+	local own = oneLine(r.waiting_for) ~= ""
 	for _, w in val(r.waits) or {} do
-		if w.state ~= "pending" then
+		if w.state ~= "pending" and not (own and w.kind == "something") then
 			local text = oneLine(w.summary)
 			return if text ~= "" then text else oneLine(w.label)
 		end
 	end
-	return oneLine(r.status)
+	return if own then "" else oneLine(r.status)
 end
 
 local function waitMatches(r: any, q: string): boolean
-	local fields = { waitTitle(r), oneLine(r.note), oneLine(r.project), waitSummary(r) }
+	local fields = { waitTitle(r), oneLine(r.note), oneLine(r.project), waitSummary(r), oneLine(r.waiting_for) }
 	for _, w in queryWords(q) do
 		local ok = false
 		for _, text in fields do
@@ -2694,10 +2704,15 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	if cardPane(r, true) then
 		table.insert(buttons, button("Card", "wait_card", { keys = { "shift", "enter" } }))
 	end
+	table.insert(buttons, button("Waiting for…", "wait_what", { keys = { "f2" } }))
 	local peekKeys = if b.filter == "" then { "space" } else nil
 	table.insert(buttons, button(if b.peek then "Hide details" else "Details", "peek", { icon = "message", keys = peekKeys, on = b.peek }))
 	table.insert(kids, withp(ui.row(buttons), { key = "actions", wrap = true }))
 	if b.peek then
+		local waitingFor = oneLine(r.waiting_for)
+		if waitingFor ~= "" then -- in full: the row's own line clips it at 100 characters
+			table.insert(kids, detailLines("waiting-for", "Waiting for", { ui.text(waitingFor) }))
+		end
 		local suggested = oneLine(r.suggested_note)
 		if suggested ~= "" then
 			table.insert(kids, withp(ui.row({
@@ -2752,6 +2767,14 @@ local function waitingView(b: Block, now: number): Node
 		table.insert(kids, groupHead("w-" .. g.ball.id, { ui.span(g.ball.title, "strong"), ui.span("  " .. #g.rows, "muted") }))
 		for _, r in g.rows do
 			table.insert(kids, waitingItem(r, now, q))
+			local waitingFor = oneLine(r.waiting_for)
+			if waitingFor ~= "" and waitingFor ~= waitTitle(r) then -- a pane record named by the text says it already
+				local spans: { any } = { ui.span("Waiting for: ", "muted") }
+				for _, s in highlighted(clip(waitingFor, 100), q) do
+					table.insert(spans, s)
+				end
+				table.insert(kids, withp(ui.text(spans), { key = "wf-" .. waitKey(r), role = "codexbar.waitingfor" }))
+			end
 			if sel and sel.key == waitKey(r) then
 				table.insert(kids, waitingPeek(b, r, now))
 			end
@@ -2843,6 +2866,8 @@ local function dockView(b: Block, now: number): Node
 			end
 			table.insert(hints, key("del"))
 			table.insert(hints, ui.span("\u{a0}done   ", "dim"))
+			table.insert(hints, key("f2"))
+			table.insert(hints, ui.span("\u{a0}waiting\u{a0}for   ", "dim"))
 		elseif b.tab == "history" then
 			table.insert(hints, key("del"))
 			table.insert(hints, ui.span("\u{a0}dismiss   ", "dim"))
@@ -3065,6 +3090,9 @@ local function waitingAct(b: Block, name: string, r: any)
 		waitingRun(b.cx, "accept note", waitArgs("note", r, { "--accept-suggested" }))
 	elseif name == "wait_card" then
 		waitingRequest(b, { op = "open", target = tonumber(val(r.pane)), card = true })
+	elseif name == "wait_what" then
+		-- `cx:prompt` is the window's: it asks over the dashboard and calls `what`.
+		waitingRequest(b, { op = "what", args = waitArgs("what", r), text = oneLine(r.waiting_for) })
 	end
 end
 
@@ -3265,6 +3293,8 @@ tern.block.define("dashboard", {
 			act(b, "wait_done")
 		elseif k.text == "+" and b.tab == "waiting" and b.filter == "" then
 			act(b, "wait_snooze")
+		elseif name == "f2" and b.tab == "waiting" then
+			act(b, "wait_what")
 		elseif name == "backspace" then
 			if b.filter == "" then
 				return false
@@ -3700,3 +3730,21 @@ local initialGoto = tern.kv.get("goto")
 store.lastGoto = if type(initialGoto) == "table" then initialGoto.seq else nil
 store.lastPoke = tern.kv.get("waitingPoke")
 tern.timer(0, tick)
+
+-- The set-aside items (waiting_menu.json, validated by the CLI), once per load
+-- and again a minute after a failure: the window half builds its pane picker from them.
+store.loadMenu = function()
+	python(WAITING_CLI, { "menu" }, 30000, function(res)
+		local okj, data = pcall(tern.json.decode, res.stdout)
+		if res.status == 0 and okj and type(data) == "table" and val(data.ok) == true and type(val(data.items)) == "table" then
+			tern.kv.set("waitingMenu", { items = val(data.items) })
+			return
+		end
+		local detail = if okj and type(data) == "table" then str(data.error) else ""
+		detail = if detail ~= "" then detail else firstLine(res.stderr)
+		tern.kv.set("waitingMenu", { error = if detail ~= "" then detail else "exit " .. res.status })
+		tern.log.warn("codexbar: waiting menu failed", detail)
+		store.menuRetryAt = os.time() + 60
+	end)
+end
+store.loadMenu()

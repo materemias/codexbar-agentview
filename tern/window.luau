@@ -982,7 +982,7 @@ end)
 
 -- Waiting: setting aside --------------------------------------------------------------
 
-type SetAside = { pane: number, cwd: string?, note: string, label: string }
+type SetAside = { pane: number, cwd: string?, note: string, waitingFor: string, label: string }
 
 -- A pane that runs no omp session: Tern's own picker sets it aside as a pane record.
 local function setAsideTarget(pane: number, info: PaneInfo): SetAside
@@ -990,6 +990,7 @@ local function setAsideTarget(pane: number, info: PaneInfo): SetAside
 	return {
 		pane = pane, cwd = info.cwd,
 		note = if record and type(record.note) == "string" then record.note else "",
+		waitingFor = if record and type(record.waiting_for) == "string" then record.waiting_for else "",
 		label = clipped(if info.running then info.running.line else info.title, 60),
 	}
 end
@@ -1023,43 +1024,39 @@ local function timeArgs(text: string): { string }
 	return { "--at", text }
 end
 
--- The last steps: my sentence (a something's text says it all), then `add` and the park.
+-- Runs the CLI command that sets the pane aside, then parks the pane.
+local function commitSetAside(t: SetAside, args: { string })
+	waitingCli(args, function(data, err, cx)
+		if not data then
+			waitingFailed("set aside", err, cx)
+		elseif cx then
+			local open = dashboard(cx)
+			if open then
+				closePane(cx, open.pane)
+			end
+			afterRestore(function(cx2)
+				local ok, parkErr = cx2.layout:park(t.pane)
+				if not ok then
+					waitingFailed("park", parkErr, cx2)
+				end
+			end)
+		end
+	end)
+end
+
+-- The last steps: my sentence, then `add` and the park.
 local function finishSetAside(cx: WindowCx, t: SetAside, kind: string, args: { string })
-	local function finish(note: string)
-		local full = { "add", "--pane", tostring(t.pane), "--kind", kind, "--by", "user" }
+	ask(cx, { value = t.note, placeholder = "Why set it aside, what next?", action = "set aside" }, function(note)
+		local full = { "add", "--pane", tostring(t.pane), "--kind", kind, "--by", "user", "--label", t.label }
 		for _, a in args do
 			table.insert(full, a)
-		end
-		if kind ~= "something" then -- names the pane record; a something's text does
-			table.insert(full, "--label")
-			table.insert(full, t.label)
 		end
 		if note ~= "" then
 			table.insert(full, "--note")
 			table.insert(full, note)
 		end
-		waitingCli(full, function(data, err, cx3)
-			if not data then
-				waitingFailed("set aside", err, cx3)
-			elseif cx3 then
-				local open = dashboard(cx3)
-				if open then
-					closePane(cx3, open.pane)
-				end
-				afterRestore(function(cx4)
-					local ok, parkErr = cx4.layout:park(t.pane)
-					if not ok then
-						waitingFailed("park", parkErr, cx4)
-					end
-				end)
-			end
-		end)
-	end
-	if kind == "something" then
-		finish("")
-		return
-	end
-	ask(cx, { value = t.note, placeholder = "Why set it aside, what next?", action = "set aside" }, finish)
+		commitSetAside(t, full)
+	end)
 end
 
 local function setAsidePr(cx: WindowCx, t: SetAside, target: { string })
@@ -1157,33 +1154,49 @@ local SET_ASIDE_FLOWS: { [string]: (WindowCx, SetAside) -> () } = {
 			end)
 		end)
 	end,
-	command = function(cx, t)
+	check = function(cx, t) -- a literal command: no agent writes it here
 		ask(cx, { placeholder = "Command line; done when it exits 0", action = "next" }, function(argv, cx2)
 			ask(cx2, { value = "15m", placeholder = "Check every", action = "next" }, function(interval, cx3)
 				finishSetAside(cx3, t, "command", { "--argv", argv, "--interval", interval })
 			end)
 		end)
 	end,
-	something = function(cx, t)
-		ask(cx, { placeholder = "What are you waiting for?", action = "set aside" }, function(what, cx2)
+	-- The pane's one free-text status: `what` sets it (or updates the one it has); its text says it all.
+	["for"] = function(cx, t)
+		ask(cx, { value = t.waitingFor, placeholder = "What are you waiting for?", action = "set aside" }, function(what, cx2)
 			if what == "" then
 				waitingFailed("set aside", "say what you wait for", cx2)
 			else
-				finishSetAside(cx2, t, "something", { "--what", what })
+				commitSetAside(t, { "what", "--pane", tostring(t.pane), "--text", what })
 			end
 		end)
 	end,
 }
 
--- The labels and descriptions of the omp extension's menu, without its omp-only items.
-local SHELL_ITEMS: { PickItem } = {
-	{ label = "Retry later", detail = "/wait 2d · after a while or at a time", flow = "time" },
-	{ label = "Job finishes", detail = "the command in this pane", flow = "job" },
-	{ label = "GitHub PR", detail = "/wait gh pr · until reviewed, ready, merged, released or new activity", flow = "pr" },
-	{ label = "GitHub release", detail = "/wait gh release · a repo's next release", flow = "release" },
-	{ label = "Command check", detail = "/wait check · run a command every 15m until it succeeds", flow = "command" },
-	{ label = "Something else", detail = "/wait for · anything; you mark it done", flow = "something" },
-}
+-- The shared menu's items for a pane (`waitingMenu`, published by the host from
+-- waiting_menu.json), in the file's order; nil and the host's error without
+-- them, nil alone while the host is still loading it.
+local function paneItems(): ({ PickItem }?, string?)
+	local menu = tern.kv.get("waitingMenu")
+	if type(menu) ~= "table" or type(menu.items) ~= "table" then
+		return nil, if type(menu) == "table" and type(menu.error) == "string" then menu.error else nil
+	end
+	local items: { PickItem } = {}
+	for _, it in menu.items do -- kv tables are read-only proxies: plain loops, no table library
+		local forPane = false
+		for _, target in (if type(it) == "table" and type(it.targets) == "table" then it.targets else {}) do
+			forPane = forPane or target == "pane"
+		end
+		if forPane and SET_ASIDE_FLOWS[it.id] then
+			local detail = if type(it.pane_detail) == "string" then it.pane_detail else tostring(it.detail)
+			local command = if type(it.command) == "string" and it.command ~= "" then it.command .. " · " else ""
+			table.insert(items, { label = tostring(it.label), detail = command .. detail, flow = it.id })
+		elseif forPane then
+			tern.log.warn("codexbar: waiting_menu.json item has no Tern flow", tostring(it.id))
+		end
+	end
+	return items, nil
+end
 
 -- An omp session's menu is the extension's, drawn in its composer: Tern only
 -- asks for it, and brings the pane forward for the menu to be seen.
@@ -1220,8 +1233,16 @@ local function setAside(cx: WindowCx)
 		requestMenu(pane, session)
 		return
 	end
+	local items, err = paneItems()
+	if not items and not err then
+		cx:toast("info", "CodexBar AgentView: the wait menu is still loading")
+		return
+	elseif not items or #items == 0 then
+		cx:toast("error", "CodexBar AgentView: no wait menu", err or "waiting_menu.json lists nothing for panes")
+		return
+	end
 	local t = setAsideTarget(pane, info)
-	choose(cx, { items = SHELL_ITEMS, placeholder = "What does this wait for?", action = "next" }, function(item, cx2)
+	choose(cx, { items = items, placeholder = "What does this wait for?", action = "next" }, function(item, cx2)
 		SET_ASIDE_FLOWS[item.flow](cx2, t)
 	end)
 end
@@ -1353,7 +1374,8 @@ local lastWaitingRequest = if type(initialWaitingRequest) == "table" then initia
 
 -- Dashboard buttons that need a window: like picking from a popup, they close
 -- the dashboard, and what they do waits for its layout to come back. The list
--- spans windows, so the window holding the target answers too.
+-- spans windows, so the window holding the target answers too. "Waiting for…"
+-- asks over the dashboard instead, which shows the new text once the CLI answers.
 local function waitingRequest(cx: WindowCx)
 	local request = tern.kv.get("waitingRequest")
 	if type(request) ~= "table" or type(request.pane) ~= "number" or request.seq == lastWaitingRequest then
@@ -1366,6 +1388,22 @@ local function waitingRequest(cx: WindowCx)
 		return
 	end
 	lastWaitingRequest = request.seq
+	if request.op == "what" then
+		local args: { string } = {} -- kv tables are read-only proxies
+		for _, a in (if type(request.args) == "table" then request.args else {}) do
+			table.insert(args, tostring(a))
+		end
+		ask(cx, { value = tostring(request.text or ""), placeholder = "What are you waiting for? Empty clears it", action = "save" }, function(text)
+			table.insert(args, "--text")
+			table.insert(args, text)
+			waitingCli(args, function(data, err, cx2)
+				if not data then
+					waitingFailed("set what you wait for", err, cx2)
+				end
+			end)
+		end)
+		return
+	end
 	if ours then
 		closePane(cx, request.pane)
 	end
