@@ -25,6 +25,11 @@ What you get:
 - **Get it all back.** After a reboot or crash, **Restore all** reopens your
   kitty sessions in their own windows and your Tern sessions as tabs. Closed
   one by mistake? Bring it back from History with one click.
+- **Set sessions aside without losing why.** Park a session with one
+  sentence about what it waits for: a time, a GitHub pull request or release,
+  a command, a job, anything else you name, or "when I have time". Code watches the wait, sends the
+  session its follow-up prompt when it fires, and tells you what happened
+  while you were away.
 
 Use either interface, or both. 
 
@@ -89,6 +94,8 @@ for it.
 | kitty or Tern | Optional | Optional | Launch and Restore all; with both, Teleport to Tern |
 | kitty remote control | Optional | Optional | Exact focus of kitty windows |
 | `notify-send` | Optional | | Usage and waiting-for-input alerts |
+| [`gh`](https://cli.github.com), logged in | Optional | Optional | Pull request waits |
+| [omp](https://github.com/can1357/oh-my-pi) | Optional | Optional | `/wait`, the row above the composer and prompt delivery for set-aside sessions |
 
 ## Install
 
@@ -136,20 +143,40 @@ On macOS:
   Claude's token from the login Keychain.
 - Restores open on the current desktop.
 
+### omp extension (set-aside sessions)
+
+The extension gives omp the `/wait` command and the `waitingfor` agent tool,
+draws the row above the composer and delivers wait prompts. On Linux the
+Plasma **Install** button links it; anywhere else, run the Tern palette
+command `CodexBar AgentView: Install omp extension` or:
+
+```sh
+python3 contents/scripts/install_integration.py --omp-extension
+```
+
+It links `~/.omp/agent/extensions/codexbar-waitingfor.ts` (under
+`$PI_CODING_AGENT_DIR` or `$OMP_AGENT_DIR` when set) to the checkout. omp loads extensions at start, so
+run `/restart` in sessions that were already open. `--omp-extension
+--uninstall` removes the link.
+
 ## Keyboard shortcuts
 
 | Key | Action | Where |
 | --- | --- | --- |
 | `Super+A` | Open the popup on Agents | Plasma |
-| `Ctrl+Alt+A` / `Ctrl+Alt+U` | Toggle the dashboard on Agents / Usage | Tern |
+| `Ctrl+Alt+A` / `Ctrl+Alt+U` / `Ctrl+Alt+W` | Toggle the dashboard on Agents / Usage / Waiting | Tern |
+| `Ctrl+Alt+B` | Set the focused session aside (in omp outside Tern too) | Tern, omp |
+| `Ctrl+Alt+I` | Show or hide the focused session's card (in omp outside Tern: its details above the composer) | Tern, omp |
 | `←` / `→` | Switch tabs | Both |
-| `↑` / `↓` | Select a row on Agents or History | Both |
+| `↑` / `↓` | Select a row on Agents, Waiting or History | Both |
 | `Space` | Peek at the selected session; while filtering, types a space | Both |
-| `Enter` | Agents: jump to the session. History: launch it | Both |
+| `Enter` | Agents: jump to the session. History: launch it. Waiting: open or resume it | Both |
+| `Shift+Enter` | Agents and Waiting: open the selected session's card | Tern |
 | `Tab` | Hide or show sessions idle for over a day | Both |
-| `Delete` | Dismiss the selected History row | Tern |
+| `Delete` | Dismiss the selected History row; Waiting: mark it done | Tern |
+| `+` | Waiting: snooze the selected wait by a day | Tern |
 | `R` | Refresh (Usage tab) | Both |
-| Typing | Filter Agents and History | Both |
+| Typing | Filter Agents, Waiting and History | Both |
 | `Esc` | Clear the filter, keeping the selected session, then close | Both |
 
 KDE binds `Ctrl+Alt+A` to Activate Window Demanding Attention. Clear it in
@@ -160,7 +187,9 @@ System Settings → Shortcuts → KWin, or Tern never sees the key.
 ### Usage
 
 - **Meters per provider.** Bars with percent used and reset countdown. Balance
-  providers (OpenRouter, Kilo, TypeSafe) show what is left instead.
+  providers (OpenRouter, Kilo, TypeSafe) show what is left instead. A Claude
+  window nobody has used since its reset reads `not started · resets 5h after
+  first use`: Anthropic starts the next window on the first message.
 - **Pace.** Each bar has a tick where even use would sit right now, and the
   reset line adds `proj N%`, the usage at reset if the current rate holds.
   Bars stay green while you are behind the tick, whatever the percentage.
@@ -224,6 +253,89 @@ System Settings → Shortcuts → KWin, or Tern never sees the key.
   30 days by default (`cleanupPeriodDays`), so older sessions don't come back.
   A dismissed session stays gone until you use it again.
 
+### Waiting (set-aside sessions)
+
+For sessions you leave and come back to later. Each one gets your own
+sentence about why you left it, what it waits for, and a history of what
+happened since.
+
+- **Set aside.** `Ctrl+Alt+B` or `/wait` opens one menu, the same in Tern and
+  in omp: this session's waits with Done and +1 day, then what the session
+  waits for, your sentence and, optionally, a prompt to send when it fires;
+  then it parks the pane. Each item shows the one-line command that does the
+  same. Shell panes in Tern get a shorter picker of their own.
+- **The commands.** Type `/wait ` for completions; `/wait help` shows them
+  above the composer.
+
+  | Command | Waits for |
+  |---|---|
+  | `/wait 2d <sentence> [-- prompt]` | a while (`3h`, `1h30m`, `1w`) |
+  | `/wait 2026-11-07 09:00 <sentence> [-- prompt]` | a date and time, or just `18:00` |
+  | `/wait gh pr [N\|URL] [ready\|review\|merged\|released\|activity] <sentence> [-- prompt]` | a pull request: the default `ready` means checks green, a bot reviewed the latest push and no open thread; `activity` is the next comment, review, merge or close from anyone else |
+  | `/wait gh babysit [N\|URL] [sentence]` | a bot review; then the agent fixes what's real, and the wait follows the PR to ready and merged |
+  | `/wait gh release [owner/repo] <sentence> [-- prompt]` | a repo's next GitHub release, checked hourly |
+  | `/wait check [every 10m] <command> [-- prompt]` | a command that exits 0, run without a shell every 15 minutes by default |
+  | `/wait for <what>` | anything else; you mark it done |
+  | `/wait later [S\|M\|L] <sentence>` | the time you have for it; pins the session |
+  | `/wait list`, `/wait done [w1]`, `/wait note <text>` | the session's waits, closing one or all, your sentence |
+
+  Without a PR number, `gh pr` and `gh babysit` take the PR the agent last
+  named, else the current branch's; `gh release` takes the current repo. A
+  shell job in Tern can also wait for the job to end, closing the pane on
+  success if you like. Any wait can have a deadline (CLI and agent tool),
+  after which it comes back to you while still being watched.
+- **Follow-up prompts.** A wait can carry a prompt (`/wait 2d retry the
+  migration -- Run the migration again and report`). When it fires, the omp
+  extension sends it into the session, parked or not, after the running turn.
+  A prompt can have a check (a command or PR state) that decides whether the
+  turn did its job; without one, the wait comes back as "ran, take a look". A
+  closed session never restarts by itself: Resume reopens it and then sends
+  the prompt.
+- **The agent can add waits too,** for example after opening a PR, through
+  the `waitingfor` tool. It never overwrites your sentence; its suggestion
+  waits for you to accept it.
+- **The Waiting tab** (`Ctrl+Alt+W`) groups sessions by who has the next
+  step: on me, machine watching, waiting on something, when I have time. Space
+  shows the sentence, the history, the next step, the recap and the session's
+  pull requests; Enter opens the session in its own tab, or resumes a closed
+  one; `+` snoozes a day; Delete marks it done; `Shift+Enter` opens its card.
+- **When I have time** lists every session pinned with omp's `/pin`, closed
+  ones too, sorted by the size you gave it. Setting a session aside for when
+  you have time pins it, and Done unpins it. It never notifies.
+- **Pull requests of a session.** The ones it created (`gh pr create` or
+  omp's GitHub tool), the ones it waits for, and the last five mentioned in
+  the conversation, with title, state, review and checks.
+- **On the pane.** A row above the omp composer
+  (`⏳ PR#42 · review on head · 2d · "fix, merge, release"`, `●` when it's
+  back on you), a status line segment and a yellow tab while it needs you.
+  `/wait` answers in the same place, under the row, until your next input.
+  The first time you focus a session whose wait fired, a card in the pane's
+  corner shows your sentence, what happened since and the next step. The same
+  card opens for any omp session with `Ctrl+Alt+I` (`Session card`), a
+  click on the row above the composer or on the status segment, or the Card
+  button (`Shift+Enter`) on Agents and Waiting, with the folder, branch,
+  model, pull requests, waits and schedules; focus it to use its buttons and
+  links.
+- **Repeating prompts** from your own `/schedule` extension
+  (`~/.omp/agent/schedule/`) show as `↻ every 2h · next 16:00` beside the
+  session's waits in its status, tooltip and card. The row above the omp
+  composer leaves them out, because omp-schedule draws its own.
+- **Plasma** shows the waits only with Settings → Agents → **Tern
+  integration** on: an hourglass on waiting rows (`●` when one is back on
+  you, its line in the tooltip) and an amber count beside the panel dots.
+- **tern-awui** shows the same groups on the phone, with +1 day, Done and push
+  notifications when a session comes back to you.
+
+PR waits read GitHub through `gh` every 3 minutes (15 while rate limited or
+waiting for a release). The review bots are Greptile, Macroscope, CodeRabbit,
+Codex, Copilot, Gemini, Cursor Bugbot, Sourcery and roboomp; pass `--bots` to
+the CLI for others. A review counts when a bot finished on the latest push and
+no bot's check still runs. Ready also goes ahead 15 minutes after a push that
+no bot reviews, since Copilot and Codex don't review every push by default.
+Everything goes through `contents/scripts/codexbar_waiting.py`,
+which keeps its state in `waiting.json` and `waiting_view.json` in the state
+folder.
+
 ### Panel (Plasma)
 
 Usage rings per provider and window, coloured by pace, which you can set to
@@ -241,7 +353,8 @@ which turns it into one meter per account
 
 The dashboard opens to the right of your rightmost pane and closes when you
 focus anything else, putting the layout back as it was. Palette commands
-`CodexBar AgentView: Agents`, `Usage`, `History` and `Settings` cover what the
+`CodexBar AgentView: Agents`, `Usage`, `Waiting`, `History`, `Settings`,
+`Set aside…` and `Install omp extension` cover what the
 keys do not. Settings, also at the right of the dashboard's status bar,
 opens a native tab with search; **Include non-Tern agents** (off by default)
 adds kitty, VS Code and other hosts. Desktop notifications and the panel are
