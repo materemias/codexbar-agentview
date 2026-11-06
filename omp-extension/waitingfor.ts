@@ -331,6 +331,23 @@ export function waitCompletions(prefix: string, waits = []) {
 	return items.length > 0 ? items : null;
 }
 
+/** The theme color of an outcome: what a session's headline and row prefix are drawn in. */
+const TONES: Record<string, string> = { fulfilled: "success", attention: "warning", overdue: "warning" };
+
+/** The CLI's composer row: its prefix in the outcome's color, and what happened in bold when fulfilled. */
+function rowText(session, theme): string {
+	const row: string = session.composer_row;
+	const tone = TONES[session.outcome];
+	const space = row.indexOf(" ");
+	if (!tone || space < 0) return row;
+	const prefix = row.slice(0, space);
+	const rest = row.slice(space + 1);
+	const headline = session.headline;
+	// theme.bold can come out plain, so the bold is written out.
+	const fired = session.outcome === "fulfilled" && headline && row.startsWith(headline) ? headline.slice(space + 1) : "";
+	return `${theme.fg(tone, prefix)} ${fired ? `\x1b[1m${fired}\x1b[22m${rest.slice(fired.length)}` : rest}`;
+}
+
 /** An ISO time as the panel shows it, without seconds and year. */
 function when(iso: string): string {
 	return iso.slice(5, 16).replace("T", " ");
@@ -375,6 +392,7 @@ function detailsPanel(card) {
 		const sentence = card.note || (waits.length > 0 ? "" : "Nothing is waiting in this session.");
 		const place = [card.project, card.branch].filter(Boolean).join(" · ");
 		return [
+			card.headline && theme.fg(TONES[card.outcome] ?? "muted", card.headline),
 			sentence && theme.bold(sentence),
 			card.suggested_note && `Suggested: ${card.suggested_note}`,
 			place && muted(place),
@@ -614,7 +632,7 @@ export default function (pi) {
 	let timers = [];
 	let debounce;
 	let watcher;
-	let shownLine: string | undefined | null = null; // null: draw next time, whatever the line is
+	let shownLine: string | undefined | null = null; // what drawRow last drew; null: draw next time, whatever it is
 	let waits = []; // this session's open waits, as the last applied view had them
 	let menuOpen = false;
 	let menuSeq = 0; // the last menu request seen
@@ -636,12 +654,15 @@ export default function (pi) {
 	};
 	const inOrder = (step) => (tail = tail.then(step).catch(log));
 
-	function drawRow(line: string | undefined) {
-		if (!ctx || line === shownLine) return;
-		shownLine = line;
+	function drawRow(session) {
+		const line = session?.composer_row || undefined;
+		const shown = line && JSON.stringify([session.outcome, session.headline, line]);
+		if (!ctx || shown === shownLine) return;
+		shownLine = shown;
 		// In Tern a click on the row opens the session's card.
-		const text = line && process.env.TERN_PANE ? `\x1b]8;;codexbar-agentview://card/${sessionId}\x1b\\${line}\x1b]8;;\x1b\\` : line;
-		ctx.ui.setWidget(WIDGET, text ? [text] : undefined, { placement: "aboveEditor" });
+		const [open, close] = process.env.TERN_PANE ? [`\x1b]8;;codexbar-agentview://card/${sessionId}\x1b\\`, "\x1b]8;;\x1b\\"] : ["", ""];
+		const widget = (_tui, theme) => panelComponent((t) => open + rowText(session, t) + close, theme);
+		ctx.ui.setWidget(WIDGET, line ? widget : undefined, { placement: "aboveEditor" });
 		// omp draws widgets in the order they were set, and the panel belongs under the row.
 		if (panel) drawPanel(ctx);
 	}
@@ -702,7 +723,7 @@ export default function (pi) {
 		viewsApplied += 1;
 		const session = view.sessions?.find((record) => record.session_id === sessionId);
 		waits = session?.waits ?? [];
-		drawRow(session?.composer_row || undefined);
+		drawRow(session);
 		if (session?.prompts_queued > 0) void claimPrompts();
 		answerMenuRequest(view);
 	}
@@ -789,7 +810,8 @@ export default function (pi) {
 	}
 
 	function heartbeat() {
-		return cli(["heartbeat", "--session", sessionId, "--features", "menu"]);
+		const pane = process.env.TERN_PANE;
+		return cli(["heartbeat", "--session", sessionId, ...(pane ? ["--pane", pane] : []), "--features", "menu"]);
 	}
 
 	function activate(c) {
