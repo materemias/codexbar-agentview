@@ -117,9 +117,9 @@ The Waiting tab, Plasma and tern-awui group sessions the same way:
 
 | Group | What's in it |
 |---|---|
-| On me | a wait fired, ran its prompt, needs attention, or is overdue |
-| Machine watching | code is checking something |
-| Scheduled | the session has only `/schedule` jobs, which prompt it on their own |
+| On me | a wait was fulfilled, needs you, or is overdue |
+| Machine watching | code is checking something: a PR, a release, a command, a job |
+| On a timer | only time has to pass: a Retry later wait, or `/schedule` jobs that prompt the session on their own |
 | Waiting on something | something else waits, with your words for it |
 | When I have time | sessions you pinned or set aside for later |
 
@@ -138,6 +138,29 @@ A closed session never restarts by itself. Its wait comes back to you with
 Resume, which reopens the session in a new Tern tab and then sends the
 prompt. A live session without the extension can't take prompts; its wait
 comes back to you saying so.
+## When a wait is fulfilled
+
+A wait that happened stays in On me until you mark it Done, and everything
+shows it the same way:
+
+| Mark | Means | Color |
+|---|---|---|
+| ✅ | fulfilled: what you waited for happened (`✅ PR#20 merged`) | green |
+| ⚠️ | needs you: a check failed, a PR conflicts or was closed, a prompt couldn't be sent | yellow |
+| ⏰ | overdue: its deadline passed, still watched | yellow |
+| ⏲ | waiting for a time | |
+| ⏳ | waiting for anything else | |
+
+The row above the composer, the Waiting tab row and the status segment start
+with the mark. The session card opens with a banner such as
+`✅ Fulfilled · PR#20 merged · 2h ago`, and the fulfilling line in "Since
+then" is green. In On me, the ⚠️ sessions come first, then ⏰, then ✅. A tab
+holding a session that's on you turns green when all of them are fulfilled and
+yellow when one needs you.
+
+When a babysat PR is merged early, the steps it skipped (review, ready) are
+closed and the merged step fires at once.
+
 
 ## Coming back
 
@@ -181,10 +204,10 @@ happened since, and the next step. Focus it to use its buttons and links.
 Outside Tern, `Ctrl+Alt+I` shows the same details above the composer.
 
 **On the pane** a row above the omp composer says what the session waits for
-(`⏳ PR#42 · review on head · 2d · "fix, merge, release"`, starting with `●`
-when it's back on you). Tern adds a status line segment and colors the tab
-yellow while a session in it is on you. It only colors tabs that have no color
-of their own, and only removes the yellow it set.
+(`⏳ PR#42 · review on head · 2d · "fix, merge, release"`, with the marks
+above). Tern adds a status line segment and colors the tab green or yellow
+while a session in it is on you. It only colors tabs that have no color of
+their own, and only removes the colors it set.
 
 ## When I have time
 
