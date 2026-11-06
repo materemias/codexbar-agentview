@@ -1829,8 +1829,10 @@ def _wait_view(wait: dict, now: datetime) -> dict:
         "summary": _summary(wait, now), "state": wait["state"],
         "ball": _wait_ball(wait), "overdue": wait["overdue"],
         "outcome": outcome,
-        # A wait that fired before these were kept has only its label and start.
-        "fired_text": (wait.get("fired_text") or wait["label"]) if fulfilled else None,
+        # A wait that fired before these were kept has only its label and start;
+        # a PR's summary ("PR#20 merged") says more than a chain step's label ("Merged").
+        "fired_text": (wait.get("fired_text") or (_summary(wait, now) if wait["kind"] == "pr" else wait["label"]))
+        if fulfilled else None,
         "fired_at": (wait.get("fired_at") or wait["created_at"]) if fulfilled else None,
         "reason": wait["reason"], "created_at": wait["created_at"],
         "due_at": None if due is None else _iso(datetime.fromtimestamp(due).astimezone()),
