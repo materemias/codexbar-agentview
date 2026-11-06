@@ -1,4 +1,4 @@
-/* CodexBar AgentView dashboard, scoped to the block's regions; the PR rule after it also reaches the session card. */
+/* CodexBar AgentView dashboard, scoped to the block's regions; the rules after it also reach the session card. */
 
 [data-surface='plugin.codexbar-agentview.dashboard'] {
 	/* Agents and History: the list takes all the height under the tabs and filter.
@@ -72,7 +72,8 @@
 		background: rgb(from var(--sf-warn) r g b / 8%);
 		box-shadow: inset 2px 0 0 var(--sf-warn);
 	}
-	.sf-item[data-tone='success'] .sf-item-label .sf-t-success:first-child {
+	/* A working session's dot pulses; a fulfilled wait has nothing left to do. */
+	.sf-item[data-tone='success']:not([data-role='codexbar.waiting']) .sf-item-label .sf-t-success:first-child {
 		animation: codexbar-pulse 1.6s ease-in-out infinite;
 	}
 	.sf-item[data-role='codexbar.old'] {
@@ -96,7 +97,8 @@
 		box-shadow: inset 0 0 0 1px var(--l2);
 	}
 
-	/* Waiting: the free-text "Waiting for: …" line, under its row's label. */
+	/* Waiting: what happened and the free-text "Waiting for: …" line, under their row's label. */
+	[data-role='codexbar.headline'],
 	[data-role='codexbar.waitingfor'] {
 		margin: -2px 0 4px 42px;
 	}
@@ -131,6 +133,21 @@
 [data-role='codexbar.pr'] .sf-link.sf-t-muted {
 	color: inherit;
 	opacity: .65;
+}
+
+/* Session card (a canvas, outside the block): its outcome, tinted like a Waiting row. */
+[data-role='codexbar.banner'] {
+	padding: 6px 10px;
+	border-radius: 6px;
+
+	&[data-tone='success'] {
+		background: rgb(from var(--sf-ok) r g b / 12%);
+		box-shadow: inset 2px 0 0 var(--sf-ok);
+	}
+	&[data-tone='warning'] {
+		background: rgb(from var(--sf-warn) r g b / 12%);
+		box-shadow: inset 2px 0 0 var(--sf-warn);
+	}
 }
 
 @keyframes codexbar-pulse {

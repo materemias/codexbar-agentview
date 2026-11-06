@@ -10,8 +10,8 @@
 -- codexbar_waiting.py owns the sessions set aside. This half calls its `tick`,
 -- shows its view on the Waiting tab and publishes what the window half needs:
 -- `waitingView`, the outbox `waitingActions`, `paneSessions`, the set-aside
--- items `waitingMenu`; the window half answers with `waitingRequest` and
--- `waitingPoke`.
+-- items `waitingMenu`; the window half answers with `waitingRequest`, which
+-- `codexbar-agentview://request` wakes it for, and `waitingPoke`.
 
 local ui = tern.ui
 
@@ -1140,6 +1140,7 @@ local function waitingPanes(): { [string]: any }
 			panes[tostring(pane)] = {
 				text = str(r.status),
 				on_me = r.ball == "on_me",
+				outcome = val(r.outcome),
 				unseen = val(r.unseen) == true,
 				session = session,
 				record = record,
@@ -2263,9 +2264,9 @@ end
 local LAUNCH_HOSTS = { kitty = true, tern = true }
 
 local BALLS = {
-	{ id = "on_me", title = "On me" },
+	{ id = "on_me", title = "On me", rank = { attention = 1, overdue = 2, fulfilled = 3 } },
 	{ id = "on_machine", title = "Machine watching" },
-	{ id = "scheduled", title = "Scheduled" },
+	{ id = "on_timer", title = "On a timer" },
 	{ id = "on_someone", title = "Waiting on something" },
 	{ id = "on_my_time", title = "When I have time" },
 }
@@ -2298,7 +2299,7 @@ local function waitSummary(r: any): string
 end
 
 local function waitMatches(r: any, q: string): boolean
-	local fields = { waitTitle(r), oneLine(r.note), oneLine(r.project), waitSummary(r), oneLine(r.waiting_for) }
+	local fields = { waitTitle(r), oneLine(r.note), oneLine(r.project), waitSummary(r), oneLine(r.waiting_for), oneLine(r.headline) }
 	for _, w in queryWords(q) do
 		local ok = false
 		for _, text in fields do
@@ -2314,7 +2315,8 @@ local function waitMatches(r: any, q: string): boolean
 	return true
 end
 
--- The view's order within each group, sessions before panes.
+-- The view's order within each group, sessions before panes; a group with a
+-- `rank` sorts by outcome first, in that same order within each.
 local function waitingGroups(q: string): { { ball: any, rows: { any } } }
 	local out = {}
 	for _, ball in BALLS do
@@ -2325,6 +2327,15 @@ local function waitingGroups(q: string): { { ball: any, rows: { any } } }
 					table.insert(rows, r)
 				end
 			end
+		end
+		if ball.rank then
+			local order: { [any]: number } = {}
+			for i, r in rows do
+				order[r] = (ball.rank[r.outcome] or 4) * #rows + i
+			end
+			table.sort(rows, function(x, y)
+				return order[x] < order[y]
+			end)
 		end
 		if #rows > 0 then
 			table.insert(out, { ball = ball, rows = rows })
@@ -2630,25 +2641,47 @@ local function waitingTime(r: any, now: number): (string, string)
 	return if since then ageFrom(since * 1000, now * 1000) else "", "dim"
 end
 
-local function waitingItem(r: any, now: number, q: string): Node
-	local onMe = r.ball == "on_me"
-	local label: { Span | string } = {}
-	if onMe or val(r.unseen) == true then
-		table.insert(label, ui.span("● ", "warning"))
+-- A do block: the main chunk is at Luau's 200-local limit.
+local addWaitingRow: (kids: { Node }, r: any, now: number, q: string) -> ()
+do
+	local OUTCOMES = {
+		fulfilled = { prefix = "✅ ", tone = "success" },
+		attention = { prefix = "⚠️ ", tone = "warning" },
+		overdue = { prefix = "⏰ ", tone = "warning" },
+	}
+
+	-- The row, then what happened under it, in the outcome's tone.
+	addWaitingRow = function(kids, r, now, q)
+		local onMe = r.ball == "on_me"
+		local outcome = OUTCOMES[r.outcome]
+		local label: { Span | string } = {}
+		if outcome then
+			table.insert(label, ui.span(outcome.prefix, outcome.tone))
+		elseif onMe or val(r.unseen) == true then
+			table.insert(label, ui.span("● ", "warning"))
+		end
+		for _, s in highlighted(waitTitle(r), q) do
+			table.insert(label, s)
+		end
+		-- The label carries the outcome's mark, so its line under the row doesn't repeat it.
+		local headline = if outcome then oneLine(r.headline) else ""
+		if outcome and string.sub(headline, 1, #outcome.prefix) == outcome.prefix then
+			headline = string.sub(headline, #outcome.prefix + 1)
+		end
+		local time, token = waitingTime(r, now)
+		table.insert(kids, ui.node("item", {
+			key = waitKey(r),
+			label = label,
+			detail = if headline ~= "" then nil else waitSummary(r),
+			value = { ui.span(string.format("%7s", time), token) },
+			icon = if str(r.session_id) ~= "" then AGENT_ICONS.omp else "terminal",
+			tone = if outcome then outcome.tone elseif onMe then "warning" else nil,
+			role = "codexbar.waiting",
+		}))
+		if headline ~= "" then
+			table.insert(kids, withp(ui.text({ ui.span(clip(headline, 100), outcome.tone) }), { key = "hl-" .. waitKey(r), role = "codexbar.headline" }))
+		end
 	end
-	for _, s in highlighted(waitTitle(r), q) do
-		table.insert(label, s)
-	end
-	local time, token = waitingTime(r, now)
-	return ui.node("item", {
-		key = waitKey(r),
-		label = label,
-		detail = waitSummary(r),
-		value = { ui.span(string.format("%7s", time), token) },
-		icon = if str(r.session_id) ~= "" then AGENT_ICONS.omp else "terminal",
-		tone = if onMe then "warning" else nil,
-		role = "codexbar.waiting",
-	})
 end
 
 local function detailLines(key: string, head: string, lines: { Node }): Node
@@ -2725,7 +2758,7 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 			local at = epoch(h.at)
 			table.insert(history, withp(ui.text({
 				ui.span((if at then absoluteTime(at, now) else "") .. "  ", "dim"),
-				oneLine(h.text),
+				ui.span(oneLine(h.text), if h.kind == "fired" then "success" else nil),
 			}), { key = "h" .. i }))
 		end
 		if #history > 0 then
@@ -2766,7 +2799,7 @@ local function waitingView(b: Block, now: number): Node
 	for _, g in waitingGroups(q) do
 		table.insert(kids, groupHead("w-" .. g.ball.id, { ui.span(g.ball.title, "strong"), ui.span("  " .. #g.rows, "muted") }))
 		for _, r in g.rows do
-			table.insert(kids, waitingItem(r, now, q))
+			addWaitingRow(kids, r, now, q)
 			local waitingFor = oneLine(r.waiting_for)
 			if waitingFor ~= "" and waitingFor ~= waitTitle(r) then -- a pane record named by the text says it already
 				local spans: { any } = { ui.span("Waiting for: ", "muted") }
@@ -2825,6 +2858,7 @@ local function dockView(b: Block, now: number): Node
 			local onMe = tonumber(val(w.on_me)) or 0
 			table.insert(segs, seg("on_me", onMe .. " on me", { icon = "warn", tone = if onMe > 0 then "warning" else "muted", priority = 5 }))
 			table.insert(segs, seg("machine", (tonumber(val(w.on_machine)) or 0) .. " watched", { icon = "activity", tone = "muted", priority = 4 }))
+			table.insert(segs, seg("timer", (tonumber(val(w.on_timer)) or 0) .. " on a timer", { icon = "history", tone = "muted", priority = 3 }))
 			table.insert(segs, seg("someone", (tonumber(val(w.on_someone)) or 0) .. " on something", { icon = "users", tone = "muted", priority = 3 }))
 			table.insert(segs, seg("my_time", (tonumber(val(w.on_my_time)) or 0) .. " when I have time", { icon = "clock", tone = "muted", priority = 2 }))
 		elseif b.tab == "agents" then
@@ -3041,11 +3075,12 @@ local function teleport(b: Block, r: any)
 end
 
 -- Layout work belongs to the window half; the dashboard's window takes this up
--- like `settingsRequest`.
+-- like `settingsRequest`, at once through the link, else on its poll.
 local function waitingRequest(b: Block, request: { [string]: any })
 	request.pane = b.cx.pane
 	request.seq = tern.now()
 	tern.kv.set("waitingRequest", request)
+	b.cx:open("codexbar-agentview://request")
 end
 
 -- `verb` aimed at the row's session, or at its pane for a non-omp one.

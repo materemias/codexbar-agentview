@@ -12,7 +12,8 @@
 -- carries out `waitingActions`: one leader window shows the toasts, and each
 -- pane's action falls to the window holding that pane, as windows don't share
 -- panes. So do its agent and pane events and tab colors. `waitingPoke` makes the
--- host tick after a CLI call from here.
+-- host tick after a CLI call from here; `codexbar-agentview://request`, from the
+-- host, makes this half take `waitingRequest` up without waiting for the poll.
 --
 -- `tern.kv` and `tern.process` belong to the machine each half runs on: a window
 -- attached to a remote host runs this half on its own machine, beside another
@@ -37,16 +38,110 @@ end
 -- The dashboard this window opened, with the layout from before it opened.
 type Popup = {
 	pane: number, tab: number?, snap: LayoutSnapshot,
-	deadline: number, tries: number, restoring: boolean, placing: boolean,
-	equalized: boolean, moves: number, targets: { [number]: boolean },
+	deadline: number, restoreBy: number, restoring: boolean, placing: boolean,
+	closed: boolean, equalized: boolean, moves: number, targets: { [number]: boolean },
 }
 local opened: Popup? = nil
+
+local restoreWaiters: { (WindowCx) -> () } = {} -- see `afterRestore`
+
+local function restoreFinished(cx: WindowCx)
+	local waiters = restoreWaiters
+	restoreWaiters = {}
+	for _, fn in waiters do
+		fn(cx)
+	end
+end
 
 local function closePane(cx: WindowCx, pane: number)
 	if opened and opened.pane == pane then
 		opened.placing = false
+		opened.closed = true
 	end
 	cx.layout:close(pane)
+end
+
+-- However the dashboard closes (toggle, Esc, switching to a session, focus
+-- leaving it, closing the pane), the layout returns to how it was before it
+-- opened. `pane_closed` fires before the tree drops the pane, `tern close`
+-- from the CLI sends none, and a pane can leave `session:panes()` while its
+-- tab tree still holds it. So the restore waits for both, looking on each
+-- frame as what it holds up (`afterRestore`) is a card or a focus to show. It
+-- refuses when other blocks opened or closed meanwhile, which no retry changes:
+-- the layout then stays as it is.
+local function inTrees(cx: WindowCx, pane: number): boolean
+	local function walk(n: any): boolean
+		if type(n) ~= "table" then
+			return false
+		end
+		local p = n.pane
+		if type(p) == "number" and p == pane then
+			return true
+		end
+		return walk(n[1]) or walk(n[2])
+	end
+	for _, t in cx.session:tabs() do
+		local layout = cx.session:layout(t.id)
+		if layout and walk(layout.root) then
+			return true
+		end
+	end
+	return false
+end
+
+local function attemptRestore(cx: WindowCx, o: Popup)
+	if opened ~= o then
+		return
+	end
+	local gone = not paneInfo(cx, o.pane) and not inTrees(cx, o.pane)
+	if not gone and tern.now() < o.restoreBy then
+		tern.timer(16, function(cx2)
+			if cx2 then
+				attemptRestore(cx2, o)
+			end
+		end)
+		return
+	end
+	opened = nil
+	local ok, err = false, "the dashboard is still in the layout"
+	if gone then
+		ok, err = cx.layout:restore(o.snap)
+	end
+	if not ok then
+		tern.log.info("codexbar: layout not restored", err)
+	end
+	restoreFinished(cx)
+end
+
+local function restoreLayout(cx: WindowCx)
+	local o = opened
+	if not o or o.restoring or (paneInfo(cx, o.pane) and not o.closed) then
+		return
+	end
+	if o.placing and o.tab == nil and tern.now() < o.deadline then
+		return
+	end
+	o.restoring = true
+	o.placing = false
+	o.restoreBy = tern.now() + 2000
+	attemptRestore(cx, o)
+end
+
+-- Closes the dashboard this window opened and runs `fn` once its layout is back:
+-- the restore refuses after a block opened and would park an unparked pane
+-- again. A close has usually landed by now, so this restores here and then, with
+-- no timer in the way: one can take a few hundred ms to fire in an idle window.
+local function afterRestore(cx: WindowCx, fn: (WindowCx) -> ())
+	local o = opened
+	if not o then
+		fn(cx)
+		return
+	end
+	table.insert(restoreWaiters, fn)
+	if not o.closed then
+		closePane(cx, o.pane)
+	end
+	restoreLayout(cx)
 end
 
 -- The dashboard to act on in this window (the focused one, else the first) and
@@ -184,13 +279,18 @@ end
 local function toggle(cx: WindowCx, tab: string)
 	local info, shown = dashboard(cx)
 	if not info then
+		-- A dashboard closing right now never restores: nothing waits for it.
+		if opened then
+			opened = nil
+			restoreFinished(cx)
+		end
 		-- Capture the original layout before creating the dashboard.
 		local snap = cx.layout:snapshot()
 		local pane = cx:new_block(KIND, { tab }, "beside", { focus = true })
 		if pane then
 			local o: Popup = {
 				pane = pane, snap = snap, deadline = tern.now() + 3000,
-				tries = 0, restoring = false, placing = true,
+				restoreBy = 0, restoring = false, placing = true, closed = false,
 				equalized = false, moves = 0, targets = {},
 			}
 			opened = o
@@ -239,6 +339,12 @@ tern.command({ id = "settings", title = "CodexBar AgentView: Settings", icon = "
 	openSettings(cx)
 end })
 
+local OUTCOME_TONES = {
+	fulfilled = { card = "success", status = "ok" },
+	attention = { card = "warning", status = "warn" },
+	overdue = { card = "warning", status = "warn" },
+}
+
 tern.chrome.status(function(pane)
 	local s = tern.kv.get("summary")
 	if type(s) ~= "table" then
@@ -251,9 +357,10 @@ tern.chrome.status(function(pane)
 	local w = if type(s.waiting) == "table" then s.waiting else {}
 	local here = if type(w.panes) == "table" then w.panes[tostring(pane.pane)] else nil
 	if type(here) == "table" and here.text ~= "" then
+		local tones = OUTCOME_TONES[here.outcome]
 		table.insert(segments, {
 			text = here.text,
-			tone = if here.on_me then "warn" else "muted",
+			tone = if tones then tones.status elseif here.on_me then "warn" else "muted",
 			command = "plugin.codexbar-agentview.session_card",
 		})
 	end
@@ -325,17 +432,26 @@ local function python(script: string, args: { string }, done: (ProcessResult, Wi
 	end
 end
 
--- One CLI call; `done` gets the answer, or nil and the error. The host ticks after it.
-local function waitingCli(args: { string }, done: (any, string?, WindowCx?) -> ())
+-- One read-only CLI call; `done` gets the answer, or nil and the error.
+local function waitingRead(args: { string }, done: (any, string?, WindowCx?) -> ())
 	python("codexbar_waiting.py", args, function(res, cx)
 		local okj, data = pcall(tern.json.decode, res.stdout)
 		if res.status == 0 and okj and type(data) == "table" and data.ok == true then
-			tern.kv.set("waitingPoke", tern.now())
 			done(data, nil, cx)
 		else
 			local detail = if okj and type(data) == "table" and type(data.error) == "string" then data.error else firstLine(res.stderr)
 			done(nil, if detail ~= "" then detail else "exit " .. res.status, cx)
 		end
+	end)
+end
+
+-- One CLI call that can change the state: the host ticks after it.
+local function waitingCli(args: { string }, done: (any, string?, WindowCx?) -> ())
+	waitingRead(args, function(data, err, cx)
+		if data then
+			tern.kv.set("waitingPoke", tern.now())
+		end
+		done(data, err, cx)
 	end)
 end
 
@@ -392,30 +508,21 @@ local function paneSession(pane: number): string?
 	return if type(e) == "table" and e.provider == "omp" then e.session else nil
 end
 
+-- The omp extension the view knows in `pane`, whatever `paneSessions` says: a
+-- new omp session has no session file yet and shows as untracked there.
+local function paneExtension(pane: number): any
+	local view = tern.kv.get("waitingView")
+	local panes = if type(view) == "table" then view.extension_panes else nil
+	local e = if type(panes) == "table" then panes[tostring(pane)] else nil
+	return if type(e) == "table" then e else nil
+end
+
 local function targetArgs(verb: string, pane: number, session: string?, extra: { string }?): { string }
 	local args = { verb, if session then "--session" else "--pane", if session then session else tostring(pane) }
 	for _, a in extra or {} do
 		table.insert(args, a)
 	end
 	return args
-end
-
--- Runs `fn` once this window's dashboard restore finished: the restore refuses
--- after a block opened and would park an unparked pane again.
-local function afterRestore(fn: (WindowCx) -> ())
-	local tries = 0
-	local function step(cx: WindowCx?)
-		if not cx then
-			return
-		end
-		if opened and tries < 60 then
-			tries += 1
-			tern.timer(50, step)
-		else
-			fn(cx)
-		end
-	end
-	tern.timer(0, step)
 end
 
 -- Waiting: the session card --------------------------------------------------------
@@ -520,6 +627,30 @@ local PR_STATE_TONE = { open = "success", draft = "muted", merged = "info", clos
 local PR_REVIEW_TONE = { approved = "success", changes_requested = "error", review_required = "muted" }
 local PR_CHECKS_TONE = { passing = "success", failing = "error", pending = "warning" }
 
+-- "✅ Fulfilled · PR#20 merged · 2h ago", "⚠️ Needs you · reason", "⏰ Overdue · label".
+local function cardBanner(r: any, now: number): Node?
+	local tones = OUTCOME_TONES[r.outcome]
+	if not tones then
+		return nil
+	end
+	local wait: any = {}
+	for _, w in (if type(r.waits) == "table" then r.waits else {}) do
+		if w.outcome == r.outcome then
+			wait = w
+			break
+		end
+	end
+	local head, detail, tail = "⏰ Overdue", wait.label, nil
+	if r.outcome == "fulfilled" then
+		local at = epoch(wait.fired_at)
+		head, detail, tail = "✅ Fulfilled", wait.fired_text, if at then age(now - at) .. " ago" else nil
+	elseif r.outcome == "attention" then
+		head, detail = "⚠️ Needs you", if wait.reason and wait.reason ~= "" then wait.reason else wait.label
+	end
+	local text = head .. (if detail and detail ~= "" then " · " .. clipped(tostring(detail), 120) else "") .. (if tail then " · " .. tail else "")
+	return ui.node("row", { role = "codexbar.banner", tone = tones.card }, { ui.text({ ui.span(text, tones.card) }) })
+end
+
 local function prRow(pr: any): Node
 	local text = "PR#" .. tostring(pr.number) .. " " .. clipped(tostring(pr.title or pr.repo), 60)
 	local kids: { Node } = { ui.text({ ui.link(text, pr.url, if pr.source == "mentioned" then "muted" else nil) }) }
@@ -597,6 +728,10 @@ end
 local function cardView(cx: WindowCx, pane: number, r: any, reading: boolean): Node
 	local now = os.time()
 	local kids: { Node } = {}
+	local banner = cardBanner(r, now)
+	if banner then
+		table.insert(kids, banner)
+	end
 	local function section(head: string, rows: { Node })
 		if #rows > 0 then
 			table.insert(kids, cardSection(head, rows))
@@ -637,7 +772,8 @@ local function cardView(cx: WindowCx, pane: number, r: any, reading: boolean): N
 	local since: { Node } = {}
 	local history = list("history")
 	for i = math.max(1, #history - 4), #history do
-		table.insert(since, ui.text(clipped(tostring(history[i].text), 120)))
+		local text = clipped(tostring(history[i].text), 120)
+		table.insert(since, ui.text({ ui.span(text, if history[i].kind == "fired" then "success" else nil) }))
 	end
 	section("Since then", since)
 	if type(r.next_step) == "string" and r.next_step ~= "" then
@@ -679,8 +815,9 @@ local function cardDock(pane: number, r: any): Node
 end
 
 -- Floats the card over `pane`, one per pane, and marks the record seen. An omp
--- session needs no record: the card opens at once on what the view knows, as
--- `card` asks GitHub and can take seconds, and fills in when that answers.
+-- session needs no record: the card opens at once on what the view knows, a
+-- skeleton without one, fills in from `card --cached`, local files only, and
+-- then from `card`, which asks GitHub and can take seconds.
 -- `known` is the session a link named: it wins over what the agents scan, which
 -- lags a session started or resumed in the pane, maps there.
 local function openCard(cx: WindowCx, pane: number, known: string?)
@@ -725,23 +862,53 @@ local function openCard(cx: WindowCx, pane: number, known: string?)
 	if not session then
 		return
 	end
-	waitingCli({ "card", "--session", session }, function(data, readErr, cx2)
-		if not cx2 or cardOf(cx2, pane) ~= canvas then -- closed meanwhile
-			return
-		end
-		if data then
-			cx2.canvas:set(canvas, {
-				title = cardTitle(cx2, pane, data.card),
-				view = cardView(cx2, pane, data.card, false),
-				dock = cardDock(pane, data.card),
-			})
-			return
-		end
-		waitingFailed("session card", readErr, cx2)
-		if record then
-			cx2.canvas:set(canvas, { view = cardView(cx2, pane, record, false) })
+	local best = record -- what the card shows if the last read fails
+	local function show(cx2: WindowCx, card: any, reading: boolean)
+		best = card
+		cx2.canvas:set(canvas, {
+			title = cardTitle(cx2, pane, card),
+			view = cardView(cx2, pane, card, reading),
+			dock = cardDock(pane, card),
+		})
+	end
+	local function closed(cx2: WindowCx?): boolean
+		return not cx2 or cardOf(cx2, pane) ~= canvas
+	end
+	-- `card` can answer first: its success outdates `card --cached`, and its
+	-- failure leaves the card to whatever `--cached` still brings.
+	local cachedPending, fresh, failed = true, false, false
+	local function settle(cx2: WindowCx)
+		if best then
+			show(cx2, best, false)
 		else
 			cx2.layout:close(canvas)
+		end
+	end
+	waitingRead({ "card", "--session", session, "--cached" }, function(cached, _err, cx2)
+		cachedPending = false
+		if fresh or closed(cx2) then
+			return
+		end
+		if cached then
+			show(cx2 :: WindowCx, cached.card, not failed)
+		elseif failed then
+			settle(cx2 :: WindowCx)
+		end
+	end)
+	waitingCli({ "card", "--session", session }, function(data, readErr, cx2)
+		fresh = data ~= nil
+		if closed(cx2) then
+			return
+		end
+		local cx3 = cx2 :: WindowCx
+		if data then
+			show(cx3, data.card, false)
+			return
+		end
+		waitingFailed("session card", readErr, cx3)
+		failed = true
+		if not cachedPending then
+			settle(cx3)
 		end
 	end)
 end
@@ -771,7 +938,7 @@ local function toggleCardOn(cx: WindowCx, pane: number, known: string?)
 	if open then
 		closePane(cx, open.pane)
 	end
-	afterRestore(function(cx2)
+	afterRestore(cx, function(cx2)
 		openCard(cx2, pane, known)
 	end)
 end
@@ -787,17 +954,6 @@ end
 
 -- Tern's preset takes Ctrl+Alt+Shift+B (browser PiP); the omp extension's details panel shares this chord outside Tern.
 tern.command({ id = "session_card", title = "CodexBar AgentView: Session card", icon = "message", keys = { "ctrl+alt+i" }, run = toggleCard })
-
--- omp's status row links `codexbar-agentview://card/<session id>` inside Tern;
--- the row is drawn in that session's own pane, the one clicked.
-tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
-	local id = string.match(link.url, "^codexbar%-agentview://card/([^/?#]+)/?$")
-	if not id then
-		return nil
-	end
-	toggleCardOn(cx, link.pane, id)
-	return { handled = true }
-end)
 
 tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 	local pane = cardOwner(ev.about)
@@ -925,17 +1081,21 @@ local function runActions(cx: WindowCx, leader: boolean)
 	end
 end
 
--- Yellow on this window's tabs holding an `on_me` pane. Tabs the user colored
--- stay theirs; the ones colored here are kept per window in `waitingTabs:<key>`
--- and cleared here.
+-- This window's tabs holding `on_me` panes turn green when all of those are
+-- fulfilled, else yellow. Tabs the user colored stay theirs; the ones colored
+-- here are kept per window in `waitingTabs:<key>` and cleared here.
 local function colorTabs(cx: WindowCx)
 	local tabsKey = "waitingTabs:" .. cx:window_key()
 	local entries = waitingEntries()
-	local want: { [number]: boolean } = {}
+	local want: { [number]: TabColor } = {}
 	for _, p in cx.session:panes() do
 		local entry = entries[tostring(p.pane)]
 		if type(entry) == "table" and entry.on_me and p.tab then
-			want[p.tab] = true
+			if entry.outcome ~= "fulfilled" then
+				want[p.tab] = "yellow"
+			elseif not want[p.tab] then
+				want[p.tab] = "green"
+			end
 		end
 	end
 	local stored = tern.kv.get(tabsKey)
@@ -949,16 +1109,14 @@ local function colorTabs(cx: WindowCx)
 	local keep = tern.json.array()
 	for _, t in cx.session:tabs() do
 		local color = if t.color == tern.json.null then nil else t.color
-		if want[t.id] then
-			if color == nil then
-				cx.layout:color_tab(t.id, "yellow")
-				color = "yellow"
-				mine[t.id] = true
+		local ours = mine[t.id] and (color == "yellow" or color == "green")
+		local wanted = want[t.id]
+		if wanted and (color == nil or ours) then
+			if color ~= wanted then
+				cx.layout:color_tab(t.id, wanted)
 			end
-			if mine[t.id] and color == "yellow" then
-				table.insert(keep, t.id)
-			end
-		elseif mine[t.id] and color == "yellow" then
+			table.insert(keep, t.id)
+		elseif ours then
 			cx.layout:color_tab(t.id, nil)
 		end
 	end
@@ -1034,7 +1192,7 @@ local function commitSetAside(t: SetAside, args: { string })
 			if open then
 				closePane(cx, open.pane)
 			end
-			afterRestore(function(cx2)
+			afterRestore(cx, function(cx2)
 				local ok, parkErr = cx2.layout:park(t.pane)
 				if not ok then
 					waitingFailed("park", parkErr, cx2)
@@ -1200,8 +1358,8 @@ end
 
 -- An omp session's menu is the extension's, drawn in its composer: Tern only
 -- asks for it, and brings the pane forward for the menu to be seen.
-local function requestMenu(pane: number, session: string)
-	waitingCli({ "menu-request", "--session", session }, function(data, err, cx)
+local function requestMenu(pane: number)
+	waitingCli({ "menu-request", "--pane", tostring(pane) }, function(data, err, cx)
 		if not cx then
 			return
 		end
@@ -1215,7 +1373,7 @@ local function requestMenu(pane: number, session: string)
 			if open then
 				closePane(cx, open.pane)
 			end
-			afterRestore(function(cx2)
+			afterRestore(cx, function(cx2)
 				cx2.layout:focus(pane)
 			end)
 		end
@@ -1228,9 +1386,13 @@ local function setAside(cx: WindowCx)
 		cx:toast("info", "CodexBar AgentView: no pane to set aside")
 		return
 	end
-	local session = paneSession(pane)
-	if session then
-		requestMenu(pane, session)
+	local extension = paneExtension(pane)
+	if extension and extension.menu == true then
+		requestMenu(pane)
+		return
+	elseif extension or paneSession(pane) then
+		-- Decided here, as the view knows: the CLI would only say the same.
+		cx:toast("info", "No wait menu: " .. (if extension then "this session runs an older waitingfor extension: /restart it" else "no omp extension in this pane"))
 		return
 	end
 	local items, err = paneItems()
@@ -1280,80 +1442,18 @@ tern.on("focus", function(ev, cx)
 	-- publishes the `seen`, `cardAt` keeps a refocus from opening it again.
 	local entry = waitingEntry(ev.pane)
 	if entry and entry.unseen and os.time() - (cardAt[ev.pane] or 0) > 10 then
-		afterRestore(function(cx2)
+		afterRestore(cx, function(cx2)
 			openCard(cx2, ev.pane)
 		end)
 	end
 end)
 
--- However the dashboard closes (toggle, Esc, switching to a session, focus
--- leaving it, closing the pane), the layout returns to how it was before it
--- opened. `pane_closed` fires before the tree drops the pane, `tern close`
--- from the CLI sends none, and a pane can leave `session:panes()` while its
--- tab tree still holds it. So once the pane is gone the restore waits for
--- the trees too, and is retried every 100 ms for 2 s; a refusal that lasts
--- means other blocks really changed, and the layout stays as it is.
-local function inTrees(cx: WindowCx, pane: number): boolean
-	local function walk(n: any): boolean
-		if type(n) ~= "table" then
-			return false
-		end
-		local p = n.pane
-		if type(p) == "number" and p == pane then
-			return true
-		end
-		return walk(n[1]) or walk(n[2])
-	end
-	for _, t in cx.session:tabs() do
-		local layout = cx.session:layout(t.id)
-		if layout and walk(layout.root) then
-			return true
-		end
-	end
-	return false
-end
-
-local function attemptRestore(cx: WindowCx, o: Popup)
-	if opened ~= o then
-		return
-	end
-	local ok, err = false, "the dashboard is still in the layout"
-	if not inTrees(cx, o.pane) then
-		ok, err = cx.layout:restore(o.snap)
-	end
-	o.tries += 1
-	if ok or o.tries >= 20 then
-		opened = nil
-		if not ok then
-			tern.log.info("codexbar: layout not restored", err)
-		end
-		return
-	end
-	tern.timer(100, function(cx2)
-		if cx2 then
-			attemptRestore(cx2, o)
-		end
-	end)
-end
-
-local function restoreLayout(cx: WindowCx)
-	local o = opened
-	if not o or o.restoring or paneInfo(cx, o.pane) then
-		return
-	end
-	if o.placing and o.tab == nil and tern.now() < o.deadline then
-		return
-	end
-	o.restoring = true
-	o.placing = false
-	attemptRestore(cx, o)
-end
-
 tern.on("pane_closed", function(ev, _cx)
 	local o = opened
 	if o and ev.pane == o.pane then
 		o.placing = false
-		tern.timer(50, function(cx2)
+		o.closed = true
+		tern.timer(0, function(cx2)
 			if cx2 then
 				restoreLayout(cx2)
 			end
@@ -1407,7 +1507,7 @@ local function waitingRequest(cx: WindowCx)
 	if ours then
 		closePane(cx, request.pane)
 	end
-	afterRestore(function(cx2)
+	afterRestore(cx, function(cx2)
 		if request.op == "launch" then
 			-- As History's Launch: an interactive shell loads the user's PATH and stays when the agent exits.
 			local shell = shellQuote(tern.getenv("SHELL") or "/bin/sh")
@@ -1451,6 +1551,26 @@ local function poll(cx: WindowCx?)
 	end
 	if cx then
 		restoreLayout(cx)
+-- omp's status row links `codexbar-agentview://card/<session id>` inside Tern;
+-- the row is drawn in that session's own pane, the one clicked. The host half
+-- opens `codexbar-agentview://request` after it publishes `waitingRequest`: the
+-- one way it can reach this half without waiting for the poll.
+tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
+	if link.url == "codexbar-agentview://request" then
+		local ok, err = pcall(waitingRequest, cx)
+		if not ok then
+			tern.log.error("codexbar:", err)
+		end
+		return { handled = true }
+	end
+	local id = string.match(link.url, "^codexbar%-agentview://card/([^/?#]+)/?$")
+	if not id then
+		return nil
+	end
+	toggleCardOn(cx, link.pane, id)
+	return { handled = true }
+end)
+
 		local request = tern.kv.get("settingsRequest")
 		if type(request) == "table" and type(request.pane) == "number" and request.seq ~= lastSettingsRequest then
 			local info = paneInfo(cx, request.pane)
@@ -1466,7 +1586,7 @@ local function poll(cx: WindowCx?)
 			end
 		end
 	end
-	-- An open dashboard's buttons act through this poll.
+	-- What `codexbar-agentview://request` misses comes through here: a request from another window's dashboard.
 	tern.timer(if cx and dashboard(cx) then 250 else 1000, poll)
 end
 
