@@ -12,7 +12,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-const CLI = path.join(path.dirname(fs.realpathSync(import.meta.path)), "..", "contents", "scripts", "codexbar_waiting.py");
+const SCRIPTS = path.join(path.dirname(fs.realpathSync(import.meta.path)), "..", "contents", "scripts");
+const CLI = path.join(SCRIPTS, "codexbar_waiting.py");
+/** The set-aside items, shared with Tern's picker. */
+const MENU_FILE = path.join(SCRIPTS, "waiting_menu.json");
 const STATE_BASE = process.env.XDG_STATE_HOME ?? "";
 const STATE_DIR = path.join(path.isAbsolute(STATE_BASE) ? STATE_BASE : path.join(os.homedir(), ".local", "state"), "codexbar-agentview");
 const VIEW_NAME = "waiting_view.json";
@@ -33,6 +36,10 @@ const MENU_REQUEST_MS = 15_000;
 const RESEND_WINDOW = 10;
 /** How many of the session's latest messages the menu looks through for a PR. */
 const PR_WINDOW = 4;
+/** How often a check runs when nothing says; the CLI's default too. */
+const CHECK_EVERY = "15m";
+/** How long the agent has to turn a described check into a command. */
+const CHECK_TTL_MS = 10 * 60_000;
 
 const DURATION = /^(\d+[smhdw])+$/;
 const REPO = /^[\w.-]+\/[\w.-]+$/;
@@ -53,8 +60,8 @@ const SIZES = [
 ];
 /**
  * What /wait takes: /wait help, an error's usage and the completion list all read this.
- * `word`: what completes the form (under `gh ` with `gh`); `alone`: nothing follows the word;
- * `featured`: /wait help shows its example.
+ * `word`: what completes the form (under `gh ` with `gh`; one form per word); `alone`: nothing
+ * follows the word; `featured`: /wait help shows its example.
  */
 const FORMS = [
 	{ usage: "/wait", what: "open the menu (Ctrl+Alt+B outside Tern)" },
@@ -68,7 +75,6 @@ const FORMS = [
 		usage: "/wait <date> [HH:MM] <sentence> [-- prompt]",
 		what: "at a time: 2026-11-07 09:00, or just 18:00 (the next one)",
 		example: "2026-11-07 09:00 send the invoice",
-		featured: true,
 	},
 	{
 		word: "pr",
@@ -94,15 +100,21 @@ const FORMS = [
 	},
 	{
 		word: "check",
-		usage: "/wait check [every <dur>] <command line> [-- prompt]",
-		what: "until the command exits 0 (default every 15m)",
-		example: "check every 10m curl -fsS https://example.com/health -- Tell me it is back",
+		usage: "/wait check [every <dur>] <what to check> [-- prompt]",
+		what: `the agent writes a command for it; code runs it until it exits 0 (default every ${CHECK_EVERY})`,
+		example: "check every 10m the staging deploy is green -- Tell me what changed",
+		featured: true,
+	},
+	{
+		usage: "/wait check [every <dur>] ! <command line> [-- prompt]",
+		what: "your own command, run until it exits 0",
+		example: "check ! curl -fsS https://example.com/health -- Tell me it is back",
 		featured: true,
 	},
 	{
 		word: "for",
-		usage: "/wait for <what you wait for>",
-		what: "anything; you mark it done",
+		usage: "/wait for [what you wait for]",
+		what: "this session's free-text wait, in your words; you mark it done; alone, it clears",
 		example: "for Anna's answer on the contract",
 		featured: true,
 	},
@@ -131,7 +143,8 @@ const TOP_CHOICES = [
 	...FORMS.filter((form) => form.word && !form.gh),
 ].map(choice);
 const GH_CHOICES = FORMS.filter((form) => form.gh).map(choice);
-const CHECK_CHOICES = [{ label: "every", description: "how often to run it: every 10m (default 15m)" }];
+const BANG = { label: "!", description: "your own command line instead: ! curl -fsS https://example.com/health" };
+const CHECK_CHOICES = [{ label: "every", description: `how often to run it: every 10m (default ${CHECK_EVERY})` }, BANG];
 /** Their text may hold a `--` of its own, as they never fire a prompt. */
 const NO_PROMPT: Record<string, true> = { done: true, note: true, later: true, for: true };
 
@@ -191,13 +204,32 @@ function userArgs(sentence: string, prompt?: string): string[] {
 	return [...(sentence ? [`--note=${sentence}`] : []), ...(prompt ? [`--prompt=${prompt}`] : []), "--by", "user", "--park"];
 }
 
-function checkOptions(command: string, interval?: string): string[] {
-	return [`--argv=${command}`, "--predicate=exit0", `--label=${command}`, ...(interval ? [`--interval=${interval}`] : [])];
+function checkOptions(argv: string, label: string, interval: string): string[] {
+	return ["--kind", "command", `--argv=${argv}`, "--predicate=exit0", `--label=${label}`, `--interval=${interval}`];
 }
 
 /**
- * `{command, args}` for one /wait line, `{error, forms}` for a bad one. `needs: "pr"|"repo"`: a
- * target still to resolve, `pr` being the reference the line gave.
+ * A check, or `{error}`: `! command` runs as given; anything else is a description, and `check`
+ * asks the agent for its command.
+ */
+function checkRequest(what: string, interval = CHECK_EVERY, prompt?: string) {
+	if (!DURATION.test(interval)) return { error: `Check every takes a duration such as 10m, not ${interval}.` };
+	const literal = what.match(/^!(?:\s+([\s\S]*))?$/);
+	if (!literal) return { check: { description: what, interval, prompt: prompt || undefined } };
+	const command = literal[1]?.trim();
+	if (!command) return { error: "A command line must follow the !." };
+	return { command: "add", args: [...checkOptions(command, command, interval), ...userArgs("", prompt)] };
+}
+
+/** The free-text wait set to `text`, which parks the session; empty clears it. */
+function whatRequest(text: string) {
+	return { command: "what", args: [`--text=${text}`, ...(text ? ["--park"] : [])] };
+}
+
+/**
+ * `{command, args}` for one /wait line, `{check}` for a check the agent is to write, `{error,
+ * forms}` for a bad line. `needs: "pr"|"repo"`: a target still to resolve, `pr` being the
+ * reference the line gave.
  */
 export function parseWait(input: string) {
 	const [first, line] = cut(input.trim());
@@ -228,12 +260,15 @@ export function parseWait(input: string) {
 			return sentence ? add("later", sized ? [`--size=${size}`] : [], sentence) : bad("later needs a sentence.");
 		}
 		case "for":
-			return rest ? add("something", [`--what=${rest}`], "") : bad("Say what you wait for.");
+			return whatRequest(rest);
 		case "check": {
-			const every = rest.match(/^every(?:\s+(\S+)\s*([\s\S]*))?$/);
-			if (every && !DURATION.test(every[1] ?? "")) return bad(`every takes a duration such as 10m, not ${every[1] ?? "nothing"}.`);
-			const command = every ? every[2] : rest;
-			return command ? add("command", checkOptions(command, every?.[1]), "") : bad("check needs a command line.");
+			// Not followed by a duration, `every` starts the description: check every backup ran.
+			const every = rest.match(/^every\s+(\S+)\s*([\s\S]*)$/);
+			const timed = every && DURATION.test(every[1]);
+			const what = timed ? every[2] : rest;
+			if (!what) return bad("check needs what to check, or ! and a command line.");
+			const request = checkRequest(what, timed ? every[1] : undefined, prompt);
+			return request.error ? bad(request.error) : request;
 		}
 		case "gh pr": {
 			const [head, tail] = cut(rest);
@@ -279,6 +314,7 @@ function choicesAfter(words: string[], waits) {
 	if (path === "gh pr" || (words.length === 3 && path.startsWith("gh pr ") && PR_REF.test(words[2]))) return UNTILS;
 	if (path === "later") return SIZES;
 	if (path === "check") return CHECK_CHOICES;
+	if (words.length === 3 && path.startsWith("check every ") && DURATION.test(words[2])) return [BANG];
 	if (path === "done") return waits.map((wait) => ({ label: wait.id, value: wait.id, description: wait.label }));
 	return [];
 }
@@ -432,7 +468,7 @@ const TOOL_FLAGS = {
 	after: "after",
 };
 
-/** The CLI options of an agent's `add`; never `--park`, as only the user sets a session aside. */
+/** The CLI options of an agent's own `add`; never `--park`, as only the user sets a session aside. */
 async function toolAddArgs(params, session: string, cwd: string): Promise<string[]> {
 	if (!params.kind) throw new Error("add needs a kind");
 	const args = ["add", "--session", session, "--kind", params.kind, "--by", "agent"];
@@ -474,25 +510,24 @@ async function askPr(c, pr: string | undefined) {
 	return ref ? prTarget(ref, c.cwd) : undefined;
 }
 
+const PROMPT_TITLE = "Prompt to send when it fires (empty: only tell me)";
+
 /**
- * The menu's ways to set a session aside. `options` asks what the form needs and gives its CLI
- * options; undefined ends the flow (Esc, or a required line left empty). The sentence and the
- * prompt come after it, unless the flow turns them off. Shell panes get Tern's own picker with the
- * same labels, in tern/host.luau.
+ * The steps of the menu's items, keyed by the item ids of MENU_FILE, which holds their text.
+ * `options` asks what the form needs and gives its CLI options; undefined ends the flow (Esc, or a
+ * required line left empty). The sentence and the prompt come after it, unless the flow turns
+ * them off. `request` instead asks everything and gives a request as parseWait does. Shell panes
+ * get Tern's own picker from the same file.
  */
-const FLOWS = [
-	{
-		label: "Retry later",
-		description: "/wait 2d · after a while or at a time",
+const FLOWS = {
+	time: {
 		kind: "time",
 		async options(c) {
 			const due = await ask(c, "When? 2d, 3h, 18:00 or 2026-11-07 09:00", "1d");
 			return due ? timeOptions(due) : undefined;
 		},
 	},
-	{
-		label: "GitHub PR",
-		description: "/wait gh pr · until reviewed, ready, merged, released or new activity",
+	pr: {
 		kind: "pr",
 		async options(c, pr) {
 			const target = await askPr(c, pr);
@@ -500,16 +535,12 @@ const FLOWS = [
 			return until ? [...target, `--until=${until.until}`] : undefined;
 		},
 	},
-	{
-		label: "Babysit a PR",
-		description: "/wait gh babysit · bot review, the agent fixes, then ready and merged",
+	babysit: {
 		command: "babysit-pr",
 		prompt: false,
 		options: askPr,
 	},
-	{
-		label: "GitHub release",
-		description: "/wait gh release · a repo's next release",
+	release: {
 		kind: "release",
 		async options(c) {
 			const repo = await ask(c, "Repository, owner/repo", (await ghValue(GH_REPO, c.cwd, GH_GUESS_MS)).value);
@@ -518,30 +549,26 @@ const FLOWS = [
 			return [`--repo=${repo}`];
 		},
 	},
-	{
-		label: "Command check",
-		description: "/wait check · run a command every 15m until it succeeds",
-		kind: "command",
-		async options(c) {
-			const command = await ask(c, "Command, e.g. gh run view 123 --exit-status");
-			const interval = command && (await ask(c, "Check every", "15m"));
-			return command && interval !== undefined ? checkOptions(command, interval) : undefined;
+	check: {
+		async request(c) {
+			const what = await ask(c, "What should be checked? Describe it, or ! and a command");
+			if (!what) return undefined;
+			const every = await ask(c, "Check every", CHECK_EVERY);
+			if (every === undefined) return undefined;
+			const prompt = await ask(c, PROMPT_TITLE);
+			if (prompt === undefined) return undefined;
+			const request = checkRequest(what, every.replace(/\s+/g, "").toLowerCase() || CHECK_EVERY, prompt);
+			if (request.error) throw new Error(request.error);
+			return request;
 		},
 	},
-	{
-		label: "Something else",
-		description: "/wait for · anything; you mark it done",
-		kind: "something",
-		sentence: false,
-		prompt: false,
-		async options(c) {
-			const what = await ask(c, "What do you wait for?");
-			return what ? [`--what=${what}`] : undefined;
+	for: {
+		async request(c, record) {
+			const what = await ask(c, "What do you wait for? (empty: nothing any more)", record?.waiting_for ?? "");
+			return what === undefined ? undefined : whatRequest(what);
 		},
 	},
-	{
-		label: "When I have time",
-		description: "/wait later · pinned, no reminder; S, M or L",
+	later: {
 		kind: "later",
 		prompt: false,
 		async options(c) {
@@ -549,7 +576,36 @@ const FLOWS = [
 			return size ? [`--size=${size.label}`] : undefined;
 		},
 	},
-];
+};
+
+/** The menu's items for an omp session, in file order: `{label, description, flow}`, or the reason there are none. */
+function readMenu() {
+	try {
+		const { items } = JSON.parse(fs.readFileSync(MENU_FILE, "utf8"));
+		return {
+			items: items
+				.filter((item) => item.targets?.includes("session") && Object.hasOwn(FLOWS, item.id))
+				.map((item) => ({
+					label: item.label,
+					description: item.command ? `${item.command} · ${item.detail}` : item.detail,
+					flow: FLOWS[item.id],
+				})),
+		};
+	} catch (error) {
+		return { items: [], error: `Can't read the menu ${MENU_FILE}: ${error instanceof Error ? error.message : error}` };
+	}
+}
+const MENU = readMenu();
+
+/** What the agent gets for a described check. */
+function checkInstruction(description: string): string {
+	return [
+		`I want to wait until this holds: "${description}".`,
+		"Write a command that exits 0 exactly when it holds and non-zero otherwise. It runs without a shell, as an argv; use sh -c '…' only when it needs pipes.",
+		"Run it once now and show me its exit code and output.",
+		"Then call the waitingfor tool with action add, kind command and argv, and nothing else: the label, the interval and the rest come from my /wait check.",
+	].join("\n");
+}
 
 export default function (pi) {
 	const z = pi.zod;
@@ -571,6 +627,8 @@ export default function (pi) {
 	let claimAgain = false;
 	// Prompts this process sent: a follow-up stays out of the transcript until the turn ends.
 	const sent = new Set<string>();
+	// Checks the user described and the agent is to write, by session, with the instruction it got.
+	const checks = new Map<string, { description: string; interval: string; prompt?: string; instruction: string; at: number }>();
 
 	const log = (error) => pi.logger?.debug("waitingfor", { error: error instanceof Error ? error.message : String(error) });
 	const quietly = (task) => {
@@ -744,6 +802,8 @@ export default function (pi) {
 		activatedAt = Date.now() - (Date.now() % 1000);
 		setPanel(c, undefined);
 		sessionId = c.sessionManager.getSessionId();
+		// A session switched away from took its queued instruction with it.
+		for (const id of checks.keys()) if (id !== sessionId) checks.delete(id);
 		watchView();
 		timers = [
 			c.setInterval(() => quietly(refresh), REFRESH_MS),
@@ -768,9 +828,12 @@ export default function (pi) {
 		ctx = undefined;
 	});
 
-	// A non-final agent_end hands over to a queued follow-up, which may be the prompt being settled.
+	// A non-final agent_end hands over to a queued follow-up, which may be the prompt being settled
+	// or the instruction for a described check.
 	pi.on("agent_end", (event, c) => {
-		if (!event?.willContinue) report("turn_finished", (session) => session.waits?.length > 0, c);
+		if (event?.willContinue) return;
+		report("turn_finished", (session) => session.waits?.length > 0, c);
+		dropUnwrittenCheck(c);
 	});
 	pi.on("input", (_event, c) => {
 		if (panel) setPanel(c, undefined);
@@ -798,13 +861,63 @@ export default function (pi) {
 		else if (action === "+1 day") await act(c, ["snooze", "--session", session, `--wait=${id}`, "--for", "1d"]);
 	}
 
-	/** The steps of one flow, then its command and the park. Nothing happens before the command. */
-	async function setAside(c, session: string, flow, pr: string | undefined, note: string) {
+	/** A described check whose turn ended without the tool call is dropped, and the user told. */
+	function dropUnwrittenCheck(c) {
+		if (!ctx || c?.agent?.kind === "sub" || !checks.delete(sessionId)) return;
+		setPanel(ctx, errorPanel("The agent didn't register a check."));
+	}
+
+	/**
+	 * The described check an agent call writes: an add of a command in the turn the check's
+	 * instruction started, within 10 minutes of that start. A turn that was running when the user
+	 * asked has an older last user message.
+	 */
+	function checkWritten(c, params) {
+		if (params.action !== "add" || params.kind !== "command" || !params.argv) return undefined;
+		const session = c.sessionManager.getSessionId();
+		const check = checks.get(session);
+		const last = c.sessionManager
+			.getBranch()
+			.findLast((entry) => entry.type === "message" && entry.message?.role === "user")?.message;
+		if (!check || !last || messageText(last) !== check.instruction) return undefined;
+		if (Date.now() - (Number(last.timestamp) || check.at) <= CHECK_TTL_MS) return check;
+		checks.delete(session);
+		if (ctx && session === sessionId) setPanel(ctx, errorPanel("The agent took over 10 minutes: its command is its own wait, not your check."));
+		return undefined;
+	}
+
+	/**
+	 * Leaves a described check to the agent; its waitingfor call adds it as the user's (see the tool).
+	 * One at a time: a queued instruction can't be taken back, so a second one would get the first's command.
+	 */
+	function requestCheck(c, check) {
+		const session = c.sessionManager.getSessionId();
+		const pending = checks.get(session);
+		if (pending) throw new Error(`The agent is still on the check "${pending.description}"; ask for the next one after its turn.`);
+		const instruction = checkInstruction(check.description);
+		checks.set(session, { ...check, instruction, at: Date.now() });
+		try {
+			pi.sendUserMessage(instruction, c.isIdle() ? undefined : { deliverAs: "followUp" });
+		} catch (error) {
+			checks.delete(session);
+			throw error;
+		}
+	}
+
+	/** Carries out a request from a /wait line or the menu for `c`'s session. */
+	async function perform(c, request) {
+		if (request.check) return requestCheck(c, request.check);
+		const target = await targetOptions(request, c);
+		await act(c, [request.command, "--session", c.sessionManager.getSessionId(), ...target, ...request.args]);
+	}
+
+	/** The steps of an `options` flow, then its command and the park. Nothing happens before the command. */
+	async function setAside(c, session: string, flow, pr: string | undefined, record) {
 		const options = await flow.options(c, pr);
 		if (!options) return;
-		const sentence = flow.sentence === false ? "" : await ask(c, "Why set it aside, what next?", note);
+		const sentence = await ask(c, "Why set it aside, what next?", record?.note ?? "");
 		if (sentence === undefined) return;
-		const prompt = flow.prompt === false ? "" : await ask(c, "Prompt to send when it fires (empty: only tell me)");
+		const prompt = flow.prompt === false ? "" : await ask(c, PROMPT_TITLE);
 		if (prompt === undefined) return;
 		const kind = flow.kind ? ["--kind", flow.kind] : [];
 		await act(c, [flow.command ?? "add", "--session", session, ...kind, ...options, ...userArgs(sentence, prompt)]);
@@ -815,21 +928,27 @@ export default function (pi) {
 		menuOpen = true;
 		setPanel(c, undefined);
 		try {
+			if (MENU.error) throw new Error(MENU.error);
 			const session = c.sessionManager.getSessionId();
 			const record = (await act(c, ["list", "--session", session])).sessions?.[0];
 			const open = record?.waits ?? [];
 			const pr = lastPr(c);
-			const prFlow = FLOWS.find((flow) => flow.kind === "pr");
+			const prItem = MENU.items.find((item) => item.flow === FLOWS.pr);
 			const short = pr?.replace(/^https:\/\/github\.com\/(.+)\/pull\/(\d+)$/, "$1#$2");
+			const first = pr && prItem ? [{ ...prItem, description: prItem.description.replace("gh pr", `gh pr ${short}`) }] : [];
 			const items = [
-				...(pr ? [{ ...prFlow, description: prFlow.description.replace("gh pr", `gh pr ${short}`) }] : []),
+				...first,
 				...(open.length > 0 ? [{ label: `This session's waits (${open.length})`, description: "done or one more day" }] : []),
-				...FLOWS.filter((flow) => !pr || flow !== prFlow),
+				...MENU.items.filter((item) => first.length === 0 || item !== prItem),
 			];
 			const chosen = await pick(c, "What does this wait for?", items);
 			if (!chosen) return;
-			if (chosen.options) await setAside(c, session, chosen, pr, record?.note ?? "");
-			else await waitMenu(c, session, open);
+			if (!chosen.flow) await waitMenu(c, session, open);
+			else if (!chosen.flow.request) await setAside(c, session, chosen.flow, pr, record);
+			else {
+				const request = await chosen.flow.request(c, record);
+				if (request) await perform(c, request);
+			}
 		} catch (error) {
 			setPanel(c, errorPanel(error instanceof Error ? error.message : String(error)));
 		} finally {
@@ -849,8 +968,7 @@ export default function (pi) {
 			else if (parsed.command === "list") await showDetails(c);
 			else {
 				try {
-					const target = await targetOptions(parsed, c);
-					await act(c, [parsed.command, "--session", c.sessionManager.getSessionId(), ...target, ...parsed.args]);
+					await perform(c, parsed);
 				} catch (error) {
 					setPanel(c, errorPanel(error instanceof Error ? error.message : String(error)));
 				}
@@ -875,7 +993,7 @@ export default function (pi) {
 			"Not for re-prompting yourself on a timer with no event to watch: that is the schedule tool.",
 			"note is your suggested sentence for the user. The user's own sentence always stands: never try to overwrite it, and don't repeat a note the session already has.",
 			"prompt is sent into this session when the wait fires. list shows the open waits, done closes one by its id.",
-			"This tool never parks the session; setting it aside is the user's call.",
+			"This tool never parks the session on its own; setting it aside is the user's call. When the user's /wait check asked you for a command, call add with kind command and argv only: it becomes their check.",
 		].join("\n"),
 		parameters: z.object({
 			action: z.enum(["add", "babysit_pr", "list", "done"]).describe("What to do"),
@@ -912,9 +1030,13 @@ export default function (pi) {
 			if (c.agent?.kind === "sub") throw new Error("waitingfor belongs to the main session; report back to it instead");
 			const session = c.sessionManager.getSessionId();
 			let args;
+			// The user's described check this call writes; a failed add keeps it for the agent's retry.
+			const check = checkWritten(c, params);
 			switch (params.action) {
 				case "add":
-					args = await toolAddArgs(params, session, c.cwd);
+					args = check
+						? ["add", "--session", session, ...checkOptions(JSON.stringify(params.argv), check.description, check.interval), ...userArgs("", check.prompt)]
+						: await toolAddArgs(params, session, c.cwd);
 					break;
 				case "babysit_pr":
 					args = [
@@ -937,6 +1059,10 @@ export default function (pi) {
 					args = ["list", "--session", session];
 			}
 			const { view, ...answer } = await act(c, args);
+			if (check) {
+				if (checks.get(session) === check) checks.delete(session);
+				if (ctx && session === sessionId) setPanel(ctx, () => `Check: ${params.argv.join(" ")} every ${check.interval}`);
+			}
 			const result = params.action === "list" ? (answer.sessions?.[0] ?? { waits: [] }) : answer;
 			return { content: [{ type: "text", text: JSON.stringify(result) }], details: {} };
 		},
