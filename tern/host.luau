@@ -644,7 +644,16 @@ local function windowRow(key: string, label: string, w: any, now: number, stale:
 				reset ..= " · next reset " .. absoluteTime(pool.nextReset, now) .. " (" .. span(pool.nextReset - now) .. ")"
 			end
 		else
-			reset = formatReset(w, now)
+			-- Claude reports an unused window as 0% without a reset: the next
+			-- window opens on the first message.
+			local minutes = tonumber(val(w.windowMinutes)) or 0
+			if pct == 0 and minutes > 0 and not epoch(w.resetsAt) and str(w.resetDescription) == "" then
+				local length = if minutes == 300 then "5h" elseif minutes == 1440 then "1d"
+					elseif minutes == 10080 then "7d" else span(minutes * 60)
+				reset = "not started · resets " .. length .. " after first use"
+			else
+				reset = formatReset(w, now)
+			end
 		end
 		if reset ~= "" then
 			table.insert(meta, ui.span(reset, "muted"))

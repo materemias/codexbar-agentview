@@ -215,8 +215,22 @@ ColumnLayout {
                 (isComposite ? pool.usedPercent : rec.usedPercent) || 0))
             readonly property color tint: section.stale ? Kirigami.Theme.disabledTextColor
                 : root.colorFor(pct, paceSettled ? pacePct : -1)
+            readonly property string windowText: {
+                var wm = rec.windowMinutes || 0
+                return rec.startsAt ? root.relativeMs(paceWindowMs).replace(/^in /, "")
+                    : wm === 300 ? "5h" : wm === 1440 ? "1d"
+                    : wm === 10080 ? "7d"
+                    : root.relativeMs(paceWindowMs).replace(/^in /, "")
+            }
             readonly property string resetText: {
-                if (!isComposite) return section.stale ? "" : root.formatReset(rec, root.nowMs)
+                if (!isComposite) {
+                    if (section.stale) return ""
+                    // Claude reports an unused window as 0% without a reset:
+                    // the next window opens on the first message.
+                    if (!rec.resetsAt && !rec.resetDescription && rec.windowMinutes && pct === 0)
+                        return "not started · resets " + windowText + " after first use"
+                    return root.formatReset(rec, root.nowMs)
+                }
                 // A last-known pool keeps its allowance count, not its reset.
                 var line = pool.remaining.toFixed(1) + " of " + pool.total + " "
                     + rec.allowanceUnit + " allowances left"
@@ -280,18 +294,13 @@ ColumnLayout {
                 : " · proj " + Math.round(projectedPct) + "%"
             readonly property string paceTip: {
                 if (!paceValid) return ""
-                var wm = rec.windowMinutes || 0
-                var windowTxt = rec.startsAt ? root.relativeMs(paceWindowMs).replace(/^in /, "")
-                    : wm === 300 ? "5h" : wm === 1440 ? "1d"
-                    : wm === 10080 ? "7d"
-                    : root.relativeMs(paceWindowMs).replace(/^in /, "")
                 if (!paceSettled) {
                     return "Window just started — pace projection shows once "
                         + "it passes 3% elapsed"
                 }
                 var elapsedTxt = paceElapsedMs >= 60000
                     ? root.relativeMs(paceElapsedMs).replace(/^in /, "") : "<1m"
-                var line = (isComposite ? "Average " : "") + elapsedTxt + " elapsed of " + windowTxt
+                var line = (isComposite ? "Average " : "") + elapsedTxt + " elapsed of " + rowItem.windowText
                     + " (" + Math.round(pacePct) + "%)"
                 if (overPace) {
                     var msToFull = pct > 0
