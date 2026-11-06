@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Set up CodexBar AgentView's Linux Plasma integration.
+"""Set up CodexBar AgentView's Linux Plasma integration and its omp extension.
 
 Hookless — the widget itself runs the aggregator every poll tick. This
 script handles the bits the widget can't:
@@ -12,11 +12,16 @@ script handles the bits the widget can't:
     pre-hookless versions of the plasmoid.
   * Legacy identity cleanup: removes the codexbar:// handler and
     codexbar-xhr env files earlier versions installed.
+  * omp extension: symlinks omp-extension/waitingfor.ts into omp's
+    extensions directory. This part also runs on macOS, on its own, with
+    --omp-extension.
 
 Usage:
-  install_integration.py              install everything
-  install_integration.py --uninstall  remove everything we installed
-  install_integration.py --status     report what's currently installed
+  install_integration.py                  install everything
+  install_integration.py --uninstall      remove everything we installed
+  install_integration.py --status         report what's currently installed
+  install_integration.py --omp-extension [--uninstall]
+                                          install or remove only the omp extension
 """
 from __future__ import annotations
 
@@ -85,6 +90,12 @@ LEGACY_ENV_FILES = (PLASMA_ENV_DIR / "codexbar-xhr.sh", SYSTEMD_ENV_DIR / "codex
 # up the old unit on install if it's still around.
 LEGACY_SYSTEMD_FILE = Path.home() / ".config" / "systemd" / "user" / "codexbar-agents.service"
 LEGACY_SYSTEMD_NAME = "codexbar-agents.service"
+
+# Symlinked into omp's extensions directory. The applet package doesn't carry
+# it, as the extension needs the repo's scripts: only a checkout can install it.
+OMP_EXTENSION_SOURCE = SCRIPT_DIR.parents[1] / "omp-extension" / "waitingfor.ts"
+OMP_EXTENSION_NAME = "codexbar-waitingfor.ts"
+DEFAULT_OMP_AGENT_DIR = Path.home() / ".omp" / "agent"
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +335,62 @@ def remove_legacy_systemd_service() -> str:
 
 
 # ---------------------------------------------------------------------------
+# omp extension
+# ---------------------------------------------------------------------------
+
+def _omp_extension_link() -> Path:
+    # omp itself reads PI_CODING_AGENT_DIR; codexbar_waiting.py checks the same order.
+    agent_dir = os.environ.get("PI_CODING_AGENT_DIR") or os.environ.get("OMP_AGENT_DIR")
+    return (Path(agent_dir) if agent_dir else DEFAULT_OMP_AGENT_DIR) / "extensions" / OMP_EXTENSION_NAME
+
+
+def _is_our_omp_link(link: Path) -> bool:
+    """Any checkout's link counts, so a moved repo's dangling one is still ours."""
+    return link.is_symlink() and Path(os.readlink(link)).parts[-2:] == OMP_EXTENSION_SOURCE.parts[-2:]
+
+
+def install_omp_extension() -> str:
+    if not OMP_EXTENSION_SOURCE.is_file():
+        raise RuntimeError("not in this copy; run --omp-extension from a checkout")
+    link = _omp_extension_link()
+    if (link.exists() or link.is_symlink()) and not _is_our_omp_link(link):
+        raise RuntimeError(f"{link} exists and isn't ours; left alone")
+    if link.resolve() == OMP_EXTENSION_SOURCE:
+        return "omp extension: already current"
+    # The name ends outside .ts, so a starting omp can't discover it half-made.
+    temporary = link.with_name(f"{link.name}.{os.getpid()}.tmp")
+    try:
+        link.parent.mkdir(parents=True, exist_ok=True)
+        temporary.unlink(missing_ok=True)
+        temporary.symlink_to(OMP_EXTENSION_SOURCE)
+        os.replace(temporary, link)
+    except OSError as exc:
+        raise RuntimeError(f"can't link {link}: {exc}") from exc
+    return f"omp extension: linked {link}"
+
+
+def remove_omp_extension() -> str:
+    link = _omp_extension_link()
+    if not link.exists() and not link.is_symlink():
+        return "omp extension: removed nothing"
+    if not _is_our_omp_link(link):
+        return f"omp extension: left {link}, it isn't ours"
+    link.unlink()
+    return f"omp extension: removed {link}"
+
+
+def _omp_extension_status() -> str:
+    link = _omp_extension_link()
+    if _is_our_omp_link(link):
+        if not link.exists():
+            return "broken link"
+        # The applet package has no source of its own to compare with.
+        current = link.resolve() == OMP_EXTENSION_SOURCE or not OMP_EXTENSION_SOURCE.is_file()
+        return "yes" if current else f"other checkout: {link.resolve()}"
+    return "not ours" if link.exists() or link.is_symlink() else "no"
+
+
+# ---------------------------------------------------------------------------
 # Top-level
 # ---------------------------------------------------------------------------
 
@@ -356,6 +423,10 @@ def install_all() -> str:
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
+    try:
+        parts.append(install_omp_extension())
+    except RuntimeError as exc:
+        parts.append(f"omp extension: {exc}")
     return "\n".join(p for p in parts if p)
 
 
@@ -367,15 +438,18 @@ def uninstall_all() -> str:
         remove_legacy_identity(),
         remove_focus_url_handler(),
         remove_env_script(),
+        remove_omp_extension(),
     ]
     return "\n".join(p for p in parts if p)
 
 
 def status_all() -> str:
+    omp_extension = f"omp extension:               {_omp_extension_status()}"
     if sys.platform != "linux":
         return (
             "Plasma integration is Linux-only.\n"
-            "Tern needs no Plasma integration; it calls the helpers directly."
+            "Tern needs no Plasma integration; it calls the helpers directly.\n"
+            f"{omp_extension}"
         )
     plasma_env = "yes" if PLASMA_ENV_FILE.is_file() else "no"
     systemd_env = "yes" if SYSTEMD_ENV_FILE.is_file() else "no"
@@ -383,7 +457,8 @@ def status_all() -> str:
     return (
         f"plasma-workspace env script: {plasma_env}\n"
         f"systemd-user env file:       {systemd_env}\n"
-        f"focus url handler:           {url_ok}"
+        f"focus url handler:           {url_ok}\n"
+        f"{omp_extension}"
     )
 
 
@@ -391,12 +466,17 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--uninstall", action="store_true")
     parser.add_argument("--status", action="store_true")
+    parser.add_argument("--omp-extension", action="store_true",
+                        help="install or remove only the omp extension (Linux and macOS)")
     args = parser.parse_args(argv)
     if args.status:
         print(status_all())
         return 0
     try:
-        result = uninstall_all() if args.uninstall else install_all()
+        if args.omp_extension:
+            result = remove_omp_extension() if args.uninstall else install_omp_extension()
+        else:
+            result = uninstall_all() if args.uninstall else install_all()
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)
         return 1
