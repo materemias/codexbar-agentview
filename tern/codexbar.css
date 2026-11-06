@@ -1,4 +1,4 @@
-/* CodexBar AgentView dashboard. Every rule is scoped to the block's regions. */
+/* CodexBar AgentView dashboard, scoped to the block's regions; the PR rule after it also reaches the session card. */
 
 [data-surface='plugin.codexbar-agentview.dashboard'] {
 	/* Agents and History: the list takes all the height under the tabs and filter.
@@ -67,6 +67,11 @@
 		background: rgb(from var(--sf-bad) r g b / 9%);
 		box-shadow: inset 2px 0 0 var(--sf-bad);
 	}
+	/* Waiting: a session whose next step is mine. */
+	.sf-item[data-tone='warning'] {
+		background: rgb(from var(--sf-warn) r g b / 8%);
+		box-shadow: inset 2px 0 0 var(--sf-warn);
+	}
 	.sf-item[data-tone='success'] .sf-item-label .sf-t-success:first-child {
 		animation: codexbar-pulse 1.6s ease-in-out infinite;
 	}
@@ -104,6 +109,23 @@
 		background: var(--well, var(--l1));
 		box-shadow: inset 0 0 0 1px var(--l2);
 	}
+
+	/* Keycaps: the mono font draws ⏎ and ⌦ too small to read, on buttons and in
+	   the footer; the UI font, with a symbol font behind it for the glyphs it
+	   lacks, draws them at their size. */
+	.sf-kbd .kbd,
+	.sf-t-key {
+		font-family: system-ui, 'DejaVu Sans', 'Segoe UI Symbol', sans-serif;
+		font-size: 12px;
+		min-width: 18px;
+	}
+}
+
+/* Waiting tab and session card (a canvas, outside the block): a PR the session
+   only mentions. The link color would beat the `muted` token. */
+[data-role='codexbar.pr'] .sf-link.sf-t-muted {
+	color: inherit;
+	opacity: .65;
 }
 
 @keyframes codexbar-pulse {

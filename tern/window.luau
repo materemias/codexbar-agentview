@@ -6,12 +6,24 @@
 -- (switch a dashboard tab) and `focus` (the last focused pane that is not a
 -- CodexBar AgentView block).
 --
+-- For sessions set aside it adds the set-aside command, which on an omp pane asks
+-- the omp extension to open its menu and elsewhere shows Tern's own picker, and
+-- the session card, also opened from `codexbar-agentview://card/<id>` links. It
+-- carries out `waitingActions`: one leader window shows the toasts, and each
+-- pane's action falls to the window holding that pane, as windows don't share
+-- panes. So do its agent and pane events and tab colors. `waitingPoke` makes the
+-- host tick after a CLI call from here.
+--
 -- `tern.kv` and `tern.process` belong to the machine each half runs on: a window
 -- attached to a remote host runs this half on its own machine, beside another
 -- daemon. Layout work therefore goes through the window API only.
 
 local KIND = "codexbar-agentview.dashboard"
 local SETTINGS_KIND = "codexbar-agentview.settings"
+local CANVAS_KIND = "tern.canvas"
+local SCRIPTS = tern.plugin.dir .. "/../contents/scripts"
+local LEASE_S = 30
+local CARD_ABOUT = "Session card of pane "
 
 local function paneInfo(cx: WindowCx, pane: number): PaneInfo?
 	for _, p in cx.session:panes() do
@@ -214,6 +226,9 @@ end
 tern.command({ id = "agents", title = "CodexBar AgentView: Agents", icon = "users", keys = { "ctrl+alt+a" }, run = function(cx)
 	toggle(cx, "agents")
 end })
+tern.command({ id = "waiting", title = "CodexBar AgentView: Waiting", icon = "clock", keys = { "ctrl+alt+w" }, run = function(cx)
+	toggle(cx, "waiting")
+end })
 tern.command({ id = "usage", title = "CodexBar AgentView: Usage", icon = "gauge", keys = { "ctrl+alt+u" }, run = function(cx)
 	toggle(cx, "usage")
 end })
@@ -224,7 +239,7 @@ tern.command({ id = "settings", title = "CodexBar AgentView: Settings", icon = "
 	openSettings(cx)
 end })
 
-tern.chrome.status(function(_pane)
+tern.chrome.status(function(pane)
 	local s = tern.kv.get("summary")
 	if type(s) ~= "table" then
 		return nil
@@ -232,6 +247,15 @@ tern.chrome.status(function(_pane)
 	local segments = {}
 	for _, u in (if type(s.usage) == "table" then s.usage else {}) do
 		table.insert(segments, { text = u.text, icon = u.icon, tone = u.tone, command = "plugin.codexbar-agentview.usage" })
+	end
+	local w = if type(s.waiting) == "table" then s.waiting else {}
+	local here = if type(w.panes) == "table" then w.panes[tostring(pane.pane)] else nil
+	if type(here) == "table" and here.text ~= "" then
+		table.insert(segments, {
+			text = here.text,
+			tone = if here.on_me then "warn" else "muted",
+			command = "plugin.codexbar-agentview.session_card",
+		})
 	end
 	local c = if type(s.counts) == "table" then s.counts else {}
 	local parts = {}
@@ -252,6 +276,14 @@ tern.chrome.status(function(_pane)
 			command = "plugin.codexbar-agentview.agents",
 		})
 	end
+	if (w.on_me or 0) > 0 then
+		table.insert(segments, {
+			text = w.on_me .. " on me",
+			icon = "clock",
+			tone = "warn",
+			command = "plugin.codexbar-agentview.waiting",
+		})
+	end
 	if (tonumber(s.restore) or 0) > 0 then
 		table.insert(segments, { text = s.restore .. " to restore", icon = "history", tone = "warn", command = "plugin.codexbar-agentview.history" })
 	end
@@ -263,10 +295,952 @@ local function remember(cx: WindowCx, pane: number?)
 		return
 	end
 	local info = paneInfo(cx, pane)
-	if info and info.block ~= KIND and info.block ~= SETTINGS_KIND and tern.kv.get("focus") ~= pane then
+	if info and info.block ~= KIND and info.block ~= SETTINGS_KIND and info.block ~= CANVAS_KIND and tern.kv.get("focus") ~= pane then
 		tern.kv.set("focus", pane)
 	end
 end
+
+-- Waiting: the CLI ---------------------------------------------------------------
+
+local function firstLine(text: string): string
+	return string.match(text, "[^\n]+") or ""
+end
+
+local function shellQuote(text: string): string
+	return "'" .. string.gsub(text, "'", "'\\''") .. "'"
+end
+
+local function trim(text: string): string
+	return string.match(text, "^%s*(.-)%s*$") or text
+end
+
+local function python(script: string, args: { string }, done: (ProcessResult, WindowCx?) -> ())
+	local argv = { tern.kv.get("python") or "python3", SCRIPTS .. "/" .. script }
+	for _, a in args do
+		table.insert(argv, a)
+	end
+	local ok, err = pcall(tern.process.run, argv, { timeout_ms = 30000 }, done)
+	if not ok then
+		done({ status = -1, stdout = "", stderr = tostring(err), timed_out = false }, nil)
+	end
+end
+
+-- One CLI call; `done` gets the answer, or nil and the error. The host ticks after it.
+local function waitingCli(args: { string }, done: (any, string?, WindowCx?) -> ())
+	python("codexbar_waiting.py", args, function(res, cx)
+		local okj, data = pcall(tern.json.decode, res.stdout)
+		if res.status == 0 and okj and type(data) == "table" and data.ok == true then
+			tern.kv.set("waitingPoke", tern.now())
+			done(data, nil, cx)
+		else
+			local detail = if okj and type(data) == "table" and type(data.error) == "string" then data.error else firstLine(res.stderr)
+			done(nil, if detail ~= "" then detail else "exit " .. res.status, cx)
+		end
+	end)
+end
+
+local function waitingFailed(what: string, err: string?, cx: WindowCx?)
+	tern.log.warn("codexbar: " .. what .. " failed", err)
+	if cx then
+		cx:toast("error", "CodexBar AgentView: " .. what .. " failed", err)
+	end
+end
+
+-- A CLI call whose answer nothing here reads.
+local function waitingSend(what: string, args: { string })
+	waitingCli(args, function(data, err, cx)
+		if not data then
+			waitingFailed(what, err, cx)
+		end
+	end)
+end
+
+-- What the host published per pane.
+local function waitingEntries(): { [string]: any }
+	local s = tern.kv.get("summary")
+	local w = if type(s) == "table" then s.waiting else nil
+	local panes = if type(w) == "table" then w.panes else nil
+	return if type(panes) == "table" then panes else {}
+end
+
+-- One pane's entry, nil when no record watches it.
+local function waitingEntry(pane: number): any
+	local entry = waitingEntries()[tostring(pane)]
+	return if type(entry) == "table" then entry else nil
+end
+
+-- A pane's full record in the view.
+local function waitingRecord(pane: number): any
+	local view = tern.kv.get("waitingView")
+	if type(view) ~= "table" then
+		return nil
+	end
+	for _, field in { "sessions", "panes" } do
+		for _, r in (if type(view[field]) == "table" then view[field] else {}) do
+			if r.pane == pane and (field == "panes" or r.live == true) then
+				return r
+			end
+		end
+	end
+	return nil
+end
+
+-- The omp session a pane runs.
+local function paneSession(pane: number): string?
+	local map = tern.kv.get("paneSessions")
+	local e = if type(map) == "table" then map[tostring(pane)] else nil
+	return if type(e) == "table" and e.provider == "omp" then e.session else nil
+end
+
+local function targetArgs(verb: string, pane: number, session: string?, extra: { string }?): { string }
+	local args = { verb, if session then "--session" else "--pane", if session then session else tostring(pane) }
+	for _, a in extra or {} do
+		table.insert(args, a)
+	end
+	return args
+end
+
+-- Runs `fn` once this window's dashboard restore finished: the restore refuses
+-- after a block opened and would park an unparked pane again.
+local function afterRestore(fn: (WindowCx) -> ())
+	local tries = 0
+	local function step(cx: WindowCx?)
+		if not cx then
+			return
+		end
+		if opened and tries < 60 then
+			tries += 1
+			tern.timer(50, step)
+		else
+			fn(cx)
+		end
+	end
+	tern.timer(0, step)
+end
+
+-- Waiting: the session card --------------------------------------------------------
+
+local ui = tern.ui
+local cardAt: { [number]: number } = {} -- owner pane -> when its card last opened
+
+-- The canvases carry their owner pane, and the session they show (none for a
+-- pane record), in `about`, so a plugin reload forgets nothing.
+local function cardOwner(about: string?): number?
+	return tonumber(string.match(about or "", "^" .. CARD_ABOUT .. "(%d+)"))
+end
+
+local function cardSession(about: string?): string?
+	return string.match(about or "", " for session ([%w%-]+)")
+end
+
+local function cardOf(cx: WindowCx, pane: number): number?
+	for _, c in cx.canvas:list() do
+		if c.owner == tern.plugin.id and cardOwner(c.about) == pane then
+			return c.pane
+		end
+	end
+	return nil
+end
+
+local function cardSection(head: string, rows: { Node }): Node
+	local kids: { Node } = { ui.text({ ui.span(head, "muted") }) }
+	for _, row in rows do
+		table.insert(kids, row)
+	end
+	return ui.lines(kids)
+end
+
+local function clipped(text: string, n: number): string
+	local flat = string.gsub(text, "%s+", " ")
+	if (utf8.len(flat) or #flat) <= n then
+		return flat
+	end
+	return string.sub(flat, 1, (utf8.offset(flat, n) or (n + 1)) - 1) .. "…"
+end
+
+-- Seconds since the epoch of an ISO 8601 time; without an offset it counts as UTC.
+-- A copy of the host half's: the halves share no code.
+local function epoch(iso: any): number?
+	if type(iso) ~= "string" then
+		return nil
+	end
+	local y, m, d, hh, mm, ss = string.match(iso, "^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)")
+	if not y then
+		return nil
+	end
+	local year, month, day = tonumber(y) :: number, tonumber(m) :: number, tonumber(d) :: number
+	if month <= 2 then
+		year -= 1
+	end
+	local era = year // 400
+	local yoe = year - era * 400
+	local doy = (153 * (if month > 2 then month - 3 else month + 9) + 2) // 5 + day - 1
+	local doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+	local sign, offsetH, offsetM = string.match(iso, "([+-])(%d%d):?(%d%d)$")
+	local offset = if sign then (tonumber(offsetH) :: number) * 3600 + (tonumber(offsetM) :: number) * 60 else 0
+	return (era * 146097 + doe - 719468) * 86400
+		+ (tonumber(hh) :: number) * 3600
+		+ (tonumber(mm) :: number) * 60
+		+ (tonumber(ss) :: number)
+		- (if sign == "-" then -offset else offset)
+end
+
+-- Largest unit only: "7m", "23h", "4d".
+local function age(secs: number): string
+	local mins = math.max(0, secs) // 60
+	return if mins < 60 then mins .. "m" elseif mins < 1440 then (mins // 60) .. "h" else (mins // 1440) .. "d"
+end
+
+-- "project · branch · model · state · started 2h ago · active 3m ago"
+local function cardFacts(r: any, now: number): string
+	local parts: { string } = {}
+	local function add(text: any)
+		if type(text) == "string" and text ~= "" then
+			table.insert(parts, text)
+		end
+	end
+	add(r.project)
+	add(r.branch)
+	if type(r.model) == "string" then
+		add((string.gsub(string.match(r.model, "[^/]*$") or r.model, "^claude%-", "")))
+	end
+	add(r.agent_state or r.agent_state_raw)
+	local started, active = epoch(r.started_at), epoch(r.active_at)
+	if started then
+		add("started " .. age(now - started) .. " ago")
+	end
+	if active then
+		add("active " .. age(now - active) .. " ago")
+	end
+	return table.concat(parts, " · ")
+end
+
+-- The Waiting tab's peek in the host half colors PR states the same.
+local PR_STATE_TONE = { open = "success", draft = "muted", merged = "info", closed = "error" }
+local PR_REVIEW_TONE = { approved = "success", changes_requested = "error", review_required = "muted" }
+local PR_CHECKS_TONE = { passing = "success", failing = "error", pending = "warning" }
+
+local function prRow(pr: any): Node
+	local text = "PR#" .. tostring(pr.number) .. " " .. clipped(tostring(pr.title or pr.repo), 60)
+	local kids: { Node } = { ui.text({ ui.link(text, pr.url, if pr.source == "mentioned" then "muted" else nil) }) }
+	if PR_STATE_TONE[pr.state] then
+		table.insert(kids, ui.badge(pr.state, PR_STATE_TONE[pr.state]))
+	end
+	if PR_REVIEW_TONE[pr.review] then
+		table.insert(kids, ui.badge((string.gsub(pr.review, "_", " ")), PR_REVIEW_TONE[pr.review]))
+	end
+	if PR_CHECKS_TONE[pr.checks] then
+		table.insert(kids, ui.badge("checks " .. pr.checks, PR_CHECKS_TONE[pr.checks]))
+	end
+	return ui.node("row", { wrap = true, gap = "sm", role = "codexbar.pr" }, kids)
+end
+
+-- A chain's later steps are muted: nothing watches them yet.
+local function waitRow(w: any, now: number): Node
+	local text = tostring(w.summary or w.label or w.kind)
+	local spans: { Span | string } = { if w.state == "pending" then ui.span("Then: " .. text, "muted") else text }
+	local due = epoch(w.due_at)
+	if w.overdue == true then
+		table.insert(spans, ui.span("  overdue", "error"))
+	elseif due and due <= now then
+		table.insert(spans, ui.span("  due", "warning"))
+	elseif due then
+		table.insert(spans, ui.span("  due in " .. age(due - now), "muted"))
+	end
+	return ui.text(spans)
+end
+
+-- Exact, unlike `age`: "90m", "2h", "45s".
+local function period(secs: number): string
+	if secs % 86400 == 0 then
+		return (secs // 86400) .. "d"
+	elseif secs % 3600 == 0 then
+		return (secs // 3600) .. "h"
+	elseif secs % 60 == 0 then
+		return (secs // 60) .. "m"
+	end
+	return secs .. "s"
+end
+
+local function scheduleRow(j: any, now: number): Node
+	local every = tonumber(j.every_s)
+	local due = epoch(j.due_at)
+	local text = if every then "every " .. period(every) else "once"
+	if due then
+		text ..= if due > now then " · next in " .. age(due - now) else " · next now"
+	end
+	return ui.text({ ui.span(text .. "  ", "muted"), clipped(tostring(j.prompt), 80) })
+end
+
+-- The recap, else the last exchange, which is left for the full card.
+local function cardRecap(cx: WindowCx, pane: number, r: any, reading: boolean): Node?
+	if type(r.recap) == "string" and r.recap ~= "" then
+		return cardSection("Recap", { ui.text(clipped(r.recap, 300)) })
+	end
+	if reading then
+		return nil
+	end
+	local ok, messages = pcall(function()
+		return cx.agents:transcript(pane, { last = 2 })
+	end)
+	local lines: { Node } = {}
+	for _, m in (if ok then messages else {}) do
+		table.insert(lines, ui.text((if m.role == "user" then "You: " else "Agent: ") .. clipped(m.text, 200)))
+	end
+	if #lines == 0 and type(r.last_prompt) == "string" and r.last_prompt ~= "" then
+		table.insert(lines, ui.text("You: " .. clipped(r.last_prompt, 200)))
+	end
+	return if #lines > 0 then cardSection("Last exchange", lines) else nil
+end
+
+-- `r` is a card, or while `reading` one comes, what the view knows.
+local function cardView(cx: WindowCx, pane: number, r: any, reading: boolean): Node
+	local now = os.time()
+	local kids: { Node } = {}
+	local function section(head: string, rows: { Node })
+		if #rows > 0 then
+			table.insert(kids, cardSection(head, rows))
+		end
+	end
+	local function list(field: string): { any }
+		return if type(r[field]) == "table" then r[field] else {}
+	end
+	if type(r.note) == "string" and r.note ~= "" then
+		table.insert(kids, ui.text({ ui.span(r.note, "strong") }))
+	end
+	if type(r.suggested_note) == "string" and r.suggested_note ~= "" then
+		table.insert(kids, ui.text({ ui.span("Suggested: ", "muted"), r.suggested_note }))
+	end
+	local aside = epoch(r.set_aside_at)
+	if aside then
+		table.insert(kids, ui.text({ ui.span("Set aside " .. age(now - aside) .. " ago", "muted") }))
+	end
+	local facts = cardFacts(r, now)
+	if facts ~= "" then
+		table.insert(kids, ui.text({ ui.span(facts, "muted") }))
+	end
+	local prs: { Node } = {}
+	for _, pr in list("prs") do
+		table.insert(prs, prRow(pr))
+	end
+	section("Pull requests", prs)
+	local waits: { Node } = {}
+	for _, w in list("waits") do
+		table.insert(waits, waitRow(w, now))
+	end
+	section("Waiting for", waits)
+	local schedules: { Node } = {}
+	for _, j in list("schedules") do
+		table.insert(schedules, scheduleRow(j, now))
+	end
+	section("Schedules", schedules)
+	local since: { Node } = {}
+	local history = list("history")
+	for i = math.max(1, #history - 4), #history do
+		table.insert(since, ui.text(clipped(tostring(history[i].text), 120)))
+	end
+	section("Since then", since)
+	if type(r.next_step) == "string" and r.next_step ~= "" then
+		section("Next step", { ui.text(r.next_step) })
+	end
+	local recap = cardRecap(cx, pane, r, reading)
+	if recap then
+		table.insert(kids, recap)
+	end
+	if reading then
+		table.insert(kids, ui.text({ ui.span("Reading the session…", "dim") }))
+	end
+	return ui.col(kids)
+end
+
+local function cardTitle(cx: WindowCx, pane: number, r: any): string
+	local info = paneInfo(cx, pane)
+	local title = r.title or r.label or (info and info.title)
+	return clipped(if type(title) == "string" and title ~= "" then title else "Session", 70)
+end
+
+-- Done and +1 day need waits of a record, and +1 day one that snoozing moves.
+-- Both act on the pane's entry, so it has to be the card's session: a link can
+-- name one the agents scan has not mapped to the pane yet.
+local function cardDock(pane: number, r: any): Node
+	local function act(text: string, name: string, variant: string?): Node
+		return ui.button(text, { key = name, size = "sm", variant = variant, actions = { click = name } })
+	end
+	local kids: { Node } = {}
+	local entry = waitingEntry(pane)
+	if entry and entry.session == r.session_id and r.has_record ~= false and type(r.waits) == "table" and #r.waits > 0 then
+		table.insert(kids, act("Done", "card_done", "primary"))
+		if entry.wait then
+			table.insert(kids, act("+1 day", "card_snooze"))
+		end
+	end
+	table.insert(kids, act("Close", "card_close", "quiet"))
+	return ui.row(kids)
+end
+
+-- Floats the card over `pane`, one per pane, and marks the record seen. An omp
+-- session needs no record: the card opens at once on what the view knows, as
+-- `card` asks GitHub and can take seconds, and fills in when that answers.
+-- `known` is the session a link named: it wins over what the agents scan, which
+-- lags a session started or resumed in the pane, maps there.
+local function openCard(cx: WindowCx, pane: number, known: string?)
+	if cardOf(cx, pane) then
+		return
+	end
+	local record = waitingRecord(pane)
+	if known and record and record.session_id ~= known then
+		record = nil
+	end
+	-- A pane record stays what the pane shows: a session started there later has none of its waits.
+	local session = if record then record.session_id else (known or paneSession(pane))
+	if not record and not session then
+		cx:toast("info", "CodexBar AgentView: this pane has no session card")
+		return
+	end
+	cardAt[pane] = os.time()
+	local shown = record or {}
+	local canvas, err = cx.canvas:open({
+		title = cardTitle(cx, pane, shown),
+		view = cardView(cx, pane, shown, session ~= nil),
+		dock = cardDock(pane, shown),
+		about = CARD_ABOUT .. pane .. (if session then " for session " .. session else "")
+			.. ". Done, when shown, ends its waits, +1 day, when shown, snoozes the first due one, Close only closes this card.",
+		how = "beside",
+		target = pane,
+		focus = false,
+	})
+	if not canvas then
+		waitingFailed("session card", err, cx)
+		return
+	end
+	local ok, floatErr = cx.layout:float(canvas, pane, "tr", { focus = false, size = { 0.45, 0.75 } })
+	if not ok then
+		cx.layout:close(canvas)
+		waitingFailed("session card", floatErr, cx)
+		return
+	end
+	if record and session and record.unseen == true then
+		waitingSend("mark seen", { "seen", "--session", session })
+	end
+	if not session then
+		return
+	end
+	waitingCli({ "card", "--session", session }, function(data, readErr, cx2)
+		if not cx2 or cardOf(cx2, pane) ~= canvas then -- closed meanwhile
+			return
+		end
+		if data then
+			cx2.canvas:set(canvas, {
+				title = cardTitle(cx2, pane, data.card),
+				view = cardView(cx2, pane, data.card, false),
+				dock = cardDock(pane, data.card),
+			})
+			return
+		end
+		waitingFailed("session card", readErr, cx2)
+		if record then
+			cx2.canvas:set(canvas, { view = cardView(cx2, pane, record, false) })
+		else
+			cx2.layout:close(canvas)
+		end
+	end)
+end
+
+-- The focused pane; from the dashboard or a card, the pane focus came from.
+local function focusedTarget(cx: WindowCx): (number?, PaneInfo?)
+	local pane = cx.session:focused()
+	local info = if pane then paneInfo(cx, pane) else nil
+	if info and (info.block == KIND or info.block == SETTINGS_KIND or info.block == CANVAS_KIND) then
+		pane = tonumber(tern.kv.get("focus"))
+		info = if pane then paneInfo(cx, pane) else nil
+	end
+	if pane and info then
+		return pane, info
+	end
+	return nil, nil
+end
+
+-- Closes `pane`'s card, or opens it once a dashboard this closes has restored its layout.
+local function toggleCardOn(cx: WindowCx, pane: number, known: string?)
+	local canvas = cardOf(cx, pane)
+	if canvas then
+		cx.layout:close(canvas)
+		return
+	end
+	local open = dashboard(cx)
+	if open then
+		closePane(cx, open.pane)
+	end
+	afterRestore(function(cx2)
+		openCard(cx2, pane, known)
+	end)
+end
+
+local function toggleCard(cx: WindowCx)
+	local pane = focusedTarget(cx)
+	if not pane then
+		cx:toast("info", "CodexBar AgentView: no pane to show a card for")
+		return
+	end
+	toggleCardOn(cx, pane)
+end
+
+-- Tern's preset takes Ctrl+Alt+Shift+B (browser PiP); the omp extension's details panel shares this chord outside Tern.
+tern.command({ id = "session_card", title = "CodexBar AgentView: Session card", icon = "message", keys = { "ctrl+alt+i" }, run = toggleCard })
+
+-- omp's status row links `codexbar-agentview://card/<session id>` inside Tern;
+-- the row is drawn in that session's own pane, the one clicked.
+tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
+	local id = string.match(link.url, "^codexbar%-agentview://card/([^/?#]+)/?$")
+	if not id then
+		return nil
+	end
+	toggleCardOn(cx, link.pane, id)
+	return { handled = true }
+end)
+
+tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
+	local pane = cardOwner(ev.about)
+	if not pane then
+		return nil
+	end
+	-- The pane may run another session by now: act only on the one the card shows.
+	local entry = waitingEntry(pane)
+	if entry and entry.session ~= cardSession(ev.about) then
+		entry = nil
+	end
+	if entry and ev.act == "card_done" then
+		waitingSend("done", targetArgs("done", pane, entry.session))
+	elseif entry and ev.act == "card_snooze" and entry.wait then
+		waitingSend("snooze", targetArgs("snooze", pane, entry.session, { "--wait", entry.wait, "--for", "1d" }))
+	end
+	cx.layout:close(ev.pane)
+	return true
+end)
+
+-- A float whose owner parked or closed moves over another pane; a card belongs to its owner.
+local function dropOrphanCards(cx: WindowCx)
+	for _, c in cx.canvas:list() do
+		local owner = if c.owner == tern.plugin.id then cardOwner(c.about) else nil
+		if owner then
+			local info = paneInfo(cx, owner)
+			if not info or info.parked then
+				cx.layout:close(c.pane)
+			end
+		end
+	end
+end
+
+-- Waiting: the leader window ---------------------------------------------------------
+
+-- Holds the lease in `tern.kv`. A claim acts from the next poll on, once a
+-- window that claimed at the same moment has overwritten it.
+local function leading(cx: WindowCx): boolean
+	local key = cx:window_key()
+	local lease = tern.kv.get("waitingLeader")
+	local now = os.time()
+	local held = type(lease) == "table" and type(lease.expires) == "number"
+	local mine = held and lease.key == key
+	if not held or lease.expires <= now or (mine and lease.expires - now < LEASE_S - 10) then
+		tern.kv.set("waitingLeader", { key = key, expires = now + LEASE_S })
+	end
+	return mine
+end
+
+type Acted = { result: string, error: string?, sending: boolean, acked: boolean }
+local acted: { [string]: Acted } = {} -- by action id: the outbox repeats an action until its ack lands
+
+local function carryOut(cx: WindowCx, a: any, info: PaneInfo?): (string, string?)
+	if a.type == "toast" then
+		local level = if a.level == "success" or a.level == "error" then a.level else "info"
+		cx:toast(level, tostring(a.text), if type(a.sub) == "string" then a.sub else nil)
+		return "done"
+	end
+	if not info then
+		return "done" -- the session has no Tern pane
+	end
+	if a.type == "park" then
+		if info.parked then
+			return "done"
+		end
+		local ok, err = cx.layout:park(info.pane)
+		return if ok then "done" else "failed", err
+	elseif a.type == "close_pane" then
+		cx.layout:close(info.pane)
+		return "done"
+	end
+	return "failed", "unknown action " .. tostring(a.type)
+end
+
+-- Whether this window should take `a` up now. A pane action no window holds
+-- stays queued for the window that will; the host acks it once the pane is gone.
+local function ownsAction(a: any, info: PaneInfo?, leader: boolean): boolean
+	if info then
+		-- A dashboard's layout restore would bring a pane parked now back.
+		return not (a.type == "park" and opened)
+	end
+	return leader and (a.type == "toast" or tonumber(a.pane) == nil)
+end
+
+local function runActions(cx: WindowCx, leader: boolean)
+	local actions = tern.kv.get("waitingActions")
+	local listed: { [string]: boolean } = {}
+	for _, a in (if type(actions) == "table" then actions else {}) do
+		local id = tostring(a.id)
+		listed[id] = true
+		local state = acted[id]
+		local pane = if a.type ~= "toast" then tonumber(a.pane) else nil
+		local info = if pane then paneInfo(cx, pane) else nil
+		if not state and ownsAction(a, info, leader) then
+			local ok, result, err = pcall(carryOut, cx, a, info)
+			state = {
+				result = if ok then result else "failed",
+				error = if ok then err else tostring(result),
+				sending = false,
+				acked = false,
+			}
+			acted[id] = state
+		end
+		if state and not state.sending and not state.acked then
+			local sent = state
+			sent.sending = true
+			local args = { "ack", "--action", id, "--result", state.result }
+			if state.error then
+				table.insert(args, "--error")
+				table.insert(args, state.error)
+			end
+			waitingCli(args, function(data, err)
+				sent.sending = false
+				sent.acked = data ~= nil
+				if not data then
+					tern.log.warn("codexbar: ack failed", id, err)
+				end
+			end)
+		end
+	end
+	for id, state in acted do
+		if state.acked and not listed[id] then
+			acted[id] = nil
+		end
+	end
+end
+
+-- Yellow on this window's tabs holding an `on_me` pane. Tabs the user colored
+-- stay theirs; the ones colored here are kept per window in `waitingTabs:<key>`
+-- and cleared here.
+local function colorTabs(cx: WindowCx)
+	local tabsKey = "waitingTabs:" .. cx:window_key()
+	local entries = waitingEntries()
+	local want: { [number]: boolean } = {}
+	for _, p in cx.session:panes() do
+		local entry = entries[tostring(p.pane)]
+		if type(entry) == "table" and entry.on_me and p.tab then
+			want[p.tab] = true
+		end
+	end
+	local stored = tern.kv.get(tabsKey)
+	local mine: { [number]: boolean } = {}
+	for _, id in (if type(stored) == "table" then stored else {}) do
+		mine[id] = true
+	end
+	if next(want) == nil and next(mine) == nil then
+		return
+	end
+	local keep = tern.json.array()
+	for _, t in cx.session:tabs() do
+		local color = if t.color == tern.json.null then nil else t.color
+		if want[t.id] then
+			if color == nil then
+				cx.layout:color_tab(t.id, "yellow")
+				color = "yellow"
+				mine[t.id] = true
+			end
+			if mine[t.id] and color == "yellow" then
+				table.insert(keep, t.id)
+			end
+		elseif mine[t.id] and color == "yellow" then
+			cx.layout:color_tab(t.id, nil)
+		end
+	end
+	table.sort(keep)
+	if tern.json.encode(keep) ~= tern.json.encode(if type(stored) == "table" then stored else tern.json.array()) then
+		tern.kv.set(tabsKey, keep)
+	end
+end
+
+local function lead(cx: WindowCx)
+	runActions(cx, leading(cx))
+	colorTabs(cx)
+end
+
+tern.on("agent_state", function(ev: AgentStateEvent, _cx: WindowCx)
+	local entry = if ev.new == "waiting_input" then waitingEntry(ev.pane) else nil
+	if entry and entry.session then
+		waitingSend("agent event", { "event", "--type", "waiting_input", "--session", entry.session })
+	end
+end)
+
+-- Waiting: setting aside --------------------------------------------------------------
+
+type SetAside = { pane: number, cwd: string?, note: string, label: string }
+
+-- A pane that runs no omp session: Tern's own picker sets it aside as a pane record.
+local function setAsideTarget(pane: number, info: PaneInfo): SetAside
+	local record = waitingRecord(pane)
+	return {
+		pane = pane, cwd = info.cwd,
+		note = if record and type(record.note) == "string" then record.note else "",
+		label = clipped(if info.running then info.running.line else info.title, 60),
+	}
+end
+
+-- Both end the flow when dismissed.
+local function ask(cx: WindowCx, opts: PromptOptions, fn: (string, WindowCx) -> ())
+	opts.icon = opts.icon or "clock"
+	cx:prompt(opts):next(function(text, _err, cx2)
+		if text ~= nil and cx2 then
+			fn(trim(text), cx2)
+		end
+	end)
+end
+
+local function choose(cx: WindowCx, opts: PickOptions, fn: (any, WindowCx) -> ())
+	opts.icon = opts.icon or "clock"
+	cx:pick(opts):next(function(item, _err, cx2)
+		if item ~= nil and cx2 then
+			fn(item, cx2)
+		end
+	end)
+end
+
+-- `--in 2d` for a duration, `--at` for a date or a clock time; the CLI checks both.
+local function timeArgs(text: string): { string }
+	local compact = string.lower((string.gsub(text, "%s+", "")))
+	local rest = string.gsub(compact, "%d+[smhdw]", "")
+	if rest == "" and compact ~= "" then
+		return { "--in", compact }
+	end
+	return { "--at", text }
+end
+
+-- The last steps: my sentence (a something's text says it all), then `add` and the park.
+local function finishSetAside(cx: WindowCx, t: SetAside, kind: string, args: { string })
+	local function finish(note: string)
+		local full = { "add", "--pane", tostring(t.pane), "--kind", kind, "--by", "user" }
+		for _, a in args do
+			table.insert(full, a)
+		end
+		if kind ~= "something" then -- names the pane record; a something's text does
+			table.insert(full, "--label")
+			table.insert(full, t.label)
+		end
+		if note ~= "" then
+			table.insert(full, "--note")
+			table.insert(full, note)
+		end
+		waitingCli(full, function(data, err, cx3)
+			if not data then
+				waitingFailed("set aside", err, cx3)
+			elseif cx3 then
+				local open = dashboard(cx3)
+				if open then
+					closePane(cx3, open.pane)
+				end
+				afterRestore(function(cx4)
+					local ok, parkErr = cx4.layout:park(t.pane)
+					if not ok then
+						waitingFailed("park", parkErr, cx4)
+					end
+				end)
+			end
+		end)
+	end
+	if kind == "something" then
+		finish("")
+		return
+	end
+	ask(cx, { value = t.note, placeholder = "Why set it aside, what next?", action = "set aside" }, finish)
+end
+
+local function setAsidePr(cx: WindowCx, t: SetAside, target: { string })
+	choose(cx, { placeholder = "Until", items = {
+		{ label = "Ready", detail = "checks green, bot reviewed the head, no open thread", until_ = "ready" },
+		{ label = "Review on the head", detail = "a review bot reviewed the latest push", until_ = "review_on_head" },
+		{ label = "Merged", until_ = "merged" },
+		{ label = "Released", detail = "a release's tag contains the merge", until_ = "released" },
+		{ label = "Any activity", detail = "someone else comments, reviews, pushes, merges or closes it", until_ = "activity" },
+	} }, function(item, cx2)
+		local args = { "--until", item.until_ }
+		for _, a in target do
+			table.insert(args, a)
+		end
+		finishSetAside(cx2, t, "pr", args)
+	end)
+end
+
+-- The pane's repository as owner/repo; nil and the reason when `gh` can't tell.
+local function paneRepo(t: SetAside, timeoutMs: number, done: (string?, string?, WindowCx?) -> ())
+	if not t.cwd or t.cwd == "" then -- `gh` would answer for the plugin's own folder
+		done(nil, "the pane's folder is unknown", nil)
+		return
+	end
+	local ok, err = pcall(tern.process.run, { "gh", "repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner" },
+		{ cwd = t.cwd, timeout_ms = timeoutMs }, function(res: ProcessResult, cx: WindowCx?)
+			local repo = trim(res.stdout)
+			if res.status == 0 and repo ~= "" then
+				done(repo, nil, cx)
+			else
+				local why = firstLine(res.stderr)
+				done(nil, if why ~= "" then why else "gh repo view failed", cx)
+			end
+		end)
+	if not ok then
+		done(nil, tostring(err), nil)
+	end
+end
+
+-- A bare number needs the pane's repository.
+local function prTarget(text: string, t: SetAside, done: ({ string }?, string?, WindowCx?) -> ())
+	local number = string.match(text, "^#?(%d+)$")
+	if not number then
+		done({ "--pr", text }, nil, nil)
+		return
+	end
+	paneRepo(t, 10000, function(repo, err, cx)
+		if repo then
+			done({ "--repo", repo, "--number", number }, nil, cx)
+		else
+			done(nil, tostring(err) .. "; give owner/repo#N", cx)
+		end
+	end)
+end
+
+local SET_ASIDE_FLOWS: { [string]: (WindowCx, SetAside) -> () } = {
+	time = function(cx, t)
+		ask(cx, { value = "1d", placeholder = "When? 2d, 18:00 or 2026-11-07 09:00", action = "next" }, function(text, cx2)
+			finishSetAside(cx2, t, "time", timeArgs(text))
+		end)
+	end,
+	job = function(cx, t)
+		choose(cx, { placeholder = "When the job ends", items = {
+			{ label = "Keep the pane", close = false },
+			{ label = "Close the pane on success", detail = "exit 0 closes it, a failure lands on you", close = true },
+		} }, function(item, cx2)
+			finishSetAside(cx2, t, "job", if item.close then { "--close-on-success" } else {})
+		end)
+	end,
+	pr = function(cx, t)
+		ask(cx, { placeholder = "PR URL, owner/repo#N or number", action = "next" }, function(text, cx2)
+			if text == "" then
+				waitingFailed("set aside", "give a PR URL, owner/repo#N or number", cx2)
+				return
+			end
+			prTarget(text, t, function(target, err, cx3)
+				local next_ = cx3 or cx2
+				if target then
+					setAsidePr(next_, t, target)
+				else
+					waitingFailed("find the repository", err, next_)
+				end
+			end)
+		end)
+	end,
+	release = function(cx, t)
+		-- The picker has closed by now: a slow `gh` must not hold the next prompt for long.
+		paneRepo(t, 3000, function(repo, _err, cx2)
+			ask(cx2 or cx, { value = repo, placeholder = "owner/repo", action = "next" }, function(text, cx3)
+				if string.match(text, "^[%w%._%-]+/[%w%._%-]+$") then
+					finishSetAside(cx3, t, "release", { "--repo", text })
+				else
+					waitingFailed("wait for a release", "give owner/repo", cx3)
+				end
+			end)
+		end)
+	end,
+	command = function(cx, t)
+		ask(cx, { placeholder = "Command line; done when it exits 0", action = "next" }, function(argv, cx2)
+			ask(cx2, { value = "15m", placeholder = "Check every", action = "next" }, function(interval, cx3)
+				finishSetAside(cx3, t, "command", { "--argv", argv, "--interval", interval })
+			end)
+		end)
+	end,
+	something = function(cx, t)
+		ask(cx, { placeholder = "What are you waiting for?", action = "set aside" }, function(what, cx2)
+			if what == "" then
+				waitingFailed("set aside", "say what you wait for", cx2)
+			else
+				finishSetAside(cx2, t, "something", { "--what", what })
+			end
+		end)
+	end,
+}
+
+-- The labels and descriptions of the omp extension's menu, without its omp-only items.
+local SHELL_ITEMS: { PickItem } = {
+	{ label = "Retry later", detail = "/wait 2d · after a while or at a time", flow = "time" },
+	{ label = "Job finishes", detail = "the command in this pane", flow = "job" },
+	{ label = "GitHub PR", detail = "/wait gh pr · until reviewed, ready, merged, released or new activity", flow = "pr" },
+	{ label = "GitHub release", detail = "/wait gh release · a repo's next release", flow = "release" },
+	{ label = "Command check", detail = "/wait check · run a command every 15m until it succeeds", flow = "command" },
+	{ label = "Something else", detail = "/wait for · anything; you mark it done", flow = "something" },
+}
+
+-- An omp session's menu is the extension's, drawn in its composer: Tern only
+-- asks for it, and brings the pane forward for the menu to be seen.
+local function requestMenu(pane: number, session: string)
+	waitingCli({ "menu-request", "--session", session }, function(data, err, cx)
+		if not cx then
+			return
+		end
+		if not data then
+			waitingFailed("open the wait menu", err, cx)
+		elseif data.menu ~= true then
+			-- The reason says what to do, so it leads: a toast's second line is clipped.
+			cx:toast("info", "No wait menu: " .. (if type(data.reason) == "string" then data.reason else "the omp extension did not answer"))
+		elseif cx.session:focused() ~= pane then
+			local open = dashboard(cx)
+			if open then
+				closePane(cx, open.pane)
+			end
+			afterRestore(function(cx2)
+				cx2.layout:focus(pane)
+			end)
+		end
+	end)
+end
+
+local function setAside(cx: WindowCx)
+	local pane, info = focusedTarget(cx)
+	if not pane or not info then
+		cx:toast("info", "CodexBar AgentView: no pane to set aside")
+		return
+	end
+	local session = paneSession(pane)
+	if session then
+		requestMenu(pane, session)
+		return
+	end
+	local t = setAsideTarget(pane, info)
+	choose(cx, { items = SHELL_ITEMS, placeholder = "What does this wait for?", action = "next" }, function(item, cx2)
+		SET_ASIDE_FLOWS[item.flow](cx2, t)
+	end)
+end
+
+-- Not Ctrl+Shift+W: Tern's preset closes the pane with it, and a preset's chord stays the preset's.
+tern.command({ id = "set_aside", title = "CodexBar AgentView: Set aside…", icon = "clock", keys = { "ctrl+alt+b" }, run = setAside })
+
+tern.command({ id = "install_omp_extension", title = "CodexBar AgentView: Install omp extension", icon = "puzzle", run = function(_cx)
+	python("install_integration.py", { "--omp-extension" }, function(res, cx)
+		if not cx then
+			return
+		end
+		if res.status == 0 then
+			cx:toast("success", "omp extension installed", "omp sessions load it when they start")
+		else
+			cx:toast("error", "CodexBar AgentView: installing the omp extension failed", firstLine(res.stderr))
+		end
+	end)
+end })
 
 -- The dashboard is a temporary sidebar: focus landing anywhere else (another
 -- pane, another tab, a session it switched to) closes it.
@@ -280,6 +1254,14 @@ tern.on("focus", function(ev, cx)
 		if p.block == KIND then
 			closePane(cx, p.pane)
 		end
+	end
+	-- The first focus after a wait fired brings the session card. Until the host
+	-- publishes the `seen`, `cardAt` keeps a refocus from opening it again.
+	local entry = waitingEntry(ev.pane)
+	if entry and entry.unseen and os.time() - (cardAt[ev.pane] or 0) > 10 then
+		afterRestore(function(cx2)
+			openCard(cx2, ev.pane)
+		end)
 	end
 end)
 
@@ -350,11 +1332,15 @@ tern.on("pane_closed", function(ev, _cx)
 	local o = opened
 	if o and ev.pane == o.pane then
 		o.placing = false
-		tern.timer(50, function(cx)
-			if cx then
-				restoreLayout(cx)
+		tern.timer(50, function(cx2)
+			if cx2 then
+				restoreLayout(cx2)
 			end
 		end)
+	end
+	local entry = waitingEntry(ev.pane)
+	if entry and entry.record then
+		waitingSend("pane event", { "event", "--type", "pane_closed", "--pane", tostring(ev.pane) })
 	end
 end)
 
@@ -362,6 +1348,62 @@ end)
 local summarySig = ""
 local initialSettingsRequest = tern.kv.get("settingsRequest")
 local lastSettingsRequest = if type(initialSettingsRequest) == "table" then initialSettingsRequest.seq else nil
+local initialWaitingRequest = tern.kv.get("waitingRequest")
+local lastWaitingRequest = if type(initialWaitingRequest) == "table" then initialWaitingRequest.seq else nil
+
+-- Dashboard buttons that need a window: like picking from a popup, they close
+-- the dashboard, and what they do waits for its layout to come back. The list
+-- spans windows, so the window holding the target answers too.
+local function waitingRequest(cx: WindowCx)
+	local request = tern.kv.get("waitingRequest")
+	if type(request) ~= "table" or type(request.pane) ~= "number" or request.seq == lastWaitingRequest then
+		return
+	end
+	local info = paneInfo(cx, request.pane)
+	local ours = info ~= nil and info.block == KIND
+	local held = request.target ~= nil and paneInfo(cx, request.target) ~= nil
+	if not ours and not held then
+		return
+	end
+	lastWaitingRequest = request.seq
+	if ours then
+		closePane(cx, request.pane)
+	end
+	afterRestore(function(cx2)
+		if request.op == "launch" then
+			-- As History's Launch: an interactive shell loads the user's PATH and stays when the agent exits.
+			local shell = shellQuote(tern.getenv("SHELL") or "/bin/sh")
+			cx2.layout:new_tab({
+				cwd = request.cwd,
+				command = shell .. " -ic " .. shellQuote(request.command .. "; exec " .. shell .. " -i"),
+			})
+			return
+		end
+		local target = tonumber(request.target)
+		local shown = if target then paneInfo(cx2, target) else nil
+		if not target or not shown then
+			cx2:toast("info", "CodexBar AgentView: that pane is in another window")
+			return
+		end
+		if shown.parked then
+			-- A session coming back gets a tab of its own, not a share of the current one.
+			local ok, err = cx2.layout:unpark(target)
+			if ok then
+				local tab, moveErr = cx2.layout:move_to_new_tab(target)
+				ok, err = tab ~= nil, moveErr
+			end
+			if not ok then
+				waitingFailed("open", err, cx2)
+				return
+			end
+		end
+		cx2.layout:focus(target)
+		if request.card then
+			openCard(cx2, target)
+		end
+	end)
+end
+
 local function poll(cx: WindowCx?)
 	local s = tern.kv.get("summary")
 	local sig = if s ~= nil then tern.json.encode(s) else ""
@@ -379,8 +1421,15 @@ local function poll(cx: WindowCx?)
 				openSettings(cx)
 			end
 		end
+		for _, step in { waitingRequest, dropOrphanCards, lead } do
+			local ok, err = pcall(step, cx)
+			if not ok then
+				tern.log.error("codexbar:", err)
+			end
+		end
 	end
-	tern.timer(1000, poll)
+	-- An open dashboard's buttons act through this poll.
+	tern.timer(if cx and dashboard(cx) then 250 else 1000, poll)
 end
 
 -- A timer rather than `window_start`: that hook fires once per window, not again after a plugin reload.

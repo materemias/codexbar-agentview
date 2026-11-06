@@ -6,6 +6,11 @@
 -- (default ~/.local/state/codexbar-agentview). While the applet runs,
 -- its data is fresh and reused; the plugin only runs a helper when the data it
 -- would read is older than the applet's own cadence.
+--
+-- codexbar_waiting.py owns the sessions set aside. This half calls its `tick`,
+-- shows its view on the Waiting tab and publishes what the window half needs:
+-- `waitingView`, the outbox `waitingActions`, `paneSessions`; the window half
+-- answers with `waitingRequest` and `waitingPoke`.
 
 local ui = tern.ui
 
@@ -39,6 +44,16 @@ local SCRIPTS = tern.plugin.dir .. "/../contents/scripts"
 local XDG_STATE = tern.getenv("XDG_STATE_HOME") or ""
 local STATE_DIR = (if string.sub(XDG_STATE, 1, 1) == "/" then XDG_STATE else HOME .. "/.local/state") .. "/codexbar-agentview"
 local AGENTS_FILE = STATE_DIR .. "/agents.json"
+local WAITING_FILE = STATE_DIR .. "/waiting.json"
+local WAITING_VIEW_FILE = STATE_DIR .. "/waiting_view.json"
+local WAITING_CLI = "codexbar_waiting.py"
+-- `tick` runs `command` waits (60 s each, six at a time) and GitHub polls; a
+-- killed tick loses the checks it already claimed.
+local WAITING_TIMEOUT_MS = 600000
+local WAITING_RETRY_S = 60
+
+-- The window half runs the helpers too, with the same interpreter.
+tern.kv.set("python", PYTHON)
 
 -- One-shot: carry settings over from the plugin's former id `codexbar`.
 if tern.kv.get("settings") == nil then
@@ -71,8 +86,8 @@ local PROVIDER_ICONS = { claude = "app-claude", codex = "app-codex" }
 local AGENT_ICONS = { claude = "app-claude", codex = "app-codex", omp = "app-omp", pi = "pi-mark" }
 local AGENT_NAMES = { claude = "Claude Code", codex = "Codex", omp = "omp", pi = "pi" }
 local CODEX_PLAN_WEIGHT = { plus = 1, pro = 20 }
-local TABS = { "usage", "agents", "history" }
-local TAB_NAMES = { usage = "Usage", agents = "Agents", history = "History" }
+local TABS = { "usage", "agents", "waiting", "history" }
+local TAB_NAMES = { usage = "Usage", agents = "Agents", waiting = "Waiting", history = "History" }
 
 -- Settings ------------------------------------------------------------------
 -- `tern.kv` key `settings`, a table; only this host half writes settings.
@@ -182,7 +197,7 @@ local function nowMs(): number
 	return os.time() * 1000
 end
 
--- Seconds since the epoch of an ISO 8601 UTC time.
+-- Seconds since the epoch of an ISO 8601 time; without an offset it counts as UTC.
 local function epoch(iso: any): number?
 	if type(iso) ~= "string" then
 		return nil
@@ -199,10 +214,13 @@ local function epoch(iso: any): number?
 	local yoe = year - era * 400
 	local doy = (153 * (if month > 2 then month - 3 else month + 9) + 2) // 5 + day - 1
 	local doe = yoe * 365 + yoe // 4 - yoe // 100 + doy
+	local sign, offsetH, offsetM = string.match(iso, "([+-])(%d%d):?(%d%d)$")
+	local offset = if sign then (tonumber(offsetH) :: number) * 3600 + (tonumber(offsetM) :: number) * 60 else 0
 	return (era * 146097 + doe - 719468) * 86400
 		+ (tonumber(hh) :: number) * 3600
 		+ (tonumber(mm) :: number) * 60
 		+ (tonumber(ss) :: number)
+		- (if sign == "-" then -offset else offset)
 end
 
 local MONTHS = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
@@ -345,6 +363,18 @@ local store = {
 	summarySig = "",
 	openSig = "",
 	lastGoto = nil :: any,
+	waiting = nil :: any, -- the CLI's last view
+	waitingError = nil :: string?,
+	waitingActions = nil :: any, -- the outbox as last published
+	waitingAcking = {} :: { [string]: boolean },
+	waitingRaw = "", -- waiting.json as our last tick left it
+	waitingSig = "",
+	waitingActionsSig = "",
+	waitingAgents = "",
+	waitingTicking = false,
+	waitingAgain = false,
+	waitingAt = 0, -- when the next timed tick is due
+	lastPoke = nil :: any,
 }
 
 type Block = {
@@ -1065,6 +1095,88 @@ local function historyRecords(): { any }
 	return rows
 end
 
+local function waitingList(field: string): { any }
+	local view = store.waiting
+	local list = if type(view) == "table" then val(view[field]) else nil
+	return if type(list) == "table" then list else {}
+end
+
+local function waitingCounts(): any
+	local view = store.waiting
+	local counts = if type(view) == "table" then val(view.counts) else nil
+	return if type(counts) == "table" then counts else {}
+end
+
+-- The wait +1 day pushes: one on me first, then the earliest due. `snooze` moves
+-- only these kinds; the CLI changes nothing for the others. (Inline: the main
+-- chunk is at Luau's 200-local limit.)
+local function firstDue(r: any): any
+	local first, at, onMe = nil, math.huge, false
+	for _, w in val(r.waits) or {} do
+		local kind = w.kind
+		local snoozable = w.state ~= "pending" and (val(w.overdue) == true or kind == "time" or kind == "command"
+			or kind == "pr" or kind == "something" or (kind == "job" and w.state ~= "waiting"))
+		if snoozable then
+			local due = epoch(w.due_at) or math.huge
+			local mine = w.ball == "on_me"
+			if not first or (mine and not onMe) or (mine == onMe and due < at) then
+				first, at, onMe = w, due, mine
+			end
+		end
+	end
+	return first
+end
+
+-- Per Tern pane, what the window half needs: the status segment, the session
+-- card, and which panes its events matter for.
+local function waitingPanes(): { [string]: any }
+	local panes: { [string]: any } = {}
+	local function add(pane: number?, r: any, session: string?, record: boolean)
+		if pane then
+			local wait = firstDue(r)
+			panes[tostring(pane)] = {
+				text = str(r.status),
+				on_me = r.ball == "on_me",
+				unseen = val(r.unseen) == true,
+				session = session,
+				record = record,
+				wait = if wait then str(wait.id) else nil,
+			}
+		end
+	end
+	local records: { [string]: boolean } = {}
+	for _, p in waitingList("panes") do
+		records[str(p.pane)] = true
+		add(tonumber(val(p.pane)), p, nil, true)
+	end
+	-- A session in a pane that also has a pane record speaks for that pane.
+	for _, s in waitingList("sessions") do
+		if val(s.live) == true then
+			add(tonumber(val(s.pane)), s, str(s.session_id), records[str(s.pane)] == true)
+		end
+	end
+	return panes
+end
+
+-- Panes whose next command ends a job wait: the condition's, else the record's own.
+local function jobPanes(view: any): { [number]: boolean }
+	local out: { [number]: boolean } = {}
+	for _, field in { "sessions", "panes" } do
+		for _, r in val(view[field]) or {} do
+			for _, w in val(r.waits) or {} do
+				if w.kind == "job" and w.state == "waiting" then
+					local cond = val(w.condition)
+					local pane = (if type(cond) == "table" then tonumber(val(cond.pane)) else nil) or tonumber(val(r.pane))
+					if pane then
+						out[pane] = true
+					end
+				end
+			end
+		end
+	end
+	return out
+end
+
 local function publishSummary()
 	local counts = { working = 0, blocked = 0, idle = 0, untracked = 0 }
 	for _, a in liveAgents() do
@@ -1081,6 +1193,7 @@ local function publishSummary()
 		usage = if store.usage then usageSummary(store.usage, os.time()) else tern.json.array(),
 		counts = counts,
 		restore = restore,
+		waiting = { on_me = tonumber(val(waitingCounts().on_me)) or 0, panes = waitingPanes() },
 	}
 	local sig = tern.json.encode(summary)
 	if sig ~= store.summarySig then
@@ -1137,6 +1250,160 @@ local function readAgents(): boolean
 	store.agents = if okj and type(data) == "table" then data else nil
 	return true
 end
+
+local function readWaiting(path: string): string
+	local ok, raw = pcall(tern.fs.read, path, 16 * 1024 * 1024)
+	return if ok then raw else ""
+end
+
+-- Republishes only what changed: kv.json is one file every VM rereads. `now`
+-- moves on every call and nothing here shows it.
+local function applyWaiting(view: any)
+	store.waiting = view
+	store.waitingError = nil
+	local at = view.now
+	view.now = nil
+	local sig = tern.json.encode(view)
+	view.now = at
+	if sig ~= store.waitingSig then
+		store.waitingSig = sig
+		tern.kv.set("waitingView", view)
+		publishSummary()
+		renderAll()
+	end
+end
+
+local function publishActions(actions: any)
+	store.waitingActions = actions
+	local sig = tern.json.encode(actions)
+	if sig ~= store.waitingActionsSig then
+		store.waitingActionsSig = sig
+		tern.kv.set("waitingActions", actions)
+	end
+end
+
+-- One `tick` at a time; a request during one runs right after it.
+local function waitingTick()
+	if store.waitingTicking then
+		store.waitingAgain = true
+		return
+	end
+	store.waitingTicking = true
+	store.waitingAgain = false
+	python(WAITING_CLI, { "tick" }, WAITING_TIMEOUT_MS, function(res)
+		store.waitingTicking = false
+		local okj, data = pcall(tern.json.decode, res.stdout)
+		local nextIn = WAITING_RETRY_S
+		if res.status == 0 and okj and type(data) == "table" and type(val(data.view)) == "table" then
+			applyWaiting(val(data.view))
+			publishActions(if type(val(data.actions)) == "table" then val(data.actions) else tern.json.array())
+			nextIn = tonumber(val(data.next_tick_s)) or nextIn
+		else
+			local detail = if okj and type(data) == "table" then str(data.error) else ""
+			detail = if detail ~= "" then detail else firstLine(res.stderr)
+			store.waitingError = if detail ~= "" then detail else "exit " .. res.status
+			tern.log.warn("codexbar: waiting tick failed", store.waitingError)
+			if not store.waiting then
+				renderAll()
+			end
+		end
+		store.waitingRaw = readWaiting(WAITING_FILE)
+		store.waitingAt = os.time() + nextIn
+		if store.waitingAgain then
+			waitingTick()
+		end
+	end)
+end
+
+-- Runs one CLI command. `done` gets its answer, nil after a failure the toast
+-- reported. A view in the answer means the state changed, so the tick after it
+-- publishes any window action the command queued.
+local function waitingRun(cx: BlockCx?, what: string, args: { string }, done: ((any) -> ())?)
+	python(WAITING_CLI, args, WAITING_TIMEOUT_MS, function(res)
+		local okj, data = pcall(tern.json.decode, res.stdout)
+		if res.status == 0 and okj and type(data) == "table" and val(data.ok) == true then
+			local view = val(data.view)
+			if type(view) == "table" then
+				applyWaiting(view)
+				waitingTick()
+			end
+			if done then
+				done(data)
+			end
+			return
+		end
+		local detail = if okj and type(data) == "table" then str(data.error) else ""
+		detail = if detail ~= "" then detail else firstLine(res.stderr)
+		if cx then
+			cx:toast("error", "CodexBar AgentView: " .. what .. " failed", detail)
+		else
+			tern.log.warn("codexbar: " .. what .. " failed", detail)
+		end
+		if done then
+			done(nil)
+		end
+	end)
+end
+
+-- A window sees only its own panes; this half alone can tell that a pane
+-- action's target is gone from every window.
+local function ackGonePanes()
+	local live: { [number]: boolean } = {}
+	for _, p in tern.pane.list() do
+		live[p.pane] = true
+	end
+	for _, a in (if type(store.waitingActions) == "table" then store.waitingActions else {}) do
+		local pane = tonumber(val(a.pane))
+		local id = str(a.id)
+		if a.type ~= "toast" and pane and not live[pane] and not store.waitingAcking[id] then
+			store.waitingAcking[id] = true
+			waitingRun(nil, "ack", { "ack", "--action", id, "--result", "done" }, function()
+				store.waitingAcking[id] = nil
+			end)
+		end
+	end
+end
+
+-- Which pane runs which session, for the window half's set-aside. Only a
+-- session or pane change asks for a tick: the applet rewrites agents.json every
+-- 5 s, and each tick is a Python process.
+local function noteAgents()
+	local map: { [string]: any } = {}
+	local parts = {}
+	for _, a in (if type(store.agents) == "table" then val(store.agents.agents) else nil) or {} do
+		local id = str(a.sessionId)
+		local pane = tonumber(val(a.ternPane))
+		if pane and id ~= "" then
+			map[tostring(pane)] = { session = id, provider = str(a.provider) }
+		end
+		table.insert(parts, id .. ":" .. str(a.ternPane))
+	end
+	table.sort(parts)
+	local sig = table.concat(parts, ",")
+	if sig ~= store.waitingAgents then
+		store.waitingAgents = sig
+		tern.kv.set("paneSessions", map)
+		waitingTick()
+	end
+end
+
+-- `pane_exited` reaches only this half, which also runs with no window open.
+-- The view file, not the last tick: a job can end right after its `add`, and
+-- its one event must not be lost. Most panes watch nothing, so the view decides
+-- before a Python process starts.
+local function jobFinished(pane: number, status: number)
+	local okj, view = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
+	if okj and type(view) == "table" and jobPanes(view)[pane] then
+		waitingRun(nil, "job event", { "event", "--type", "job_finished", "--pane", tostring(pane), "--status", tostring(status) })
+	end
+end
+
+tern.on("command_finished", function(ev: CommandFinishedEvent)
+	jobFinished(ev.pane, ev.status)
+end)
+tern.on("pane_exited", function(ev: PaneExitedEvent)
+	jobFinished(ev.pane, ev.status)
+end)
 
 -- Newest measurement in a snapshot, in epoch seconds.
 local function measuredAt(snap: any): number
@@ -1377,6 +1644,7 @@ local function tick()
 			prune()
 			publishOpen()
 			if readAgents() then
+				noteAgents()
 				publishSummary()
 				renderAll()
 			end
@@ -1384,6 +1652,19 @@ local function tick()
 			if not updated or nowMs() - updated > AGENTS_STALE_MS then
 				scanAgents(false)
 			end
+			ackGonePanes()
+			-- Another writer (the omp extension, tern-awui) may have queued a window action.
+			if not store.waitingTicking and readWaiting(WAITING_FILE) ~= store.waitingRaw then
+				waitingTick()
+			end
+		end
+		local poke = tern.kv.get("waitingPoke")
+		if poke ~= nil and poke ~= store.lastPoke then
+			store.lastPoke = poke
+			waitingTick()
+		end
+		if not store.waitingTicking and os.time() >= store.waitingAt then
+			waitingTick()
 		end
 		local now = os.time()
 		if now - store.cacheReadAt >= CACHE_EVERY_S then
@@ -1886,7 +2167,7 @@ local function focusedKey(list: { any }): string?
 	return hit
 end
 
-type Row = { key: string, record: any, history: boolean }
+type Row = { key: string, record: any, history: boolean, waiting: boolean? }
 
 -- Over a day in a state other than working or blocked: the tab's eye switch hides these.
 local function isOld(a: any, nowMs: number): boolean
@@ -1974,6 +2255,74 @@ end
 
 local LAUNCH_HOSTS = { kitty = true, tern = true }
 
+local BALLS = {
+	{ id = "on_me", title = "On me" },
+	{ id = "on_machine", title = "Machine watching" },
+	{ id = "on_someone", title = "Waiting on something" },
+	{ id = "on_my_time", title = "When I have time" },
+}
+
+local function waitKey(r: any): string
+	local id = str(r.session_id)
+	return if id ~= "" then "s-" .. nodeKey(id) else "p-" .. str(r.pane)
+end
+
+local function waitLive(r: any): boolean
+	return str(r.session_id) == "" or val(r.live) == true
+end
+
+local function waitTitle(r: any): string
+	local title = oneLine(if str(r.session_id) ~= "" then r.title else r.label)
+	return if title ~= "" then title else "Pane " .. str(r.pane)
+end
+
+-- What the row waits for: the first wait that is not a chain's later step.
+local function waitSummary(r: any): string
+	for _, w in val(r.waits) or {} do
+		if w.state ~= "pending" then
+			local text = oneLine(w.summary)
+			return if text ~= "" then text else oneLine(w.label)
+		end
+	end
+	return oneLine(r.status)
+end
+
+local function waitMatches(r: any, q: string): boolean
+	local fields = { waitTitle(r), oneLine(r.note), oneLine(r.project), waitSummary(r) }
+	for _, w in queryWords(q) do
+		local ok = false
+		for _, text in fields do
+			if matchPositions(text, w, true) then
+				ok = true
+				break
+			end
+		end
+		if not ok then
+			return false
+		end
+	end
+	return true
+end
+
+-- The view's order within each group, sessions before panes.
+local function waitingGroups(q: string): { { ball: any, rows: { any } } }
+	local out = {}
+	for _, ball in BALLS do
+		local rows = {}
+		for _, field in { "sessions", "panes" } do
+			for _, r in waitingList(field) do
+				if r.ball == ball.id and waitMatches(r, q) then
+					table.insert(rows, r)
+				end
+			end
+		end
+		if #rows > 0 then
+			table.insert(out, { ball = ball, rows = rows })
+		end
+	end
+	return out
+end
+
 local function selectable(b: Block): { Row }
 	local q = string.lower(b.filter)
 	local out: { Row } = {}
@@ -1981,6 +2330,12 @@ local function selectable(b: Block): { Row }
 		for _, g in agentRows(q) do
 			for _, r in g.rows do
 				table.insert(out, { key = recordKey(r), record = r, history = false })
+			end
+		end
+	elseif b.tab == "waiting" then
+		for _, g in waitingGroups(q) do
+			for _, r in g.rows do
+				table.insert(out, { key = waitKey(r), record = r, history = false, waiting = true })
 			end
 		end
 	elseif b.tab == "history" then
@@ -2002,6 +2357,15 @@ local function selected(b: Block): Row?
 		end
 	end
 	return rows[1]
+end
+
+-- The pane a row's session card floats over, nil when the row has no Card button:
+-- a live omp session in Tern on Agents, a live row with a pane on Waiting.
+local function cardPane(r: any, waiting: boolean): number?
+	if waiting then
+		return if waitLive(r) then tonumber(val(r.pane)) else nil
+	end
+	return if r.provider == "omp" then tonumber(val(r.ternPane)) else nil
 end
 
 -- A capped list scrolls itself and keeps the selected row in view. The cap is
@@ -2035,6 +2399,9 @@ local function peekNode(b: Block, r: any, history: boolean): Node
 		table.insert(buttons, button("Dismiss", "dismiss", { keys = { "del" } }))
 	else
 		table.insert(buttons, button("Focus", "focus", { variant = "primary", keys = { "enter" } }))
+		if cardPane(r, false) then
+			table.insert(buttons, button("Card", "card", { keys = { "shift", "enter" } }))
+		end
 		local ternInstalled = type(store.agents) == "table" and val(store.agents.ternInstalled) == true
 		if ternInstalled and r.host == "kitty" and str(r.resumeCommand) ~= "" then
 			table.insert(buttons, button("Teleport to Tern", "teleport", {
@@ -2235,6 +2602,167 @@ local function historyView(b: Block, now: number): Node
 	return listView(b, kids, empty)
 end
 
+-- "overdue", time left, else how long it has been set aside.
+local function waitingTime(r: any, now: number): (string, string)
+	for _, w in val(r.waits) or {} do
+		if val(w.overdue) == true then
+			return "overdue", "error"
+		end
+	end
+	local due = epoch(r.due_at)
+	if due then
+		if due <= now then
+			return "due", "warning"
+		end
+		return leftUntil(due, now), "muted"
+	end
+	local since = epoch(r.set_aside_at)
+	return if since then ageFrom(since * 1000, now * 1000) else "", "dim"
+end
+
+local function waitingItem(r: any, now: number, q: string): Node
+	local onMe = r.ball == "on_me"
+	local label: { Span | string } = {}
+	if onMe or val(r.unseen) == true then
+		table.insert(label, ui.span("● ", "warning"))
+	end
+	for _, s in highlighted(waitTitle(r), q) do
+		table.insert(label, s)
+	end
+	local time, token = waitingTime(r, now)
+	return ui.node("item", {
+		key = waitKey(r),
+		label = label,
+		detail = waitSummary(r),
+		value = { ui.span(string.format("%7s", time), token) },
+		icon = if str(r.session_id) ~= "" then AGENT_ICONS.omp else "terminal",
+		tone = if onMe then "warning" else nil,
+		role = "codexbar.waiting",
+	})
+end
+
+local function detailLines(key: string, head: string, lines: { Node }): Node
+	local kids: { Node } = { ui.text({ ui.span(head, "muted") }) }
+	for _, n in lines do
+		table.insert(kids, n)
+	end
+	return withp(ui.lines(kids), { key = key })
+end
+
+-- The same colors as the session card's badges in the window half.
+local PR_STATE_TOKEN = { open = "success", draft = "muted", merged = "info", closed = "error" }
+
+-- The session's PRs as links, in the CLI's order; those it only mentions are muted.
+local function prNodes(r: any): { Node }
+	local out: { Node } = {}
+	for _, pr in val(r.prs) or {} do
+		local text = "PR#" .. str(pr.number) .. " " .. clip(oneLine(val(pr.title) or pr.repo), 60)
+		local spans: { any } = { ui.link(text, str(pr.url), if pr.source == "mentioned" then "muted" else nil) }
+		local state = str(pr.state)
+		if state ~= "" then
+			table.insert(spans, ui.span("  " .. state, PR_STATE_TOKEN[state] or "muted"))
+		end
+		table.insert(out, withp(ui.text(spans), { key = "pr-" .. nodeKey(str(pr.repo)) .. "-" .. str(pr.number), role = "codexbar.pr" }))
+	end
+	return out
+end
+
+-- The selected row: my sentence and the buttons; Space adds the rest of the record.
+local function waitingPeek(b: Block, r: any, now: number): Node
+	local kids: { Node } = {}
+	local note = oneLine(r.note)
+	if note ~= "" then
+		table.insert(kids, withp(ui.text({ ui.span(note, "strong") }), { key = "note" }))
+	end
+	local prs = prNodes(r)
+	if #prs > 0 then
+		table.insert(kids, detailLines("prs", "Pull requests", prs))
+	end
+	local rowKey = waitKey(r)
+	local live = waitLive(r)
+	local buttons: { Node } = {}
+	if live then
+		table.insert(buttons, button("Open", "wait_open", { variant = "primary", keys = { "enter" } }))
+	else
+		table.insert(buttons, button("Resume", "wait_open", { variant = "primary", keys = { "enter" }, busy = b.busy == rowKey }))
+	end
+	table.insert(buttons, button("+1 day", "wait_snooze", {
+		keys = if b.filter == "" then { "+" } else nil,
+		disabled = if firstDue(r) then false else "Nothing to snooze",
+	}))
+	table.insert(buttons, button("Done", "wait_done", { keys = { "del" } }))
+	if cardPane(r, true) then
+		table.insert(buttons, button("Card", "wait_card", { keys = { "shift", "enter" } }))
+	end
+	local peekKeys = if b.filter == "" then { "space" } else nil
+	table.insert(buttons, button(if b.peek then "Hide details" else "Details", "peek", { icon = "message", keys = peekKeys, on = b.peek }))
+	table.insert(kids, withp(ui.row(buttons), { key = "actions", wrap = true }))
+	if b.peek then
+		local suggested = oneLine(r.suggested_note)
+		if suggested ~= "" then
+			table.insert(kids, withp(ui.row({
+				ui.text({ ui.span("Suggested: ", "muted"), suggested }),
+				button("Accept", "wait_accept"),
+			}), { key = "suggested" }))
+		end
+		local history = {}
+		for i, h in val(r.history) or {} do
+			local at = epoch(h.at)
+			table.insert(history, withp(ui.text({
+				ui.span((if at then absoluteTime(at, now) else "") .. "  ", "dim"),
+				oneLine(h.text),
+			}), { key = "h" .. i }))
+		end
+		if #history > 0 then
+			table.insert(kids, detailLines("since", "Since then", history))
+		end
+		local nextStep = oneLine(r.next_step)
+		if nextStep ~= "" then
+			table.insert(kids, detailLines("next", "Next step", { ui.text(nextStep) }))
+		end
+		local recap = oneLine(r.recap)
+		if recap ~= "" then
+			table.insert(kids, detailLines("recap", "Recap", { ui.text({ ui.span(recap, "muted") }) }))
+		end
+		local schedules = {}
+		for i, j in val(r.schedules) or {} do
+			local every = tonumber(val(j.every_s))
+			local due = epoch(j.due_at)
+			local text = if every then "every " .. string.gsub(span(every), " 0[hm]$", "") else "once"
+			if due then
+				text ..= " · next " .. absoluteTime(due, now)
+			end
+			table.insert(schedules, withp(ui.text({ ui.span(text .. "  ", "dim"), clip(oneLine(j.prompt), 80) }), { key = "j" .. i }))
+		end
+		if #schedules > 0 then
+			table.insert(kids, detailLines("schedules", "Schedules", schedules))
+		end
+	end
+	return withp(ui.col(kids), { key = "peek-" .. rowKey, role = "codexbar.peek", gap = "sm" })
+end
+
+local function waitingView(b: Block, now: number): Node
+	if not store.waiting and not store.waitingError then
+		return ui.node("skeleton", { key = "list", shape = "rows", rows = 8, aria = "Reading waits" })
+	end
+	local q = string.lower(b.filter)
+	local sel = selected(b)
+	local kids: { Node } = {}
+	for _, g in waitingGroups(q) do
+		table.insert(kids, groupHead("w-" .. g.ball.id, { ui.span(g.ball.title, "strong"), ui.span("  " .. #g.rows, "muted") }))
+		for _, r in g.rows do
+			table.insert(kids, waitingItem(r, now, q))
+			if sel and sel.key == waitKey(r) then
+				table.insert(kids, waitingPeek(b, r, now))
+			end
+		end
+	end
+	local empty = if b.filter ~= "" then noMatch(b, "wait")
+		elseif not store.waiting then emptyNode("warn", "Waits unavailable", store.waitingError)
+		else emptyNode("clock", "Nothing is set aside", "Ctrl+Alt+B sets the focused session aside.")
+	return listView(b, kids, empty)
+end
+
 local function key(text: string): Span
 	return ui.span(text, "key")
 end
@@ -2245,7 +2773,8 @@ end
 
 local function dockView(b: Block, now: number): Node
 	local segs: { Node } = {}
-	local hints: { any } = { key("←"), key("→"), ui.span(" tabs   ", "dim") }
+	-- A hint's label starts with a no-break space: a wrapped footer keeps each key beside its label.
+	local hints: { any } = { key("←"), key("→"), ui.span("\u{a0}tabs   ", "dim") }
 	if b.tab == "usage" then
 		local snap = store.usage
 		local at = math.max(store.usageAt, measuredAt(snap))
@@ -2260,7 +2789,7 @@ local function dockView(b: Block, now: number): Node
 		if type(snap) == "table" and str(snap.cliVersion) ~= "" then
 			table.insert(segs, seg("cli", "codexbar " .. str(snap.cliVersion), { side = "right", priority = 1 }))
 		end
-		for _, n in { key("r"), ui.span(" refresh   ", "dim"), key("esc"), ui.span(" close", "dim") } do
+		for _, n in { key("r"), ui.span("\u{a0}refresh   ", "dim"), key("esc"), ui.span("\u{a0}close", "dim") } do
 			table.insert(hints, n)
 		end
 	else
@@ -2268,7 +2797,14 @@ local function dockView(b: Block, now: number): Node
 		for _, a in liveAgents() do
 			c[str(a.state)] = (c[str(a.state)] or 0) + 1
 		end
-		if b.tab == "agents" then
+		if b.tab == "waiting" then
+			local w = waitingCounts()
+			local onMe = tonumber(val(w.on_me)) or 0
+			table.insert(segs, seg("on_me", onMe .. " on me", { icon = "warn", tone = if onMe > 0 then "warning" else "muted", priority = 5 }))
+			table.insert(segs, seg("machine", (tonumber(val(w.on_machine)) or 0) .. " watched", { icon = "activity", tone = "muted", priority = 4 }))
+			table.insert(segs, seg("someone", (tonumber(val(w.on_someone)) or 0) .. " on something", { icon = "users", tone = "muted", priority = 3 }))
+			table.insert(segs, seg("my_time", (tonumber(val(w.on_my_time)) or 0) .. " when I have time", { icon = "clock", tone = "muted", priority = 2 }))
+		elseif b.tab == "agents" then
 			table.insert(segs, seg("working", c.working .. " working", { icon = "activity", tone = if c.working > 0 then "success" else "muted", priority = 4 }))
 			table.insert(segs, seg("blocked", c.blocked .. " blocked", { icon = "warn", tone = if c.blocked > 0 then "error" else "muted", priority = 5 }))
 			table.insert(segs, seg("idle", c.idle .. " idle", { icon = "pause", tone = "muted", priority = 2 }))
@@ -2284,24 +2820,35 @@ local function dockView(b: Block, now: number): Node
 			table.insert(segs, seg("scan", "Scanning", { side = "right", priority = 1 }, { ui.node("spinner", { style = "dots" }) }))
 		end
 		for _, n in {
-			key("↑"), key("↓"), ui.span(" select   ", "dim"),
-			key("⏎"), ui.span(if b.tab == "agents" then " focus   " else " launch   ", "dim"),
+			key("↑"), key("↓"), ui.span("\u{a0}select   ", "dim"),
+			key("⏎"), ui.span(if b.tab == "agents" then "\u{a0}focus   " elseif b.tab == "waiting" then "\u{a0}open   " else "\u{a0}launch   ", "dim"),
 		} do
 			table.insert(hints, n)
 		end
+		if b.tab ~= "history" then
+			table.insert(hints, key("shift+enter"))
+			table.insert(hints, ui.span("\u{a0}card   ", "dim"))
+		end
 		if b.filter == "" then
 			table.insert(hints, key("space"))
-			table.insert(hints, ui.span(" conversation   ", "dim"))
+			table.insert(hints, ui.span(if b.tab == "waiting" then "\u{a0}details   " else "\u{a0}conversation   ", "dim"))
 		end
 		if b.tab == "agents" then
 			table.insert(hints, key("tab"))
-			table.insert(hints, ui.span(if setting("hideOld") then " show old   " else " hide old   ", "dim"))
+			table.insert(hints, ui.span(if setting("hideOld") then "\u{a0}show\u{a0}old   " else "\u{a0}hide\u{a0}old   ", "dim"))
+		elseif b.tab == "waiting" then
+			if b.filter == "" then
+				table.insert(hints, key("+"))
+				table.insert(hints, ui.span("\u{a0}1\u{a0}day   ", "dim"))
+			end
+			table.insert(hints, key("del"))
+			table.insert(hints, ui.span("\u{a0}done   ", "dim"))
 		elseif b.tab == "history" then
 			table.insert(hints, key("del"))
-			table.insert(hints, ui.span(" dismiss   ", "dim"))
+			table.insert(hints, ui.span("\u{a0}dismiss   ", "dim"))
 		end
 		table.insert(hints, key("esc"))
-		table.insert(hints, ui.span(if b.filter ~= "" then " clear" else " close", "dim"))
+		table.insert(hints, ui.span(if b.filter ~= "" then "\u{a0}clear" else "\u{a0}close", "dim"))
 	end
 	table.insert(segs, seg("settings", "Settings", { icon = "gear", side = "right", priority = 6, actions = { click = "settings" } }))
 	return ui.col({
@@ -2312,12 +2859,14 @@ end
 
 local function tabsNode(b: Block): Node
 	local reboot, exited = historyRows("")
-	local counts = { agents = #liveAgents(), history = #reboot + #exited }
+	local onMe = tonumber(val(waitingCounts().on_me)) or 0
+	local counts = { agents = #liveAgents(), waiting = onMe, history = #reboot + #exited }
 	local items = {}
 	for _, id in TABS do
 		local label: { any } = { ui.span(TAB_NAMES[id]) }
 		if counts[id] then
-			table.insert(label, ui.span(" " .. counts[id], if id == "history" and #reboot > 0 then "warning" else "muted"))
+			local alert = (id == "history" and #reboot > 0) or (id == "waiting" and onMe > 0)
+			table.insert(label, ui.span(" " .. counts[id], if alert then "warning" else "muted"))
 		end
 		table.insert(items, { id = id, label = label })
 	end
@@ -2342,7 +2891,8 @@ local function filterNode(b: Block): Node
 		key = "filter",
 		text = b.filter,
 		cursor = #b.filter,
-		placeholder = "Type to filter by title, prompt, folder, provider or model",
+		placeholder = if b.tab == "waiting" then "Type to filter by title, note, project or wait"
+			else "Type to filter by title, prompt, folder, provider or model",
 		icon = "search",
 		clear = true,
 		buttons = buttons,
@@ -2465,12 +3015,67 @@ local function teleport(b: Block, r: any)
 	end)
 end
 
+-- Layout work belongs to the window half; the dashboard's window takes this up
+-- like `settingsRequest`.
+local function waitingRequest(b: Block, request: { [string]: any })
+	request.pane = b.cx.pane
+	request.seq = tern.now()
+	tern.kv.set("waitingRequest", request)
+end
+
+-- `verb` aimed at the row's session, or at its pane for a non-omp one.
+local function waitArgs(verb: string, r: any, extra: { string }?): { string }
+	local id = str(r.session_id)
+	local args = { verb, if id ~= "" then "--session" else "--pane", if id ~= "" then id else str(r.pane) }
+	for _, a in extra or {} do
+		table.insert(args, a)
+	end
+	return args
+end
+
+local function waitingOpen(b: Block, r: any)
+	local pane = tonumber(val(r.pane))
+	if waitLive(r) and pane then
+		waitingRequest(b, { op = "open", target = pane })
+	elseif waitLive(r) then -- running outside Tern
+		focusRecord(b, { sessionId = r.session_id })
+	else
+		b.busy = waitKey(r)
+		waitingRun(b.cx, "resume", waitArgs("resume", r), function(data)
+			b.busy = nil
+			if data then
+				waitingRequest(b, { op = "launch", command = str(data.command), cwd = str(data.cwd) })
+			end
+			b.cx:render()
+		end)
+	end
+end
+
+local function waitingAct(b: Block, name: string, r: any)
+	if name == "wait_open" then
+		waitingOpen(b, r)
+	elseif name == "wait_done" then
+		waitingRun(b.cx, "done", waitArgs("done", r))
+	elseif name == "wait_snooze" then
+		local wait = firstDue(r)
+		if wait then
+			waitingRun(b.cx, "snooze", waitArgs("snooze", r, { "--wait", str(wait.id), "--for", "1d" }))
+		end
+	elseif name == "wait_accept" then
+		waitingRun(b.cx, "accept note", waitArgs("note", r, { "--accept-suggested" }))
+	elseif name == "wait_card" then
+		waitingRequest(b, { op = "open", target = tonumber(val(r.pane)), card = true })
+	end
+end
+
 local function activate(b: Block)
 	local row = selected(b)
 	if not row then
 		return
 	end
-	if row.history then
+	if row.waiting then
+		waitingOpen(b, row.record)
+	elseif row.history then
 		launchRecord(b, row.record)
 	else
 		focusRecord(b, row.record)
@@ -2500,11 +3105,15 @@ local function act(b: Block, name: string)
 		-- The selected row stays selected, so Esc then Space peeks at the session the filter found.
 		b.sel = if row then row.key else nil
 		b.filter = ""
+	elseif row and row.waiting then
+		waitingAct(b, name, row.record)
 	elseif row then
 		if name == "focus" then
 			focusRecord(b, row.record)
 		elseif name == "launch" then
 			launchRecord(b, row.record)
+		elseif name == "card" then
+			waitingRequest(b, { op = "open", target = tonumber(val(row.record.ternPane)), card = true })
 		elseif name == "teleport" then
 			teleport(b, row.record)
 		elseif name == "copy_resume" then -- `copy` is Tern's own action: it copies the node's text
@@ -2576,7 +3185,9 @@ tern.block.define("dashboard", {
 			end
 		else
 			table.insert(main, filterNode(b))
-			if not store.agents then
+			if b.tab == "waiting" then
+				table.insert(main, waitingView(b, now))
+			elseif not store.agents then
 				table.insert(main, ui.node("skeleton", { key = "list", shape = "rows", rows = 8, aria = "Scanning agents" }))
 			elseif b.tab == "agents" then
 				table.insert(main, agentsView(b, now * 1000))
@@ -2636,6 +3247,13 @@ tern.block.define("dashboard", {
 			move(b, 0, 1)
 		elseif name == "end" then
 			move(b, 0, math.huge)
+		elseif name == "enter" and k.shift then
+			-- The Card button's key (Tern reports Shift+Space as a plain Space). A row
+			-- without the button, History's included, ignores it.
+			local row = selected(b)
+			if row and not row.history and cardPane(row.record, row.waiting == true) then
+				act(b, if row.waiting then "wait_card" else "card")
+			end
 		elseif name == "space" and b.filter == "" then
 			-- Space peeks only while no query is in progress; after that it is a filter character.
 			b.peek = not b.peek
@@ -2643,6 +3261,10 @@ tern.block.define("dashboard", {
 			activate(b)
 		elseif name == "delete" and b.tab == "history" then
 			act(b, "dismiss")
+		elseif name == "delete" and b.tab == "waiting" then
+			act(b, "wait_done")
+		elseif k.text == "+" and b.tab == "waiting" and b.filter == "" then
+			act(b, "wait_snooze")
 		elseif name == "backspace" then
 			if b.filter == "" then
 				return false
@@ -3076,4 +3698,5 @@ tern.block.define("settings", {
 
 local initialGoto = tern.kv.get("goto")
 store.lastGoto = if type(initialGoto) == "table" then initialGoto.seq else nil
+store.lastPoke = tern.kv.get("waitingPoke")
 tern.timer(0, tick)
