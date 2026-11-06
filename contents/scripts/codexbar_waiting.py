@@ -1085,7 +1085,7 @@ def _activate_next(record: dict, wait: dict, now: datetime) -> None:
         if following is None:
             return
         if following["state"] == "pending":
-            _arm(following, now)
+            _arm_step(record, following, now)
             _log(record, now, following, f"Next: {following['label']}")
             return
         if following["state"] != "done":
@@ -1110,6 +1110,13 @@ def _settle(state: dict, record: dict, now: datetime) -> None:
 
 
 def _complete(state: dict, record: dict, wait: dict, now: datetime) -> None:
+    _finish(record, wait, now)
+    _settle(state, record, now)
+
+
+def _finish(record: dict, wait: dict, now: datetime) -> None:
+    """Close one wait without settling the record: callers that keep another
+    wait open need no `state`."""
     started = wait["state"] != "pending"
     wait["state"] = "done"
     wait.update(on_me=False, overdue=False, reason=None, verify_pending=False)
@@ -1119,7 +1126,18 @@ def _complete(state: dict, record: dict, wait: dict, now: datetime) -> None:
     # decides when the chain moves on.
     if started:
         _activate_next(record, wait, now)
-    _settle(state, record, now)
+
+
+def _arm_step(record: dict, wait: dict, now: datetime) -> None:
+    """Arm a chain step. A `something` step becomes the target's one free-text
+    status, so the one it replaces closes."""
+    _arm(wait, now)
+    if wait["kind"] != "something":
+        return
+    for other in _free_text_waits(record):
+        if other is not wait:
+            _log(record, now, other, f"Done: {other['label']}")
+            _finish(record, other, now)
 
 
 def _prompt_text(wait: dict) -> str:
@@ -2125,7 +2143,7 @@ def _park(state: dict, record: dict, agents: Agents, now: datetime) -> None:
 def _attach_after(record: dict, wait: dict, after: str | None, now: datetime) -> None:
     """Put `wait` at the end of `after`'s chain, or arm it when that has ended."""
     if after is None:
-        _arm(wait, now)
+        _arm_step(record, wait, now)
         return
     tail = _wait_in(record, after)
     if tail is None:
@@ -2134,7 +2152,7 @@ def _attach_after(record: dict, wait: dict, after: str | None, now: datetime) ->
         tail = _wait_in(record, tail["next"])
     tail["next"] = wait["id"]
     if tail["state"] in ("fired", "done"):
-        _arm(wait, now)
+        _arm_step(record, wait, now)
 
 
 def _free_text_waits(record: dict | None) -> list[dict]:

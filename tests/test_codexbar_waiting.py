@@ -2880,6 +2880,21 @@ class WhatTests(Case):
         self.assertNotEqual(now["id"], step["id"])
         self.assertEqual(self.session()["waiting_for"], "now")
         self.assertEqual(self.wait_of(step["id"])["label"], "later on")
+        self.run_cli("done", "--session", SID, "--wait", timer)
+        seen = self.session()
+        self.assertEqual([wait["id"] for wait in seen["waits"]], [step["id"]])
+        self.assertEqual(seen["waiting_for"], "later on")
+
+    def test_a_step_after_an_ended_wait_replaces_the_status(self) -> None:
+        timer = self.add("--kind", "time", "--in", "1s")["id"]
+        self.advance(seconds=2)
+        self.tick()
+        self.what("now")
+        step = self.add("--kind", "something", "--what", "next", "--after", timer)
+        self.assertEqual(step["state"], "waiting")
+        seen = self.session()
+        self.assertEqual([wait["id"] for wait in seen["waits"] if wait["kind"] == "something"], [step["id"]])
+        self.assertEqual(seen["waiting_for"], "next")
 
     def test_older_state_with_two_ends_with_one(self) -> None:
         self.what("x")
