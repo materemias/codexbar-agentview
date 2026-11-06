@@ -686,14 +686,11 @@ class ReadyTest(PollTestCase):
     def test_behind_blocks(self) -> None:
         self.assert_ready(FakeGh(pr_answer(reviews=[bot_review()], merge_state="BEHIND")), False)
 
-    def test_merged_before_ready_needs_me_and_does_not_fire(self) -> None:
+    def test_merged_before_ready_says_so_and_does_not_fire(self) -> None:
         gh = FakeGh(pr_answer(state="MERGED", reviews=[bot_review(OLD_HEAD)]))
         result = self.assert_ready(gh, False)
-        self.assertEqual(
-            result["events"],
-            [{"key": f"merged:{MERGE_SHA}", "text": "PR#7 merged before it was ready", "on_me": True}],
-        )
-        self.assertEqual(result["next_poll_s"], 3600)
+        self.assertTrue(result["merged"])
+        self.assertEqual(result["events"], [])
 
 
 class MergedTest(PollTestCase):
@@ -704,9 +701,25 @@ class MergedTest(PollTestCase):
         result = self.poll(gh, until="merged")
         self.assertTrue(result["fired"])
         self.assertEqual(result["fire_text"], "PR#7 merged")
+        self.assertTrue(result["merged"])
 
     def test_merged_at_first_poll_fires(self) -> None:
         self.assertTrue(self.poll(FakeGh(pr_answer(state="MERGED")), until="merged")["fired"])
+
+    def test_every_wait_says_the_pr_is_merged(self) -> None:
+        for until in github.UNTILS:
+            with self.subTest(until=until):
+                self.memo = {}
+                self.assertTrue(self.poll(FakeGh(pr_answer(state="MERGED")), until=until)["merged"])
+
+    def test_a_release_wait_says_so_on_later_polls_too(self) -> None:
+        gh = FakeGh(pr_answer(state="MERGED"))
+        self.poll(gh, until="released")
+        self.assertTrue(self.poll(gh, until="released")["merged"])
+
+    def test_an_open_or_closed_pr_is_not(self) -> None:
+        self.assertFalse(self.poll(FakeGh())["merged"])
+        self.assertFalse(self.poll(FakeGh(pr_answer(state="CLOSED")))["merged"])
 
 
 class ActivityTest(PollTestCase):

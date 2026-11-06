@@ -7,8 +7,9 @@ exists and reports none of it.
 
 `fired` and `confirm` describe the PR's state, so a condition that already holds
 fires on the first poll. Only events are held back by the baseline, except the
-ones that end the wait's chance of firing (closed, merged early, a release that
-needs confirming): those have no later poll to report them.
+ones that end the wait's chance of firing (closed, a release that needs
+confirming): those have no later poll to report them. `merged` says the PR is
+merged, which settles any wait on it: the caller decides how.
 
 GraphQL has a separate budget from REST. When it runs low, polls read REST,
 which has no review threads and no checks, so `ready` can't fire and
@@ -53,7 +54,7 @@ STATUS_BOTS = ("github-actions", "vercel", "netlify", "railway", "cloudflare")
 DEFAULT_POLL_S = 180
 RETRY_POLL_S = 60
 RATE_LIMITED_POLL_S = 900
-# Closed, or merged before the condition held: only a reopen can change that.
+# Closed, or merged while watching for activity: only a reopen can change that.
 ENDED_POLL_S = 3600
 RATE_FLOOR = 200
 RATE_CHECK_S = 600
@@ -704,6 +705,7 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
     repo, number, until = cond["repo"], cond["number"], cond["until"]
     merged = memo.get("merged") or {}
     if until == "released" and merged.get("sha"):
+        result["merged"] = True
         _check_release(repo, number, merged, memo, result, events, run)
         return
     pr = _fetch(repo, number, memo, result, run, now)
@@ -711,6 +713,7 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
 
     if pr["state"] == "MERGED":
         memo["merged"] = {"sha": pr["merge_sha"], "at": pr["merged_at"]}
+        result["merged"] = True
         if until == "merged":
             result["fired"] = True
             result["fire_text"] = f"PR#{number} merged"
@@ -829,15 +832,6 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
         result["fire_text"] = fire_text
         # The fire text says the same thing as the bots' own events.
         events.drop({f"bot:{bot}:{head}" for bot in reviewed})
-    elif pr["state"] == "MERGED":
-        goal = "a bot reviewed the head" if until == "review_on_head" else "it was ready"
-        events.emit(
-            f"merged:{pr['merge_sha']}",
-            f"PR#{number} merged before {goal}",
-            on_me=True,
-            always=True,
-        )
-        result["next_poll_s"] = ENDED_POLL_S
 
 
 def _invalid(cond: Json) -> str | None:
@@ -895,6 +889,7 @@ def poll(cond: Json, memo: Json, *, run: Run = subprocess.run, now: float | None
         "memo": memo,
         "events": [],
         "fired": False,
+        "merged": False,
         "fire_text": None,
         "confirm": False,
         "error": None,

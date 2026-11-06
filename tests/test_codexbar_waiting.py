@@ -143,6 +143,11 @@ class Case(unittest.TestCase):
     def state(self) -> dict:
         return json.loads((self.state_dir / "waiting.json").read_text())
 
+    def github(self, **overrides):
+        patch = mock.patch.dict(sys.modules, {"waiting_github": fake_github(**overrides)})
+        patch.start()
+        self.addCleanup(patch.stop)
+
 
 class CliShapeTests(Case):
     def test_bad_input_is_one_json_object_with_exit_2(self) -> None:
@@ -664,11 +669,6 @@ class ConditionTests(Case):
 
 
 class PrTests(Case):
-    def github(self, **overrides):
-        patch = mock.patch.dict(sys.modules, {"waiting_github": fake_github(**overrides)})
-        patch.start()
-        self.addCleanup(patch.stop)
-
     def test_pr_url_and_defaults(self) -> None:
         self.github()
         wait = self.add("--kind", "pr", "--pr", "https://example/7")
@@ -972,7 +972,7 @@ class DeadlineTests(Case):
         for wait in (timer, something):
             self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
         self.assertEqual(self.wait_of(timer)["state"], "waiting")
-        self.assertEqual(self.wait_of(timer)["ball"], "on_machine")
+        self.assertEqual(self.wait_of(timer)["ball"], "on_timer")
         self.assertEqual(self.wait_of(something)["ball"], "on_someone")
         self.advance(days=1)
         self.tick()
@@ -1133,11 +1133,99 @@ class MenuRequestTests(Case):
     def test_a_state_file_from_before_the_menu_still_loads(self) -> None:
         self.heartbeat()
         state = self.state()
-        for field in ("extension_features", "menu_seq", "menu_requests"):
+        for field in ("extension_features", "extension_panes", "menu_seq", "menu_requests"):
             del state[field]
         (self.state_dir / "waiting.json").write_text(json.dumps(state))
         self.heartbeat(SID, "--features", "menu")
         self.assertTrue(self.request()["menu"])
+
+    def test_a_heartbeat_names_the_pane_and_the_menu(self) -> None:
+        self.heartbeat(SID, "--pane", "52", "--features", "menu")
+        self.heartbeat(OTHER, "--pane", "53")
+        self.assertEqual(self.run_cli("list")["extension_panes"], {
+            "52": {"session": SID, "menu": True}, "53": {"session": OTHER, "menu": False},
+        })
+
+    def test_a_newer_session_takes_the_pane(self) -> None:
+        self.heartbeat(SID, "--pane", "52", "--features", "menu")
+        self.heartbeat(OTHER, "--pane", "52", "--features", "menu")
+        self.assertEqual(
+            self.run_cli("list")["extension_panes"], {"52": {"session": OTHER, "menu": True}},
+        )
+        self.assertEqual(self.state()["extension_panes"], {OTHER: 52})
+        self.assertEqual(self.run_cli("menu-request", "--pane", "52")["session"], OTHER)
+
+    def test_a_session_keeps_only_its_latest_pane(self) -> None:
+        self.heartbeat(SID, "--pane", "52")
+        self.heartbeat(SID, "--pane", "53")
+        self.assertEqual(list(self.run_cli("list")["extension_panes"]), ["53"])
+
+    def test_a_heartbeat_without_a_pane_keeps_the_last_one(self) -> None:
+        self.heartbeat(SID, "--pane", "52")
+        self.heartbeat(SID)
+        self.assertEqual(list(self.run_cli("list")["extension_panes"]), ["52"])
+
+    def test_a_stale_heartbeat_leaves_the_pane(self) -> None:
+        self.heartbeat(SID, "--pane", "52", "--features", "menu")
+        self.advance(seconds=waiting.EXTENSION_FRESH_S + 1)
+        self.assertEqual(self.run_cli("list")["extension_panes"], {})
+        answer = self.run_cli("menu-request", "--pane", "52")
+        self.assertEqual((answer["menu"], answer["reason"]), (False, waiting.REASON_MENU_NO_PANE))
+
+    def test_the_pane_leaves_with_the_extension_record(self) -> None:
+        self.heartbeat(SID, "--pane", "52")
+        self.advance(seconds=waiting.EXTENSION_KEPT_S + 1)
+        self.tick()
+        self.assertEqual(self.state()["extension_panes"], {})
+
+    def test_menu_request_by_pane(self) -> None:
+        self.heartbeat(SID, "--pane", "52", "--features", "menu")
+        answer = self.run_cli("menu-request", "--pane", "52")
+        self.assertTrue(answer["menu"])
+        self.assertEqual(answer["session"], SID)
+        self.assertIn(SID, answer["view"]["menu_requests"])
+
+    def test_menu_request_by_pane_refuses_an_empty_pane_and_an_old_extension(self) -> None:
+        self.heartbeat(SID, "--pane", "52")
+        empty = self.run_cli("menu-request", "--pane", "99")
+        self.assertEqual((empty["menu"], empty["reason"]), (False, "no omp extension in this pane"))
+        old = self.run_cli("menu-request", "--pane", "52")
+        self.assertEqual(
+            (old["menu"], old["session"], old["reason"]),
+            (False, SID, waiting.REASON_MENU_OLD_EXTENSION),
+        )
+        self.assertEqual(self.state()["menu_requests"], {})
+
+    def test_menu_request_needs_one_target(self) -> None:
+        self.run_cli("menu-request", expect=2)
+        self.run_cli("menu-request", "--session", SID, "--pane", "52", expect=2)
+
+    def test_a_session_gets_the_reported_pane_only_without_a_tracked_one(self) -> None:
+        self.add("--kind", "later")
+        self.heartbeat(SID, "--pane", "52")
+        self.assertEqual(self.session()["pane"], 52)
+        self.agents(SID)
+        self.assertEqual(self.session()["pane"], 40)
+        self.agents()
+        self.advance(seconds=waiting.EXTENSION_FRESH_S + 1)
+        self.assertIsNone(self.session()["pane"])
+
+    def test_a_session_that_ended_gives_its_pane_back(self) -> None:
+        self.heartbeat(SID, "--pane", "52", "--features", "menu")
+        self.advance(seconds=5)
+        self.agents(closed=[{"sessionId": SID, "cwd": "/w", "windowTitle": "x"}])
+        self.assertEqual(self.run_cli("list")["extension_panes"], {})
+        answer = self.run_cli("menu-request", "--pane", "52")
+        self.assertEqual((answer["menu"], answer["reason"]), (False, waiting.REASON_MENU_NO_PANE))
+
+    def test_a_resumed_session_keeps_its_pane_before_the_sweep_sees_it(self) -> None:
+        self.agents(closed=[{"sessionId": SID, "cwd": "/w", "windowTitle": "x"}])
+        payload = json.loads((self.state_dir / "agents.json").read_text())
+        payload["updatedAt"] = int(self.clock.timestamp() * 1000)
+        (self.state_dir / "agents.json").write_text(json.dumps(payload))
+        self.advance(seconds=5)
+        self.heartbeat(SID, "--pane", "52")
+        self.assertEqual(list(self.run_cli("list")["extension_panes"]), ["52"])
 
 
 class ChainTests(Case):
@@ -1606,8 +1694,9 @@ class ViewTests(Case):
         self.assertEqual(
             set(wait),
             {
-                "id", "kind", "label", "summary", "state", "ball", "overdue", "reason",
-                "created_at", "due_at", "deadline", "condition", "has_prompt", "next", "by",
+                "id", "kind", "label", "summary", "state", "ball", "overdue", "outcome",
+                "fired_text", "fired_at", "reason", "created_at", "due_at", "deadline",
+                "condition", "has_prompt", "next", "by",
             },
         )
         seen = self.session()
@@ -1616,13 +1705,14 @@ class ViewTests(Case):
             {
                 "session_id", "title", "cwd", "project", "live", "pane", "tern_session",
                 "agent_state", "extension", "resume_command", "note", "suggested_note",
-                "size", "set_aside_at", "pinned", "ball", "unseen", "status", "line", "composer_row",
+                "size", "set_aside_at", "pinned", "ball", "unseen", "outcome", "headline",
+                "status", "line", "composer_row",
                 "next_step", "waiting_for", "recap", "due_at", "prompts_queued", "waits",
                 "schedules", "history", "prs",
             },
         )
-        self.assertEqual(seen["status"], "⏳ Retry · in 2h")
-        self.assertEqual(seen["line"], '⏳ Retry · in 2h · "try again"')
+        self.assertEqual(seen["status"], "⏲ Retry · in 2h")
+        self.assertEqual(seen["line"], '⏲ Retry · in 2h · "try again"')
         self.assertEqual(seen["pane"], 40)
         self.assertEqual(seen["tern_session"], "Default")
         self.assertEqual(seen["agent_state"], "idle")
@@ -1636,8 +1726,12 @@ class ViewTests(Case):
         self.advance(days=2)
         self.tick()
         seen = self.session()
-        self.assertEqual(seen["status"], "● Retry · 2d")
-        self.assertEqual(seen["line"], '● Retry · 2d · "x"')
+        self.assertEqual(seen["status"], "✅ 1h passed · 0s")
+        self.advance(hours=6)
+        seen = self.session()
+        self.assertEqual(seen["status"], "✅ 1h passed · 6h")
+        self.assertEqual(seen["line"], '✅ 1h passed · 6h · "x"')
+        self.assertEqual(seen["composer_row"], seen["line"])
 
     def test_pr_line(self) -> None:
         self.add(
@@ -1654,9 +1748,9 @@ class ViewTests(Case):
 
     def test_sort_ball_then_due_then_set_aside(self) -> None:
         sids = [f"aaaa000{index}" for index in range(5)]
-        scheduled = "aaaa0006"
-        self.agents(scheduled)
-        self.write_schedule(scheduled, [{"id": 1, "prompt": "p", "dueAt": int(T0.timestamp() * 1000)}])
+        timer = "aaaa0006"
+        self.agents(timer)
+        self.write_schedule(timer, [{"id": 1, "prompt": "p", "dueAt": int(T0.timestamp() * 1000)}])
         self.add("--kind", "later", session=sids[0])
         self.add("--kind", "something", "--what", "x", session=sids[1])
         self.add("--kind", "job", "--pane", "51", session=sids[2])
@@ -1670,11 +1764,11 @@ class ViewTests(Case):
         view = self.run_cli("list")
         self.assertEqual(
             [item["session_id"] for item in view["sessions"]],
-            [fired, sids[4], sids[2], sids[3], scheduled, sids[1], sids[0]],
+            [fired, sids[2], sids[3], sids[4], timer, sids[1], sids[0]],
         )
         self.assertEqual(
             view["counts"],
-            {"on_me": 1, "on_machine": 3, "scheduled": 1, "on_someone": 1, "on_my_time": 1},
+            {"on_me": 1, "on_machine": 2, "on_timer": 2, "on_someone": 1, "on_my_time": 1},
         )
 
     def test_counts_include_panes(self) -> None:
@@ -1755,8 +1849,8 @@ class ViewTests(Case):
         self.assertEqual(self.run_cli("list")["sessions"], [])
         self.agents(SID)
         seen = self.session()
-        self.assertEqual(seen["ball"], "scheduled")
-        self.assertEqual(self.run_cli("list")["counts"]["scheduled"], 1)
+        self.assertEqual(seen["ball"], "on_timer")
+        self.assertEqual(self.run_cli("list")["counts"]["on_timer"], 1)
         self.assertEqual(seen["line"], "↻ every 90m · next 13:00")
         self.assertEqual(seen["composer_row"], "")
 
@@ -1768,7 +1862,7 @@ class ViewTests(Case):
         seen = self.session()
         self.assertEqual((seen["ball"], len(seen["schedules"])), ("on_someone", 1))
         self.run_cli("done", "--session", SID, "--wait", wait)
-        self.assertEqual(self.session()["ball"], "scheduled")
+        self.assertEqual(self.session()["ball"], "on_timer")
         self.pin(SID)
         self.assertEqual(self.session()["ball"], "on_my_time")
 
@@ -2441,6 +2535,501 @@ class CardTests(SessionPrCase):
         ):
             self.assertIsNone(waiting._git_branch("/w"))
         self.assertIsNone(waiting._git_branch(None))
+
+    def cached(self, sid: str = SID) -> dict:
+        return self.run_cli("card", "--session", sid, "--cached")["card"]
+
+    def test_cached_runs_no_process(self) -> None:
+        self.add("--kind", "later", "--note", "why")
+        self.created(1)
+        self.card()
+        self.asked.clear()
+        repo = self.root / "repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "topic", str(repo)], check=True)
+        self.agents(closed=[{"sessionId": SID, "cwd": str(repo), "windowTitle": "x"}])
+        with (
+            mock.patch.object(subprocess, "run", side_effect=AssertionError("ran a process")),
+            mock.patch.object(subprocess, "Popen", side_effect=AssertionError("ran a process")),
+        ):
+            card = self.cached()
+        self.assertEqual(self.asked, [])
+        self.assertEqual((card["title"], card["note"]), ("x", "why"))
+        self.assertEqual([pr["number"] for pr in card["prs"]], [1])
+        self.assertIsNone(card["branch"])
+
+    def test_cached_shows_what_the_last_refresh_saved(self) -> None:
+        self.created(1)
+        self.card()
+        self.advance(hours=1)
+        self.assertEqual(self.cached()["prs"][0]["title"], "A PR")
+        self.assertEqual(self.asked, [1])
+
+    def test_cached_has_every_field_of_the_plain_card(self) -> None:
+        self.add("--kind", "later")
+        self.assertEqual(set(self.cached()), set(self.card()))
+
+    def test_cached_refuses_an_unknown_session(self) -> None:
+        self.run_cli("card", "--session", OTHER, "--cached", expect=2)
+
+    def test_cached_reads_no_transcript(self) -> None:
+        self.created(1)
+        self.card()
+        self.write(user(pr_url(2)))
+        self.advance(hours=1)
+        before = (self.state_dir / "pr_cache.json").read_text()
+        self.assertEqual([pr["number"] for pr in self.cached()["prs"]], [1])
+        self.assertEqual((self.state_dir / "pr_cache.json").read_text(), before)
+        self.assertEqual(sorted(pr["number"] for pr in self.card()["prs"]), [1, 2])
+
+
+class OutcomeTests(Case):
+    """What a wait came to, and how every surface says it."""
+
+    def test_precedence_of_one_wait(self) -> None:
+        for state, on_me, overdue, outcome in (
+            ("pending", False, False, None),
+            ("waiting", False, False, None),
+            ("fired", False, False, "fulfilled"),
+            ("acting", False, False, "fulfilled"),
+            ("review", False, False, "fulfilled"),
+            ("needs_attention", False, False, "attention"),
+            ("waiting", True, False, "attention"),
+            ("acting", True, False, "attention"),
+            ("waiting", False, True, "overdue"),
+            ("waiting", True, True, "attention"),
+            ("fired", False, True, "overdue"),
+            ("needs_attention", False, True, "attention"),
+        ):
+            with self.subTest(state=state, on_me=on_me, overdue=overdue):
+                wait = {"state": state, "on_me": on_me, "overdue": overdue}
+                self.assertEqual(waiting._outcome(wait), outcome)
+
+    def test_a_waiting_wait_has_none(self) -> None:
+        wait = self.add("--kind", "time", "--in", "1h")
+        self.assertEqual((wait["outcome"], wait["fired_text"], wait["fired_at"]), (None, None, None))
+        seen = self.session()
+        self.assertEqual((seen["outcome"], seen["headline"]), (None, None))
+        self.assertTrue(seen["line"].startswith("⏲ "), seen["line"])
+
+    def test_other_waiting_kinds_keep_the_hourglass(self) -> None:
+        self.add("--kind", "job", "--pane", "51")
+        self.assertTrue(self.session()["line"].startswith("⏳ "))
+
+    def test_a_time_wait_says_how_long_it_ran_from_when_its_step_began(self) -> None:
+        first = self.add("--kind", "something", "--what", "x")["id"]
+        second = self.add("--kind", "time", "--in", "2d", "--after", first)["id"]
+        self.advance(days=3)
+        self.run_cli("done", "--session", SID, "--wait", first)
+        self.advance(days=2)
+        self.tick()
+        seen = self.wait_of(second)
+        self.assertEqual(
+            (seen["outcome"], seen["fired_text"], seen["fired_at"]),
+            ("fulfilled", "2d passed", self.clock.isoformat()),
+        )
+        session = self.session()
+        self.assertEqual((session["outcome"], session["headline"]), ("fulfilled", "✅ 2d passed"))
+
+    def test_command_fired_text(self) -> None:
+        run = [sys.executable, "-c", "print('green')"]
+        exited = self.add("--kind", "command", "--argv", json.dumps(run))["id"]
+        matched = self.add(
+            "--kind", "command", "--argv", json.dumps(run), "--predicate", "stdout_regex:green",
+        )["id"]
+        self.tick()
+        self.assertEqual(self.wait_of(exited)["fired_text"], "command exited 0")
+        self.assertEqual(self.wait_of(matched)["fired_text"], "command output matched")
+
+    def test_release_fired_text(self) -> None:
+        wait = self.add("--kind", "release", "--repo", "a/b", "--interval", "1m")["id"]
+        with mock.patch.object(waiting, "_run_argv", return_value=(0, "v1.0.0\n", "")):
+            self.tick()
+        self.advance(minutes=2)
+        with mock.patch.object(waiting, "_run_argv", return_value=(0, "v2.0.0\n", "")):
+            self.tick()
+        self.assertEqual(self.wait_of(wait)["fired_text"], "v2.0.0 released")
+        self.assertEqual(self.session()["history"][-1]["text"], "v1.0.0 → v2.0.0")
+
+    def test_a_pr_fired_text_names_the_pr(self) -> None:
+        self.github(poll=lambda cond, memo, **kwargs: poll_result(
+            memo, fired=True, fire_text="greptile reviewed abc1234",
+        ))
+        wait = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "review_on_head")
+        self.tick()
+        self.assertEqual(self.wait_of(wait["id"])["fired_text"], "PR#7 greptile reviewed abc1234")
+        self.assertEqual(self.session()["history"][-1]["text"], "greptile reviewed abc1234")
+
+    def test_a_session_with_a_prompt_running_is_fulfilled(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        wait, _ = self.queued_prompt()
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["ball"], seen["outcome"]), ("acting", "on_machine", "fulfilled"))
+        self.assertEqual(self.session()["outcome"], "fulfilled")
+
+    def test_a_review_says_the_prompt_ran(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        self.queued_prompt("--note", "x")
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.advance(hours=1)
+        seen = self.session()
+        self.assertEqual(seen["outcome"], "fulfilled")
+        self.assertEqual(seen["line"], '✅ 1s passed · prompt ran, take a look · 1h · "x"')
+
+    def test_a_closed_session_needs_me(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        wait = self.add("--kind", "time", "--in", "1s", "--prompt", "go")["id"]
+        self.advance(seconds=2)
+        self.agents()
+        self.tick()
+        seen = self.session()
+        self.assertIsNone(self.wait_of(wait)["fired_text"])
+        self.assertEqual(
+            (seen["outcome"], seen["headline"]), ("attention", f"⚠️ {waiting.REASON_CLOSED}"),
+        )
+        self.assertTrue(seen["line"].startswith("⚠️ "), seen["line"])
+        self.assertEqual(seen["history"][-1]["kind"], "attention")
+
+    def test_a_failed_job_needs_me(self) -> None:
+        self.add("--kind", "job", "--pane", "51")
+        self.run_cli("event", "--type", "job_finished", "--pane", "51", "--status", "3")
+        seen = self.session()
+        self.assertEqual((seen["outcome"], seen["headline"]), ("attention", "⚠️ Exited with status 3"))
+        self.assertEqual(seen["history"][-1]["kind"], "attention")
+
+    def test_overdue(self) -> None:
+        self.add("--kind", "something", "--what", "Reply", "--deadline-in", "1h")
+        self.advance(hours=2)
+        self.tick()
+        seen = self.session()
+        self.assertEqual((seen["outcome"], seen["headline"]), ("overdue", "⏰ Reply overdue"))
+        self.assertEqual(seen["status"], "⏰ Reply · 2h")
+        self.assertEqual(seen["history"][-1]["kind"], "attention")
+
+    def test_the_worst_wait_decides_the_session(self) -> None:
+        self.add("--kind", "time", "--in", "1h", "--label", "Soon")
+        self.add("--kind", "something", "--what", "Reply", "--deadline-in", "2h")
+        job = self.add("--kind", "job", "--pane", "51")["id"]
+        self.advance(hours=1)
+        self.tick()
+        self.assertEqual(self.session()["outcome"], "fulfilled")
+        self.advance(hours=2)
+        self.tick()
+        seen = self.session()
+        self.assertEqual(seen["outcome"], "overdue")
+        self.assertTrue(seen["line"].startswith("⏰ Reply"), seen["line"])
+        self.run_cli("event", "--type", "job_finished", "--pane", "51", "--status", "1")
+        self.assertEqual(self.wait_of(job)["outcome"], "attention")
+        seen = self.session()
+        self.assertEqual((seen["outcome"], seen["headline"]), ("attention", "⚠️ Exited with status 1"))
+
+    def test_a_fired_wait_outranks_a_waiting_one_on_the_machine(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        self.add("--kind", "job", "--pane", "51")
+        self.queued_prompt()
+        self.assertEqual(self.session()["outcome"], "fulfilled")
+        self.assertTrue(self.session()["line"].startswith("✅ "))
+
+    def test_a_pane_has_an_outcome_too(self) -> None:
+        self.run_cli("add", "--pane", "51", "--kind", "job")
+        self.run_cli("event", "--type", "job_finished", "--pane", "51", "--status", "0")
+        pane = self.run_cli("list")["panes"][0]
+        self.assertEqual(
+            (pane["outcome"], pane["headline"]), ("fulfilled", "✅ Job in pane 51: finished"),
+        )
+        self.assertTrue(pane["line"].startswith("✅ "))
+
+    def test_a_time_wait_says_what_was_asked_for_however_late_the_tick(self) -> None:
+        wait = self.add("--kind", "time", "--in", "90m")["id"]
+        self.advance(hours=9)
+        self.tick()
+        self.assertEqual(self.wait_of(wait)["fired_text"], "90m passed")
+
+    def test_a_clock_time_is_rounded(self) -> None:
+        self.advance(seconds=7)
+        wait = self.add("--kind", "time", "--at", (T0 + timedelta(hours=3)).isoformat())["id"]
+        self.advance(hours=4)
+        self.tick()
+        self.assertEqual(self.wait_of(wait)["fired_text"], "2h passed")
+
+    def test_a_snoozed_time_wait_counts_from_the_snooze(self) -> None:
+        wait = self.add("--kind", "time", "--in", "2d")["id"]
+        self.advance(days=3)
+        self.tick()
+        self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1h")
+        self.advance(hours=2)
+        self.tick()
+        self.assertEqual(self.wait_of(wait)["fired_text"], "1h passed")
+
+    def test_a_snooze_ends_the_outcome(self) -> None:
+        wait = self.add("--kind", "time", "--in", "1h")["id"]
+        self.advance(hours=2)
+        self.tick()
+        self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1h")
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["outcome"], seen["fired_text"], seen["fired_at"]), (None, None, None))
+
+    def test_a_refired_job_keeps_what_happened(self) -> None:
+        wait = self.add("--kind", "job", "--pane", "51", "--label", "Build")["id"]
+        self.run_cli("event", "--type", "job_finished", "--pane", "51", "--status", "0")
+        self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1h")
+        self.advance(hours=2)
+        self.tick()
+        self.assertEqual(self.wait_of(wait)["fired_text"], "Build: finished")
+        self.assertEqual(self.wait_of(wait)["fired_at"], self.clock.isoformat())
+
+    def test_history_marks_the_fulfilment(self) -> None:
+        self.add("--kind", "something", "--what", "x")
+        self.add("--kind", "time", "--in", "1s", "--label", "Soon")
+        self.run_cli("what", "--session", SID, "--text", "y")
+        self.advance(seconds=2)
+        self.tick()
+        self.assertEqual(
+            [(item["text"], item["kind"]) for item in self.session()["history"]],
+            [("Waiting for: y", None), ("Soon", "fired")],
+        )
+
+    def test_a_passed_verify_is_marked_in_the_history(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        self.add("--kind", "later")
+        verify = json.dumps({"type": "command", "argv": [sys.executable, "-c", "pass"]})
+        self.queued_prompt("--verify", verify)
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        last = self.session()["history"][-1]
+        self.assertTrue(last["text"].startswith("Verified:"), last)
+        self.assertEqual(last["kind"], "fired")
+
+    def test_state_from_before_outcomes_still_shows(self) -> None:
+        wait = self.add("--kind", "time", "--in", "1h", "--label", "Retry")["id"]
+        self.advance(hours=2)
+        self.tick()
+        state = self.state()
+        record = state["sessions"][SID]
+        for field in ("armed_at", "fired_text", "fired_at"):
+            del record["waits"][0][field]
+        for entry in record["history"]:
+            del entry["kind"]
+        (self.state_dir / "waiting.json").write_text(json.dumps(state))
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["fired_text"], seen["fired_at"]), ("Retry", T0.isoformat()))
+        self.assertIsNone(self.session()["history"][-1]["kind"])
+
+    def test_a_command_is_labelled_by_its_whole_line(self) -> None:
+        wait = self.add("--kind", "command", "--argv", "bash -c 'test -f /tmp/x'")
+        self.assertEqual(wait["label"], "bash -c 'test -f /tmp/x'")
+        self.assertEqual(wait["summary"], "bash -c 'test -f /tmp/x'")
+        long = self.add("--kind", "command", "--argv", "echo " + "x" * 100)
+        self.assertEqual(len(long["label"]), 60)
+
+
+class OnTimerTests(Case):
+    def test_a_time_wait_is_on_a_timer_until_it_fires(self) -> None:
+        wait = self.add("--kind", "time", "--in", "1h")["id"]
+        self.assertEqual(self.wait_of(wait)["ball"], "on_timer")
+        seen = self.run_cli("list")
+        self.assertEqual(seen["sessions"][0]["ball"], "on_timer")
+        self.assertEqual(seen["counts"]["on_timer"], 1)
+        self.assertNotIn("scheduled", seen["counts"])
+        self.advance(hours=2)
+        self.tick()
+        self.assertEqual(self.wait_of(wait)["ball"], "on_me")
+
+    def test_ball_order(self) -> None:
+        self.assertEqual(
+            waiting.BALLS, ("on_me", "on_machine", "on_timer", "on_someone", "on_my_time"),
+        )
+
+    def test_a_machine_wait_outranks_the_timer_in_one_session(self) -> None:
+        self.add("--kind", "time", "--in", "1h")
+        self.add("--kind", "job", "--pane", "51")
+        self.assertEqual(self.session()["ball"], "on_machine")
+
+
+class MergedPrTests(Case):
+    def chain(self, *argv: str, session: str = SID) -> list[str]:
+        return [wait["id"] for wait in self.run_cli(
+            "babysit-pr", "--session", session, "--repo", "o/r", "--number", "7", *argv,
+        )["waits"]]
+
+    def waits(self, sid: str = SID) -> dict:
+        return {wait["id"]: wait for wait in self.state()["sessions"][sid]["waits"]}
+
+    def merged(self, **overrides) -> None:
+        self.github(poll=lambda cond, memo, **kwargs: poll_result(memo, merged=True, **overrides))
+
+    def test_a_merge_jumps_the_chain_to_its_end(self) -> None:
+        self.github()
+        review, ready, merged, released = self.chain("--no-fix", "--released")
+        self.merged()
+        actions = self.tick()["actions"]
+        waits = self.waits()
+        self.assertEqual(
+            [waits[wait]["state"] for wait in (review, ready, merged, released)],
+            ["done", "done", "fired", "waiting"],
+        )
+        seen = self.session()
+        self.assertEqual((seen["outcome"], seen["headline"]), ("fulfilled", "✅ PR#7 merged"))
+        self.assertEqual(
+            [(item["text"], item["kind"]) for item in seen["history"]],
+            [
+                ("PR#7 merged", "fired"),
+                ("Next: Released", None),
+                ("PR#7 merged: Ready no longer needed", None),
+                ("PR#7 merged: Review on head no longer needed", None),
+            ],
+        )
+        self.assertEqual([action["text"] for action in actions], ["PR#7 merged"])
+
+    def test_a_chain_without_a_release_ends_on_the_merge(self) -> None:
+        self.github()
+        waits = self.chain("--no-fix")
+        self.merged()
+        self.tick()
+        self.assertEqual([self.waits()[wait]["state"] for wait in waits], ["done", "done", "fired"])
+
+    def test_a_ready_wait_on_a_merged_pr_is_done(self) -> None:
+        self.merged()
+        wait = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--note", "n")["id"]
+        answer = self.tick()
+        self.assertEqual(self.waits()[wait]["state"], "done")
+        self.assertEqual(answer["view"]["sessions"], [])
+        history = self.state()["sessions"][SID]["history"]
+        self.assertEqual(history[-1]["text"], "PR#7 merged: Ready no longer needed")
+        self.assertEqual(
+            [action["text"] for action in answer["actions"]], ["PR#7 merged: Ready no longer needed"],
+        )
+
+    def test_a_merge_wins_over_a_condition_that_also_holds(self) -> None:
+        self.merged(fired=True, fire_text="ready on abc")
+        wait = self.add("--kind", "pr", "--repo", "o/r", "--number", "7")["id"]
+        self.tick()
+        self.assertEqual(self.waits()[wait]["state"], "done")
+
+    def test_a_merge_settles_waits_of_other_sessions_and_only_that_pr(self) -> None:
+        # Only the lowercase spelling's poll sees it, so the others hear from the rule.
+        self.github(poll=lambda cond, memo, **kwargs: poll_result(
+            memo, merged=cond["repo"] == "o/r" and cond["number"] == 7,
+        ))
+        first = self.add("--kind", "pr", "--repo", "o/r", "--number", "7")["id"]
+        same = self.add("--kind", "pr", "--repo", "O/R", "--number", "7", session=OTHER)["id"]
+        other = self.add("--kind", "pr", "--repo", "o/r", "--number", "8", session=OTHER)["id"]
+        self.tick()
+        self.assertEqual(self.waits()[first]["state"], "done")
+        self.assertEqual(self.waits(OTHER)[same]["state"], "done")
+        self.assertEqual(self.waits(OTHER)[other]["state"], "waiting")
+
+    def test_a_merged_wait_seeing_the_merge_closes_the_steps_left_open(self) -> None:
+        def poll(cond, memo, **kwargs):
+            if cond["until"] == "merged":
+                return poll_result(memo, merged=True, fired=True, fire_text="PR#7 merged")
+            return poll_result(memo, fired=True, fire_text=f"{cond['until']} held")
+
+        self.github(poll=poll)
+        review, ready, merged = self.chain("--no-fix")
+        self.tick()
+        self.advance(minutes=1)
+        self.tick()
+        self.advance(minutes=1)
+        self.tick()
+        waits = self.waits()
+        self.assertEqual(
+            [waits[wait]["state"] for wait in (review, ready, merged)], ["done", "done", "fired"],
+        )
+
+    def test_a_merge_seen_by_a_release_wait_leaves_it_watching(self) -> None:
+        self.merged()
+        released = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "released")["id"]
+        ready = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", session=OTHER)["id"]
+        self.tick()
+        self.assertEqual(self.waits()[released]["state"], "waiting")
+        self.assertEqual(self.waits(OTHER)[ready]["state"], "done")
+
+    def test_a_merge_seen_with_an_error_still_counts(self) -> None:
+        def poll(cond, memo, **kwargs):
+            released = cond["until"] == "released"
+            return poll_result(memo, merged=released, error="gh failed" if released else None)
+
+        self.github(poll=poll)
+        self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "released")
+        ready = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", session=OTHER)["id"]
+        self.tick()
+        self.assertEqual(self.waits(OTHER)[ready]["state"], "done")
+
+    def test_a_merge_drops_the_fix_prompt_still_queued(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        self.github(poll=lambda cond, memo, **kwargs: poll_result(
+            memo, fired=cond["until"] == "review_on_head", fire_text="review landed",
+        ))
+        review, *_ = self.chain()
+        self.tick()
+        self.assertEqual(self.waits()[review]["state"], "acting")
+        self.merged()
+        self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "activity", session=OTHER)
+        self.tick()
+        self.assertEqual(self.waits()[review]["state"], "done")
+        self.assertEqual(self.run_cli("claim-prompts", "--session", SID)["prompts"], [])
+
+    def test_a_merge_fires_a_merged_wait_that_needs_me(self) -> None:
+        self.github(poll=lambda cond, memo, **kwargs: poll_result(memo, error="404"))
+        wait = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "merged")["id"]
+        for _ in range(waiting.MAX_ERRORS):
+            self.tick()
+            self.advance(minutes=4)
+        self.assertEqual(self.waits()[wait]["state"], "needs_attention")
+        self.merged()
+        self.add("--kind", "pr", "--repo", "o/r", "--number", "7", session=OTHER)
+        self.tick()
+        self.assertEqual(self.waits()[wait]["state"], "fired")
+
+    def test_a_status_refresh_sees_the_merge_nothing_polls(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        self.github(
+            poll=lambda cond, memo, **kwargs: poll_result(
+                memo, fired=cond["until"] == "review_on_head", fire_text="review landed",
+            ),
+            pr_status=lambda repo, number, run=None: {
+                "title": "A PR", "state": "merged", "review": None, "checks": None,
+            },
+        )
+        review, ready, merged = self.chain()
+        self.tick()
+        waits = self.waits()
+        self.assertEqual(
+            [waits[wait]["state"] for wait in (review, ready, merged)], ["done", "done", "fired"],
+        )
+        self.assertEqual(self.run_cli("claim-prompts", "--session", SID)["prompts"], [])
+
+    def test_an_open_status_settles_nothing(self) -> None:
+        self.github()
+        review, *_ = self.chain("--no-fix")
+        self.tick()
+        self.assertEqual(self.waits()[review]["state"], "waiting")
+
+    def test_closed_without_merge_needs_me_and_stays_watched(self) -> None:
+        closed = {"key": "closed:x", "text": "PR#7 closed without merging", "on_me": True}
+        self.github()
+        review, ready, merged = self.chain("--no-fix")
+        lone = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "merged")["id"]
+        self.github(poll=lambda cond, memo, **kwargs: poll_result(memo, events=[closed], next_poll_s=3600))
+        self.tick()
+        waits = self.waits()
+        self.assertEqual(
+            [waits[wait]["state"] for wait in (review, ready, merged, lone)],
+            ["waiting", "pending", "pending", "waiting"],
+        )
+        for wait in (review, lone):
+            self.assertEqual(self.wait_of(wait)["outcome"], "attention")
+        seen = self.session()
+        self.assertEqual(
+            (seen["outcome"], seen["headline"]), ("attention", "⚠️ PR#7 closed without merging"),
+        )
 
 
 class PinTests(Case):

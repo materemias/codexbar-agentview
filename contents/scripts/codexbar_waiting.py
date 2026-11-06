@@ -69,6 +69,7 @@ OUTBOX_RECENT_S = 5 * 60
 RECAP_CHARS = 600
 NOTE_IN_LINE_CHARS = 80
 SHORT_LABEL_CHARS = 24
+COMMAND_LABEL_CHARS = 60
 LAST_PROMPT_CHARS = 300
 BRANCH_TIMEOUT_S = 2
 
@@ -93,9 +94,14 @@ _XXH_P4 = 0x85EBCA77C2B2AE63
 _XXH_P5 = 0x27D4EB2F165667C5
 _U64 = (1 << 64) - 1
 
-# `scheduled`: a live session listed only for its /schedule jobs.
-BALLS = ("on_me", "on_machine", "scheduled", "on_someone", "on_my_time")
+# `on_timer`: nothing to do but wait for the clock: a time wait, or a live
+# session listed only for its /schedule jobs.
+BALLS = ("on_me", "on_machine", "on_timer", "on_someone", "on_my_time")
 BALL_RANK = {ball: rank for rank, ball in enumerate(BALLS)}
+# Worst first; a wait with no outcome ranks after them all.
+OUTCOMES = ("attention", "overdue", "fulfilled")
+OUTCOME_RANK = {outcome: rank for rank, outcome in enumerate(OUTCOMES)}
+OUTCOME_MARKS = {"attention": "⚠️ ", "overdue": "⏰ ", "fulfilled": "✅ "}
 SIZE_RANK = {"S": 0, "M": 1, "L": 2}
 PR_UNTIL = {
     "review_on_head": "Review on head",
@@ -127,6 +133,7 @@ REASON_REVIEW = "ran, take a look"
 REASON_OVERDUE = "past its deadline"
 REASON_MENU_NO_EXTENSION = "omp extension not loaded in this session"
 REASON_MENU_OLD_EXTENSION = "this session runs an older waitingfor extension: /restart it"
+REASON_MENU_NO_PANE = "no omp extension in this pane"
 
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -258,7 +265,7 @@ def _empty_state() -> dict:
     return {
         "version": STATE_VERSION, "wait_seq": 0, "action_seq": 0, "boot_id": "",
         "sessions": {}, "panes": {}, "actions": [], "extensions": {},
-        "extension_features": {}, "menu_seq": 0, "menu_requests": {},
+        "extension_features": {}, "extension_panes": {}, "menu_seq": 0, "menu_requests": {},
     }
 
 
@@ -845,7 +852,9 @@ class PrCache:
     race only costs a rescan or a question to GitHub, and a row that can't be
     read is dropped rather than failing every command."""
 
-    def __init__(self):
+    def __init__(self, scan: bool = True):
+        """Without `scan`, sessions keep what the last scan saved: no transcript is read."""
+        self.scan = scan
         self.path = state_paths.state_dir() / "pr_cache.json"
         self.sessions: dict[str, dict] = {}
         self.statuses: dict[str, dict] = {}
@@ -879,6 +888,8 @@ class PrCache:
         if transcript is None:
             return []
         entry = self.sessions.get(session)
+        if not self.scan:
+            return entry["prs"] if entry else []
         try:
             size = transcript.stat().st_size
         except OSError:
@@ -1017,9 +1028,12 @@ def _find_wait(state: dict, wait_id: str) -> tuple[dict, dict] | None:
     return None
 
 
-def _log(record: dict, now: datetime, wait: dict | None, text: str) -> None:
+def _log(
+    record: dict, now: datetime, wait: dict | None, text: str, kind: str | None = None,
+) -> None:
+    """`kind` is "fired" or "attention", for the lines a surface highlights."""
     record["history"].append({
-        "at": _iso(now), "wait": wait["id"] if wait else None, "text": text,
+        "at": _iso(now), "wait": wait["id"] if wait else None, "text": text, "kind": kind,
     })
     del record["history"][:-HISTORY_KEPT]
 
@@ -1053,7 +1067,7 @@ def _new_wait(state: dict, now: datetime, **fields: object) -> dict:
         "close_on_success": False, "next": None, "rev": 1, "next_check_at": None,
         "refire_at": None, "errors": 0, "memo": {}, "snapshot": None,
         "verify_pending": False, "verify_claim_until": None, "verify_memo": {},
-        "event_flag": False,
+        "event_flag": False, "armed_at": None, "fired_text": None, "fired_at": None,
     }
     wait.update(fields)
     return wait
@@ -1074,7 +1088,7 @@ def _arm(wait: dict, now: datetime) -> None:
         wait["deadline_in_s"] = None
     if wait["kind"] in ("command", "pr"):
         wait["next_check_at"] = _iso(now)
-    wait["state"] = "waiting"
+    wait.update(state="waiting", armed_at=_iso(now))
     _touch(wait)
 
 
@@ -1155,14 +1169,19 @@ def _prompt_text(wait: dict) -> str:
 
 def _fire(
     state: dict, record: dict, wait: dict, now: datetime,
-    text: str | None = None, level: str = "info",
+    text: str | None = None, level: str = "info", fired: str | None = None,
 ) -> None:
     """The condition held. With a prompt the wait stays with the machine; without
-    one the step is over, so the chain moves on while the wait waits for my Done."""
+    one the step is over, so the chain moves on while the wait waits for my Done.
+    `text` is the history's and the toast's, `fired` the surfaces' "what happened"
+    when that reads differently."""
     text = text or wait["label"]
-    wait.update(on_me=False, overdue=False, reason=None, refire_at=None)
+    wait.update(
+        on_me=False, overdue=False, reason=None, refire_at=None,
+        fired_text=fired or text, fired_at=_iso(now),
+    )
     _touch(wait)
-    _log(record, now, wait, text)
+    _log(record, now, wait, text, "fired")
     record["unseen"] = True
     if wait["prompt"]:
         wait["state"] = "acting"
@@ -1182,7 +1201,7 @@ def _attention(state: dict, record: dict, wait: dict, now: datetime, reason: str
     wait.update(reason=reason, on_me=False, verify_pending=False)
     _touch(wait)
     _cancel_prompts(record, wait)
-    _log(record, now, wait, reason)
+    _log(record, now, wait, reason, "attention")
     record["unseen"] = True
     _toast(state, record, wait, now, "error", f"{wait['label']}: {reason}")
 
@@ -1194,7 +1213,7 @@ def _flag_on_me(
     if wait["on_me"] and wait["reason"] == reason:
         return
     wait.update(on_me=True, reason=reason)
-    _log(record, now, wait, reason)
+    _log(record, now, wait, reason, "attention")
     record["unseen"] = True
     _toast(state, record, wait, now, level, f"{wait['label']}: {reason}")
 
@@ -1488,16 +1507,71 @@ def _apply_command(state: dict, record: dict, wait: dict, result: dict, now: dat
             condition["baseline"] = output
             _log(record, now, wait, f"Baseline: {output or '(empty)'}")
         elif output != baseline:
-            _fire(state, record, wait, now, f"{baseline} → {output}")
+            _fire(
+                state, record, wait, now, f"{baseline} → {output}",
+                fired=f"{output} released" if condition.get("repo") else None,
+            )
         return
     if result["holds"]:
-        _fire(state, record, wait, now)
+        exited = condition["predicate"] == "exit0"
+        _fire(
+            state, record, wait, now,
+            fired="command exited 0" if exited else "command output matched",
+        )
+
+
+def _merge_fires(wait: dict) -> bool:
+    return wait["condition"]["until"] == "merged" and wait["state"] in (
+        "pending", "waiting", "needs_attention",
+    )
+
+
+def _merge_ends(wait: dict) -> bool:
+    return wait["condition"]["until"] in ("review_on_head", "ready")
+
+
+def _pr_merged(state: dict, pr: dict, now: datetime) -> None:
+    """A merge settles every wait on the PR, in any session: nothing is left to
+    review or get ready, and the `merged` steps have happened."""
+    key, number = _pr_key(pr), pr["number"]
+    text = f"PR#{number} merged"
+    waits = [
+        (record, wait) for record in _records(state) for wait in _open_waits(record)
+        if wait["kind"] == "pr" and _pr_key(wait["condition"]) == key
+    ]
+    for record, wait in waits:
+        if _merge_fires(wait):
+            _fire(state, record, wait, now, text)
+    needless = [item for item in waits if _merge_ends(item[1])]
+    # A pending step goes first: closing the step before it would arm it.
+    needless.sort(key=lambda item: item[1]["state"] != "pending")
+    for record, wait in needless:
+        line = f"{text}: {wait['label']} no longer needed"
+        _log(record, now, wait, line)
+        if not wait["next"]:  # In a chain, a later step has the word.
+            _toast(state, record, wait, now, "info", line)
+        _complete(state, record, wait, now)
+
+
+def _merged_prs(cache: PrCache, view: dict) -> list[dict]:
+    """The open PR waits a merge has yet to settle, by GitHub's last word. Nothing
+    polls a PR while its chain's step runs a prompt or waits for me."""
+    return [
+        wait["condition"]
+        for target in (*view["sessions"], *view["panes"]) for wait in target["waits"]
+        if wait["kind"] == "pr" and (_merge_fires(wait) or _merge_ends(wait))
+        and cache.statuses.get(_pr_key(wait["condition"]), {}).get("state") == "merged"
+    ]
 
 
 def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: datetime) -> None:
     wait["memo"] = result.get("memo", wait["memo"])
     poll_s = result.get("next_poll_s") or PR_POLL_S
     wait["next_check_at"] = _iso(now + timedelta(seconds=poll_s))
+    if result.get("merged"):
+        _pr_merged(state, wait["condition"], now)
+        if wait["state"] != "waiting":
+            return
     for event in result.get("events") or []:
         if str(event.get("key", "")).startswith("head:") and wait["event_flag"]:
             # What the event said was about the old head.
@@ -1520,7 +1594,9 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
     # watched, so a compare that later proves the release fires it.
     if result.get("fired"):
         wait["snapshot"] = result.get("snapshot", wait["snapshot"])
-        _fire(state, record, wait, now, result.get("fire_text"))
+        text = result.get("fire_text") or wait["label"]
+        name = f"PR#{wait['condition']['number']} "
+        _fire(state, record, wait, now, text, fired=text if text.startswith(name) else name + text)
 
 
 def _apply_verify(state: dict, record: dict, wait: dict, result: dict, now: datetime) -> None:
@@ -1529,7 +1605,7 @@ def _apply_verify(state: dict, record: dict, wait: dict, result: dict, now: date
         wait["verify_memo"] = result.get("memo", wait["verify_memo"])
         wait["verify_claim_until"] = _iso(now + timedelta(seconds=PR_POLL_S))
     elif result["ok"]:
-        _log(record, now, wait, f"Verified: {result['reason']}")
+        _log(record, now, wait, f"Verified: {result['reason']}", "fired")
         record["unseen"] = True
         _toast(state, record, wait, now, "success", wait["label"])
         _complete(state, record, wait, now)
@@ -1576,7 +1652,7 @@ def _finish_job(state: dict, record: dict, wait: dict, status: int | None, now: 
             "type": "close_pane", "pane": wait["condition"]["pane"], "wait": wait["id"],
         })
         if not wait["prompt"]:
-            _log(record, now, wait, f"{wait['label']}: finished")
+            _log(record, now, wait, f"{wait['label']}: finished", "fired")
             _toast(state, record, wait, now, "success", f"{wait['label']}: finished")
             _complete(state, record, wait, now)
             return
@@ -1606,10 +1682,10 @@ def _housekeeping(state: dict, agents: Agents, omp: Omp, now: datetime) -> None:
         session: seen for session, seen in state["extensions"].items()
         if stamp - _parse_time(seen).timestamp() <= EXTENSION_KEPT_S
     }
-    state["extension_features"] = {
-        session: features for session, features in state["extension_features"].items()
-        if session in state["extensions"]
-    }
+    # A session's features and pane end with its extension's record.
+    for known in (state["extension_features"], state["extension_panes"]):
+        for session in [session for session in known if session not in state["extensions"]]:
+            del known[session]
     state["menu_requests"] = _fresh_menu_requests(state, now)
     pins = set(omp.pins())
 
@@ -1630,6 +1706,14 @@ def _housekeeping(state: dict, agents: Agents, omp: Omp, now: datetime) -> None:
     ]
 
 
+def _timer_text(wait: dict) -> str:
+    """How long a time wait ran, as asked for: a late tick doesn't change it, and
+    only a clock time that fell mid-minute gets rounded."""
+    armed = _stamp(wait.get("armed_at") or wait["created_at"])
+    seconds = max(int(_stamp(wait["condition"]["at"]) - armed), 0)
+    return f"{_compact(seconds) if seconds % 60 else _interval_text(seconds)} passed"
+
+
 def _evaluate(state: dict, now: datetime) -> None:
     """Everything that needs only the clock."""
     stamp = now.timestamp()
@@ -1640,15 +1724,15 @@ def _evaluate(state: dict, now: datetime) -> None:
             condition = wait["condition"]
             refire = _stamp(wait["refire_at"])
             if wait["kind"] == "time" and _stamp(condition["at"]) <= stamp:
-                _fire(state, record, wait, now)
+                _fire(state, record, wait, now, fired=_timer_text(wait))
             elif refire is not None and refire <= stamp:
-                _fire(state, record, wait, now)
+                _fire(state, record, wait, now, fired=wait.get("fired_text"))
             else:
                 deadline = _stamp(wait["deadline"])
                 if deadline is not None and deadline <= stamp and not wait["overdue"]:
                     wait["overdue"] = True
                     wait["reason"] = wait["reason"] or REASON_OVERDUE
-                    _log(record, now, wait, f"{wait['label']}: {REASON_OVERDUE}")
+                    _log(record, now, wait, f"{wait['label']}: {REASON_OVERDUE}", "attention")
                     record["unseen"] = True
                     _toast(state, record, wait, now, "error", f"{wait['label']}: {REASON_OVERDUE}")
 
@@ -1698,7 +1782,19 @@ def _wait_ball(wait: dict) -> str:
         return "on_me"
     if wait["state"] == "acting":
         return "on_machine"
-    return {"something": "on_someone", "later": "on_my_time"}.get(wait["kind"], "on_machine")
+    return {
+        "something": "on_someone", "later": "on_my_time", "time": "on_timer",
+    }.get(wait["kind"], "on_machine")
+
+
+def _outcome(wait: dict) -> str | None:
+    """How the wait ended up, if it did. Every on_me wait has one, and it decides
+    the wait's prefix on every surface."""
+    if wait["state"] == "needs_attention" or wait["on_me"]:
+        return "attention"
+    if wait["overdue"]:
+        return "overdue"
+    return "fulfilled" if wait["state"] in ("fired", "acting", "review") else None
 
 
 def _summary(wait: dict, now: datetime) -> str:
@@ -1716,7 +1812,7 @@ def _summary(wait: dict, now: datetime) -> str:
         baseline = condition.get("baseline")
         return f"after {baseline}" if baseline else f"next release of {condition['repo']}"
     if kind == "command":
-        return f"command {Path(condition['argv'][0]).name}"
+        return _command_line(condition)
     if kind == "job":
         return f"job in pane {condition['pane']}"
     if kind == "something":
@@ -1726,10 +1822,16 @@ def _summary(wait: dict, now: datetime) -> str:
 
 def _wait_view(wait: dict, now: datetime) -> dict:
     due = _wait_due(wait)
+    outcome = _outcome(wait)
+    fulfilled = outcome == "fulfilled"
     return {
         "id": wait["id"], "kind": wait["kind"], "label": wait["label"],
         "summary": _summary(wait, now), "state": wait["state"],
         "ball": _wait_ball(wait), "overdue": wait["overdue"],
+        "outcome": outcome,
+        # A wait that fired before these were kept has only its label and start.
+        "fired_text": (wait.get("fired_text") or wait["label"]) if fulfilled else None,
+        "fired_at": (wait.get("fired_at") or wait["created_at"]) if fulfilled else None,
         "reason": wait["reason"], "created_at": wait["created_at"],
         "due_at": None if due is None else _iso(datetime.fromtimestamp(due).astimezone()),
         "deadline": wait["deadline"], "condition": wait["condition"],
@@ -1743,8 +1845,11 @@ def _active(views: list[dict]) -> list[dict]:
 
 
 def _primary(views: list[dict]) -> dict:
+    """The wait a session is shown by. On_me waits all have an outcome and no other
+    ball has a worse one, so this is also the wait with the worst outcome."""
     return min(_active(views), key=lambda view: (
-        BALL_RANK[view["ball"]], _sort_time(view["due_at"]), view["created_at"],
+        BALL_RANK[view["ball"]], OUTCOME_RANK.get(view["outcome"], len(OUTCOMES)),
+        _sort_time(view["due_at"]), view["created_at"],
     ))
 
 
@@ -1773,7 +1878,26 @@ def _schedule_text(schedules: list[dict], now: datetime) -> str:
     return f"↻ {every}next {_clock(_parse_time(job['due_at']), now)}"
 
 
-def _headline(
+def _outcome_headline(views: list[dict]) -> tuple[str | None, str | None]:
+    """(outcome, headline) of the target: its worst open wait's."""
+    if not views:
+        return None, None
+    primary = _primary(views)
+    outcome = primary["outcome"]
+    if outcome == "fulfilled":
+        return outcome, f"{OUTCOME_MARKS[outcome]}{primary['fired_text']}"
+    if outcome == "attention":
+        return outcome, f"{OUTCOME_MARKS[outcome]}{primary['reason'] or primary['label']}"
+    if outcome == "overdue":
+        return outcome, f"{OUTCOME_MARKS[outcome]}{primary['label']} overdue"
+    return None, None
+
+
+def _wait_mark(view: dict) -> str:
+    return OUTCOME_MARKS.get(view["outcome"]) or ("⏲ " if view["kind"] == "time" else "⏳ ")
+
+
+def _status_lines(
     views: list[dict], note: str | None, pinned: bool, schedule: str, now: datetime,
 ) -> tuple[str, str, str]:
     """(status segment, line, composer row). The row leaves the schedule out:
@@ -1781,15 +1905,20 @@ def _headline(
     status = line = ""
     if views:
         primary = _primary(views)
-        on_me = primary["ball"] == "on_me"
-        mark = "● " if on_me else "⏳ "
-        if primary["kind"] == "pr":
-            short = f"PR#{primary['condition']['number']}"
+        mark = _wait_mark(primary)
+        if primary["outcome"] == "fulfilled":
+            short = _clip(primary["fired_text"], SHORT_LABEL_CHARS)
+            age = _compact(now.timestamp() - _stamp(primary["fired_at"]))
+            ran = [f"prompt {REASON_REVIEW}"] if primary["state"] == "review" else []
+            parts = [primary["fired_text"], *ran, age]
         else:
-            short = _clip(primary["label"], SHORT_LABEL_CHARS)
-        detail = (primary["reason"] if on_me else None) or primary["label"]
-        age = _when(primary, now)
-        parts = [short] + ([detail] if detail != short else []) + [age]
+            if primary["kind"] == "pr":
+                short = f"PR#{primary['condition']['number']}"
+            else:
+                short = _clip(primary["label"], SHORT_LABEL_CHARS)
+            detail = (primary["reason"] if primary["outcome"] else None) or primary["label"]
+            age = _when(primary, now)
+            parts = [short] + ([detail] if detail != short else []) + [age]
         if note:
             parts.append(f'"{_clip(note, NOTE_IN_LINE_CHARS)}"')
         status = f"{mark}{short} · {age}"
@@ -1843,7 +1972,30 @@ def _waiting_for(views: list[dict]) -> str | None:
 
 
 def _history_view(record: dict | None) -> list[dict]:
-    return record["history"][-HISTORY_SHOWN:] if record else []
+    # Lines from before `kind` have none.
+    return [{"kind": None, **entry} for entry in record["history"][-HISTORY_SHOWN:]] if record else []
+
+
+def _reported_pane(state: dict, agents: Agents, session: str, now: datetime) -> int | None:
+    """The pane the session's extension last named, while it may still run there.
+    Only a session agents.json has seen end counts as gone: a new one isn't in
+    agents.json by its id until it has a session file."""
+    if not _extension_fresh(state, session, now):
+        return None
+    if session in agents.closed and not _running(state, agents, session):
+        return None
+    return state["extension_panes"].get(session)
+
+
+def _extension_panes(state: dict, agents: Agents, now: datetime) -> dict:
+    """By pane: which session's extension runs there, and whether it has the menu."""
+    panes = {}
+    for session in state["extension_panes"]:
+        pane = _reported_pane(state, agents, session, now)
+        if pane is not None:
+            features = state["extension_features"].get(session, ())
+            panes[str(pane)] = {"session": session, "menu": FEATURE_MENU in features}
+    return panes
 
 
 def _session_view(
@@ -1859,12 +2011,18 @@ def _session_view(
         ball = min((view["ball"] for view in _active(views)), key=BALL_RANK.get)
     else:
         # Listed only for its /schedule jobs: those run on their own.
-        ball = "on_my_time" if pinned else "scheduled" if schedules else "on_machine"
-    status, line, composer_row = _headline(views, note, pinned, _schedule_text(schedules, now), now)
+        ball = "on_my_time" if pinned else "on_timer" if schedules else "on_machine"
+    status, line, composer_row = _status_lines(
+        views, note, pinned, _schedule_text(schedules, now), now,
+    )
+    outcome, headline = _outcome_headline(views)
     dues = [view["due_at"] for view in _active(views) if view["due_at"]]
+    pane = info["pane"]
+    if pane is None:
+        pane = _reported_pane(state, facts.agents, session, now)
     return {
         "session_id": session, "title": info["title"], "cwd": info["cwd"],
-        "project": info["project"], "live": info["live"], "pane": info["pane"],
+        "project": info["project"], "live": info["live"], "pane": pane,
         "tern_session": _text(live.get("ternSession")) or None,
         "agent_state": agent_state if agent_state in ("working", "blocked", "idle") else None,
         "extension": _extension_fresh(state, session, now),
@@ -1874,6 +2032,7 @@ def _session_view(
         "size": record["size"] if record else None,
         "set_aside_at": record["set_aside_at"] if record else None,
         "pinned": pinned, "ball": ball, "unseen": bool(record and record["unseen"]),
+        "outcome": outcome, "headline": headline,
         "status": status, "line": line, "composer_row": composer_row,
         "next_step": _next_step(views),
         "waiting_for": _waiting_for(views),
@@ -1887,13 +2046,15 @@ def _session_view(
 
 def _pane_view(record: dict, now: datetime) -> dict:
     views = [_wait_view(wait, now) for wait in _open_waits(record)]
-    status, line, _ = _headline(views, record["note"], False, "", now)
+    status, line, _ = _status_lines(views, record["note"], False, "", now)
+    outcome, headline = _outcome_headline(views)
     dues = [view["due_at"] for view in _active(views) if view["due_at"]]
     return {
         "pane": record["pane"],
         "label": _primary(views)["label"] if views else None,
         "note": record["note"],
         "ball": min((view["ball"] for view in _active(views)), key=BALL_RANK.get),
+        "outcome": outcome, "headline": headline,
         "status": status, "line": line, "waits": views,
         "waiting_for": _waiting_for(views),
         "history": _history_view(record),
@@ -1946,6 +2107,7 @@ def _build_view(
     return {
         "ok": True, "now": _iso(now), "counts": counts, "sessions": sessions, "panes": panes,
         "menu_requests": _fresh_menu_requests(state, now),
+        "extension_panes": _extension_panes(state, agents, now),
     }
 
 
@@ -2043,11 +2205,15 @@ def _parse_verify(text: str) -> dict:
     raise BadInput("--verify type must be command or pr")
 
 
+def _command_line(condition: dict) -> str:
+    return _clip(shlex.join(condition["argv"]), COMMAND_LABEL_CHARS)
+
+
 def _default_label(kind: str, condition: dict) -> str:
     if kind == "command" and condition.get("repo"):
         return f"next release of {condition['repo']}"
     if kind == "command":
-        return f"{Path(condition['argv'][0]).name} check"
+        return _command_line(condition)
     if kind == "job":
         return f"Job in pane {condition['pane']}"
     if kind == "pr":
@@ -2417,6 +2583,7 @@ def cmd_snooze(args: argparse.Namespace) -> dict:
             wait.update(deadline=until, overdue=False)
         elif wait["kind"] == "time":
             condition["at"] = until
+            wait["armed_at"] = _iso(now)
         elif wait["kind"] == "something":
             # A deadline is the only time it has, so a snooze sets one.
             wait["deadline"] = until
@@ -2529,6 +2696,13 @@ def cmd_heartbeat(args: argparse.Namespace) -> dict:
     def apply(state: dict, now: datetime) -> dict:
         state["extensions"][args.session] = _iso(now)
         state["extension_features"][args.session] = features
+        if args.pane is not None:
+            # A pane runs one session: a newer one there replaces the old mapping.
+            panes = state["extension_panes"]
+            state["extension_panes"] = {
+                session: pane for session, pane in panes.items() if pane != args.pane
+            }
+            state["extension_panes"][args.session] = args.pane
         record = state["sessions"].get(args.session)
         if record:
             _clear_delivery_flags(record)
@@ -2540,15 +2714,24 @@ def cmd_heartbeat(args: argparse.Namespace) -> dict:
 def cmd_menu_request(args: argparse.Namespace) -> dict:
     """Tern can't draw in omp's composer: the session's extension opens the menu
     when it sees the request in the view."""
+    session, pane = _target(args)
     now = _now()
+    agents = _read_agents()
     with _transaction() as state:
-        if not _extension_fresh(state, args.session, now):
-            return {"ok": True, "menu": False, "reason": REASON_MENU_NO_EXTENSION}
-        if FEATURE_MENU not in state["extension_features"].get(args.session, ()):
-            return {"ok": True, "menu": False, "reason": REASON_MENU_OLD_EXTENSION}
+        if pane is not None:
+            session = next((
+                held for held in state["extension_panes"]
+                if _reported_pane(state, agents, held, now) == pane
+            ), None)
+            if session is None:
+                return {"ok": True, "menu": False, "reason": REASON_MENU_NO_PANE}
+        elif not _extension_fresh(state, session, now):
+            return {"ok": True, "menu": False, "session": session, "reason": REASON_MENU_NO_EXTENSION}
+        if FEATURE_MENU not in state["extension_features"].get(session, ()):
+            return {"ok": True, "menu": False, "session": session, "reason": REASON_MENU_OLD_EXTENSION}
         state["menu_seq"] += 1
-        state["menu_requests"][args.session] = {"seq": state["menu_seq"], "at": _iso(now)}
-        return {"ok": True, "menu": True, "view": _publish(state, now)}
+        state["menu_requests"][session] = {"seq": state["menu_seq"], "at": _iso(now)}
+        return {"ok": True, "menu": True, "session": session, "view": _publish(state, now, agents)}
 
 
 def cmd_claim_prompts(args: argparse.Namespace) -> dict:
@@ -2645,12 +2828,18 @@ def cmd_tick(args: argparse.Namespace) -> dict:
             _merge(state, finished, now)
             _delivery_pass(state, agents, now)
             answer = finish(state, agents)
-    stale = PrCache().stale(
+    cache = PrCache()
+    stale = cache.stale(
         [pr for session in answer["view"]["sessions"] for pr in session["prs"]], now,
     )
     if stale:
         _refresh_prs(stale, now)
+        cache = PrCache()
+    merged = _merged_prs(cache, answer["view"])
+    if stale or merged:
         with _transaction() as state:
+            for pr in merged:
+                _pr_merged(state, pr, now)
             answer = finish(state, agents)
     return answer
 
@@ -2691,7 +2880,9 @@ def _git_branch(cwd: str | None) -> str | None:
 
 
 def cmd_card(args: argparse.Namespace) -> dict:
-    """Works for any omp session, with or without a record, live or closed."""
+    """Works for any omp session, with or without a record, live or closed.
+    `--cached` answers at once from local files; the plain form also asks GitHub
+    and git."""
     session = args.session
     state = _load_state()
     now = _now()
@@ -2704,14 +2895,15 @@ def cmd_card(args: argparse.Namespace) -> dict:
     pinned = session in omp.pins()
     if not (record or row or transcript or pinned):
         raise BadInput(f"unknown session: {session}")
-    cache = PrCache()
-    prs = cache.session_prs(session, transcript, record)
-    cache.save()
-    _refresh_prs(
-        cache.stale(prs, now, sources=("created", "wait", "mentioned"), settled_s=PR_STALE_S),
-        now,
-    )
-    cache = PrCache()
+    cache = PrCache(scan=not args.cached)
+    if not args.cached:
+        prs = cache.session_prs(session, transcript, record)
+        cache.save()
+        _refresh_prs(
+            cache.stale(prs, now, sources=("created", "wait", "mentioned"), settled_s=PR_STALE_S),
+            now,
+        )
+        cache = PrCache()
     facts.prefetch([session])
     view = _session_view(
         session, record, facts, pinned, omp.schedules(session), state, now, cache,
@@ -2728,7 +2920,7 @@ def cmd_card(args: argparse.Namespace) -> dict:
             row.get("stateChangedAt") or row.get("updatedAt") or row.get("lastSeenAt")
         ),
         "last_prompt": prompt or None,
-        "branch": _git_branch(view["cwd"]),
+        "branch": None if args.cached else _git_branch(view["cwd"]),
         "has_record": record is not None,
     }}
 
@@ -2902,14 +3094,22 @@ def _parser() -> argparse.ArgumentParser:
     snooze.add_argument("--for", dest="for_", required=True)
 
     for name, run in (
-        ("seen", cmd_seen), ("card", cmd_card), ("menu-request", cmd_menu_request),
+        ("seen", cmd_seen),
         ("claim-prompts", cmd_claim_prompts), ("resume", cmd_resume),
     ):
         command(name, run).add_argument("--session", type=_session_arg, required=True)
 
+    card = command("card", cmd_card)
+    card.add_argument("--session", type=_session_arg, required=True)
+    card.add_argument("--cached", action="store_true")
+
     heartbeat = command("heartbeat", cmd_heartbeat)
     heartbeat.add_argument("--session", type=_session_arg, required=True)
+    heartbeat.add_argument("--pane", type=_pane_arg)
     heartbeat.add_argument("--features")
+
+    menu_request = command("menu-request", cmd_menu_request)
+    _add_target(menu_request)
 
     remove = command("remove", cmd_remove)
     _add_target(remove)
