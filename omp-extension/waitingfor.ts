@@ -867,23 +867,42 @@ export default function (pi) {
 		setPanel(ctx, errorPanel("The agent didn't register a check."));
 	}
 
+	/** When `check`'s instruction reached the agent, as its user message has it; undefined while still queued. */
+	function checkStarted(c, check): number | undefined {
+		const entry = c.sessionManager
+			.getBranch()
+			.findLast(
+				(item) =>
+					item.type === "message" &&
+					item.message?.role === "user" &&
+					!(Number(item.message.timestamp) < check.at) && // not the same words from an earlier check
+					messageText(item.message) === check.instruction,
+			);
+		return entry && (Number(entry.message.timestamp) || check.at);
+	}
+
+	/** `c`'s session's described check; 10 minutes after its instruction reached the agent it has expired. */
+	function pendingCheck(c) {
+		const session = c.sessionManager.getSessionId();
+		const check = checks.get(session);
+		const started = check && checkStarted(c, check);
+		if (started === undefined || Date.now() - started <= CHECK_TTL_MS) return check;
+		checks.delete(session);
+		if (ctx && session === sessionId) setPanel(ctx, errorPanel("The check expired: the agent took over 10 minutes to write it."));
+		return undefined;
+	}
+
 	/**
 	 * The described check an agent call writes: an add of a command in the turn the check's
-	 * instruction started, within 10 minutes of that start. A turn that was running when the user
-	 * asked has an older last user message.
+	 * instruction started. A turn that was running when the user asked has an older last user message.
 	 */
 	function checkWritten(c, params) {
 		if (params.action !== "add" || params.kind !== "command" || !params.argv) return undefined;
-		const session = c.sessionManager.getSessionId();
-		const check = checks.get(session);
+		const check = pendingCheck(c);
 		const last = c.sessionManager
 			.getBranch()
 			.findLast((entry) => entry.type === "message" && entry.message?.role === "user")?.message;
-		if (!check || !last || messageText(last) !== check.instruction) return undefined;
-		if (Date.now() - (Number(last.timestamp) || check.at) <= CHECK_TTL_MS) return check;
-		checks.delete(session);
-		if (ctx && session === sessionId) setPanel(ctx, errorPanel("The agent took over 10 minutes: its command is its own wait, not your check."));
-		return undefined;
+		return check && last && messageText(last) === check.instruction ? check : undefined;
 	}
 
 	/**
@@ -892,7 +911,7 @@ export default function (pi) {
 	 */
 	function requestCheck(c, check) {
 		const session = c.sessionManager.getSessionId();
-		const pending = checks.get(session);
+		const pending = pendingCheck(c);
 		if (pending) throw new Error(`The agent is still on the check "${pending.description}"; ask for the next one after its turn.`);
 		const instruction = checkInstruction(check.description);
 		checks.set(session, { ...check, instruction, at: Date.now() });
