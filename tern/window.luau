@@ -651,9 +651,15 @@ local function cardBanner(r: any, now: number): Node?
 	return ui.node("row", { role = "codexbar.banner", tone = tones.card }, { ui.text({ ui.span(text, tones.card) }) })
 end
 
+-- Why a PR is on the card: the session waits on it, created it, or only mentioned it.
+local PR_SOURCE_TEXT = { wait = "waiting on", created = "created" }
+
 local function prRow(pr: any): Node
 	local text = "PR#" .. tostring(pr.number) .. " " .. clipped(tostring(pr.title or pr.repo), 60)
 	local kids: { Node } = { ui.text({ ui.link(text, pr.url, if pr.source == "mentioned" then "muted" else nil) }) }
+	if PR_SOURCE_TEXT[pr.source] then
+		table.insert(kids, ui.badge(PR_SOURCE_TEXT[pr.source], "muted"))
+	end
 	if PR_STATE_TONE[pr.state] then
 		table.insert(kids, ui.badge(pr.state, PR_STATE_TONE[pr.state]))
 	end
@@ -664,6 +670,17 @@ local function prRow(pr: any): Node
 		table.insert(kids, ui.badge("checks " .. pr.checks, PR_CHECKS_TONE[pr.checks]))
 	end
 	return ui.node("row", { wrap = true, gap = "sm", role = "codexbar.pr" }, kids)
+end
+
+-- "16:00" today, else "Nov 6, 16:00"; the Waiting tab in the host half writes times the same.
+local MONTHS = { "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" }
+local function clockTime(t: number, now: number): string
+	local hhmm = os.date("%H:%M", t)
+	if os.date("%Y-%m-%d", t) == os.date("%Y-%m-%d", now) then
+		return hhmm
+	end
+	local d = os.date("*t", t)
+	return MONTHS[d.month] .. " " .. d.day .. ", " .. hhmm
 end
 
 -- A chain's later steps are muted: nothing watches them yet.
@@ -703,10 +720,13 @@ local function scheduleRow(j: any, now: number): Node
 	return ui.text({ ui.span(text .. "  ", "muted"), clipped(tostring(j.prompt), 80) })
 end
 
--- The recap, else the last exchange, which is left for the full card.
+-- The recap with its time, else the last exchange, which is left for the full card. A recap
+-- written before the session's later turns is shown dimmed, as an earlier one.
 local function cardRecap(cx: WindowCx, pane: number, r: any, reading: boolean): Node?
 	if type(r.recap) == "string" and r.recap ~= "" then
-		return cardSection("Recap", { ui.text(clipped(r.recap, 300)) })
+		local at = epoch(r.recap_at)
+		local head = (if r.recap_stale == true then "Earlier recap" else "Recap") .. (if at then " · " .. clockTime(at, os.time()) else "")
+		return cardSection(head, { ui.text({ ui.span(clipped(r.recap, 300), if r.recap_stale == true then "muted" else nil) }) })
 	end
 	if reading then
 		return nil
@@ -755,10 +775,12 @@ local function cardView(cx: WindowCx, pane: number, r: any, reading: boolean): N
 		table.insert(kids, ui.text({ ui.span(facts, "muted") }))
 	end
 	local prs: { Node } = {}
+	local mentioned: { Node } = {}
 	for _, pr in list("prs") do
-		table.insert(prs, prRow(pr))
+		table.insert(if pr.source == "mentioned" then mentioned else prs, prRow(pr))
 	end
 	section("Pull requests", prs)
+	section("Mentioned", mentioned)
 	local waits: { Node } = {}
 	for _, w in list("waits") do
 		table.insert(waits, waitRow(w, now))
@@ -772,10 +794,14 @@ local function cardView(cx: WindowCx, pane: number, r: any, reading: boolean): N
 	local since: { Node } = {}
 	local history = list("history")
 	for i = math.max(1, #history - 4), #history do
+		local at = epoch(history[i].at)
 		local text = clipped(tostring(history[i].text), 120)
-		table.insert(since, ui.text({ ui.span(text, if history[i].kind == "fired" then "success" else nil) }))
+		table.insert(since, ui.text({
+			ui.span(if at then clockTime(at, now) .. "  " else "", "muted"),
+			ui.span(text, if history[i].kind == "fired" then "success" else nil),
+		}))
 	end
-	section("Since then", since)
+	section("Since set aside", since)
 	if type(r.next_step) == "string" and r.next_step ~= "" then
 		section("Next step", { ui.text(r.next_step) })
 	end

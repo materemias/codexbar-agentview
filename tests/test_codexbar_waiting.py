@@ -1758,7 +1758,7 @@ class ViewTests(Case):
                 "agent_state", "extension", "resume_command", "note", "suggested_note",
                 "size", "set_aside_at", "pinned", "ball", "unseen", "outcome", "headline",
                 "status", "line", "composer_row",
-                "next_step", "waiting_for", "recap", "due_at", "prompts_queued", "waits",
+                "next_step", "waiting_for", "recap", "recap_at", "recap_stale", "due_at", "prompts_queued", "waits",
                 "schedules", "history", "prs",
             },
         )
@@ -2024,6 +2024,33 @@ class ClosedSessionTests(Case):
     def test_resume(self) -> None:
         self.transcript(SID)
         answer = self.run_cli("resume", "--session", SID)
+    def test_a_closed_sessions_recap_has_its_time(self) -> None:
+        self.transcript(SID)
+        self.history_db([(SID, "older", 1), (SID, "newest", 1_793_958_276)])
+        self.add("--kind", "later")
+        seen = self.session()
+        self.assertEqual(waiting._stamp(seen["recap_at"]), 1_793_958_276)
+        self.assertFalse(seen["recap_stale"])
+
+    def test_a_live_omp_recap_gets_its_time_from_the_history_db(self) -> None:
+        self.history_db([(SID, "live recap", 1_793_958_276)])
+        self.agents(SID)
+        payload = json.loads((self.state_dir / "agents.json").read_text())
+        payload["agents"][0]["recapStale"] = True
+        (self.state_dir / "agents.json").write_text(json.dumps(payload))
+        self.add("--kind", "later")
+        seen = self.session()
+        self.assertEqual(
+            (seen["recap"], waiting._stamp(seen["recap_at"]), seen["recap_stale"]),
+            ("live recap", 1_793_958_276, True),
+        )
+
+    def test_a_recap_omp_did_not_write_has_no_time(self) -> None:
+        self.history_db([(SID, "an older omp recap", 1_793_958_276)])
+        self.agents(SID)  # its recap, "live recap", is Claude's away summary or newer
+        self.add("--kind", "later")
+        self.assertIsNone(self.session()["recap_at"])
+
         self.assertEqual(answer["command"], f"cd -- /w/project && omp --resume {SID}")
         self.assertEqual(answer["cwd"], "/w/project")
 
@@ -2985,6 +3012,15 @@ class MergedPrTests(Case):
         review, ready, merged = self.chain("--no-fix")
         self.tick()
         self.advance(minutes=1)
+    def test_a_pr_its_waits_saw_merged_reads_merged_before_the_status_refresh(self) -> None:
+        self.github()  # its pr_status still says open
+        self.chain("--no-fix")
+        self.merged()
+        self.tick()
+        self.assertEqual(
+            [(pr["title"], pr["state"]) for pr in self.session()["prs"]], [("PR 7", "merged")],
+        )
+
         self.tick()
         self.advance(minutes=1)
         self.tick()

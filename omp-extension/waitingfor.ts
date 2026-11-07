@@ -391,17 +391,23 @@ function detailsPanel(card) {
 		const history = (card.history ?? []).slice(-5);
 		const sentence = card.note || (waits.length > 0 ? "" : "Nothing is waiting in this session.");
 		const place = [card.project, card.branch].filter(Boolean).join(" · ");
+		const source = { wait: "waiting on", created: "created" };
+		const prLine = (pr) => {
+			const facts = [source[pr.source], pr.state, pr.review?.replaceAll("_", " "), pr.checks && `checks ${pr.checks}`].filter(Boolean).join(", ");
+			return [`${pr.repo}#${pr.number}`, facts, pr.title].filter(Boolean).join("  ");
+		};
+		const prs = card.prs ?? [];
+		const mentioned = prs.filter((pr) => pr.source === "mentioned");
 		return [
 			card.headline && theme.fg(TONES[card.outcome] ?? "muted", card.headline),
 			sentence && theme.bold(sentence),
 			card.suggested_note && `Suggested: ${card.suggested_note}`,
 			place && muted(place),
-			...(card.prs ?? []).map((pr) => {
-				const facts = [pr.state, pr.review?.replaceAll("_", " "), pr.checks && `checks ${pr.checks}`].filter(Boolean).join(", ");
-				return [`${pr.repo}#${pr.number}`, facts, pr.title].filter(Boolean).join("  ");
-			}),
+			...prs.filter((pr) => pr.source !== "mentioned").map(prLine),
+			mentioned.length > 0 && muted("Mentioned"),
+			...mentioned.map((pr) => muted(prLine(pr))),
 			...waits.map((wait) => `${wait.id}  ${wait.summary || wait.label} (${waitFacts(wait)})`),
-			history.length > 0 && muted("Since then"),
+			history.length > 0 && muted("Since set aside"),
 			...history.map(({ at, text }) => `${when(at)}  ${text}`),
 			card.next_step && `Next: ${card.next_step}`,
 		]

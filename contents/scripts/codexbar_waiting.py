@@ -451,14 +451,14 @@ class Omp:
             pass
         return out
 
-    def titles_and_recaps(self, ids: list[str]) -> tuple[dict[str, str], dict[str, str]]:
-        """history.db's titles and newest recaps, each table optional."""
+    def titles_and_recaps(self, ids: list[str]) -> tuple[dict[str, str], dict[str, tuple[str, int]]]:
+        """history.db's titles and newest recaps with their `created_at` (seconds), each table optional."""
         db = self.root / "history.db"
         if not ids or not db.is_file():
             return {}, {}
         marks = ",".join("?" * len(ids))
         titles: dict[str, str] = {}
-        recaps: dict[str, str] = {}
+        recaps: dict[str, tuple[str, int]] = {}
         try:
             con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.5)
         except sqlite3.Error:
@@ -473,14 +473,14 @@ class Omp:
                 }
             with contextlib.suppress(sqlite3.Error):
                 # Oldest first, so the newest recap of each session wins.
-                for sid, recap in con.execute(
-                    f"SELECT session_id, recap FROM session_recaps WHERE session_id IN ({marks})"
+                for sid, recap, created_at in con.execute(
+                    f"SELECT session_id, recap, created_at FROM session_recaps WHERE session_id IN ({marks})"
                     " ORDER BY created_at, id",
                     ids,
                 ):
                     recap = " ".join(_text(recap).split())
                     if recap:
-                        recaps[sid] = recap[:RECAP_CHARS]
+                        recaps[sid] = (recap[:RECAP_CHARS], created_at if isinstance(created_at, int) else 0)
         finally:
             con.close()
         return titles, recaps
@@ -506,13 +506,12 @@ class Facts:
         self.agents = agents
         self.omp = omp or Omp()
         self._titles: dict[str, str] = {}
-        self._recaps: dict[str, str] = {}
+        self._recaps: dict[str, tuple[str, int]] = {}
 
     def prefetch(self, ids: list[str]) -> None:
-        """One history.db read for every session the command will describe."""
-        self._titles, self._recaps = self.omp.titles_and_recaps(
-            [sid for sid in ids if sid not in self.agents.live]
-        )
+        """One history.db read for every session the command will describe: titles and recaps
+        of closed ones, and the time of every omp recap, which agents.json doesn't keep."""
+        self._titles, self._recaps = self.omp.titles_and_recaps(ids)
 
     def describe(self, session: str) -> dict:
         live = self.agents.live.get(session)
@@ -523,7 +522,12 @@ class Facts:
         command = _text(row.get("resumeCommand"))
         if live is None:
             title = title or self._titles.get(session, "")
-            recap = recap or self._recaps.get(session, "")
+        stored, seconds = self._recaps.get(session, ("", 0))
+        if not recap and live is None:
+            recap = stored
+        # Both sides clip the same normalized text, so one is a prefix of the other. A recap
+        # that isn't omp's (Claude Code's away summary) has no time.
+        dated = bool(recap and stored) and (stored.startswith(recap) or recap.startswith(stored))
         if not title or not cwd or (live is None and not command):
             header = self.omp.header(session)
             title = title or header["title"]
@@ -535,6 +539,9 @@ class Facts:
             "cwd": cwd or None,
             "project": Path(cwd).name or None,
             "recap": recap or None,
+            "recap_at": _iso(datetime.fromtimestamp(seconds).astimezone()) if dated and seconds else None,
+            # omp's recap of an earlier exchange: the session has had turns since it was written.
+            "recap_stale": bool(recap) and row.get("recapStale") is True,
             "live": live is not None,
             "pane": self.agents.pane_of(session),
             "resume_command": None if live is not None else command or None,
@@ -919,7 +926,10 @@ class PrCache:
     def session_prs(
         self, session: str, transcript: Path | None, record: dict | None,
     ) -> list[dict]:
-        """One session's PRs: created, then wait, then mentioned, newest first."""
+        """One session's PRs: created, then wait, then mentioned, newest first.
+
+        A PR the session's own waits saw merged says so before the status cache's next refresh,
+        so its badge never contradicts the wait that fired on the merge."""
         scanned = self._scan(session, transcript)
         rows: dict[str, dict] = {}
         for pr in (
@@ -928,7 +938,18 @@ class PrCache:
             *(pr for pr in reversed(scanned) if pr["source"] == "mentioned"),
         ):
             rows.setdefault(_pr_key(pr), pr)
-        return [self._row(pr) for pr in rows.values()]
+        merged = {
+            _pr_key(wait["condition"]) for wait in (record["waits"] if record else [])
+            if wait["kind"] == "pr" and (
+                (wait.get("memo") or {}).get("merged")
+                or (wait["condition"].get("until") in ("merged", "released") and wait.get("fired_at"))
+            )
+        }
+        views = [self._row(pr) for pr in rows.values()]
+        for view in views:
+            if _pr_key(view) in merged:
+                view["state"] = "merged"
+        return views
 
     def stale(
         self, prs: list[dict], now: datetime, *,
@@ -2041,7 +2062,7 @@ def _session_view(
         "status": status, "line": line, "composer_row": composer_row,
         "next_step": _next_step(views),
         "waiting_for": _waiting_for(views),
-        "recap": info["recap"],
+        "recap": info["recap"], "recap_at": info["recap_at"], "recap_stale": info["recap_stale"],
         "due_at": min(dues, key=_stamp) if dues else None,
         "prompts_queued": _prompts_queued(record, now),
         "waits": views, "schedules": schedules, "history": _history_view(record),

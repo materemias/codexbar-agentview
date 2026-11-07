@@ -2695,12 +2695,20 @@ end
 -- The same colors as the session card's badges in the window half.
 local PR_STATE_TOKEN = { open = "success", draft = "muted", merged = "info", closed = "error" }
 
--- The session's PRs as links, in the CLI's order; those it only mentions are muted.
-local function prNodes(r: any): { Node }
+-- The session's PRs as links, in the CLI's order: the ones it waits on or created, each saying
+-- which, or with `mentioned` the ones it only mentions, muted.
+local function prNodes(r: any, mentioned: boolean): { Node }
 	local out: { Node } = {}
 	for _, pr in val(r.prs) or {} do
+		if (pr.source == "mentioned") ~= mentioned then
+			continue
+		end
 		local text = "PR#" .. str(pr.number) .. " " .. clip(oneLine(val(pr.title) or pr.repo), 60)
-		local spans: { any } = { ui.link(text, str(pr.url), if pr.source == "mentioned" then "muted" else nil) }
+		local spans: { any } = { ui.link(text, str(pr.url), if mentioned then "muted" else nil) }
+		local source = if pr.source == "wait" then "waiting on" elseif pr.source == "created" then "created" else ""
+		if source ~= "" then
+			table.insert(spans, ui.span("  " .. source, "dim"))
+		end
 		local state = str(pr.state)
 		if state ~= "" then
 			table.insert(spans, ui.span("  " .. state, PR_STATE_TOKEN[state] or "muted"))
@@ -2717,9 +2725,13 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	if note ~= "" then
 		table.insert(kids, withp(ui.text({ ui.span(note, "strong") }), { key = "note" }))
 	end
-	local prs = prNodes(r)
+	local prs = prNodes(r, false)
 	if #prs > 0 then
 		table.insert(kids, detailLines("prs", "Pull requests", prs))
+	end
+	local mentioned = prNodes(r, true)
+	if #mentioned > 0 then
+		table.insert(kids, detailLines("mentioned", "Mentioned", mentioned))
 	end
 	local rowKey = waitKey(r)
 	local live = waitLive(r)
@@ -2762,7 +2774,7 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 			}), { key = "h" .. i }))
 		end
 		if #history > 0 then
-			table.insert(kids, detailLines("since", "Since then", history))
+			table.insert(kids, detailLines("since", "Since set aside", history))
 		end
 		local nextStep = oneLine(r.next_step)
 		if nextStep ~= "" then
@@ -2770,7 +2782,9 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 		end
 		local recap = oneLine(r.recap)
 		if recap ~= "" then
-			table.insert(kids, detailLines("recap", "Recap", { ui.text({ ui.span(recap, "muted") }) }))
+			local at = epoch(r.recap_at)
+			local head = (if val(r.recap_stale) == true then "Earlier recap" else "Recap") .. (if at then " · " .. absoluteTime(at, now) else "")
+			table.insert(kids, detailLines("recap", head, { ui.text({ ui.span(recap, "muted") }) }))
 		end
 		local schedules = {}
 		for i, j in val(r.schedules) or {} do

@@ -214,7 +214,10 @@ you focus a session whose wait fired, and on demand with `Ctrl+Alt+I`, a click
 on the row above the composer or on the status segment, or `Shift+Enter` in
 the dashboard. It shows your sentence, the folder, branch and model, the
 session's pull requests with their state, its waits and schedules, what
-happened since, and the next step. Focus it to use its buttons and links.
+happened since you set it aside (each line with its time), the next step,
+and omp's latest recap of the session with the time omp wrote it. A recap
+written before the session's later turns is headed "Earlier recap" and
+dimmed. Focus the card to use its buttons and links.
 Outside Tern, `Ctrl+Alt+I` shows the same details above the composer.
 
 **On the pane** a row above the omp composer says what the session waits for
@@ -237,10 +240,12 @@ sentence; its suggestion waits for you to accept it.
 
 ## Pull requests of a session
 
-The card and the details list the session's PRs: the ones it created
-(`gh pr create` or omp's GitHub tool), the ones it waits for, and the last
-five mentioned in the conversation, each with its title, state, review and
-checks.
+The card and the details list the session's PRs under **Pull requests**: the
+ones it waits on (marked "waiting on") and the ones it created (marked
+"created", by `gh pr create` or omp's GitHub tool). The last five PRs mentioned
+in the conversation follow under **Mentioned**. Each shows its title, state,
+review and checks; statuses refresh every 10 minutes, but a PR that the
+session's own wait saw merged reads merged at once.
 
 ## Elsewhere
 
