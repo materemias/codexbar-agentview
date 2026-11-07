@@ -1204,6 +1204,15 @@ end
 
 -- The last steps: my sentence, then `add` and the park.
 local function finishSetAside(cx: WindowCx, t: SetAside, kind: string, args: { string })
+	local cwd = if t.cwd and string.sub(t.cwd, 1, 1) == "/" then t.cwd else nil
+	if kind == "command" and not cwd then
+		waitingFailed("set aside", "the pane's folder is unknown", cx)
+		return
+	end
+	if cwd and (kind == "command" or kind == "release") then
+		table.insert(args, "--cwd")
+		table.insert(args, cwd)
+	end
 	ask(cx, { value = t.note, placeholder = "Why set it aside, what next?", action = "set aside" }, function(note)
 		local full = { "add", "--pane", tostring(t.pane), "--kind", kind, "--by", "user", "--label", t.label }
 		for _, a in args do
@@ -1235,7 +1244,7 @@ end
 
 -- The pane's repository as owner/repo; nil and the reason when `gh` can't tell.
 local function paneRepo(t: SetAside, timeoutMs: number, done: (string?, string?, WindowCx?) -> ())
-	if not t.cwd or t.cwd == "" then -- `gh` would answer for the plugin's own folder
+	if not t.cwd or string.sub(t.cwd, 1, 1) ~= "/" then -- `gh` would answer for the plugin's own folder
 		done(nil, "the pane's folder is unknown", nil)
 		return
 	end

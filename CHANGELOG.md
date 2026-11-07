@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Breaking
+
+- Recreate command waits and command-based follow-up checks that have no saved working directory.
+
 ### Features
 
 - Filters take several words separated by spaces, in any order: a session matches when each word appears in its title, prompt, folder, provider, model or recent messages, and every matched word is highlighted.
@@ -25,6 +29,7 @@
 - Launch and Teleport prevent duplicate starts of the same session.
 - Integration installation preserves file associations when an update fails.
 - Follow-up verification runs in the background after the agent's turn ends.
+- Wait checks use the saved project or pane directory and report a missing directory.
 - The installed Plasma package includes the omp extension.
 
 ## 0.3.0 (2026-11-02)

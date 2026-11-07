@@ -88,11 +88,13 @@ class Case(unittest.TestCase):
         self.addCleanup(clock.stop)
 
     def agents(self, *live: str, closed: list[dict] | None = None, boot: str = "") -> None:
+        for sid in live:
+            (self.root / sid[:4]).mkdir(exist_ok=True)
         payload = {
             "bootId": boot,
             "agents": [
                 {
-                    "sessionId": sid, "provider": "omp", "cwd": "/w/" + sid[:4],
+                    "sessionId": sid, "provider": "omp", "cwd": str(self.root / sid[:4]),
                     "state": "idle", "ternPane": 40 + index, "ternSession": "Default",
                     "windowTitle": f"title {sid[:4]}", "recap": "live recap",
                     "resumeCommand": f"omp --resume {sid}",
@@ -453,6 +455,39 @@ class ConditionTests(Case):
         )
         self.tick()
         self.assertEqual(self.wait_of(wait)["state"], "fired")
+
+    def test_command_without_known_session_folder_captures_registration_directory(self) -> None:
+        for session_cwd in (None, ""):
+            with self.subTest(session_cwd=session_cwd):
+                self.agents(closed=[{"sessionId": SID, "cwd": session_cwd}])
+                with mock.patch.object(waiting.os, "getcwd", return_value=str(self.root)):
+                    wait = self.add("--kind", "command", "--argv", '["true"]')["id"]
+                saved = next(
+                    item for item in self.state()["sessions"][SID]["waits"] if item["id"] == wait
+                )
+                self.assertEqual(saved["condition"]["cwd"], str(self.root))
+
+    def test_command_preserves_known_missing_or_relative_session_folder(self) -> None:
+        for session_cwd in ("relative", str(self.root / "missing")):
+            with self.subTest(session_cwd=session_cwd):
+                self.agents(closed=[{"sessionId": SID, "cwd": session_cwd}])
+                wait = self.add("--kind", "command", "--argv", '["true"]')["id"]
+                saved = next(
+                    item for item in self.state()["sessions"][SID]["waits"] if item["id"] == wait
+                )
+                self.assertEqual(saved["condition"]["cwd"], session_cwd)
+
+    def test_command_rejects_unsaved_or_relative_directory_before_spawning(self) -> None:
+        for cwd in (None, "", "relative", 42):
+            with self.subTest(cwd=cwd), mock.patch.object(waiting, "_run_argv") as run:
+                condition = {"argv": ["true"], "predicate": "exit0"}
+                if cwd is not None:
+                    condition["cwd"] = cwd
+                result = waiting._run_command(condition)
+                self.assertFalse(result["holds"])
+                self.assertIn("cwd", result["error"])
+                self.assertIn("recreate", result["error"])
+                run.assert_not_called()
 
     def test_five_failures_need_attention(self) -> None:
         wait = self.add(

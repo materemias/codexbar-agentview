@@ -274,6 +274,9 @@ the session your follow-up prompt when it fires, and the Waiting tab
 (`Ctrl+Alt+W`), the row above the omp composer and the session card
 (`Ctrl+Alt+I`) tell you what happened since and what's next.
 
+Command checks run in the captured project or Tern pane directory. If that
+directory disappears, the check reports failure rather than running elsewhere.
+Checks saved by older versions without a working directory must be recreated.
 After a follow-up turn ends, the next background tick runs its verification.
 
 [Session lifecycle](docs/session-lifecycle.md) covers the commands, what each

@@ -1326,7 +1326,7 @@ def _run_argv(argv: list[str], cwd: str | None) -> tuple[int | None, str, str]:
         process = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, errors="replace",
-            start_new_session=True, cwd=cwd if cwd and os.path.isdir(cwd) else None,
+            start_new_session=True, cwd=cwd,
         )
     except (OSError, ValueError) as error:
         return None, "", str(error)
@@ -1364,7 +1364,10 @@ def _predicate(predicate: str, code: int, stdout: str) -> tuple[bool, str]:
 
 
 def _run_command(condition: dict) -> dict:
-    code, stdout, detail = _run_argv(condition["argv"], condition.get("cwd"))
+    cwd = condition.get("cwd")
+    if not isinstance(cwd, str) or not cwd or not os.path.isabs(cwd):
+        return {"holds": False, "error": "Command cwd is not a saved absolute directory; recreate this wait"}
+    code, stdout, detail = _run_argv(condition["argv"], cwd)
     if code is None:
         return {"holds": False, "error": detail}
     if condition["predicate"] == "changed":
@@ -2388,6 +2391,8 @@ def _start_wait(
 
 def cmd_add(args: argparse.Namespace) -> dict:
     kind = args.kind
+    if args.cwd is not None and (not os.path.isabs(args.cwd) or not os.path.isdir(args.cwd)):
+        raise BadInput("--cwd must be an absolute existing directory")
     agents = _read_agents()
     if kind == "job":
         session, pane = args.session, None if args.session else args.pane
@@ -2408,9 +2413,13 @@ def cmd_add(args: argparse.Namespace) -> dict:
     verify = _parse_verify(args.verify) if args.verify else None
     deadline, deadline_in_s = _time_or_in(args.deadline, args.deadline_in, "deadline")
     facts = Facts(agents)
-    cwd = facts.describe(session)["cwd"] if session else None
-    for check in (condition, verify):
-        if check and check["type"] == "command" and cwd:
+    cwd = args.cwd
+    if cwd is None and session:
+        cwd = facts.describe(session)["cwd"] or None
+    command_checks = [check for check in (condition, verify) if check and check["type"] == "command"]
+    if command_checks:
+        cwd = cwd if cwd is not None else os.getcwd()
+        for check in command_checks:
             check["cwd"] = cwd
 
     def apply(state: dict, now: datetime) -> dict:
@@ -3042,6 +3051,7 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--at")
     add.add_argument("--in", dest="in_")
     add.add_argument("--argv")
+    add.add_argument("--cwd")
     add.add_argument("--interval")
     add.add_argument("--predicate")
     add.add_argument("--what")

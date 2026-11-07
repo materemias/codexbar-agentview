@@ -108,6 +108,17 @@ registering a check, the area above the composer says so. One described check
 can be pending at a time. With `!` you give the command yourself and no agent
 is asked.
 
+Command checks capture their directory when the wait is added: an explicit
+`add --cwd` overrides the known session project directory; otherwise, the
+known session project directory is preferred over the registration directory.
+Tern captures the pane's directory. `--cwd` must be an absolute, existing
+directory and also applies to release checks and command-based follow-up
+verification. A known session directory is retained even if already missing
+when registered; the check reports failure rather than using another directory.
+Only checks with no known session directory use the registration directory.
+Legacy checks with no saved directory require recreation; their project
+directory is never guessed.
+
 **Deadlines.** Any wait can have one (from the CLI and the agent's tool).
 When it passes, the wait comes back to you as overdue and is still watched.
 
