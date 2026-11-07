@@ -131,13 +131,16 @@ are listed.
 
 When a wait with a prompt fires, the omp extension sends the prompt into the
 session, parked or not, after the running turn. A prompt can carry a check (a
-command or a PR state) that decides whether the turn did its job. Without one,
-the wait comes back to you as "ran, take a look".
+command or a PR state) that decides whether the turn did its job. When the
+turn ends, verification is queued for a background tick, not run inside the
+extension's turn-finished event. Without a check, the wait comes back to you
+as "ran, take a look".
 
 A closed session never restarts by itself. Its wait comes back to you with
 Resume, which reopens the session in a new Tern tab and then sends the
 prompt. A live session without the extension can't take prompts; its wait
 comes back to you saying so.
+
 ## When a wait is fulfilled
 
 A wait that happened stays in On me until you mark it Done, and everything
@@ -160,7 +163,6 @@ yellow when one needs you.
 
 When a babysat PR is merged early, the steps it skipped (review, ready) are
 closed and the merged step fires at once.
-
 
 ## Coming back
 
@@ -242,7 +244,9 @@ Everything goes through one program, `contents/scripts/codexbar_waiting.py`.
 It is the only writer of `waiting.json` in the state folder and rewrites
 `waiting_view.json` after every change; Tern, the omp extension, Plasma and
 tern-awui read that view and act only through the CLI. The Tern plugin calls
-its `tick` command, which evaluates the due checks and returns what a window
-has to do (toast, park, close a pane). Prompts go through the omp extension
-inside the session, so they reach parked sessions and never touch your draft.
+its `tick` command, which evaluates due checks and queued follow-up
+verifications, then returns what a window has to do (toast, park, close a
+pane). The extension's turn-finished event only queues verification. Prompts
+go through the omp extension inside the session, so they reach parked sessions
+and never touch your draft.
 Pull requests are read through `gh`; nothing ever writes to GitHub.

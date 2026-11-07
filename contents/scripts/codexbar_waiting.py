@@ -2629,7 +2629,7 @@ def cmd_remove(args: argparse.Namespace) -> dict:
 
 
 def _settle_turn(state: dict, record: dict, now: datetime) -> None:
-    """The turn after a delivered prompt ended: verify it, or hand it to me."""
+    """The delivered prompt's turn ended: queue verification, or hand it to me."""
     queue = record["prompt_queue"]
     if not queue or queue[0]["state"] != "delivered":
         return
@@ -2647,6 +2647,7 @@ def _settle_turn(state: dict, record: dict, now: datetime) -> None:
         _toast(state, record, wait, now, "info", f"{wait['label']}: {REASON_REVIEW}")
     else:
         wait.update(verify_pending=True, verify_claim_until=None)
+        _touch(wait)
 
 
 def cmd_event(args: argparse.Namespace) -> dict:
@@ -2659,7 +2660,6 @@ def cmd_event(args: argparse.Namespace) -> dict:
         session = agents.session_of(args.pane)
     if kind in ("turn_finished", "waiting_input") and args.session is None and args.pane is None:
         raise BadInput(f"{kind} needs --session or --pane")
-    jobs: list[dict] = []
 
     def apply(state: dict, now: datetime) -> dict:
         record = state["sessions"].get(session) if session else None
@@ -2668,7 +2668,6 @@ def cmd_event(args: argparse.Namespace) -> dict:
             for wait in _open_waits(record):
                 if wait["reason"] == REASON_QUESTION:
                     wait.update(on_me=False, reason=None)
-            jobs.extend(_claim_verifies(record, now))
         elif kind == "waiting_input" and record:
             for wait in _open_waits(record):
                 if wait["state"] == "acting":
@@ -2684,12 +2683,7 @@ def cmd_event(args: argparse.Namespace) -> dict:
             _pane_closed(state, args.pane, now)
         return {}
 
-    answer = _mutate(apply, agents=agents)
-    if jobs:
-        now = _now()
-        finished = _run_jobs(jobs, now)
-        answer = _mutate(lambda state, moment: _merge(state, finished, moment), now, agents)
-    return answer
+    return _mutate(apply, agents=agents)
 
 
 def cmd_heartbeat(args: argparse.Namespace) -> dict:

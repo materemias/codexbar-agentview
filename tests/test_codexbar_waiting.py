@@ -802,7 +802,10 @@ class PrTests(Case):
         prompt = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]
         self.assertEqual(prompt["text"], "fix o/r#7 at abc123")
         self.run_cli("ack", "--action", prompt["action"], "--result", "delivered")
-        view = self.run_cli("event", "--type", "turn_finished", "--session", SID)["view"]
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.assertEqual(before, [])
+        self.assertEqual(self.wait_of(first)["state"], "acting")
+        view = self.tick()["view"]
         self.assertEqual(before, [{"head": "abc123", "threads": []}])
         self.assertEqual(
             [(wait["label"], wait["state"]) for wait in view["sessions"][0]["waits"]],
@@ -814,6 +817,7 @@ class PrTests(Case):
         prompt = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]
         self.run_cli("ack", "--action", prompt["action"], "--result", "delivered")
         self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.tick()
         seen = self.session()
         self.assertEqual(self.wait_of(first)["state"], "needs_attention")
         self.assertEqual(self.wait_of(first)["reason"], "head did not move")
@@ -881,6 +885,7 @@ class PrTests(Case):
         verify = json.dumps({"type": "pr", "repo": "o/r", "number": 7, "until": "merged"})
         wait, _ = self.queued_prompt("--verify", verify)
         self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.tick()
         self.assertEqual(self.wait_of(wait)["state"], "needs_attention")
 
     def test_gh_failure_during_a_fix_verify_is_retried(self) -> None:
@@ -899,6 +904,7 @@ class PrTests(Case):
         action = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]["action"]
         self.run_cli("ack", "--action", action, "--result", "delivered")
         self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.tick()
         self.assertEqual(self.wait_of(first)["state"], "acting")
         self.advance(minutes=4)
         self.tick()
@@ -909,6 +915,7 @@ class PrTests(Case):
         self.heartbeat()
         verify = json.dumps({"type": "command", "argv": [sys.executable, "-c", "pass"]})
         wait, _ = self.queued_prompt("--verify", verify)
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
         real = waiting._run_jobs
 
         def snooze_and_run_it_again(jobs, now):
@@ -917,13 +924,17 @@ class PrTests(Case):
             self.tick()
             action = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]["action"]
             self.run_cli("ack", "--action", action, "--result", "delivered")
-            with mock.patch.object(waiting, "_claim_verifies", lambda record, now: []):
-                self.run_cli("event", "--type", "turn_finished", "--session", SID)
+            self.run_cli("event", "--type", "turn_finished", "--session", SID)
             return real(jobs, now)
 
         with mock.patch.object(waiting, "_run_jobs", snooze_and_run_it_again):
-            self.run_cli("event", "--type", "turn_finished", "--session", SID)
+            self.tick()
         self.assertEqual(self.wait_of(wait)["state"], "acting")
+        saved = self.state()["sessions"][SID]["waits"][0]
+        self.assertTrue(saved["verify_pending"])
+        self.assertIsNone(saved["verify_claim_until"])
+        self.tick()
+        self.assertEqual(self.run_cli("list")["sessions"], [])
 
 
 class DeadlineTests(Case):
@@ -1361,6 +1372,9 @@ class PromptTests(Case):
         wait, _ = self.queued_prompt("--verify", verify)
         following = self.add("--kind", "later", "--after", wait)["id"]
         self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.assertEqual(self.wait_of(wait)["state"], "acting")
+        self.assertEqual(self.wait_of(following)["state"], "pending")
+        self.tick()
         self.assertEqual([item["id"] for item in self.session()["waits"]], [following])
         self.assertEqual(self.wait_of(following)["state"], "waiting")
 
@@ -1369,14 +1383,16 @@ class PromptTests(Case):
         wait, _ = self.queued_prompt("--verify", verify)
         following = self.add("--kind", "later", "--after", wait)["id"]
         self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.tick()
         self.assertEqual(self.wait_of(wait)["state"], "needs_attention")
         self.assertEqual(self.wait_of(following)["state"], "pending")
 
     def test_verify_left_behind_by_a_crash_runs_in_tick(self) -> None:
         verify = json.dumps({"type": "command", "argv": [sys.executable, "-c", "pass"]})
         wait, _ = self.queued_prompt("--verify", verify)
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
         with mock.patch.object(waiting, "_run_jobs", lambda jobs, now: []):
-            self.run_cli("event", "--type", "turn_finished", "--session", SID)
+            self.tick()
         self.assertEqual(self.wait_of(wait)["state"], "acting")
         self.tick()
         self.assertEqual(self.wait_of(wait)["state"], "acting")
@@ -2800,6 +2816,7 @@ class OutcomeTests(Case):
         verify = json.dumps({"type": "command", "argv": [sys.executable, "-c", "pass"]})
         self.queued_prompt("--verify", verify)
         self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.tick()
         last = self.session()["history"][-1]
         self.assertTrue(last["text"].startswith("Verified:"), last)
         self.assertEqual(last["kind"], "fired")
