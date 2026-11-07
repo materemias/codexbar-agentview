@@ -3,9 +3,13 @@ from __future__ import annotations
 from contextlib import ExitStack
 import io
 import json
+import os
 import sys
 import runpy
+import socket
+import subprocess
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -239,6 +243,452 @@ class LaunchTests(unittest.TestCase):
                          ["d2", "d5", "unknown"])
         self.assertEqual(json.loads(stdout.getvalue()),
                          [["omp", "d2"], ["omp", "unknown"]])
+
+
+class SessionOperationOwnershipTests(unittest.TestCase):
+    # Each helper imports the production CLI afresh. Only terminal dispatch
+    # and process inspection/signalling are replaced: no daemon or agent runs.
+    WORKER = textwrap.dedent(r"""
+        import json
+        import os
+        from pathlib import Path
+        import socket
+        import subprocess
+        import sys
+        import time
+        from contextlib import ExitStack
+        from unittest import mock
+
+        scripts, directory, action, mode, provider, descriptor = sys.argv[1:]
+        sys.path.insert(0, scripts)
+        import codexbar_focus as focus
+
+        root = Path(directory)
+        channel = socket.socket(fileno=int(descriptor))
+        channel.settimeout(10)
+
+        def event(value):
+            data = (json.dumps(value) + "\n").encode()
+            fd = os.open(root / "events.jsonl",
+                         os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            try:
+                os.write(fd, data)
+            finally:
+                os.close(fd)
+
+        def terminal(args, socket=""):
+            if args[:2] == ["new", "tab"]:
+                if mode == "fail":
+                    event({"kind": "failed-start"})
+                    return subprocess.CompletedProcess(args, 1, "", "controlled startup failure")
+                event({"kind": "dispatch", "action": action, "provider": provider, "argv": args})
+                if mode == "crash":
+                    os._exit(86)
+                if mode == "accepted-timeout":
+                    return None
+                if mode == "hold":
+                    channel.sendall(b"D")
+                    if channel.recv(1) != b"G":
+                        raise RuntimeError("dispatch was not released")
+                return subprocess.CompletedProcess(args, 0, '{"block": 9}', "")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        def stopped(pid, timeout):
+            if mode == "writer-stuck":
+                return False
+            # Simulate the sweep observing the old writer's exit while the
+            # resumed tab is still in startup and not discoverable.
+            payload = json.loads(focus.AGGREGATE_PATH.read_text())
+            payload["agents"] = []
+            focus.AGGREGATE_PATH.write_text(json.dumps(payload))
+            return True
+
+        with ExitStack() as stack:
+            if mode in ("expired", "unresolved-empty-cwd", "unresolved-same-cwd"):
+                expired = time.monotonic() + focus.SESSION_START_RESERVATION_SECONDS + 1
+                stack.enter_context(mock.patch.object(focus.time, "monotonic", return_value=expired))
+            stack.enter_context(mock.patch.object(focus, "_tern_ready", return_value=True))
+            stack.enter_context(mock.patch.object(focus, "_tern", side_effect=terminal))
+            stack.enter_context(mock.patch.object(focus, "_user_shell", return_value="/bin/sh"))
+            stack.enter_context(mock.patch.object(focus.agents, "_pgrep", return_value=[]))
+            stack.enter_context(mock.patch.object(focus.agents, "tern_bin", return_value="/unused/tern"))
+            if mode in ("unresolved-empty-cwd", "unresolved-same-cwd"):
+                stack.enter_context(mock.patch.object(
+                    focus.agents, "_pgrep",
+                    side_effect=lambda _provider, services=False: [] if services else [424242]))
+                stack.enter_context(mock.patch.object(focus.agents, "_resume_arg", return_value=""))
+                stack.enter_context(mock.patch.object(focus.agents, "_shell_resume_arg", return_value=""))
+                stack.enter_context(mock.patch.object(
+                    focus.agents, "_cwd_of",
+                    return_value=str(root) if mode == "unresolved-same-cwd" else ""))
+                stack.enter_context(mock.patch.dict(
+                    focus.agents._INFO_FN,
+                    {provider: lambda pid: {"sessionId": "another-session", "identityExact": False}}))
+            if action == "--teleport":
+                info = {"sessionId": "same-session", "identityExact": True,
+                        "state": "idle", "cwd": str(root)}
+                stack.enter_context(mock.patch.dict(
+                    focus.agents._INFO_FN, {provider: lambda pid: info}))
+                stack.enter_context(mock.patch.object(
+                    focus.agents, "_pgrep",
+                    side_effect=lambda _provider, services=False: [] if services else [424242]))
+                stack.enter_context(mock.patch.object(focus.agents, "_resume_arg", return_value=""))
+                stack.enter_context(mock.patch.object(focus.agents, "_held_rollouts", return_value=set()))
+                stack.enter_context(mock.patch.object(focus.agents, "_codex_home", return_value=str(root)))
+                stack.enter_context(mock.patch.object(focus.agents, "_cwd_of", return_value=str(root)))
+                stack.enter_context(mock.patch.object(
+                    focus.agents, "_parent_walk_for_host", return_value=("kitty", [])))
+                stack.enter_context(mock.patch.object(focus.agents, "_ppid_of", return_value=0))
+                stack.enter_context(mock.patch.object(focus.agents, "_comm_of", return_value=""))
+                stack.enter_context(mock.patch.object(
+                    focus, "_signal", side_effect=lambda pid, sig:
+                    event({"kind": "signal", "pid": pid, "signal": sig})))
+                stack.enter_context(mock.patch.object(focus, "_wait_exit", side_effect=stopped))
+            channel.sendall(b"R")
+            if channel.recv(1) != b"G":
+                raise RuntimeError("helper was not started")
+            channel.sendall(b"C")
+            code = focus.main(["--tern", action, provider, "same-session"])
+        channel.close()
+        sys.exit(code)
+    """)
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.env = {
+            "HOME": str(self.root / "home"),
+            "XDG_STATE_HOME": str(self.root / "state"),
+            "XDG_CONFIG_HOME": str(self.root / "config"),
+            "XDG_CACHE_HOME": str(self.root / "cache"),
+            "XDG_DATA_HOME": str(self.root / "data"),
+            "XDG_RUNTIME_DIR": str(self.root / "runtime"),
+            "OMP_CONFIG_DIR": str(self.root / "omp"),
+            "OMP_STATE_DIR": str(self.root / "omp-state"),
+            "CODEX_HOME": str(self.root / "codex"),
+            "CLAUDE_CONFIG_DIR": str(self.root / "claude"),
+            "PATH": "",
+        }
+        for value in self.env.values():
+            if value:
+                Path(value).mkdir(parents=True, exist_ok=True)
+        self.path = Path(self.env["XDG_STATE_HOME"]) / "codexbar-agentview" / "agents.json"
+        self.path.parent.mkdir()
+        self.record = entry(
+            provider="codex", sessionId="same-session", cwd=str(self.root),
+            host="tern", desktop="",
+            resumeCommand=focus.agents._resume_command(
+                "codex", "same-session", str(self.root), True),
+        )
+        self.snapshot()
+
+    def snapshot(self, live: bool = False) -> None:
+        agents = ([{"provider": "codex", "sessionId": "same-session",
+                    "pid": 424242, "host": "kitty"}] if live else [])
+        self.path.write_text(json.dumps({"agents": agents, "history": [self.record]}))
+
+    @staticmethod
+    def stop_helper(process: subprocess.Popen, channel: socket.socket) -> None:
+        channel.close()
+        if process.poll() is None:
+            process.kill()
+        process.communicate(timeout=5)
+
+    def start_helper(self, action: str = "--launch", mode: str = "normal",
+                     provider: str = "codex"):
+        parent, child = socket.socketpair()
+        parent.settimeout(10)
+        try:
+            process = subprocess.Popen(
+                [sys.executable, "-I", "-B", "-c", self.WORKER, str(SCRIPTS),
+                 str(self.root), action, mode, provider, str(child.fileno())],
+                env=self.env, pass_fds=(child.fileno(),),
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True,
+            )
+        except BaseException:
+            parent.close()
+            raise
+        finally:
+            child.close()
+        self.addCleanup(self.stop_helper, process, parent)
+        self.assertEqual(parent.recv(1), b"R", "helper failed before becoming ready")
+        parent.sendall(b"G")
+        self.assertEqual(parent.recv(1), b"C", "helper was not released to call the production CLI")
+        return process, parent
+
+    def finish_helper(self, process: subprocess.Popen) -> tuple[int, str]:
+        _stdout, stderr = process.communicate(timeout=15)
+        return process.returncode, stderr
+
+    def events(self) -> list[dict]:
+        path = self.root / "events.jsonl"
+        return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+    def dispatches(self) -> list[dict]:
+        return [event for event in self.events() if event["kind"] == "dispatch"]
+
+    def test_competing_launch_helpers_dispatch_one_resume(self) -> None:
+        first, barrier = self.start_helper(mode="hold")
+        self.assertEqual(barrier.recv(1), b"D")
+        second, _ = self.start_helper()
+        # The second caller is released to call main while the first is at
+        # the startup boundary. It may refuse immediately or wait for it.
+        barrier.sendall(b"G")
+        first_result = self.finish_helper(first)
+        second_result = self.finish_helper(second)
+        self.assertEqual(first_result[0], 0, first_result[1])
+        self.assertEqual(len(self.dispatches()), 1,
+                         "competing helpers dispatched two writers for one session")
+        self.assertEqual(second_result[0], 5, second_result[1])
+
+    def test_completed_helper_keeps_reservation_until_writer_discovery(self) -> None:
+        first, _ = self.start_helper()
+        self.assertEqual(self.finish_helper(first)[0], 0)
+        # No writer has appeared in agents.json yet. A process-local lock
+        # released on CLI exit cannot protect this startup gap.
+        self.assertEqual(json.loads(self.path.read_text())["agents"], [])
+        second, _ = self.start_helper()
+        result = self.finish_helper(second)
+        self.assertEqual(len(self.dispatches()), 1,
+                         "helper exit released ownership before writer discovery")
+        self.assertEqual(result[0], 5, result[1])
+
+    def test_first_teleport_after_successful_launch_reconciles_discovered_writer(self) -> None:
+        launched, _ = self.start_helper()
+        result = self.finish_helper(launched)
+        self.assertEqual(result[0], 0, result[1])
+        self.snapshot(live=True)
+        teleport, _ = self.start_helper(action="--teleport")
+        result = self.finish_helper(teleport)
+        self.assertEqual(result[0], 0, result[1])
+        self.assertEqual([event["action"] for event in self.dispatches()],
+                         ["--launch", "--teleport"])
+        kinds = [event["kind"] for event in self.events()]
+        self.assertEqual(kinds, ["dispatch", "signal", "dispatch"])
+        self.assertEqual(json.loads(self.path.read_text())["agents"], [],
+                         "teleport must observe the old writer exit before dispatch")
+
+    def test_teleport_after_successful_launch_still_requires_old_writer_exit(self) -> None:
+        launched, _ = self.start_helper()
+        result = self.finish_helper(launched)
+        self.assertEqual(result[0], 0, result[1])
+        self.snapshot(live=True)
+        teleport, _ = self.start_helper(action="--teleport", mode="writer-stuck")
+        result = self.finish_helper(teleport)
+        self.assertEqual(result[0], 10, result[1])
+        self.assertIn("agent did not exit", result[1])
+        self.assertEqual(len(self.dispatches()), 1)
+        self.assertEqual([event["kind"] for event in self.events()],
+                         ["dispatch", "signal", "signal"])
+        self.assertTrue(json.loads(self.path.read_text())["agents"])
+
+    def test_accepted_terminal_timeout_keeps_reservation_for_retry(self) -> None:
+        ambiguous, _ = self.start_helper(mode="accepted-timeout")
+        result = self.finish_helper(ambiguous)
+        self.assertIn(result[0], (0, 8), result[1])
+        self.assertEqual(len(self.dispatches()), 1)
+        self.assertEqual(json.loads(self.path.read_text())["agents"], [])
+        retry, _ = self.start_helper()
+        result = self.finish_helper(retry)
+        self.assertEqual(len(self.dispatches()), 1,
+                         "an ambiguous terminal reply dispatched a second writer")
+        self.assertEqual(result[0], 5, result[1])
+
+    def test_expired_reservation_ignores_unresolved_process_without_cwd(self) -> None:
+        self.record.update(
+            provider="pi", resumeCommand=focus.agents._resume_command(
+                "pi", "same-session", str(self.root), True))
+        self.snapshot()
+        launched, _ = self.start_helper(provider="pi")
+        result = self.finish_helper(launched)
+        self.assertEqual(result[0], 0, result[1])
+        retry, _ = self.start_helper(provider="pi", mode="unresolved-empty-cwd")
+        result = self.finish_helper(retry)
+        self.assertEqual(result[0], 0, result[1])
+        self.assertEqual(len(self.dispatches()), 2,
+                         "a disappeared process with no cwd blocked an unrelated session")
+
+    def test_expired_reservation_refuses_unresolved_process_in_same_cwd(self) -> None:
+        self.record.update(
+            provider="pi", resumeCommand=focus.agents._resume_command(
+                "pi", "same-session", str(self.root), True))
+        self.snapshot()
+        launched, _ = self.start_helper(provider="pi")
+        result = self.finish_helper(launched)
+        self.assertEqual(result[0], 0, result[1])
+        retry, _ = self.start_helper(provider="pi", mode="unresolved-same-cwd")
+        result = self.finish_helper(retry)
+        self.assertEqual(result[0], 5, result[1])
+        self.assertEqual(len(self.dispatches()), 1,
+                         "an unresolved writer in the same cwd must still prevent dispatch")
+
+    def test_failed_terminal_start_releases_reservation_for_retry(self) -> None:
+        failed, _ = self.start_helper(mode="fail")
+        result = self.finish_helper(failed)
+        self.assertEqual(result[0], 8, result[1])
+        self.assertIn("controlled startup failure", result[1])
+        self.assertEqual(self.dispatches(), [])
+        retry, _ = self.start_helper()
+        result = self.finish_helper(retry)
+        self.assertEqual(result[0], 0, result[1])
+        self.assertEqual(len(self.dispatches()), 1)
+
+    def test_same_session_id_in_different_providers_has_independent_ownership(self) -> None:
+        other = {
+            **self.record, "provider": "omp",
+            "resumeCommand": focus.agents._resume_command(
+                "omp", "same-session", str(self.root), True),
+        }
+        self.path.write_text(json.dumps({"agents": [], "history": [self.record, other]}))
+        codex, barrier = self.start_helper(mode="hold")
+        self.assertEqual(barrier.recv(1), b"D")
+        omp, _ = self.start_helper(provider="omp")
+        # Unrelated ownership must not serialize startup behind Codex.
+        omp_result = self.finish_helper(omp)
+        barrier.sendall(b"G")
+        codex_result = self.finish_helper(codex)
+        self.assertEqual(omp_result[0], 0, omp_result[1])
+        self.assertEqual(codex_result[0], 0, codex_result[1])
+        self.assertEqual([event["provider"] for event in self.dispatches()], ["codex", "omp"])
+
+    def test_teleport_and_launch_share_session_ownership(self) -> None:
+        self.snapshot(live=True)
+        teleport, barrier = self.start_helper(action="--teleport", mode="hold")
+        self.assertEqual(barrier.recv(1), b"D")
+        self.assertEqual(json.loads(self.path.read_text())["agents"], [])
+        launch, _ = self.start_helper()
+        barrier.sendall(b"G")
+        teleport_result = self.finish_helper(teleport)
+        launch_result = self.finish_helper(launch)
+        self.assertEqual(teleport_result[0], 0, teleport_result[1])
+        self.assertEqual(self.events()[0]["kind"], "signal")
+        self.assertEqual(len(self.dispatches()), 1,
+                         "launch raced the teleport between old-writer exit and discovery")
+        self.assertEqual(self.dispatches()[0]["action"], "--teleport")
+        self.assertEqual(launch_result[0], 5, launch_result[1])
+
+    def test_crashed_dispatch_stays_reserved_then_retries_after_expiry(self) -> None:
+        crashed, _ = self.start_helper(mode="crash")
+        result = self.finish_helper(crashed)
+        self.assertEqual(result[0], 86, result[1])
+        self.assertEqual(len(self.dispatches()), 1)
+        blocked, _ = self.start_helper()
+        result = self.finish_helper(blocked)
+        self.assertEqual(result[0], 5, result[1])
+        self.assertEqual(len(self.dispatches()), 1)
+        retry, _ = self.start_helper(mode="expired")
+        result = self.finish_helper(retry)
+        self.assertEqual(result[0], 0, result[1])
+        self.assertEqual(len(self.dispatches()), 2)
+
+    def test_expired_reservations_reconcile_every_provider_and_refuse_writers(self) -> None:
+        cases = (
+            ("codex", False, True), ("pi", False, True),
+            ("opencode", False, False), ("codex", True, True),
+        )
+        for provider, service, exact in cases:
+            with self.subTest(provider=provider, service=service):
+                directory = self.root / f"{provider}-{service}"
+                directory.mkdir()
+                path = directory / "agents.json"
+                record = {
+                    **self.record, "provider": provider,
+                    "resumeCommand": focus.agents._resume_command(
+                        provider, "same-session", str(self.root), True),
+                }
+                path.write_text(json.dumps({"agents": [], "history": [record]}))
+                with (
+                    mock.patch.object(focus, "AGGREGATE_PATH", path),
+                    mock.patch.object(focus, "_launch_tern", return_value=0) as dispatch,
+                    mock.patch.object(focus.sys, "stderr", io.StringIO()),
+                    mock.patch.object(focus.agents, "_held_rollouts", return_value=set()),
+                    mock.patch.object(focus.agents, "_resume_arg", return_value=""),
+                    mock.patch.object(focus.agents, "_shell_resume_arg", return_value=""),
+                    mock.patch.object(focus.agents, "_codex_home", return_value=str(self.root)),
+                    mock.patch.object(focus.agents, "_cwd_of", return_value=str(self.root)),
+                ):
+                    self.assertEqual(focus.launch(provider, "same-session"), 0)
+                    expired = focus.time.monotonic() + focus.SESSION_START_RESERVATION_SECONDS + 1
+                    info = {"sessionId": "same-session", "cwd": str(self.root),
+                            "identityExact": exact}
+                    with (
+                        mock.patch.object(focus.time, "monotonic", return_value=expired),
+                        mock.patch.object(
+                            focus.agents, "_pgrep",
+                            side_effect=lambda _provider, services=False: [77] if services == service else []),
+                        mock.patch.dict(focus.agents._INFO_FN, {provider: lambda _pid: info}),
+                    ):
+                        self.assertEqual(focus.launch(provider, "same-session"), 5)
+                    dispatch.assert_called_once()
+                    # Discovery releases the startup reservation, but never
+                    # dispatches. Once that writer exits, retry need not wait.
+                    self.assertEqual(focus.launch(provider, "same-session"), 0)
+                    self.assertEqual(dispatch.call_count, 2)
+
+    def test_expired_codex_reservation_checks_every_server_rollout(self) -> None:
+        with (
+            mock.patch.object(focus, "AGGREGATE_PATH", self.path),
+            mock.patch.object(focus, "_launch_tern", return_value=0) as dispatch,
+            mock.patch.object(focus.sys, "stderr", io.StringIO()),
+        ):
+            self.assertEqual(focus.launch("codex", "same-session"), 0)
+            expired = focus.time.monotonic() + focus.SESSION_START_RESERVATION_SECONDS + 1
+            with (
+                mock.patch.object(focus.time, "monotonic", return_value=expired),
+                mock.patch.object(
+                    focus.agents, "_pgrep",
+                    side_effect=lambda _provider, services=False: [77] if services else []),
+                mock.patch.object(focus.agents, "_codex_home", return_value=str(self.root)),
+                mock.patch.object(focus.agents, "_held_rollouts", return_value={
+                    str(self.root / "sessions" / "other.jsonl"),
+                    str(self.root / "sessions" / "rollout-same-session.jsonl"),
+                }),
+                mock.patch.object(focus.agents, "_resume_arg", return_value=""),
+                mock.patch.dict(focus.agents._INFO_FN, {"codex": lambda _pid: {
+                    "sessionId": "another-session", "identityExact": True}}),
+            ):
+                self.assertEqual(focus.launch("codex", "same-session"), 5)
+            dispatch.assert_called_once()
+
+    def test_expired_reservation_does_not_treat_unresolved_writer_as_absent(self) -> None:
+        with (
+            mock.patch.object(focus, "AGGREGATE_PATH", self.path),
+            mock.patch.object(focus, "_launch_tern", return_value=0) as dispatch,
+            mock.patch.object(focus.sys, "stderr", io.StringIO()),
+            mock.patch.object(focus.agents, "_held_rollouts", return_value=set()),
+            mock.patch.object(focus.agents, "_resume_arg", return_value=""),
+            mock.patch.object(focus.agents, "_codex_home", return_value=str(self.root)),
+        ):
+            self.assertEqual(focus.launch("codex", "same-session"), 0)
+            expired = focus.time.monotonic() + focus.SESSION_START_RESERVATION_SECONDS + 1
+            for info in ({}, {"sessionId": "other", "identityExact": False}):
+                with (
+                    self.subTest(info=info),
+                    mock.patch.object(focus.time, "monotonic", return_value=expired),
+                    mock.patch.object(focus.agents, "_pgrep",
+                                      side_effect=lambda _provider, services=False: [] if services else [77]),
+                    mock.patch.object(focus.agents, "_cwd_of", return_value=str(self.root)),
+                    mock.patch.dict(focus.agents._INFO_FN, {"codex": lambda _pid: info}),
+                ):
+                    self.assertEqual(focus.launch("codex", "same-session"), 5)
+            dispatch.assert_called_once()
+
+    def test_expired_reservation_refuses_when_provider_inspection_is_unavailable(self) -> None:
+        with (
+            mock.patch.object(focus, "AGGREGATE_PATH", self.path),
+            mock.patch.object(focus, "_launch_tern", return_value=0) as dispatch,
+            mock.patch.object(focus.sys, "stderr", io.StringIO()),
+        ):
+            self.assertEqual(focus.launch("codex", "same-session"), 0)
+            expired = focus.time.monotonic() + focus.SESSION_START_RESERVATION_SECONDS + 1
+            with (
+                mock.patch.object(focus.time, "monotonic", return_value=expired),
+                mock.patch.dict(focus.agents._INFO_FN, {}, clear=True),
+            ):
+                self.assertEqual(focus.launch("codex", "same-session"), 5)
+            dispatch.assert_called_once()
 
 
 class TeleportTests(unittest.TestCase):

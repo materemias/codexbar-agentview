@@ -35,6 +35,7 @@ launches open on the current desktop, and other hosts fail.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import pwd
@@ -46,7 +47,9 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from pathlib import Path
+from typing import Literal
 from urllib.parse import quote
 
 import codexbar_agents as agents
@@ -380,9 +383,135 @@ def _kwin_place(pid: int, desktop: str) -> bool:
     return False
 
 
+# A terminal can accept a command before its agent becomes discoverable.
+# Keep that startup gap owned even after the helper exits or crashes.
+SESSION_START_RESERVATION_SECONDS = 60.0
+
+
+class _DispatchAckUnknown(Exception):
+    """A terminal may have started the writer without acknowledging it."""
+
+
+def _session_writer_status(provider: str, session_id: str, cwd: str) -> str:
+    """Return running, uncertain or absent, including non-focusable writers."""
+    with agents._process_snapshot():
+        source = agents._BACKFILL_SOURCES.get(provider)
+        if source is not None:
+            held, unresolved = source.live()
+        else:
+            info_fn = agents._INFO_FN.get(provider)
+            if info_fn is None:
+                return "uncertain"
+            flags = (
+                ("--session", "--session-id") if provider == "pi"
+                else (agents._RESUME_PREFIXES[provider][-1],)
+            )
+            held, unresolved = set(), set()
+            for services in (False, True):
+                for pid in agents._pgrep(provider, services=services):
+                    for flag in flags:
+                        resumed = agents._resume_arg(pid, flag)
+                        if provider == "pi":
+                            resumed = resumed or agents._shell_resume_arg(pid, provider, flag)
+                        if resumed:
+                            held.add(resumed)
+                    # A Codex app-server can hold several sessions; its
+                    # selected info record alone does not name every writer.
+                    if provider == "codex":
+                        paths = agents._held_rollouts(
+                            pid, agents._codex_home(pid) + "/sessions/"
+                        )
+                        if any(path.endswith(f"-{session_id}.jsonl") for path in paths):
+                            held.add(session_id)
+                    try:
+                        info = info_fn(pid)
+                    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+                        info = {}
+                    info = info if isinstance(info, dict) else {}
+                    sid = agents._session_id(info.get("sessionId"))
+                    if sid:
+                        held.add(sid)
+                    if not sid or info.get("identityExact") is not True:
+                        if directory := agents._cwd_of(pid):
+                            unresolved.add(directory)
+                        if directory := agents._text(info.get("cwd")):
+                            unresolved.add(directory)
+    if session_id in held:
+        return "running"
+    return "uncertain" if cwd and cwd in unresolved else "absent"
+
+
+def _session_operation(
+    provider: str, session_id: str, kind: Literal["launch", "teleport"],
+    operation: Callable[[str, str, dict], int],
+) -> int:
+    """Own validation through dispatch, then reserve the writer's startup."""
+    digest = hashlib.sha256(json.dumps([provider, session_id]).encode()).hexdigest()
+    reservation = AGGREGATE_PATH.with_name(f"{AGGREGATE_PATH.name}.{digest}.startup.json")
+    # Never unlink the flock file: a waiter must keep sharing the same inode.
+    with agents._aggregate_lock(AGGREGATE_PATH, reservation.with_suffix(".lock")):
+        payload = agents._load_payload(AGGREGATE_PATH)
+        record = next(
+            (r for r in payload["agents"] + payload["history"]
+             if agents._record_key(r) == (provider, session_id)), {}
+        )
+        cwd = agents._text(record.get("cwd"))
+        try:
+            previous = json.loads(reservation.read_text())
+            if not isinstance(previous, dict):
+                previous = {}
+        except FileNotFoundError:
+            previous = None
+        except (OSError, ValueError):
+            previous = {}
+        boot_id = agents._read_boot_id()
+        if previous is not None:
+            if not cwd:
+                cwd = agents._text(previous.get("cwd"))
+            # Expiry is not evidence of an absent writer. Reconcile every
+            # provider before allowing a crashed/abandoned startup to retry.
+            status = _session_writer_status(provider, session_id, cwd)
+            if status == "running":
+                reservation.unlink(missing_ok=True)
+                blocked = kind == "launch"
+            else:
+                deadline = previous.get("expiresAt")
+                now = time.monotonic()
+                pending = (
+                    previous.get("bootId") == boot_id
+                    and isinstance(deadline, (int, float)) and not isinstance(deadline, bool)
+                    and now < deadline <= now + SESSION_START_RESERVATION_SECONDS
+                )
+                blocked = status != "absent" or pending
+            if blocked:
+                sys.stderr.write("codexbar_focus: session is already running or starting\n")
+                return 5
+        owner = {
+            "bootId": boot_id, "cwd": cwd,
+            "expiresAt": time.monotonic() + SESSION_START_RESERVATION_SECONDS,
+        }
+        agents._write_file(reservation, json.dumps(owner), durable=True)
+        # An exception may follow dispatch; leave its bounded reservation
+        # intact, just as when the helper is killed at that boundary.
+        try:
+            result = operation(provider, session_id, payload)
+        except _DispatchAckUnknown:
+            result = 8
+        else:
+            if result != 0:
+                reservation.unlink(missing_ok=True)
+                return result
+        owner["expiresAt"] = time.monotonic() + SESSION_START_RESERVATION_SECONDS
+        agents._write_file(reservation, json.dumps(owner), durable=True)
+        return result
+
+
 def launch(provider: str, session_id: str) -> int:
     """Resume one history record in a new kitty window or Tern tab."""
-    payload = agents._load_payload(AGGREGATE_PATH)
+    return _session_operation(provider, session_id, "launch", _launch)
+
+
+def _launch(provider: str, session_id: str, payload: dict) -> int:
     key = (provider, session_id)
     if any(agents._record_key(r) == key for r in payload["agents"]):
         sys.stderr.write("codexbar_focus: session is already running\n")
@@ -394,21 +523,14 @@ def launch(provider: str, session_id: str) -> int:
         sys.stderr.write("codexbar_focus: no history record for session\n")
         return 2
     cwd = record.get("cwd") if isinstance(record.get("cwd"), str) else ""
-    source = agents._BACKFILL_SOURCES.get(provider)
-    if source is not None:
-        # The saved list misses processes the sweep doesn't show: headless
-        # resumes, hosts it doesn't know, or one that started since. One
-        # writing a session it can't name may be writing this one.
-        with agents._process_snapshot():
-            held, unresolved = source.live()
-        if session_id in held:
-            sys.stderr.write("codexbar_focus: session is already running\n")
-            return 5
-        if cwd in unresolved:
-            sys.stderr.write(
-                f"codexbar_focus: a running {provider} in {cwd} may be writing this session\n"
-            )
-            return 5
+    status = _session_writer_status(provider, session_id, cwd)
+    if status != "absent":
+        message = (
+            "session is already running" if status == "running"
+            else f"a running {provider} in {cwd} may be writing this session"
+        )
+        sys.stderr.write(f"codexbar_focus: {message}\n")
+        return 5
     command = record.get("resumeCommand")
     if not command or command != agents._resume_command(
         provider, session_id, cwd, True, record.get("codexHome")
@@ -512,10 +634,13 @@ def teleport(provider: str, session_id: str) -> int:
 
     The agent must exit first: a session file has one live writer, so Tern
     starts only after the kitty process is gone."""
+    return _session_operation(provider, session_id, "teleport", _teleport)
+
+
+def _teleport(provider: str, session_id: str, payload: dict) -> int:
     if not agents.tern_bin():
         sys.stderr.write("codexbar_focus: Tern is not installed\n")
         return 7
-    payload = agents._load_payload(AGGREGATE_PATH)
     key = (provider, session_id)
     record = next(
         (r for r in payload["agents"] if agents._record_key(r) == key), None
@@ -626,8 +751,11 @@ def _launch_tern(cwd: str, shell: str, command: str) -> int:
         "new", "tab", "--json", "--cwd", cwd or str(Path.home()), "--",
         *_resume_shell_argv(shell, command),
     ])
-    if proc is None or proc.returncode != 0:
-        detail = (proc.stderr.strip() if proc else "") or "tern is not available"
+    if proc is None:
+        sys.stderr.write("codexbar_focus: launch failed: Tern did not acknowledge tab creation\n")
+        raise _DispatchAckUnknown
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or "tern is not available"
         sys.stderr.write(f"codexbar_focus: launch failed: {detail}\n")
         return 8
     # A tab created from the command line stays in the background.

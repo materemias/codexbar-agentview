@@ -255,6 +255,10 @@ System Settings → Shortcuts → KWin, or Tern never sees the key.
   30 days by default (`cleanupPeriodDays`), so older sessions don't come back.
   A dismissed session stays gone until you use it again.
 
+Launch and Teleport share a startup guard for each session. A second request
+while it starts asks you to retry; the startup reservation lasts up to
+60 seconds. A session that is already running cannot be resumed again.
+
 ### Waiting (set-aside sessions)
 
 For sessions you leave and come back to later. `Ctrl+Alt+B` or `/wait` sets
