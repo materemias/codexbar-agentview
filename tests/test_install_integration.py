@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -228,7 +229,7 @@ class IntegrationPlatformTests(unittest.TestCase):
         other.write_text("export default () => {};\n")
         self.omp_link.parent.mkdir(parents=True)
         self.omp_link.symlink_to(other)
-        self.assertIn(f"other checkout: {other}", self.run_main("--status")[1])
+        self.assertIn(str(other), self.run_main("--status")[1])
         with mock.patch.object(self.installer, "OMP_EXTENSION_SOURCE", self.home / "package/omp-extension/waitingfor.ts"):
             self.assertIn("omp extension:               yes", self.run_main("--status")[1])
 
@@ -412,6 +413,54 @@ class MimeappsAtomicWriteTests(unittest.TestCase):
 
     def test_drop_mimeapps_key_preserves_existing_bytes_on_write_failure(self) -> None:
         self.assert_failed_write_preserves_associations("drop")
+
+
+class PackagedIntegrationTests(unittest.TestCase):
+    def test_staged_package_installs_a_self_contained_omp_extension(self) -> None:
+        package = Path(os.environ.get(
+            "CODEXBAR_TEST_PACKAGE_DIR", str(SCRIPT_PATH.parents[2] / "build/package"),
+        )).resolve()
+        if not (package / "contents/scripts/install_integration.py").is_file():
+            self.skipTest(
+                "requires the staged CMake package; build package or set "
+                "CODEXBAR_TEST_PACKAGE_DIR to its directory"
+            )
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            installed = home / "installed-package"
+            shutil.copytree(package, installed)
+            environment = _isolated_environment(home)
+            result = subprocess.run(
+                [sys.executable, str(installed / "contents/scripts/install_integration.py"),
+                 "--omp-extension"],
+                cwd=home, env=environment,
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            self.assertEqual(
+                result.returncode, 0,
+                f"the shipped installer must link the omp extension: {result.stdout}{result.stderr}",
+            )
+            link = home / ".omp/agent/extensions/codexbar-waitingfor.ts"
+            self.assertTrue(link.is_symlink(), "the packaged installer did not install its extension")
+            extension = link.resolve(strict=True)
+            self.assertTrue(extension.is_relative_to(installed),
+                            "the extension must not depend on the source checkout")
+            self.assertTrue(extension.is_file())
+            scripts = extension.parent.parent / "contents/scripts"
+            cli = scripts / "codexbar_waiting.py"
+            menu = scripts / "waiting_menu.json"
+            self.assertTrue(cli.is_file(), "the linked extension's CLI must be shipped")
+            self.assertTrue(menu.is_file(), "the linked extension's menu must be shipped")
+            response = subprocess.run(
+                [sys.executable, str(cli), "menu"],
+                cwd=home, env=environment,
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            self.assertEqual(response.returncode, 0, response.stderr)
+            answer = json.loads(response.stdout)
+            self.assertTrue(answer["ok"], answer)
+            self.assertTrue(any("session" in item["targets"] for item in answer["items"]),
+                            "the packaged CLI must load a usable session menu")
 
 
 if __name__ == "__main__":

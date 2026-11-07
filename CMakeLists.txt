@@ -26,6 +26,10 @@ add_custom_target(package ALL
         "${package_dir}/"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/contents" "${package_dir}/contents"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${package_dir}/omp-extension"
+    COMMAND ${CMAKE_COMMAND} -E copy
+        "${CMAKE_SOURCE_DIR}/omp-extension/waitingfor.ts"
+        "${package_dir}/omp-extension/"
     COMMAND ${CMAKE_COMMAND} -E rm -rf
         "${package_dir}/contents/scripts/__pycache__"
     COMMAND ${CMAKE_COMMAND} -E copy

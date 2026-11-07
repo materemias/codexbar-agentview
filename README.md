@@ -157,10 +157,12 @@ command `CodexBar AgentView: Install omp extension` or:
 python3 contents/scripts/install_integration.py --omp-extension
 ```
 
-It links `~/.omp/agent/extensions/codexbar-waitingfor.ts` (under
-`$PI_CODING_AGENT_DIR` or `$OMP_AGENT_DIR` when set) to the checkout. omp
-loads extensions at start, so run `/restart` in sessions that were already
-open. `--omp-extension --uninstall` removes the link. What it does:
+The Plasma package includes the omp extension. The installer links
+`~/.omp/agent/extensions/codexbar-waitingfor.ts` (under
+`$PI_CODING_AGENT_DIR` or `$OMP_AGENT_DIR` when set) to the installed package
+or checkout it runs from. Keep that source in place. omp loads extensions at
+start, so run `/restart` in sessions that were already open.
+`--omp-extension --uninstall` removes the link. What it does:
 [Session lifecycle](docs/session-lifecycle.md).
 
 ## Keyboard shortcuts

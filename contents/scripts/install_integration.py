@@ -92,8 +92,7 @@ LEGACY_ENV_FILES = (PLASMA_ENV_DIR / "codexbar-xhr.sh", SYSTEMD_ENV_DIR / "codex
 LEGACY_SYSTEMD_FILE = Path.home() / ".config" / "systemd" / "user" / "codexbar-agents.service"
 LEGACY_SYSTEMD_NAME = "codexbar-agents.service"
 
-# Symlinked into omp's extensions directory. The applet package doesn't carry
-# it, as the extension needs the repo's scripts: only a checkout can install it.
+# Symlinked into omp's extensions directory from a checkout or applet package.
 OMP_EXTENSION_SOURCE = SCRIPT_DIR.parents[1] / "omp-extension" / "waitingfor.ts"
 OMP_EXTENSION_NAME = "codexbar-waitingfor.ts"
 DEFAULT_OMP_AGENT_DIR = Path.home() / ".omp" / "agent"
@@ -376,7 +375,7 @@ def _is_our_omp_link(link: Path) -> bool:
 
 def install_omp_extension() -> str:
     if not OMP_EXTENSION_SOURCE.is_file():
-        raise RuntimeError("not in this copy; run --omp-extension from a checkout")
+        raise RuntimeError("not in this copy; use a complete checkout or applet package")
     link = _omp_extension_link()
     if (link.exists() or link.is_symlink()) and not _is_our_omp_link(link):
         raise RuntimeError(f"{link} exists and isn't ours; left alone")
@@ -409,9 +408,8 @@ def _omp_extension_status() -> str:
     if _is_our_omp_link(link):
         if not link.exists():
             return "broken link"
-        # The applet package has no source of its own to compare with.
         current = link.resolve() == OMP_EXTENSION_SOURCE or not OMP_EXTENSION_SOURCE.is_file()
-        return "yes" if current else f"other checkout: {link.resolve()}"
+        return "yes" if current else f"other copy: {link.resolve()}"
     return "not ours" if link.exists() or link.is_symlink() else "no"
 
 
