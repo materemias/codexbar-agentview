@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import contextlib
+import errno
 import importlib.util
 import io
 import json
 import os
+import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -235,6 +238,180 @@ class IntegrationPlatformTests(unittest.TestCase):
         code, output = self.run_main("--omp-extension")
         self.assertEqual(code, 1)
         self.assertIn("can't link", output)
+
+
+class MimeappsReplacementTests(unittest.TestCase):
+    setUp = IntegrationPlatformTests.setUp
+
+    def test_updates_preserve_symlink_and_target_mode(self) -> None:
+        target = self.home / "associations.list"
+        target.write_text("[Default Applications]\ntext/plain=editor.desktop;\n")
+        target.chmod(0o640)
+        config = self.installer.MIMEAPPS_FILE
+        config.parent.mkdir(exist_ok=True)
+        config.symlink_to(Path("..") / target.name)
+        original_link = os.readlink(config)
+        self.installer._set_mimeapps_default(self.installer.SCHEME_KEY, "new.desktop")
+        self.assertIn(f"{self.installer.SCHEME_KEY}=new.desktop;", target.read_text())
+        self.assertTrue(self.installer._drop_mimeapps_key(self.installer.SCHEME_KEY))
+        self.assertEqual(target.read_text(), "[Default Applications]\ntext/plain=editor.desktop;\n")
+        self.assertEqual(target.stat().st_mode & 0o7777, 0o640)
+        self.assertTrue(config.is_symlink())
+        self.assertEqual(os.readlink(config), original_link)
+        self.assertEqual(list(target.parent.glob(".associations.list.*.tmp")), [])
+
+    def test_failed_replace_preserves_bytes_and_removes_temporary(self) -> None:
+        config = self.installer.MIMEAPPS_FILE
+        config.parent.mkdir(exist_ok=True)
+        original = b"[Default Applications]\nx-scheme-handler/codexbar-agentview=old.desktop;\n"
+        for operation in ("set", "drop"):
+            with self.subTest(operation=operation):
+                config.write_bytes(original)
+                with mock.patch.object(self.installer.os, "replace", side_effect=OSError(errno.EACCES, "denied")):
+                    with self.assertRaises(OSError):
+                        if operation == "set":
+                            self.installer._set_mimeapps_default(self.installer.SCHEME_KEY, "new.desktop")
+                        else:
+                            self.installer._drop_mimeapps_key(self.installer.SCHEME_KEY)
+                self.assertEqual(config.read_bytes(), original)
+                self.assertEqual(list(config.parent.glob(".mimeapps.list.*.tmp")), [])
+
+
+def _isolated_environment(home: Path) -> dict[str, str]:
+    return {
+        "HOME": str(home),
+        "PATH": os.defpath,
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+        "XDG_DATA_HOME": str(home / ".local/share"),
+        "XDG_STATE_HOME": str(home / ".local/state"),
+        "XDG_RUNTIME_DIR": str(home / "run"),
+        "OMP_AGENT_DIR": str(home / ".omp/agent"),
+        "PI_CODING_AGENT_DIR": str(home / ".omp/agent"),
+        "PYTHONDONTWRITEBYTECODE": "1",
+    }
+
+
+class MimeappsEncodingTests(unittest.TestCase):
+    def assert_utf8_associations_survive_ascii_locale(self, operation: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            mimeapps = home / ".config/mimeapps.list"
+            mimeapps.parent.mkdir()
+            unrelated = "text/plain=éditeur.desktop;日本語.desktop;\n".encode("utf-8")
+            scheme = b"x-scheme-handler/codexbar-agentview="
+            original = (
+                b"[Default Applications]\n"
+                + unrelated
+                + scheme + b"old.desktop;\n"
+                + b"\n[Added Associations]\n"
+                + "application/pdf=lecteur-écran.desktop;\n".encode("utf-8")
+            )
+            mimeapps.write_bytes(original)
+            child = textwrap.dedent("""
+                import importlib.util
+                import sys
+                from pathlib import Path
+
+                assert sys.flags.utf8_mode == 0, "requires Python UTF-8 mode disabled"
+                script = Path(sys.argv[1])
+                sys.path.insert(0, str(script.parent))
+                spec = importlib.util.spec_from_file_location("ascii_installer", script)
+                installer = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(installer)
+                if sys.argv[2] == "set":
+                    installer._set_mimeapps_default(installer.SCHEME_KEY, "new.desktop")
+                else:
+                    assert installer._drop_mimeapps_key(installer.SCHEME_KEY)
+            """)
+            environment = _isolated_environment(home)
+            environment.update({
+                "LC_ALL": "C",
+                "PYTHONUTF8": "0",
+                "PYTHONCOERCECLOCALE": "0",
+            })
+            result = subprocess.run(
+                [sys.executable, "-c", child, str(SCRIPT_PATH), operation],
+                cwd=home, env=environment,
+                capture_output=True, timeout=10, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
+            expected = original.replace(
+                scheme + b"old.desktop;\n",
+                scheme + b"new.desktop;\n" if operation == "set" else b"",
+            )
+            self.assertEqual(
+                mimeapps.read_bytes(), expected,
+                "MIME updates must preserve unrelated UTF-8 desktop IDs under an ASCII locale",
+            )
+
+    def test_set_preserves_utf8_associations_under_ascii_locale(self) -> None:
+        self.assert_utf8_associations_survive_ascii_locale("set")
+
+    def test_drop_preserves_utf8_associations_under_ascii_locale(self) -> None:
+        self.assert_utf8_associations_survive_ascii_locale("drop")
+
+
+@unittest.skipUnless(sys.platform == "linux", "requires Linux RLIMIT_FSIZE")
+class MimeappsAtomicWriteTests(unittest.TestCase):
+    def assert_failed_write_preserves_associations(self, operation: str) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            mimeapps = home / ".config/mimeapps.list"
+            mimeapps.parent.mkdir()
+            original = (
+                b"# Keep unrelated user associations intact.\n"
+                b"[Default Applications]\n"
+                b"text/plain=editor.desktop;other-editor.desktop;\n"
+                b"x-scheme-handler/codexbar-agentview=old.desktop;\n"
+                b"x-scheme-handler/https=browser.desktop;\n"
+                b"\n[Added Associations]\n"
+                b"application/pdf=reader.desktop;browser.desktop;\n"
+            )
+            mimeapps.write_bytes(original)
+            child = textwrap.dedent("""
+                import importlib.util
+                import json
+                import resource
+                import signal
+                import sys
+                from pathlib import Path
+
+                script = Path(sys.argv[1])
+                sys.path.insert(0, str(script.parent))
+                spec = importlib.util.spec_from_file_location("limited_installer", script)
+                installer = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(installer)
+                signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+                resource.setrlimit(resource.RLIMIT_FSIZE, (32, 32))
+                try:
+                    if sys.argv[2] == "set":
+                        installer._set_mimeapps_default(installer.SCHEME_KEY, "new.desktop")
+                    else:
+                        installer._drop_mimeapps_key(installer.SCHEME_KEY)
+                except OSError as error:
+                    print(json.dumps({"errno": error.errno}))
+                else:
+                    print(json.dumps({"errno": None}))
+            """)
+            result = subprocess.run(
+                [sys.executable, "-c", child, str(SCRIPT_PATH), operation],
+                cwd=home, env=_isolated_environment(home),
+                capture_output=True, text=True, timeout=10, check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["errno"], errno.EFBIG,
+                             "the operation must encounter the real file-size write limit")
+            self.assertEqual(
+                mimeapps.read_bytes(), original,
+                "a failed MIME update must preserve every original association byte",
+            )
+
+    def test_set_mimeapps_default_preserves_existing_bytes_on_write_failure(self) -> None:
+        self.assert_failed_write_preserves_associations("set")
+
+    def test_drop_mimeapps_key_preserves_existing_bytes_on_write_failure(self) -> None:
+        self.assert_failed_write_preserves_associations("drop")
 
 
 if __name__ == "__main__":

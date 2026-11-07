@@ -31,6 +31,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -239,17 +240,41 @@ def remove_focus_url_handler() -> str:
     return f"removed {DESKTOP_FILE.name} and unregistered {SCHEME}://"
 
 
+def _write_mimeapps(text: str) -> None:
+    """Replace the config atomically, following any user-owned symlink."""
+    target = MIMEAPPS_FILE.resolve()
+    try:
+        mode = target.stat().st_mode & 0o7777
+    except FileNotFoundError:
+        mode = 0o600
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=target.parent,
+            prefix=f".{target.name}.", suffix=".tmp", delete=False,
+        ) as output:
+            temporary = Path(output.name)
+            os.fchmod(output.fileno(), mode)
+            output.write(text)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def _drop_mimeapps_key(scheme: str) -> bool:
     """Remove every mimeapps.list line for scheme; True when one went."""
     try:
-        text = MIMEAPPS_FILE.read_text()
+        text = MIMEAPPS_FILE.read_text(encoding="utf-8")
     except OSError:
         return False
     lines = text.splitlines()
     kept = [ln for ln in lines if ln.split("=", 1)[0].strip() != scheme]
     if len(kept) == len(lines):
         return False
-    MIMEAPPS_FILE.write_text("\n".join(kept) + "\n")
+    _write_mimeapps("\n".join(kept) + "\n")
     return True
 
 
@@ -271,7 +296,7 @@ def remove_legacy_identity() -> str:
 
 def _set_mimeapps_default(scheme: str, desktop_name: str) -> None:
     MIMEAPPS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    text = MIMEAPPS_FILE.read_text() if MIMEAPPS_FILE.is_file() else ""
+    text = MIMEAPPS_FILE.read_text(encoding="utf-8") if MIMEAPPS_FILE.is_file() else ""
     out: list[str] = []
     in_section = False
     inserted = False
@@ -300,7 +325,7 @@ def _set_mimeapps_default(scheme: str, desktop_name: str) -> None:
             out.append("")
         out.append("[Default Applications]")
         out.append(f"{scheme}={desktop_name};")
-    MIMEAPPS_FILE.write_text("\n".join(out) + "\n")
+    _write_mimeapps("\n".join(out) + "\n")
 
 
 # ---------------------------------------------------------------------------

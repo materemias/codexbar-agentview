@@ -23,6 +23,7 @@
 - In the Tern extension, clearing a filter keeps the selected session selected, as in the applet, so Esc then Space peeks at the session the filter found.
 - A Claude 5h window that hasn't started since its reset says `not started · resets 5h after first use` instead of leaving its reset line empty.
 - Launch and Teleport prevent duplicate starts of the same session.
+- Integration installation preserves file associations when an update fails.
 
 ## 0.3.0 (2026-11-02)
 

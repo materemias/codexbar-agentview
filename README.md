@@ -123,6 +123,9 @@ for it.
 The `codexbar` path defaults to `/usr/bin/codexbar`, where Arch's
 `codexbar-cli` package puts it. Change it in Settings → Backend.
 
+Updating file associations preserves existing settings, including symlinked
+configuration. A failed write leaves the original configuration intact.
+
 ### Tern extension
 
 From the repository root:
