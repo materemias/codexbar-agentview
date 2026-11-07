@@ -579,7 +579,35 @@ class UsageCacheTests(IsolatedUsageTestCase):
         self.assertNotIn("cacheOnly", first)
         second = self.snapshot([self.record(used=99)], min_interval=60)
         self.assertTrue(second["cacheOnly"])
+        self.assertTrue(second["sharedCache"])
         self.assertEqual([r["primary"]["usedPercent"] for r in second["providers"]], [42])
+
+    def test_shared_cache_freshness_uses_requesting_cadence_and_grace(self) -> None:
+        for age, stale in ((149, False), (150, False), (151, True)):
+            with self.subTest(age=age):
+                self.measured = self.now - dt.timedelta(seconds=age)
+                self.snapshot([self.record(used=95)])
+                before = self.cache_path.read_bytes()
+                with (
+                    mock.patch.object(fetch._dt, "datetime", wraps=dt.datetime) as clock,
+                    mock.patch.object(fetch, "_claim_fetch", return_value=False),
+                ):
+                    clock.now.return_value = self.now
+                    shared = self.snapshot(min_interval=60)
+                self.assertTrue(shared["cacheOnly"])
+                self.assertTrue(shared["sharedCache"])
+                self.assertEqual(shared["providers"][0]["stale"], stale)
+                self.assertEqual(self.cache_path.read_bytes(), before)
+
+    def test_explicit_cache_only_does_not_adopt_recent_shared_usage(self) -> None:
+        self.measured = self.now
+        self.snapshot([self.record(used=95)])
+        with mock.patch.object(fetch, "_claim_fetch") as claim:
+            restored = self.snapshot(cache_only=True, min_interval=60)
+        claim.assert_not_called()
+        self.assertTrue(restored["cacheOnly"])
+        self.assertNotIn("sharedCache", restored)
+        self.assertTrue(restored["providers"][0]["stale"])
 
     def test_cached_claude_accounts_keep_their_plan_weight(self) -> None:
         # Tern renders the combined Claude bar from the cache alone.

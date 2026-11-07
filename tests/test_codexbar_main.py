@@ -1,9 +1,11 @@
 """Run the actual applet root with isolated inputs and the native process plugin."""
+import datetime as dt
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import xml.etree.ElementTree as ET
@@ -17,7 +19,8 @@ PLUGIN = ROOT / "build/package/contents/ui/process"
 @unittest.skipUnless(Path(QML).is_file() and (PLUGIN / "libcodexbarprocess.so").is_file(),
                      "Build the native package and install the Qt 6 qml tool first")
 class MainLifecycleTest(unittest.TestCase):
-    def applet(self, scenario, helper_case=None, views=False):
+    def applet(self, scenario, helper_case=None, views=False, real_fetch=False,
+               scenario_seconds=6):
         with tempfile.TemporaryDirectory(prefix="codexbar-main-") as directory:
             root = Path(directory)
 
@@ -64,6 +67,16 @@ class MainLifecycleTest(unittest.TestCase):
                     value = default.split(",") if default else []
                 else:
                     value = "/backend-a" if name == "cliPath" else default
+                if real_fetch:
+                    if kind == "Bool":
+                        value = name == "enableKilo" or (
+                            name == "usageNotifications"
+                            and bool((helper_case or {}).get("usageNotifications")))
+                    elif name == "cliPath":
+                        value = str(root / "bin/codexbar")
+                    elif name == "refreshSeconds":
+                        value = 3600
+                value = (helper_case or {}).get("configuration", {}).get(name, value)
                 configuration.append(f"property var {name}: {json.dumps(value)}")
             put(module + "Plasmoid.qml", "pragma Singleton\nimport QtQuick\nQtObject {\n"
                 "signal activated()\nproperty int formFactor: 2\nproperty string globalShortcut: ''\n"
@@ -106,6 +119,10 @@ number = len(history)
 normal = sum(call["backend"] == backend and not call["cache"] for call in history)
 time.sleep(0.15)
 test = json.loads((root / "scenario.json").read_text())
+snapshots = (test or {}).get("freshSnapshots", {}).get(backend, [])
+if snapshots and not cache:
+    print(json.dumps(snapshots[min(normal - 1, len(snapshots) - 1)]))
+    sys.exit(0)
 if test and test.get("failure") is not None and normal >= 2:
     if cache:
         if test.get("recoveryFails"):
@@ -140,6 +157,34 @@ print(json.dumps({"updatedAt": now, "fatal": None, "cacheOnly": cache,
         "stale": cache, "primary": {"usedPercent": percent}, "updatedAt": now}],
     "codexRotation": rotation, "cliVersion": backend}))
 ''')
+            if real_fetch:
+                # Keep the real helper, normalization, cache and flock claim path.
+                # Kilo has no Meridian/Claude or forecast HTTP fallback.
+                for name in ("codexbar_fetch.py", "state_paths.py"):
+                    shutil.copy2(ROOT / "contents/scripts" / name, root / "scripts" / name)
+                put("bin/codexbar", '''#!/usr/bin/env python3
+import datetime, json, pathlib, sys
+root = pathlib.Path(__file__).parent.parent
+if sys.argv[1:] == ["--version"]:
+    print("CodexBar 0.56.3")
+else:
+    assert sys.argv[1:4] == ["usage", "--json", "--provider"], sys.argv
+    with (root / "scripts/calls").open("a") as output:
+        output.write(json.dumps({"provider": sys.argv[4]}) + "\\n")
+    print(json.dumps([{"usage": {
+        "updatedAt": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "primary": {"usedPercent": int((root / (
+            "replacement-percent" if pathlib.Path(__file__).name.endswith("-b")
+            else "provider-percent")).read_text()),
+                    "windowMinutes": 300}}}]))
+''')
+                (root / "bin/codexbar").chmod(0o755)
+                shutil.copy2(root / "bin/codexbar", root / "bin/codexbar-b")
+                put("replacement-percent", "67")
+                put("expire-claim.py", '''import os, pathlib
+state = pathlib.Path(os.environ["XDG_STATE_HOME"]) / "codexbar-agentview"
+(state / "fetch_claim").write_text("0\\n")
+''')
             put("bin/notify-send", "#!/usr/bin/env python3\n"
                 "import json, pathlib, sys, time\n"
                 "time.sleep(0.8)\n"
@@ -152,10 +197,12 @@ print(json.dumps({"updatedAt": now, "fatal": None, "cacheOnly": cache,
             (root / "bin/notify-send").chmod(0o755)
             put("test.qml", '''import QtQuick
 import org.kde.plasma.plasmoid
+import "ui/process" as Process
 Item {
     id: fixture
     property int stage: 0
     property int ticks: 0
+    property double deadlineMs: Date.now() + ''' + str(scenario_seconds * 1000) + '''
     property string oldCommand: ""
     property var compact: null
     property var rows: []
@@ -163,6 +210,26 @@ Item {
     property var section: null
     property var popup: null
     property int since: 0
+    property int freshFetches: 0
+    property bool controlFinished: false
+    property string expireCommand: ''' + json.dumps(
+                "python3 " + json.dumps(str(root / "expire-claim.py"))) + '''
+    Connections {
+        target: applet.item
+        function onFetchKindChanged() {
+            if (applet.item.fetchKind === "fresh") fixture.freshFetches++
+        }
+    }
+    Process.CommandRunner {
+        id: controlRunner
+        onFinished: function(command, exitCode, standardOutput, standardError) {
+            if (exitCode !== 0) {
+                console.error("FAIL claim expiry: " + standardError)
+                Qt.exit(1)
+            }
+            fixture.controlFinished = true
+        }
+    }
     function check(condition, message) {
         if (!condition) throw new Error(message)
     }
@@ -175,7 +242,9 @@ Item {
         interval: 20; running: true; repeat: true
         onTriggered: {
             try {
-                if (++fixture.ticks > 300) throw new Error("applet scenario timed out at stage " + fixture.stage)
+                fixture.ticks++
+                if (Date.now() > fixture.deadlineMs)
+                    throw new Error("applet scenario timed out at stage " + fixture.stage)
                 var app = applet.item
                 if (!app) return
 ''' + scenario + '''
@@ -191,16 +260,370 @@ Item {
                        QT_FORCE_STDERR_LOGGING="1", QT_LOGGING_TO_CONSOLE="1",
                        QML_IMPORT_PATH=str(root / "imports"),
                        QML_XHR_ALLOW_FILE_READ="1", XDG_STATE_HOME=str(root / "state"),
+                       HOME=str(root), XDG_CONFIG_HOME=str(root / "config"),
+                       XDG_CACHE_HOME=str(root / "cache"), XDG_DATA_HOME=str(root / "data"),
+                       CODEX_HOME=str(root / ".codex"), CLAUDE_CONFIG_DIR=str(root / ".claude"),
+                       OMP_AGENT_DIR=str(root / ".omp/agent"),
                        PATH=str(root / "bin") + os.pathsep + os.environ["PATH"])
+            if real_fetch:
+                seed_percent = (helper_case or {}).get("seedPercent", 42)
+                put("provider-percent", str(seed_percent))
+                seed = subprocess.run(
+                    [sys.executable, str(root / "scripts/codexbar_fetch.py"),
+                     "--cli-path", str(root / "bin/codexbar"),
+                     "--providers", "kilo", "--min-interval", "3600"],
+                    env=env, capture_output=True, text=True, timeout=5)
+                self.assertEqual(seed.returncode, 0, seed.stdout + seed.stderr)
+                self.assertEqual(json.loads(seed.stdout)["providers"][0]["primary"]["usedPercent"],
+                                 seed_percent)
+                cache_case = (helper_case or {}).get("seedCache", {})
+                if cache_case:
+                    cache_path = root / "state/codexbar-agentview/usage_cache.json"
+                    payload = json.loads(cache_path.read_text())
+                    record = payload["providers"]["kilo"]["records"][0]
+                    record.update(cache_case.get("record", {}))
+                    if "ageSeconds" in cache_case:
+                        measured = (dt.datetime.now(dt.timezone.utc)
+                                    - dt.timedelta(seconds=cache_case["ageSeconds"])).isoformat()
+                        record.update(updatedAt=measured, cachedAt=measured)
+                    cache_path.write_text(json.dumps(payload))
+                # The preceding poller has published a reading and a recent claim.
+                # Only requests made by the actual applet count below.
+                (root / "scripts/calls").unlink()
+                put("provider-percent", "81")
+                if (helper_case or {}).get("expireInitialClaim"):
+                    put("state/codexbar-agentview/fetch_claim", "0\n")
+                if (helper_case or {}).get("delayFirstFresh"):
+                    # Delay process startup before the real helper stamps its claim.
+                    # The poll Timer still starts naturally with the applet.
+                    shutil.copy2(root / "scripts/codexbar_fetch.py",
+                                 root / "scripts/real_codexbar_fetch.py")
+                    put("scripts/codexbar_fetch.py", '''import pathlib, runpy, sys, time
+root = pathlib.Path(__file__).parent
+first = root / "first-fresh-started"
+if "--cache-only" not in sys.argv and not first.exists():
+    first.touch()
+    time.sleep(1.2)
+runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
+''')
             result = subprocess.run([QML, str(root / "test.qml")], env=env,
-                                    capture_output=True, text=True, timeout=15)
+                                    capture_output=True, text=True, timeout=scenario_seconds + 9)
             output = result.stdout + result.stderr
             self.assertEqual(result.returncode, 0, output)
             self.assertIn("PASS actual main", output)
-            calls = [json.loads(line) for line in (root / "scripts/calls").read_text().splitlines()]
+            call_path = root / "scripts/calls"
+            calls = [json.loads(line) for line in call_path.read_text().splitlines()] if call_path.exists() else []
             notifications = root / "bin/notifications"
             return calls, ([json.loads(line) for line in notifications.read_text().splitlines()]
                            if notifications.exists() else [])
+
+    def test_automatic_refresh_respects_shared_fetch_claim_and_expiry(self):
+        calls, notifications = self.applet('''
+                if (fixture.stage === 0) {
+                    // Startup restores cache, then schedules the real automatic refresh.
+                    if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
+                    fixture.check(app.snapshot.providers.length === 1, "cached reading was lost")
+                    fixture.check(app.snapshot.providers[0].primary.usedPercent === 42,
+                        "automatic refresh executed provider despite a fresh shared claim")
+                    fixture.check(app.snapshot.cacheOnly === true, "recent claim did not serve cache")
+                    fixture.check(app.lastError === "", "cache-only response became a UI error")
+                    fixture.check(app.snapshot.codexRotation === null
+                        && app.snapshot.claudeRotation === null, "cached response exposed rotation status")
+                    fixture.stage = 1
+                    controlRunner.run(fixture.expireCommand)
+                } else if (fixture.stage === 1) {
+                    if (!fixture.controlFinished) return
+                    fixture.stage = 2
+                    app.refresh(true)
+                } else if (fixture.stage === 2) {
+                    if (app.loading) return
+                    fixture.check(fixture.freshFetches === 2, "expired claim refresh did not complete")
+                    fixture.check(app.snapshot.providers[0].primary.usedPercent === 81,
+                        "expired claim did not allow a provider fetch")
+                    fixture.check(app.snapshot.cacheOnly !== true, "expired claim still served cache only")
+                    fixture.check(app.lastError === "", "expired claim refresh failed")
+                    fixture.stage = 3
+                    app.refresh(true)
+                } else if (fixture.stage === 3) {
+                    if (app.loading) return
+                    fixture.check(app.snapshot.cacheOnly === true, "new claim allowed a duplicate fetch")
+                    fixture.check(app.snapshot.providers[0].primary.usedPercent === 81,
+                        "newly cached reading was lost")
+                    fixture.check(app.lastError === "", "new cache-only response became a UI error")
+                    console.log("PASS actual main")
+                    Qt.quit()
+                }
+''', real_fetch=True)
+        self.assertEqual(calls, [{"provider": "kilo"}],
+                         "only the refresh after shared claim expiry may execute the provider")
+        self.assertEqual(notifications, [])
+
+    def test_recent_shared_reading_is_current_and_notifies_critical_usage_once(self):
+        calls, notifications = self.applet('''
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
+                fixture.check(app.snapshot.providers.length === 1
+                    && app.snapshot.providers[0].primary.usedPercent === 95,
+                    "recent shared 95% reading must remain usable")
+                fixture.check(app.snapshot.cacheOnly === true, "shared claim must refuse provider execution")
+                fixture.check(app.snapshot.providers[0].stale !== true,
+                    "fresh shared reading was incorrectly presented as last known")
+                fixture.check(app.lastError === "", "shared current reading became a fetch error")
+                if (Object.keys(app.pendingNotifications).length) return
+                if (fixture.stage === 0) {
+                    fixture.stage = 1
+                    app.refresh(true)
+                } else {
+                    fixture.check(fixture.freshFetches === 2, "second automatic refresh did not complete")
+                    console.log("PASS actual main shared current usage alert")
+                    Qt.quit()
+                }
+''', {"usageNotifications": True, "seedPercent": 95}, real_fetch=True)
+        self.assertEqual(calls, [], "adopting current shared usage must not execute the provider")
+        self.assertEqual(len(notifications), 1,
+                         "current shared critical usage must notify once across repeated claim refusals")
+        self.assertIn("CodexBar AgentView usage critical", notifications[0])
+        self.assertTrue(any("Kilo" in part and "95%" in part for part in notifications[0]),
+                        notifications)
+
+    def test_shared_old_failed_or_source_stale_usage_stays_last_known_and_silent(self):
+        for cache_case in (
+            {"ageSeconds": 10_800},
+            {"record": {"stale": True, "refreshError": "controlled upstream failure"}},
+            {"record": {"stale": True, "sourceStale": True, "refreshError": ""}},
+        ):
+            with self.subTest(cache_case=cache_case):
+                calls, notifications = self.applet('''
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
+                fixture.check(app.snapshot.providers.length === 1
+                    && app.snapshot.providers[0].primary.usedPercent === 95,
+                    "last-known shared 95% reading must remain visible")
+                fixture.check(app.snapshot.cacheOnly === true, "recent claim must still suppress a fetch")
+                fixture.check(app.snapshot.providers[0].stale === true,
+                    "old, failed or source-stale shared reading was presented as current")
+                fixture.check(app.lastError === "", "valid last-known response became a fetch error")
+                if (Object.keys(app.pendingNotifications).length) return
+                if (fixture.stage === 0) {
+                    fixture.stage = 1
+                    app.refresh(true)
+                } else {
+                    fixture.check(fixture.freshFetches === 2, "second claim refusal did not complete")
+                    console.log("PASS actual main shared last-known usage stays silent")
+                    Qt.quit()
+                }
+''', {"usageNotifications": True, "seedPercent": 95, "seedCache": cache_case},
+                    real_fetch=True)
+                self.assertEqual(calls, [], "last-known cache must respect the shared claim")
+                self.assertEqual(notifications, [],
+                                 "old, failed or source-stale usage must not notify")
+
+    def test_manual_refresh_bypasses_fresh_shared_claim(self):
+        calls, notifications = self.applet('''
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
+                if (fixture.stage === 0) {
+                    check(app.snapshot.cacheOnly === true
+                        && app.snapshot.providers[0].primary.usedPercent === 42,
+                        "startup must adopt the preceding poller's reading")
+                    fixture.stage = 1
+                    app.refresh()
+                } else {
+                    check(fixture.freshFetches === 2, "manual refresh did not complete")
+                    check(app.snapshot.providers.length === 1
+                        && app.snapshot.providers[0].primary.usedPercent === 81,
+                        "Refresh now must execute the provider despite a fresh shared claim")
+                    check(app.snapshot.cacheOnly !== true && app.lastError === "",
+                        "manual refresh must publish a fresh successful reading")
+                    console.log("PASS actual main manual refresh bypasses shared claim")
+                    Qt.quit()
+                }
+''', real_fetch=True)
+        self.assertEqual(calls, [{"provider": "kilo"}],
+                         "manual refresh must execute the actual helper's provider path")
+        self.assertEqual(notifications, [])
+
+    def test_backend_change_bypasses_fresh_shared_claim(self):
+        calls, notifications = self.applet('''
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
+                if (fixture.stage === 0) {
+                    check(app.snapshot.providers.length === 1
+                        && app.snapshot.providers[0].primary.usedPercent === 42,
+                        "the old backend starts with its scoped shared reading")
+                    fixture.stage = 1
+                    Plasmoid.configuration.cliPath = app.cliPath + "-b"
+                    check(app.snapshot.providers.length === 0,
+                        "replacement backend must immediately retire the old scoped reading")
+                } else {
+                    if (fixture.freshFetches < 2) return
+                    check(app.snapshot.providers.length === 1
+                        && app.snapshot.providers[0].primary.usedPercent === 67,
+                        "new backend must fetch its own reading, not an empty claim-refused cache")
+                    check(app.snapshot.cacheOnly !== true && app.lastError === "",
+                        "backend change must complete a fresh successful fetch")
+                    console.log("PASS actual main backend change bypasses shared claim")
+                    Qt.quit()
+                }
+''', real_fetch=True)
+        self.assertEqual(calls, [{"provider": "kilo"}],
+                         "the replacement executable must run despite the old backend's claim")
+        self.assertEqual(notifications, [])
+
+    def test_first_natural_poll_fetches_after_delayed_initial_helper(self):
+        calls, notifications = self.applet('''
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
+                if (fixture.stage === 0) {
+                    check(app.snapshot.cacheOnly !== true
+                        && app.snapshot.providers[0].primary.usedPercent === 81,
+                        "expired initial claim must allow the delayed first provider reading")
+                    fixture.oldCommand = app.snapshot.providers[0].updatedAt
+                    fixture.stage = 1
+                } else {
+                    // Do not drive refresh: wait for the applet's own first poll Timer.
+                    if (fixture.freshFetches < 2) return
+                    check(fixture.freshFetches === 2, "missed the first natural polling result")
+                    check(app.snapshot.cacheOnly !== true,
+                        "first natural poll was refused by the applet's own fresh claim")
+                    check(app.snapshot.providers[0].updatedAt !== fixture.oldCommand,
+                        "first natural poll must publish a second provider measurement")
+                    console.log("PASS actual main natural polling follows helper completion")
+                    Qt.quit()
+                }
+''', {"configuration": {"refreshSeconds": 10}, "expireInitialClaim": True,
+      "delayFirstFresh": True}, real_fetch=True, scenario_seconds=16)
+        self.assertEqual(calls, [{"provider": "kilo"}, {"provider": "kilo"}],
+                         "both startup and the first natural poll must execute the provider")
+        self.assertEqual(notifications, [])
+
+    def test_shared_cache_preserves_forecast_and_cli_version_for_same_backend(self):
+        initial = {
+            "providers": [{"id": "codex", "ok": True, "sourceScope": "a" * 64,
+                           "primary": {"usedPercent": 42}}],
+            "forecast": {"ok": True, "signal": {
+                "deadlineAt": "2099-01-01T12:00:00Z", "percent": 75}},
+            "cliVersion": "CodexBar 0.56.3",
+        }
+        shared = dict(initial, cacheOnly=True, sharedCache=True, forecast=None, cliVersion=None,
+                      providers=[{"id": "codex", "ok": True, "sourceScope": "a" * 64,
+                                  "primary": {"usedPercent": 83}}])
+        shared_without_metadata = {"providers": shared["providers"],
+                                   "cacheOnly": True, "sharedCache": True}
+        calls, notifications = self.applet('''
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
+                if (fixture.stage === 0) {
+                    check(app.codexForecastState(app.snapshot.forecast) === "announced"
+                        && app.snapshot.cliVersion === "CodexBar 0.56.3",
+                        "initial fresh response must establish usable metadata")
+                    fixture.stage = 1
+                    app.refresh(true)
+                } else {
+                    check(app.snapshot.sharedCache === true
+                        && app.snapshot.providers[0].primary.usedPercent === 83,
+                        "the new shared usage response must replace the old provider reading")
+                    check(app.codexForecastState(app.snapshot.forecast) === "announced"
+                        && app.snapshot.forecast.signal.percent === 75,
+                        "shared-cache adoption must retain the existing valid forecast")
+                    check(app.snapshot.cliVersion === "CodexBar 0.56.3",
+                        "shared-cache adoption must retain the current backend's CLI version")
+                    if (fixture.stage === 1) {
+                        fixture.stage = 2
+                        app.refresh(true)
+                    } else {
+                        console.log("PASS actual main shared cache retains current backend metadata")
+                        Qt.quit()
+                    }
+                }
+''', {"freshSnapshots": {"/backend-a": [initial, shared, shared_without_metadata]}})
+        self.assertEqual([call["cache"] for call in calls], [True, False, False, False])
+        self.assertEqual(notifications, [])
+
+    def test_shared_cache_uses_current_local_rotation_badges_and_clears_deleted_status(self):
+        records = [{"id": provider, "ok": True, "sourceScope": provider[0] * 64,
+                    "accountEmail": provider + "@example.test", "primary": {"usedPercent": 42}}
+                   for provider in ("claude", "codex")]
+        initial = {"providers": records}
+        shared = {"providers": records, "cacheOnly": True, "sharedCache": True}
+        deleted = dict(shared, claudeRotation=None, codexRotation=None)
+        for provider in ("claude", "codex"):
+            initial[provider + "Rotation"] = {
+                "mode": "FILL", "operatingMode": "auto",
+                "accountAvailability": {provider + "@example.test": "open"}}
+            shared[provider + "Rotation"] = {
+                "mode": "TARGET", "operatingMode": "confirm",
+                "accountAvailability": {provider + "@example.test": "blocked"}}
+        calls, notifications = self.applet('''
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
+                for (var index = 0; index < app.snapshot.providers.length; index++) {
+                    var record = app.snapshot.providers[index]
+                    var rotation = app.providerRotation(record.id)
+                    if (fixture.stage === 0) {
+                        check(rotation && rotation.mode === "FILL"
+                            && app.accountAvailabilityIndicator(record) === "\\uD83D\\uDFE2",
+                            "initial fresh response establishes local rotation badges")
+                    } else if (fixture.stage === 1) {
+                        check(rotation && rotation.mode === "TARGET"
+                            && rotation.operatingMode === "confirm",
+                            "shared-cache response must use its current local rotation, not clear or copy old status")
+                        check(app.accountAvailabilityIndicator(record) === "\\uD83D\\uDD12",
+                            "shared-cache response must display the newly blocked account badge")
+                    } else {
+                        check(rotation === null && app.accountAvailabilityIndicator(record) === "",
+                            "deleted local rotation must clear the old badge, never resurrect it from memory")
+                    }
+                }
+                check(app.snapshot.providers.length === 2, "both providers must remain represented")
+                if (fixture.stage === 2) {
+                    console.log("PASS actual main shared cache adopts only current local rotation badges")
+                    Qt.quit()
+                } else {
+                    fixture.stage++
+                    app.refresh(true)
+                }
+''', {"configuration": {"enableClaude": True},
+      "freshSnapshots": {"/backend-a": [initial, shared, deleted]}})
+        self.assertEqual([call["cache"] for call in calls], [True, False, False, False])
+        self.assertEqual(notifications, [],
+                         "adopting local cache badges is not a fresh mode-transition notification")
+
+    def test_shared_cache_does_not_carry_metadata_across_backend_generations(self):
+        initial = {
+            "providers": [{"id": "codex", "ok": True, "sourceScope": "a" * 64,
+                           "primary": {"usedPercent": 42}}],
+            "forecast": {"ok": True, "signal": {
+                "deadlineAt": "2099-01-01T12:00:00Z", "percent": 75}},
+            "cliVersion": "CodexBar 0.56.3",
+            "codexRotation": {"mode": "FILL", "operatingMode": "auto"},
+        }
+        replacement = {
+            "providers": [{"id": "codex", "ok": True, "sourceScope": "b" * 64,
+                           "primary": {"usedPercent": 83}}],
+            "cacheOnly": True, "sharedCache": True,
+            "forecast": None, "cliVersion": None, "codexRotation": None,
+        }
+        calls, notifications = self.applet('''
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
+                if (fixture.stage === 0) {
+                    check(app.snapshot.forecast && app.snapshot.cliVersion
+                        && app.snapshot.codexRotation, "old backend must start with metadata")
+                    fixture.stage = 1
+                    Plasmoid.configuration.cliPath = "/backend-b"
+                    check(app.snapshot.forecast === null && app.snapshot.cliVersion === null
+                        && app.snapshot.codexRotation === null,
+                        "backend change must synchronously clear its old metadata")
+                } else {
+                    if (fixture.freshFetches < 2) return
+                    check(app.snapshot.sharedCache === true
+                        && app.snapshot.providers.length === 1
+                        && app.snapshot.providers[0].sourceScope === "b".repeat(64)
+                        && app.snapshot.providers[0].primary.usedPercent === 83,
+                        "replacement backend may adopt only its current credential scope")
+                    check(app.snapshot.forecast === null && app.snapshot.cliVersion === null
+                        && app.snapshot.codexRotation === null,
+                        "shared cache must not recover another backend generation's metadata")
+                    console.log("PASS actual main shared metadata remains backend scoped")
+                    Qt.quit()
+                }
+''', {"freshSnapshots": {"/backend-a": [initial], "/backend-b": [replacement]}})
+        self.assertEqual([call["backend"] for call in calls],
+                         ["/backend-a", "/backend-a", "/backend-b"])
+        self.assertEqual(notifications, [])
 
     def test_authoritative_empty_fatal_snapshot_does_not_resurrect_memory(self):
         calls, notifications = self.applet('''

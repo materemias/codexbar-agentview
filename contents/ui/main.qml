@@ -326,6 +326,8 @@ PlasmoidItem {
         id: runner
 
         onFinished: function(command, exitCode, standardOutput, standardError) {
+            // Anchor the next poll to completion, not the previous timer tick.
+            poll.restart()
             if (root.fetchGeneration !== root.backendGeneration) {
                 root.loading = false
                 root.fetchKind = ""
@@ -351,14 +353,24 @@ PlasmoidItem {
                 })
                 var error = parsed.fatal ? parsed.fatal.message || "fetch failed"
                     : exitCode !== 0 ? stderr || "fetch failed (exit " + exitCode + ")" : ""
-                var fresh = kind === "fresh" && !error && parsed.cacheOnly !== true
-                if (!fresh || root.enabledProviders.indexOf("claude") < 0) parsed.claudeRotation = null
-                if (!fresh || root.enabledProviders.indexOf("codex") < 0) parsed.codexRotation = null
+                var current = kind === "fresh" && !error
+                    && (parsed.cacheOnly !== true || parsed.sharedCache === true)
+                var fresh = current && parsed.cacheOnly !== true
+                if (current && parsed.sharedCache === true) {
+                    // A claim refusal omits network metadata, but rereads local rotation.
+                    if (parsed.forecast == null && root.codexForecastState(root.snapshot.forecast))
+                        parsed.forecast = root.snapshot.forecast
+                    if (parsed.cliVersion == null && typeof root.snapshot.cliVersion === "string"
+                            && root.snapshot.cliVersion.trim())
+                        parsed.cliVersion = root.snapshot.cliVersion
+                }
+                if (!current || root.enabledProviders.indexOf("claude") < 0) parsed.claudeRotation = null
+                if (!current || root.enabledProviders.indexOf("codex") < 0) parsed.codexRotation = null
                 // The helper owns credential and cache-age validation, including empty results.
                 root.snapshot = parsed
                 if (kind !== "recovery-cache") root.lastError = error
                 var result = Notifications.usage(root.usageNotificationState,
-                    parsed.providers, Date.now(), fresh && root.usageNotificationsEnabled)
+                    parsed.providers, Date.now(), current && root.usageNotificationsEnabled)
                 root.usageNotificationState = result.state
                 root.dispatchNotifications(result.events)
                 var modeResult = Notifications.ompMode(root.ompModeNotificationState,
@@ -384,7 +396,7 @@ PlasmoidItem {
             root.fetchKind = ""
             if (kind === "startup-cache") {
                 // Commit cached readings before starting any network command.
-                Qt.callLater(root.refresh)
+                Qt.callLater(function() { root.refresh(true) })
             }
         }
     }
@@ -901,7 +913,7 @@ PlasmoidItem {
         root.waitingOnMeCount = onMe
     }
 
-    function refresh() {
+    function refresh(automatic = false) {
         if (root.cacheRestoring || root.loading) return
         if (root.enabledProviders.length === 0) {
             root.snapshot = {
@@ -918,10 +930,11 @@ PlasmoidItem {
                 root.ompModeNotificationState, null, false).state
             return
         }
-        root.fetchProviders("fresh")
+        root.fetchProviders("fresh", automatic)
     }
 
-    function fetchProviders(kind) {
+    function fetchProviders(kind, automatic) {
+        poll.stop()
         root.loading = true
         root.fetchKind = kind
         root.fetchGeneration = root.backendGeneration
@@ -930,8 +943,11 @@ PlasmoidItem {
             + " --providers " + Command.shellQuote(root.enabledProviders.join(","))
         if (kind !== "fresh") {
             cmd += " --cache-only"
-        } else if (root.codexForecastEnabled) {
-            cmd += " --forecast-url https://codex-reset.com/api/forecast"
+        } else {
+            if (automatic === true)
+                cmd += " --min-interval " + String(root.refreshMs / 1000)
+            if (root.codexForecastEnabled)
+                cmd += " --forecast-url https://codex-reset.com/api/forecast"
         }
         runner.run(cmd)
     }
@@ -940,9 +956,12 @@ PlasmoidItem {
         id: poll
         interval: root.refreshMs
         running: true; repeat: true
-        onTriggered: root.refresh()
+        onTriggered: root.refresh(true)
     }
-    onRefreshMsChanged: { poll.interval = root.refreshMs; poll.restart() }
+    onRefreshMsChanged: {
+        poll.interval = root.refreshMs
+        if (!root.loading) poll.restart()
+    }
 
     // One scan timer; completion triggers the file read.
     Timer {

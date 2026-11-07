@@ -2086,8 +2086,18 @@ def main(argv: list[str]) -> int:
         "cliVersion": None,
     }
     cli_missing = not (os.path.isfile(cli) and os.access(cli, os.X_OK)) and not shutil.which(cli)
-    cache_only = args.cache_only or not _claim_fetch(args.min_interval)
-    if cache_only:
+    shared_cache = not args.cache_only and not _claim_fetch(args.min_interval)
+    if args.cache_only or shared_cache:
+        if shared_cache:
+            # Match Tern's adoption grace: two requesting intervals plus 30 s.
+            # A refused claim is not a refresh and never renews the measurement.
+            max_age = 2 * args.min_interval + 30
+            for record in restored:
+                measured = _parse_iso(record.get("cachedAt"))
+                if measured is not None and 0 <= (now - measured).total_seconds() <= max_age \
+                        and not record.get("refreshError") and not record.get("sourceStale"):
+                    record["stale"] = False
+            out["sharedCache"] = True
         _attach_recent_usage(restored, _usage_history_entries(_usage_cache_payload(), now), now)
         out["cacheOnly"] = True
         out["inputs"] = _cache_inputs(providers)

@@ -222,6 +222,10 @@ System Settings → Shortcuts → KWin, or Tern never sees the key.
 - **Last known.** When a refresh fails, the last reading stays, muted and
   marked with its time. A single failed Meridian poll on a reading under
   10 minutes old shows no error, since Meridian retries on its own.
+- **Shared refreshes.** Plasma and Tern coordinate usage fetches so overlapping
+  polls reuse the same reading within the configured refresh interval.
+  Recent successful shared readings still drive usage warnings in Plasma.
+  Refresh now and CLI changes fetch immediately.
 - **Warnings.** A desktop alert at 80% and 95%, or earlier when the pace says
   the window runs out before it resets. Plasma only.
 

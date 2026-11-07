@@ -30,6 +30,7 @@
 - Integration installation preserves file associations when an update fails.
 - Follow-up verification runs in the background after the agent's turn ends.
 - Wait checks use the saved project or pane directory and report a missing directory.
+- Plasma and Tern share usage refreshes within the configured interval.
 - The installed Plasma package includes the omp extension.
 
 ## 0.3.0 (2026-11-02)
