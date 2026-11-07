@@ -25,8 +25,9 @@ Press `Ctrl+Alt+B` or type `/wait` in omp. Both open the same menu:
 3. Your sentence: why you left it, what comes next. It starts with the
    session's current sentence.
 4. Optionally, a prompt to send into the session when the wait fires.
+5. Whether to park the pane: **Park it** or **Keep it open**.
 
-Then the pane is parked. Parked cards stay as Tern draws them.
+A one-line `/wait` command always parks. Parked cards stay as Tern draws them.
 
 In Tern, `Ctrl+Alt+B` on an omp pane asks that session's omp extension to open
 its menu above the composer, so there is one menu, not two. A session started

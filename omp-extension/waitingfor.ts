@@ -199,9 +199,9 @@ function splitPrompt(text: string): [string, string | undefined] {
 	return match ? [match[1], match[2] ?? ""] : [text, undefined];
 }
 
-/** The options a user's own wait ends with: the sentence, the prompt, and the park. */
-function userArgs(sentence: string, prompt?: string): string[] {
-	return [...(sentence ? [`--note=${sentence}`] : []), ...(prompt ? [`--prompt=${prompt}`] : []), "--by", "user", "--park"];
+/** The options a user's own wait ends with: the sentence, the prompt, and the park unless the menu was told not to. */
+function userArgs(sentence: string, prompt?: string, park = true): string[] {
+	return [...(sentence ? [`--note=${sentence}`] : []), ...(prompt ? [`--prompt=${prompt}`] : []), "--by", "user", ...(park ? ["--park"] : [])];
 }
 
 function checkOptions(argv: string, label: string, interval: string): string[] {
@@ -212,18 +212,18 @@ function checkOptions(argv: string, label: string, interval: string): string[] {
  * A check, or `{error}`: `! command` runs as given; anything else is a description, and `check`
  * asks the agent for its command.
  */
-function checkRequest(what: string, interval = CHECK_EVERY, prompt?: string) {
+function checkRequest(what: string, interval = CHECK_EVERY, prompt?: string, park = true) {
 	if (!DURATION.test(interval)) return { error: `Check every takes a duration such as 10m, not ${interval}.` };
 	const literal = what.match(/^!(?:\s+([\s\S]*))?$/);
-	if (!literal) return { check: { description: what, interval, prompt: prompt || undefined } };
+	if (!literal) return { check: { description: what, interval, prompt: prompt || undefined, park } };
 	const command = literal[1]?.trim();
 	if (!command) return { error: "A command line must follow the !." };
-	return { command: "add", args: [...checkOptions(command, command, interval), ...userArgs("", prompt)] };
+	return { command: "add", args: [...checkOptions(command, command, interval), ...userArgs("", prompt, park)] };
 }
 
-/** The free-text wait set to `text`, which parks the session; empty clears it. */
-function whatRequest(text: string) {
-	return { command: "what", args: [`--text=${text}`, ...(text ? ["--park"] : [])] };
+/** The free-text wait set to `text`, which parks the session unless told not to; empty clears it. */
+function whatRequest(text: string, park = true) {
+	return { command: "what", args: [`--text=${text}`, ...(text && park ? ["--park"] : [])] };
 }
 
 /**
@@ -530,6 +530,16 @@ async function askPr(c, pr: string | undefined) {
 
 const PROMPT_TITLE = "Prompt to send when it fires (empty: only tell me)";
 
+const PARK_CHOICES = [
+	{ label: "Park it", description: "off the screen until you open it", park: true },
+	{ label: "Keep it open", description: "stays where it is", park: false },
+];
+
+/** The menu's last step: true to park the session, false to keep it open, undefined on Esc. */
+async function askPark(c): Promise<boolean | undefined> {
+	return (await pick(c, "Park the session?", PARK_CHOICES))?.park;
+}
+
 /**
  * The steps of the menu's items, keyed by the item ids of MENU_FILE, which holds their text.
  * `options` asks what the form needs and gives its CLI options; undefined ends the flow (Esc, or a
@@ -575,7 +585,9 @@ const FLOWS = {
 			if (every === undefined) return undefined;
 			const prompt = await ask(c, PROMPT_TITLE);
 			if (prompt === undefined) return undefined;
-			const request = checkRequest(what, every.replace(/\s+/g, "").toLowerCase() || CHECK_EVERY, prompt);
+			const park = await askPark(c);
+			if (park === undefined) return undefined;
+			const request = checkRequest(what, every.replace(/\s+/g, "").toLowerCase() || CHECK_EVERY, prompt, park);
 			if (request.error) throw new Error(request.error);
 			return request;
 		},
@@ -583,7 +595,9 @@ const FLOWS = {
 	for: {
 		async request(c, record) {
 			const what = await ask(c, "What do you wait for? (empty: nothing any more)", record?.waiting_for ?? "");
-			return what === undefined ? undefined : whatRequest(what);
+			if (what === undefined) return undefined;
+			const park = what ? await askPark(c) : false;
+			return park === undefined ? undefined : whatRequest(what, park);
 		},
 	},
 	later: {
@@ -952,7 +966,7 @@ export default function (pi) {
 		await act(c, [request.command, "--session", c.sessionManager.getSessionId(), ...target, ...request.args]);
 	}
 
-	/** The steps of an `options` flow, then its command and the park. Nothing happens before the command. */
+	/** The steps of an `options` flow, then its command and, if chosen, the park. Nothing happens before the command. */
 	async function setAside(c, session: string, flow, pr: string | undefined, record) {
 		const options = await flow.options(c, pr);
 		if (!options) return;
@@ -960,8 +974,10 @@ export default function (pi) {
 		if (sentence === undefined) return;
 		const prompt = flow.prompt === false ? "" : await ask(c, PROMPT_TITLE);
 		if (prompt === undefined) return;
+		const park = await askPark(c);
+		if (park === undefined) return;
 		const kind = flow.kind ? ["--kind", flow.kind] : [];
-		await act(c, [flow.command ?? "add", "--session", session, ...kind, ...options, ...userArgs(sentence, prompt)]);
+		await act(c, [flow.command ?? "add", "--session", session, ...kind, ...options, ...userArgs(sentence, prompt, park)]);
 	}
 
 	async function openMenu(c) {
@@ -1076,7 +1092,7 @@ export default function (pi) {
 			switch (params.action) {
 				case "add":
 					args = check
-						? ["add", "--session", session, ...checkOptions(JSON.stringify(params.argv), check.description, check.interval), ...userArgs("", check.prompt)]
+						? ["add", "--session", session, ...checkOptions(JSON.stringify(params.argv), check.description, check.interval), ...userArgs("", check.prompt, check.park ?? true)]
 						: await toolAddArgs(params, session, c.cwd);
 					break;
 				case "babysit_pr":

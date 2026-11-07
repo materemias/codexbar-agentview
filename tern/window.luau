@@ -1182,8 +1182,8 @@ local function timeArgs(text: string): { string }
 	return { "--at", text }
 end
 
--- Runs the CLI command that sets the pane aside, then parks the pane.
-local function commitSetAside(t: SetAside, args: { string })
+-- Runs the CLI command that sets the pane aside, then parks the pane if asked to.
+local function commitSetAside(t: SetAside, args: { string }, park: boolean)
 	waitingCli(args, function(data, err, cx)
 		if not data then
 			waitingFailed("set aside", err, cx)
@@ -1191,6 +1191,9 @@ local function commitSetAside(t: SetAside, args: { string })
 			local open = dashboard(cx)
 			if open then
 				closePane(cx, open.pane)
+			end
+			if not park then
+				return
 			end
 			afterRestore(cx, function(cx2)
 				local ok, parkErr = cx2.layout:park(t.pane)
@@ -1202,7 +1205,17 @@ local function commitSetAside(t: SetAside, args: { string })
 	end)
 end
 
--- The last steps: my sentence, then `add` and the park.
+-- The flow's last step: park the pane, or leave it where it is.
+local function askPark(cx: WindowCx, fn: (boolean, WindowCx) -> ())
+	choose(cx, { placeholder = "Park the pane?", items = {
+		{ label = "Park it", detail = "off the screen until you open it", park = true },
+		{ label = "Keep it open", park = false },
+	} }, function(item, cx2)
+		fn(item.park, cx2)
+	end)
+end
+
+-- The last steps: my sentence, whether to park, then `add` and the park.
 local function finishSetAside(cx: WindowCx, t: SetAside, kind: string, args: { string })
 	local cwd = if t.cwd and string.sub(t.cwd, 1, 1) == "/" then t.cwd else nil
 	if kind == "command" and not cwd then
@@ -1213,7 +1226,7 @@ local function finishSetAside(cx: WindowCx, t: SetAside, kind: string, args: { s
 		table.insert(args, "--cwd")
 		table.insert(args, cwd)
 	end
-	ask(cx, { value = t.note, placeholder = "Why set it aside, what next?", action = "set aside" }, function(note)
+	ask(cx, { value = t.note, placeholder = "Why set it aside, what next?", action = "next" }, function(note, cx2)
 		local full = { "add", "--pane", tostring(t.pane), "--kind", kind, "--by", "user", "--label", t.label }
 		for _, a in args do
 			table.insert(full, a)
@@ -1222,7 +1235,9 @@ local function finishSetAside(cx: WindowCx, t: SetAside, kind: string, args: { s
 			table.insert(full, "--note")
 			table.insert(full, note)
 		end
-		commitSetAside(t, full)
+		askPark(cx2, function(park)
+			commitSetAside(t, full, park)
+		end)
 	end)
 end
 
@@ -1330,11 +1345,13 @@ local SET_ASIDE_FLOWS: { [string]: (WindowCx, SetAside) -> () } = {
 	end,
 	-- The pane's one free-text status: `what` sets it (or updates the one it has); its text says it all.
 	["for"] = function(cx, t)
-		ask(cx, { value = t.waitingFor, placeholder = "What are you waiting for?", action = "set aside" }, function(what, cx2)
+		ask(cx, { value = t.waitingFor, placeholder = "What are you waiting for?", action = "next" }, function(what, cx2)
 			if what == "" then
 				waitingFailed("set aside", "say what you wait for", cx2)
 			else
-				commitSetAside(t, { "what", "--pane", tostring(t.pane), "--text", what })
+				askPark(cx2, function(park)
+					commitSetAside(t, { "what", "--pane", tostring(t.pane), "--text", what }, park)
+				end)
 			end
 		end)
 	end,
