@@ -730,6 +730,15 @@ class ReadyTest(PollTestCase):
         gh.runs = NOT_FOUND
         self.assert_ready(gh, True)
 
+    def test_a_once_bot_on_the_head_does_not_stand_in_for_an_every_push_bot(self) -> None:
+        reviews = [bot_review(OLD_HEAD, "roboomp", "PRR_old"), bot_review(login="copilot-pull-request-reviewer")]
+        gh = FakeGh(pr_answer(reviews=reviews, committed="1970-01-01T00:17:00Z"))
+        self.assert_ready(gh, False)
+        self.clock = 1020 + github.BOT_SETTLE_S
+        self.assert_ready(gh, False)
+        gh.pr = pr_answer(reviews=[*reviews, bot_review(login="roboomp", rid="PRR_new")])
+        self.assertIn("reviewed", self.assert_ready(gh, True)["fire_text"])
+
     def test_a_bot_that_reviews_every_push_is_waited_for_and_reported_after_an_hour(self) -> None:
         review = bot_review(OLD_HEAD, "roboomp")
         gh = FakeGh(pr_answer(reviews=[review], committed="1970-01-01T00:17:00Z"))

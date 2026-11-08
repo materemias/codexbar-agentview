@@ -857,16 +857,18 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
     elif until == "ready" and not bot_pending and _gates_open(pr, gate):
         bots = None
         age = now - _epoch(pr["committed_at"])
+        # A bot that reviews every push and reviewed this PR before must review this
+        # push too, whoever else did: Copilot on the head doesn't stand in for roboomp.
         every_push = [bot for bot in earlier_bots if bot not in ONCE_BOTS]
-        if reviewed:
-            bots = f"{', '.join(reviewed)} reviewed"
-        elif every_push:
+        if every_push:
             if is_open and age > BOT_STUCK_S:
                 events.emit(
                     f"noreview:{head}",
                     f"{', '.join(every_push)} hasn't reviewed {short} in an hour",
                     on_me=True,
                 )
+        elif reviewed:
+            bots = f"{', '.join(reviewed)} reviewed"
         elif is_open and age >= BOT_SETTLE_S:
             where = f" ({', '.join(earlier_bots)} reviewed an earlier head)" if earlier_bots else ""
             bots = f"no bot reviewed {short} in {BOT_SETTLE_S // 60} min{where}"
