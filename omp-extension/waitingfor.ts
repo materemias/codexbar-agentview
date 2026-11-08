@@ -541,9 +541,14 @@ const PARK_CHOICES = [
 	{ label: "Keep it open", description: "stays where it is", park: false },
 ];
 
-/** The menu's last step: true to park the session, false to keep it open, undefined on Esc. */
-async function askPark(c): Promise<boolean | undefined> {
-	return (await pick(c, "Park the session?", PARK_CHOICES))?.park;
+// "When I have time" sessions stay away a long while; the pin brings them back.
+const CLOSE_CHOICE = { label: "Close the session", description: "it stays pinned; resume it from When I have time", park: false, close: true };
+
+/** The menu's last step: the chosen `{park, close?}`, undefined on Esc. `canClose` offers closing first. */
+async function askPark(c, canClose = false) {
+	return canClose
+		? pick(c, "Close or park the session?", [CLOSE_CHOICE, ...PARK_CHOICES])
+		: pick(c, "Park the session?", PARK_CHOICES);
 }
 
 /**
@@ -591,9 +596,9 @@ const FLOWS = {
 			if (every === undefined) return undefined;
 			const prompt = await ask(c, PROMPT_TITLE);
 			if (prompt === undefined) return undefined;
-			const park = await askPark(c);
-			if (park === undefined) return undefined;
-			const request = checkRequest(what, every.replace(/\s+/g, "").toLowerCase() || CHECK_EVERY, prompt, park);
+			const choice = await askPark(c);
+			if (!choice) return undefined;
+			const request = checkRequest(what, every.replace(/\s+/g, "").toLowerCase() || CHECK_EVERY, prompt, choice.park);
 			if (request.error) throw new Error(request.error);
 			return request;
 		},
@@ -602,13 +607,14 @@ const FLOWS = {
 		async request(c, record) {
 			const what = await ask(c, "What do you wait for? (empty: nothing any more)", record?.waiting_for ?? "");
 			if (what === undefined) return undefined;
-			const park = what ? await askPark(c) : false;
-			return park === undefined ? undefined : whatRequest(what, park);
+			const choice = what ? await askPark(c) : PARK_CHOICES[1];
+			return choice ? whatRequest(what, choice.park) : undefined;
 		},
 	},
 	later: {
 		kind: "later",
 		prompt: false,
+		close: true,
 		async options(c) {
 			const size = await pick(c, "How big?", SIZES);
 			return size ? [`--size=${size.label}`] : undefined;
@@ -972,7 +978,11 @@ export default function (pi) {
 		await act(c, [request.command, "--session", c.sessionManager.getSessionId(), ...target, ...request.args]);
 	}
 
-	/** The steps of an `options` flow, then its command and, if chosen, the park. Nothing happens before the command. */
+	/**
+	 * The steps of an `options` flow, then its command and, if chosen, the park or, for a flow that
+	 * offers it, closing the session once the command (and with it the pin) succeeded. Nothing
+	 * happens before the command.
+	 */
 	async function setAside(c, session: string, flow, pr: string | undefined, record) {
 		const options = await flow.options(c, pr);
 		if (!options) return;
@@ -980,10 +990,12 @@ export default function (pi) {
 		if (sentence === undefined) return;
 		const prompt = flow.prompt === false ? "" : await ask(c, PROMPT_TITLE);
 		if (prompt === undefined) return;
-		const park = await askPark(c);
-		if (park === undefined) return;
+		// Closing mid-turn would cut the agent off.
+		const choice = await askPark(c, flow.close === true && c.isIdle());
+		if (!choice) return;
 		const kind = flow.kind ? ["--kind", flow.kind] : [];
-		await act(c, [flow.command ?? "add", "--session", session, ...kind, ...options, ...userArgs(sentence, prompt, park)]);
+		await act(c, [flow.command ?? "add", "--session", session, ...kind, ...options, ...userArgs(sentence, prompt, choice.park)]);
+		if (choice.close) await c.shutdown();
 	}
 
 	async function openMenu(c) {

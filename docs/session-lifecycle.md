@@ -25,7 +25,10 @@ Press `Ctrl+Alt+B` or type `/wait` in omp. Both open the same menu:
 3. Your sentence: why you left it, what comes next. It starts with the
    session's current sentence.
 4. Optionally, a prompt to send into the session when the wait fires.
-5. Whether to park the pane: **Park it** or **Keep it open**.
+5. Whether to park the pane: **Park it** or **Keep it open**. For **When I
+   have time** the first choice is **Close the session**: it ends omp once the
+   wait is saved, and the pin brings it back from the When I have time group.
+   It's offered only while the agent is idle.
 
 A one-line `/wait` command always parks. Parked cards stay as Tern draws them.
 
