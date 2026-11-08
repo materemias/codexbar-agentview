@@ -994,8 +994,14 @@ export default function (pi) {
 		const choice = await askPark(c, flow.close === true && c.isIdle());
 		if (!choice) return;
 		const kind = flow.kind ? ["--kind", flow.kind] : [];
-		await act(c, [flow.command ?? "add", "--session", session, ...kind, ...options, ...userArgs(sentence, prompt, choice.park)]);
-		if (choice.close) await c.shutdown();
+		const answer = await act(c, [flow.command ?? "add", "--session", session, ...kind, ...options, ...userArgs(sentence, prompt, choice.park)]);
+		if (!choice.close) return;
+		// The pin is what brings a closed session back: without it, stay open and say why.
+		if (answer?.pinned !== true) {
+			setPanel(c, errorPanel(`Not closed: the session couldn't be pinned (${answer?.pin_error ?? "no pin"}). Try /pin, then close it.`));
+			return;
+		}
+		await c.shutdown();
 	}
 
 	async function openMenu(c) {
