@@ -82,22 +82,33 @@ None of these checks spends tokens.
 
 **Pull request states.** `ready` (the default) means the required checks are
 green, a review bot finished on the latest push, no bot's check still runs,
-and no review thread is open. `review` waits only for the bot review on the
+and no review thread is open. CI that hasn't run doesn't count as green: on a
+PR from a fork, GitHub holds the CI until a maintainer approves it, and the
+wait says so and keeps waiting. `review` waits only for the bot review on the
 latest push. `merged` and `released` do what they say; `released` compares
 the merge commit with the release tags. `activity` fires on the next comment,
 review, merge or close from someone other than you, and on a push when the PR
 isn't yours. Failed checks, conflicts and a PR closed without merging bring
 the wait back to you at once.
 
+A fulfilled `ready` or `review` holds for one push. A new push, a conflict or
+a branch behind its base takes it back: the wait is watched again, the
+history says why (`PR#42 no longer ready: new head 1a2b3c4`), and in a chain
+the next step waits for it again.
+
 The review bots are Greptile, Macroscope, CodeRabbit, Codex, Copilot, Gemini,
-Cursor Bugbot, Sourcery and roboomp. Copilot and Codex don't review every
-push by default, so `ready` also goes ahead 15 minutes after a push no bot
-reviews. A bot check that runs for over an hour is reported once.
+Cursor Bugbot, Sourcery and roboomp. Copilot, Codex and Gemini review a PR once
+and skip later pushes, so when only they have reviewed it, `ready` goes ahead
+15 minutes after a push none of them reviews. A bot that reviews every push
+and reviewed this PR before is waited for on the new push; after an hour
+without its review, the wait tells you once. A bot check that runs for over an
+hour is reported once.
 
 **Babysit** is a chain of waits: a bot review on the latest push, then a
 prompt that asks the agent to fix the real findings and answer the rest, then
 a code check that something happened (a new push, or every thread answered),
-then `ready`, then `merged`. It never merges.
+then `ready`, then `merged`. It never merges. Babysitting a PR again replaces
+the session's earlier chain on it.
 
 **Command check from a description.** `/wait check the nightly job passed`
 sends one prompt to the session's agent: write a command that exits 0 exactly

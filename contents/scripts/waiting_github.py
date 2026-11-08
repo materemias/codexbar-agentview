@@ -48,6 +48,10 @@ DEFAULT_BOTS = (
 )
 # Every default bot but roboomp, which posts from a user account.
 APP_BOTS = frozenset(DEFAULT_BOTS) - {"roboomp"}
+# Bots that review a PR once and skip later pushes unless asked again. A head no
+# bot reviewed counts as reviewed after BOT_SETTLE_S only when every bot that
+# reviewed an earlier head is one of these; the others review every push.
+ONCE_BOTS = frozenset({"copilot", "codex", "gemini"})
 # CI and deploy bots report through checks. Their PR comments are status reports.
 STATUS_BOTS = ("github-actions", "vercel", "netlify", "railway", "cloudflare")
 
@@ -78,6 +82,8 @@ PR_SHORT_RE = re.compile(r"([\w.-]+/[\w.-]+)#(\d+)")
 
 GREEN = ("pass", "skipping")
 FAILED = ("fail", "cancel")
+# Workflow run conclusions that mean the head's CI didn't pass.
+CI_FAILED = ("failure", "cancelled", "timed_out", "startup_failure")
 # gh's buckets, worst first. Duplicate names (push and pull_request runs of one
 # job) collapse to the worst bucket.
 RANK = {"fail": 4, "cancel": 3, "pending": 2, "pass": 1, "skipping": 0}
@@ -443,6 +449,35 @@ def _required_names(repo: str, base: str, memo: Json, run: Run, now: float) -> l
     return memo["required"]["names"]
 
 
+def _ci_runs(repo: str, head: str, run: Run) -> dict[str, list[str]]:
+    """The head's workflow runs by what they mean for `ready`: `approval` (a
+    maintainer has to approve them first), `running`, `failed`. A fork's CI
+    shows no checks before approval, and a run that fails before its first job
+    shows none at all, so the rollup can't tell either from a repo without CI."""
+    runs: dict[str, list[str]] = {"approval": [], "running": [], "failed": []}
+    try:
+        lines = _gh(
+            run,
+            [
+                "api", f"repos/{repo}/actions/runs?head_sha={head}&per_page=100",
+                "--jq", '.workflow_runs[] | [.name, .status, .conclusion // ""] | @tsv',
+            ],
+        ).splitlines()
+    except GhError as error:
+        if error.transient:
+            raise
+        return runs  # Actions off, or not readable: the rollup is all there is.
+    for line in lines:
+        name, status, conclusion = (line.split("\t") + ["", "", ""])[:3]
+        if conclusion == "action_required" or status == "action_required":
+            runs["approval"].append(name)
+        elif status != "completed":
+            runs["running"].append(name)
+        elif conclusion in CI_FAILED:
+            runs["failed"].append(name)
+    return {key: sorted(set(names)) for key, names in runs.items()}
+
+
 def _plain(body: str) -> str:
     body = re.sub(r"<!--.*?-->", " ", body or "", flags=re.DOTALL)
     return html.unescape(re.sub(r"<[^>]+>", " ", body))
@@ -709,6 +744,8 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
         _check_release(repo, number, merged, memo, result, events, run)
         return
     pr = _fetch(repo, number, memo, result, run, now)
+    # What a fired wait is checked against later: a new head or a conflict takes it back.
+    result.update(head=pr["head"], merge_state=pr["merge_state"], base=pr["base"])
     start = len(events.out)
 
     if pr["state"] == "MERGED":
@@ -819,11 +856,40 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
         fire_text = f"{', '.join(reviewed)} reviewed {short}{threads}"
     elif until == "ready" and not bot_pending and _gates_open(pr, gate):
         bots = None
+        age = now - _epoch(pr["committed_at"])
+        every_push = [bot for bot in earlier_bots if bot not in ONCE_BOTS]
         if reviewed:
             bots = f"{', '.join(reviewed)} reviewed"
-        elif is_open and now - _epoch(pr["committed_at"]) >= BOT_SETTLE_S:
+        elif every_push:
+            if is_open and age > BOT_STUCK_S:
+                events.emit(
+                    f"noreview:{head}",
+                    f"{', '.join(every_push)} hasn't reviewed {short} in an hour",
+                    on_me=True,
+                )
+        elif is_open and age >= BOT_SETTLE_S:
             where = f" ({', '.join(earlier_bots)} reviewed an earlier head)" if earlier_bots else ""
             bots = f"no bot reviewed {short} in {BOT_SETTLE_S // 60} min{where}"
+        if is_open:
+            # Also while a bot is awaited: CI that can't pass is what you can act on first.
+            runs = _ci_runs(repo, head, run)
+            if runs["approval"]:
+                events.emit(
+                    f"approval:{head}",
+                    f"CI on {short} waits for a maintainer's approval ({', '.join(runs['approval'])})",
+                    always=True,  # A state, not news: the first poll must say why nothing fires.
+                )
+                bots = None
+            elif not required and (runs["running"] or runs["failed"]):
+                if runs["failed"] and not pr["checks"]:
+                    # No check in the rollup reports it, so nothing else will.
+                    events.emit(
+                        f"runfail:{head}",
+                        f"CI failed on {short} ({', '.join(runs['failed'])})",
+                        on_me=True,
+                        always=True,
+                    )
+                bots = None
         if bots:
             green = f"{len(gate)} checks green" if gate else "no checks"
             fire_text = f"ready on {short}: {green}, {bots}, no open threads"

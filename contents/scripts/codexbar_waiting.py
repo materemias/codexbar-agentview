@@ -1447,7 +1447,7 @@ def _run_job(job: dict, now: datetime) -> dict:
             return {**job, "result": _run_verify(job)}
         github = _github()
         result = github.poll(job["condition"], job["memo"], now=now.timestamp())
-        if result.get("fired") and job["fix"]:
+        if result.get("fired") and job["fix"] and job["type"] == "pr":
             try:
                 result["snapshot"] = github.snapshot(
                     job["condition"]["repo"], job["condition"]["number"]
@@ -1497,7 +1497,8 @@ def _claim_checks(state: dict, now: datetime) -> list[dict]:
         for wait in record["waits"]:
             if len(jobs) >= MAX_CHECKS_PER_TICK:
                 return jobs
-            if wait["state"] != "waiting" or wait["kind"] not in ("command", "pr"):
+            recheck = _revocable(wait)
+            if not recheck and (wait["state"] != "waiting" or wait["kind"] not in ("command", "pr")):
                 continue
             if (_stamp(wait["next_check_at"]) or 0) > stamp:
                 continue
@@ -1507,7 +1508,7 @@ def _claim_checks(state: dict, now: datetime) -> list[dict]:
                 job["type"] = "command"
                 interval = wait["condition"]["interval_s"]
             else:
-                job.update(type="pr", memo=wait["memo"], fix=wait["fix"])
+                job.update(type="recheck" if recheck else "pr", memo=wait["memo"], fix=wait["fix"])
                 interval = PR_POLL_S
             # The result sets the real next check; this only holds the claim.
             claim = max(interval, CHECK_CLAIM_S)
@@ -1548,6 +1549,51 @@ def _merge_fires(wait: dict) -> bool:
     return wait["condition"]["until"] == "merged" and wait["state"] in (
         "pending", "waiting", "needs_attention",
     )
+
+
+def _revocable(wait: dict) -> bool:
+    """A fired `review_on_head` or `ready` that waits for my Done: it was true of
+    one head, so it stays watched until then."""
+    return (
+        wait["state"] == "fired" and wait["kind"] == "pr" and bool(wait.get("fired_head"))
+        and wait["condition"]["until"] in ("review_on_head", "ready")
+    )
+
+
+def _apply_recheck(state: dict, record: dict, wait: dict, result: dict, now: datetime) -> None:
+    """Take a fired wait back when the PR moved under it: a new head, or a branch
+    that can't merge. Its events are left to the poll that runs next."""
+    wait["next_check_at"] = _iso(now + timedelta(seconds=result.get("next_poll_s") or PR_POLL_S))
+    if result.get("merged"):
+        _pr_merged(state, wait["condition"], now)
+        return
+    if result.get("error") or not result.get("head"):
+        return
+    head, merge_state = result["head"], result.get("merge_state")
+    base = result.get("base") or "its base"
+    if head != wait["fired_head"]:
+        why = f"new head {head[:7]}"
+    elif merge_state == "DIRTY":
+        why = f"conflicts with {base}"
+    elif merge_state == "BEHIND":
+        why = f"behind {base}"
+    else:
+        return
+    number = wait["condition"]["number"]
+    what = "ready" if wait["condition"]["until"] == "ready" else "reviewed"
+    line = f"PR#{number} no longer {what}: {why}"
+    wait.update(
+        state="waiting", fired_text=None, fired_at=None, fired_head=None,
+        on_me=False, reason=None, next_check_at=_iso(now),
+    )
+    _touch(wait)
+    _log(record, now, wait, line)
+    # The chain's next step waits for this one again.
+    following = _wait_in(record, wait["next"]) if wait["next"] else None
+    if following is not None and following["state"] == "waiting" and not following["on_me"]:
+        following.update(state="pending", next_check_at=None)
+        _touch(following)
+    _toast(state, record, wait, now, "info", line)
 
 
 def _merge_ends(wait: dict) -> bool:
@@ -1618,6 +1664,7 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
     # watched, so a compare that later proves the release fires it.
     if result.get("fired"):
         wait["snapshot"] = result.get("snapshot", wait["snapshot"])
+        wait["fired_head"] = result.get("head")
         text = result.get("fire_text") or wait["label"]
         name = f"PR#{wait['condition']['number']} "
         _fire(state, record, wait, now, text, fired=text if text.startswith(name) else name + text)
@@ -1647,6 +1694,9 @@ def _merge(state: dict, finished: list[dict], now: datetime) -> None:
         if job["type"] == "verify":
             if wait["rev"] == job["rev"] and wait["state"] == "acting" and wait["verify_pending"]:
                 _apply_verify(state, record, wait, job["result"], now)
+        elif job["type"] == "recheck":
+            if wait["rev"] == job["rev"] and _revocable(wait):
+                _apply_recheck(state, record, wait, job["result"], now)
         elif wait["rev"] == job["rev"] and wait["state"] == "waiting":
             apply = _apply_command if job["type"] == "command" else _apply_poll
             apply(state, record, wait, job["result"], now)
@@ -2478,6 +2528,22 @@ def cmd_add(args: argparse.Namespace) -> dict:
     return _mutate(apply, agents=agents, omp=facts.omp)
 
 
+def _drop_old_chain(record: dict, repo: str, number: int, now: datetime) -> None:
+    """A new babysit of a PR replaces the session's earlier one: its open steps
+    close at once, none of them arming the next."""
+    key = _pr_key({"repo": repo, "number": number})
+    for wait in _open_waits(record):
+        if (
+            wait["kind"] == "pr" and _pr_key(wait["condition"]) == key
+            and wait["condition"]["until"] in ("review_on_head", "ready", "merged", "released")
+        ):
+            _log(record, now, wait, f"Replaced by a new babysit: {wait['label']}")
+            wait["state"] = "done"
+            wait.update(on_me=False, overdue=False, reason=None, verify_pending=False)
+            _touch(wait)
+            _cancel_prompts(record, wait)
+
+
 def cmd_babysit_pr(args: argparse.Namespace) -> dict:
     repo, number = _pr_reference(args)
     prompt = None if args.no_fix else _github().FIX_PROMPT
@@ -2487,6 +2553,7 @@ def cmd_babysit_pr(args: argparse.Namespace) -> dict:
     def apply(state: dict, now: datetime) -> dict:
         record = _ensure(state, args.session, None)
         _begin(record, omp, now)
+        _drop_old_chain(record, repo, number, now)
         steps = ["review_on_head", "ready", "merged"]
         if args.released:
             steps.append("released")

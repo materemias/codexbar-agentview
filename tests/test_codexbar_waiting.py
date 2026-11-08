@@ -3120,6 +3120,75 @@ class MergedPrTests(Case):
         )
 
 
+class FiredPrTests(Case):
+    """A fired `review_on_head` or `ready` is taken back when the PR moves under it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.pr = {"head": "a" * 40, "merge_state": "CLEAN", "holds": True}
+
+        def poll(cond, memo, **kwargs):
+            holds = self.pr["holds"] and cond["until"] in ("review_on_head", "ready")
+            return poll_result(
+                memo, fired=holds, fire_text=f"{cond['until']} on {self.pr['head'][:7]}" if holds else None,
+                head=self.pr["head"], merge_state=self.pr["merge_state"], base="main",
+            )
+
+        self.github(poll=poll)
+
+    def chain(self) -> list[str]:
+        answer = self.run_cli("babysit-pr", "--session", SID, "--repo", "o/r", "--number", "7", "--no-fix")
+        return [wait["id"] for wait in answer["waits"]]
+
+    def states(self, ids: list[str]) -> list[str]:
+        waits = {wait["id"]: wait for wait in self.state()["sessions"][SID]["waits"]}
+        return [waits[wait]["state"] for wait in ids]
+
+    def ticks(self, count: int) -> None:
+        for _ in range(count):
+            self.tick()
+            self.advance(minutes=4)
+
+    def ready(self) -> list[str]:
+        return [self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "ready")["id"]]
+
+    def test_a_new_head_takes_ready_back_and_the_chain_waits_for_it_again(self) -> None:
+        chain = self.chain()
+        self.ticks(2)
+        self.assertEqual(self.states(chain), ["fired", "fired", "waiting"])
+        self.pr.update(head="b" * 40, holds=False)
+        self.ticks(1)
+        self.assertEqual(self.states(chain), ["waiting", "waiting", "pending"])
+        seen = self.session()
+        self.assertIn("PR#7 no longer ready: new head bbbbbbb", [item["text"] for item in seen["history"]])
+        self.assertIsNone(seen["outcome"])
+        self.pr["holds"] = True
+        self.ticks(2)
+        self.assertEqual(self.states(chain), ["fired", "fired", "waiting"])
+
+    def test_a_conflict_takes_ready_back_on_the_same_head(self) -> None:
+        ready = self.ready()
+        self.ticks(1)
+        self.assertEqual(self.states(ready), ["fired"])
+        self.pr.update(merge_state="DIRTY", holds=False)
+        self.ticks(1)
+        self.assertEqual(self.states(ready), ["waiting"])
+        self.assertEqual(self.session()["history"][-1]["text"], "PR#7 no longer ready: conflicts with main")
+
+    def test_an_unchanged_pr_keeps_the_wait_fulfilled(self) -> None:
+        ready = self.ready()
+        self.ticks(3)
+        self.assertEqual(self.states(ready), ["fired"])
+
+    def test_a_new_babysit_replaces_the_sessions_old_chain_on_that_pr(self) -> None:
+        old = self.chain()
+        self.ticks(2)
+        new = self.chain()
+        self.assertEqual(self.states(old), ["done", "done", "done"])
+        self.assertEqual(self.states(new), ["waiting", "pending", "pending"])
+        self.assertIn("Replaced by a new babysit: Ready", [item["text"] for item in self.session()["history"]])
+
+
 class PinTests(Case):
     @property
     def pins_path(self) -> Path:

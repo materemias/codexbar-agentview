@@ -148,6 +148,8 @@ class FakeGh:
         self.compare: dict[str, Any] = {}
         self.rest_pr: dict = {}
         self.rest_reviews: list = []
+        # The head's workflow runs: (name, status, conclusion), or a gh answer.
+        self.runs: Any = []
 
     def count(self, needle: str) -> int:
         return sum(1 for call in self.calls if any(needle in arg for arg in call))
@@ -187,6 +189,10 @@ class FakeGh:
             page = int(target.rsplit("page=", 1)[1])
             size = github.RELEASE_PAGE
             return ok(json.dumps(self.releases[(page - 1) * size : page * size]))
+        if "/actions/runs" in target:
+            if isinstance(self.runs, subprocess.CompletedProcess):
+                return self.runs
+            return ok("".join(f"{name}\t{status}\t{conclusion}\n" for name, status, conclusion in self.runs))
         if "/compare/" in target:
             tag = target.split("...", 1)[1]
             answer = self.compare.get(tag, NOT_FOUND)
@@ -691,6 +697,51 @@ class ReadyTest(PollTestCase):
         result = self.assert_ready(gh, False)
         self.assertTrue(result["merged"])
         self.assertEqual(result["events"], [])
+
+    def test_ci_waiting_for_a_maintainers_approval_blocks_and_says_so_once(self) -> None:
+        # A fork's CI: no checks in the rollup until a maintainer approves the run.
+        gh = FakeGh(pr_answer(reviews=[bot_review()]))
+        gh.runs = [("CI", "completed", "action_required")]
+        result = self.assert_ready(gh, False)
+        self.assertEqual(
+            [event["text"] for event in result["events"]],
+            ["CI on aaaaaaa waits for a maintainer's approval (CI)"],
+        )
+        self.assertEqual(self.assert_ready(gh, False)["events"], [])
+        gh.runs = [("CI", "completed", "success")]
+        self.assert_ready(gh, True)
+
+    def test_a_workflow_still_running_blocks_without_required_checks(self) -> None:
+        gh = FakeGh(pr_answer(reviews=[bot_review()]))
+        gh.runs = [("CI", "queued", "")]
+        self.assert_ready(gh, False)
+
+    def test_a_ci_run_that_failed_before_any_job_blocks_and_needs_me(self) -> None:
+        gh = FakeGh(pr_answer(reviews=[bot_review()]))
+        gh.runs = [("CI", "completed", "failure")]
+        result = self.assert_ready(gh, False)
+        self.assertEqual(
+            [(event["text"], event["on_me"]) for event in result["events"]],
+            [("CI failed on aaaaaaa (CI)", True)],
+        )
+
+    def test_unreadable_workflow_runs_leave_the_rollup_in_charge(self) -> None:
+        gh = FakeGh(pr_answer(reviews=[bot_review()]))
+        gh.runs = NOT_FOUND
+        self.assert_ready(gh, True)
+
+    def test_a_bot_that_reviews_every_push_is_waited_for_and_reported_after_an_hour(self) -> None:
+        review = bot_review(OLD_HEAD, "roboomp")
+        gh = FakeGh(pr_answer(reviews=[review], committed="1970-01-01T00:17:00Z"))
+        self.assert_ready(gh, False)
+        self.clock = 1020 + github.BOT_SETTLE_S
+        self.assertEqual(self.assert_ready(gh, False)["events"], [])
+        self.clock = 1020 + github.BOT_STUCK_S + 1
+        self.assertEqual(
+            [(event["text"], event["on_me"]) for event in self.assert_ready(gh, False)["events"]],
+            [("roboomp hasn't reviewed aaaaaaa in an hour", True)],
+        )
+        self.assertEqual(self.assert_ready(gh, False)["events"], [])
 
 
 class MergedTest(PollTestCase):
