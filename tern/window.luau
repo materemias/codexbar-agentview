@@ -1594,15 +1594,6 @@ local function waitingRequest(cx: WindowCx)
 	end)
 end
 
-local function poll(cx: WindowCx?)
-	local s = tern.kv.get("summary")
-	local sig = if s ~= nil then tern.json.encode(s) else ""
-	if sig ~= summarySig then
-		summarySig = sig
-		tern.chrome.refresh()
-	end
-	if cx then
-		restoreLayout(cx)
 -- omp's status row links `codexbar-agentview://card/<session id>` inside Tern;
 -- the row is drawn in that session's own pane, the one clicked. The host half
 -- opens `codexbar-agentview://request` after it publishes `waitingRequest`: the
@@ -1623,6 +1614,15 @@ tern.route.link(function(link: LinkRequest, cx: WindowCx): RouteDecision?
 	return { handled = true }
 end)
 
+local function poll(cx: WindowCx?)
+	local s = tern.kv.get("summary")
+	local sig = if s ~= nil then tern.json.encode(s) else ""
+	if sig ~= summarySig then
+		summarySig = sig
+		tern.chrome.refresh()
+	end
+	if cx then
+		restoreLayout(cx)
 		local request = tern.kv.get("settingsRequest")
 		if type(request) == "table" and type(request.pane) == "number" and request.seq ~= lastSettingsRequest then
 			local info = paneInfo(cx, request.pane)
