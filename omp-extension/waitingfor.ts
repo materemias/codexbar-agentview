@@ -354,7 +354,7 @@ function when(iso: string): string {
 }
 
 function waitFacts(wait): string {
-	return [wait.state, wait.overdue ? "overdue" : null, wait.due_at ? `due ${when(wait.due_at)}` : null, wait.reason].filter(Boolean).join(", ");
+	return [wait.progress ?? wait.state, wait.overdue ? "overdue" : null, wait.due_at ? `due ${when(wait.due_at)}` : null, wait.reason].filter(Boolean).join(", ");
 }
 
 /** `forms` as aligned columns; a line too wide for `width` drops its text under the command. */

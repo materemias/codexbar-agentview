@@ -102,6 +102,11 @@ BALL_RANK = {ball: rank for rank, ball in enumerate(BALLS)}
 OUTCOMES = ("attention", "overdue", "fulfilled")
 OUTCOME_RANK = {outcome: rank for rank, outcome in enumerate(OUTCOMES)}
 OUTCOME_MARKS = {"attention": "⚠️ ", "overdue": "⏰ ", "fulfilled": "✅ "}
+# A wait whose prompt the agent runs now: no outcome yet.
+WORKING_MARK = "🔧 "
+WORKING_TEXT = "agent on it"
+# The session line names this many threads besides its primary one.
+OTHER_TRACKS_SHOWN = 2
 SIZE_RANK = {"S": 0, "M": 1, "L": 2}
 PR_UNTIL = {
     "review_on_head": "Review on head",
@@ -1863,12 +1868,13 @@ def _wait_ball(wait: dict) -> str:
 
 def _outcome(wait: dict) -> str | None:
     """How the wait ended up, if it did. Every on_me wait has one, and it decides
-    the wait's prefix on every surface."""
+    the wait's prefix on every surface. A prompt the agent still runs (`acting`)
+    is work in progress, not an outcome."""
     if wait["state"] == "needs_attention" or wait["on_me"]:
         return "attention"
     if wait["overdue"]:
         return "overdue"
-    return "fulfilled" if wait["state"] in ("fired", "acting", "review") else None
+    return "fulfilled" if wait["state"] in ("fired", "review") else None
 
 
 def _summary(wait: dict, now: datetime) -> str:
@@ -1908,6 +1914,8 @@ def _wait_view(wait: dict, now: datetime) -> dict:
         "fired_text": (wait.get("fired_text") or (_summary(wait, now) if wait["kind"] == "pr" else wait["label"]))
         if fulfilled else None,
         "fired_at": (wait.get("fired_at") or wait["created_at"]) if fulfilled else None,
+        # What the wait does right now, beyond waiting: the agent runs its prompt.
+        "progress": WORKING_TEXT if wait["state"] == "acting" and outcome is None else None,
         "reason": wait["reason"], "created_at": wait["created_at"],
         "due_at": None if due is None else _iso(datetime.fromtimestamp(due).astimezone()),
         "deadline": wait["deadline"], "condition": wait["condition"],
@@ -1970,7 +1978,47 @@ def _outcome_headline(views: list[dict]) -> tuple[str | None, str | None]:
 
 
 def _wait_mark(view: dict) -> str:
+    if view["outcome"] is None and view["state"] == "acting":
+        return WORKING_MARK
     return OUTCOME_MARKS.get(view["outcome"]) or ("⏲ " if view["kind"] == "time" else "⏳ ")
+
+
+def _tracks(views: list[dict]) -> list[list[dict]]:
+    """The target's waits by thread: a chain (steps linked by `next`) is one, any
+    other wait its own. In the waits' order, so a chain's steps stay together."""
+    by_id = {view["id"]: view for view in views}
+    following = {view["next"] for view in views if view["next"] in by_id}
+    tracks = []
+    for view in views:
+        if view["id"] in following:
+            continue
+        track, step = [], view
+        while step is not None and step not in track:
+            track.append(step)
+            step = by_id.get(step["next"]) if step["next"] else None
+        tracks.append(track)
+    return tracks
+
+
+def _track_text(view: dict) -> str:
+    """One thread in a few words, by its current step."""
+    if view["outcome"] == "fulfilled":
+        return view["fired_text"]
+    if view["outcome"] == "attention" and view["reason"]:
+        name = f"PR#{view['condition']['number']}" if view["kind"] == "pr" else view["label"]
+        return f"{name}: {view['reason']}"
+    text = view["summary"] if view["kind"] in ("pr", "something") else view["label"]
+    return f"{text}, {view['progress']}" if view["progress"] else text
+
+
+def _track_texts(views: list[dict]) -> list[str]:
+    """Every thread's current step, the target's primary one first, each with its mark."""
+    if not views:
+        return []
+    primary = _primary(views)
+    currents = [_primary(track) for track in _tracks(views)]
+    currents.sort(key=lambda current: current is not primary)
+    return [_wait_mark(current) + _track_text(current) for current in currents]
 
 
 def _status_lines(
@@ -1993,11 +2041,18 @@ def _status_lines(
             else:
                 short = _clip(primary["label"], SHORT_LABEL_CHARS)
             detail = (primary["reason"] if primary["outcome"] else None) or primary["label"]
+            if primary["progress"]:
+                detail = f"{detail}, {primary['progress']}"
             age = _when(primary, now)
             parts = [short] + ([detail] if detail != short else []) + [age]
+        # The session's other threads, each by its current step: one line tells them all.
+        others = _track_texts(views)[1:]
+        parts += [f"+ {text}" for text in others[:OTHER_TRACKS_SHOWN]]
+        if len(others) > OTHER_TRACKS_SHOWN:
+            parts.append(f"+{len(others) - OTHER_TRACKS_SHOWN} more")
         if note:
             parts.append(f'"{_clip(note, NOTE_IN_LINE_CHARS)}"')
-        status = f"{mark}{short} · {age}"
+        status = f"{mark}{short} · {age}" + (f" +{len(others)}" if others else "")
         line = mark + " · ".join(parts)
     elif pinned:
         status = "📌 pinned"
@@ -2033,10 +2088,17 @@ def _prompts_queued(record: dict | None, now: datetime) -> int:
 
 
 def _next_step(views: list[dict]) -> str | None:
+    """What needs me, else each thread's next step, named by its PR when there are several."""
     for view in views:
         if view["state"] == "needs_attention":
             return view["reason"]
-    return next((view["label"] for view in views if view["state"] == "pending"), None)
+    tracks = _tracks(views)
+    steps = []
+    for track in tracks:
+        step = next((view for view in track if view["state"] == "pending"), None)
+        if step is not None:
+            steps.append(step["summary"] if len(tracks) > 1 and step["kind"] == "pr" else step["label"])
+    return " · ".join(steps) or None
 
 
 def _waiting_for(views: list[dict]) -> str | None:
@@ -2111,6 +2173,7 @@ def _session_view(
         "outcome": outcome, "headline": headline,
         "status": status, "line": line, "composer_row": composer_row,
         "next_step": _next_step(views),
+        "threads": _track_texts(views),
         "waiting_for": _waiting_for(views),
         "recap": info["recap"], "recap_at": info["recap_at"], "recap_stale": info["recap_stale"],
         "due_at": min(dues, key=_stamp) if dues else None,
@@ -2131,7 +2194,7 @@ def _pane_view(record: dict, now: datetime) -> dict:
         "note": record["note"],
         "ball": min((view["ball"] for view in _active(views)), key=BALL_RANK.get),
         "outcome": outcome, "headline": headline,
-        "status": status, "line": line, "waits": views,
+        "status": status, "line": line, "waits": views, "threads": _track_texts(views),
         "waiting_for": _waiting_for(views),
         "history": _history_view(record),
         "due_at": min(dues, key=_stamp) if dues else None,
@@ -2530,12 +2593,15 @@ def cmd_add(args: argparse.Namespace) -> dict:
 
 def _drop_old_chain(record: dict, repo: str, number: int, now: datetime) -> None:
     """A new babysit of a PR replaces the session's earlier one: its open steps
-    close at once, none of them arming the next."""
+    close at once, none of them arming the next. Only chain steps (linked by
+    `next`) go; a wait of its own on that PR, such as one for its release with a
+    prompt to send then, stays."""
     key = _pr_key({"repo": repo, "number": number})
+    linked = {wait["next"] for wait in record["waits"] if wait["next"]}
     for wait in _open_waits(record):
         if (
             wait["kind"] == "pr" and _pr_key(wait["condition"]) == key
-            and wait["condition"]["until"] in ("review_on_head", "ready", "merged", "released")
+            and (wait["next"] or wait["id"] in linked)
         ):
             _log(record, now, wait, f"Replaced by a new babysit: {wait['label']}")
             wait["state"] = "done"

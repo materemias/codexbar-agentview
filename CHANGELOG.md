@@ -18,6 +18,9 @@
 
 ### Fixes
 
+- A wait whose prompt the agent is still running shows 🔧 at work instead of ✅ Fulfilled.
+- A session waiting for several things, such as two babysat PRs, shows each of them in its row, status and next step, not only the first.
+- Babysitting a PR no longer closes a separate wait on the same PR, such as one for its release.
 - Codex and Claude accounts are always listed in alphabetical order by email, in the widget and in Tern, instead of switching places between refreshes.
 - In the Tern extension, a slow usage-cache read that finishes late no longer replaces a newer one's result, such as bringing back an account whose login was replaced.
 - Focusing a session that runs in T3 Code 0.1 or later opens its thread instead of only raising the window.

@@ -687,6 +687,9 @@ end
 local function waitRow(w: any, now: number): Node
 	local text = tostring(w.summary or w.label or w.kind)
 	local spans: { Span | string } = { if w.state == "pending" then ui.span("Then: " .. text, "muted") else text }
+	if type(w.progress) == "string" and w.progress ~= "" then
+		table.insert(spans, ui.span("  🔧 " .. w.progress, "info"))
+	end
 	local due = epoch(w.due_at)
 	if w.overdue == true then
 		table.insert(spans, ui.span("  overdue", "error"))

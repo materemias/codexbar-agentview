@@ -111,7 +111,8 @@ hour is reported once.
 prompt that asks the agent to fix the real findings and answer the rest, then
 a code check that something happened (a new push, or every thread answered),
 then `ready`, then `merged`. It never merges. Babysitting a PR again replaces
-the session's earlier chain on it.
+the session's earlier chain on it; a wait of its own on that PR, such as one for
+its release, stays.
 
 **Command check from a description.** `/wait check the nightly job passed`
 sends one prompt to the session's agent: write a command that exits 0 exactly
@@ -177,8 +178,16 @@ shows it the same way:
 | ✅ | fulfilled: what you waited for happened (`✅ PR#20 merged`) | green |
 | ⚠️ | needs you: a check failed, a PR conflicts or was closed, a prompt couldn't be sent | yellow |
 | ⏰ | overdue: its deadline passed, still watched | yellow |
+| 🔧 | at work: the agent runs the wait's prompt, such as a babysit's review fixes | |
 | ⏲ | waiting for a time | |
 | ⏳ | waiting for anything else | |
+
+A session can wait for several things at once, say two babysat PRs and a
+release. Each chain of steps, and each wait of its own, is a thread. The row
+above the composer, the status segment (`+2`) and the Waiting tab row show
+every thread by its current step, the most urgent first:
+`⏳ PR#18849 · Ready · 27m · + ⏳ PR#26 review on head`. Next step lists each
+thread's next step.
 
 The row above the composer, the Waiting tab row and the status segment start
 with the mark. The session card opens with a banner such as

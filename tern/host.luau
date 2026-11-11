@@ -2285,17 +2285,25 @@ local function waitTitle(r: any): string
 	return if title ~= "" then title else "Pane " .. str(r.pane)
 end
 
--- What the row waits for: the first wait that is not a chain's later step. A
--- free-text wait has a line of its own (`waiting_for`), so it is skipped here.
+-- What the row waits for: each thread's current step from the CLI (`threads`), with
+-- their marks when there are several. A free-text wait has a line of its own
+-- (`waiting_for`), so it is left out here.
 local function waitSummary(r: any): string
-	local own = oneLine(r.waiting_for) ~= ""
-	for _, w in val(r.waits) or {} do
-		if w.state ~= "pending" and not (own and w.kind == "something") then
-			local text = oneLine(w.summary)
-			return if text ~= "" then text else oneLine(w.label)
+	local own = oneLine(r.waiting_for)
+	local threads: { string } = {}
+	for _, t in val(r.threads) or {} do
+		local text = oneLine(t)
+		if own == "" or string.sub(text, -#own) ~= own then
+			table.insert(threads, text)
 		end
 	end
-	return if own then "" else oneLine(r.status)
+	if #threads == 1 then
+		return (string.gsub(threads[1], "^[^ ]+ ", "", 1)) -- the row's own mark says the outcome
+	end
+	if #threads > 1 then
+		return table.concat(threads, "  ·  ")
+	end
+	return if own ~= "" then "" else oneLine(r.status)
 end
 
 local function waitMatches(r: any, q: string): boolean

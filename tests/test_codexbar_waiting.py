@@ -1746,7 +1746,7 @@ class ViewTests(Case):
             set(wait),
             {
                 "id", "kind", "label", "summary", "state", "ball", "overdue", "outcome",
-                "fired_text", "fired_at", "reason", "created_at", "due_at", "deadline",
+                "fired_text", "fired_at", "progress", "reason", "created_at", "due_at", "deadline",
                 "condition", "has_prompt", "next", "by",
             },
         )
@@ -1758,7 +1758,7 @@ class ViewTests(Case):
                 "agent_state", "extension", "resume_command", "note", "suggested_note",
                 "size", "set_aside_at", "pinned", "ball", "unseen", "outcome", "headline",
                 "status", "line", "composer_row",
-                "next_step", "waiting_for", "recap", "recap_at", "recap_stale", "due_at", "prompts_queued", "waits",
+                "next_step", "threads", "waiting_for", "recap", "recap_at", "recap_stale", "due_at", "prompts_queued", "waits",
                 "schedules", "history", "prs",
             },
         )
@@ -2669,7 +2669,7 @@ class OutcomeTests(Case):
             ("pending", False, False, None),
             ("waiting", False, False, None),
             ("fired", False, False, "fulfilled"),
-            ("acting", False, False, "fulfilled"),
+            ("acting", False, False, None),
             ("review", False, False, "fulfilled"),
             ("needs_attention", False, False, "attention"),
             ("waiting", True, False, "attention"),
@@ -2738,13 +2738,18 @@ class OutcomeTests(Case):
         self.assertEqual(self.wait_of(wait["id"])["fired_text"], "PR#7 greptile reviewed abc1234")
         self.assertEqual(self.session()["history"][-1]["text"], "greptile reviewed abc1234")
 
-    def test_a_session_with_a_prompt_running_is_fulfilled(self) -> None:
+    def test_a_session_whose_prompt_runs_is_at_work_not_fulfilled(self) -> None:
         self.agents(SID)
         self.heartbeat()
         wait, _ = self.queued_prompt()
         seen = self.wait_of(wait)
-        self.assertEqual((seen["state"], seen["ball"], seen["outcome"]), ("acting", "on_machine", "fulfilled"))
-        self.assertEqual(self.session()["outcome"], "fulfilled")
+        self.assertEqual(
+            (seen["state"], seen["ball"], seen["outcome"], seen["progress"]),
+            ("acting", "on_machine", None, "agent on it"),
+        )
+        session = self.session()
+        self.assertEqual((session["outcome"], session["headline"]), (None, None))
+        self.assertTrue(session["line"].startswith("🔧 "))
 
     def test_a_review_says_the_prompt_ran(self) -> None:
         self.agents(SID)
@@ -2805,12 +2810,13 @@ class OutcomeTests(Case):
         self.assertEqual((seen["outcome"], seen["headline"]), ("attention", "⚠️ Exited with status 1"))
 
     def test_a_fired_wait_outranks_a_waiting_one_on_the_machine(self) -> None:
-        self.agents(SID)
-        self.heartbeat()
         self.add("--kind", "job", "--pane", "51")
-        self.queued_prompt()
-        self.assertEqual(self.session()["outcome"], "fulfilled")
-        self.assertTrue(self.session()["line"].startswith("✅ "))
+        self.add("--kind", "time", "--in", "1s")
+        self.advance(seconds=2)
+        self.tick()
+        seen = self.session()
+        self.assertEqual(seen["outcome"], "fulfilled")
+        self.assertTrue(seen["line"].startswith("✅ "))
 
     def test_a_pane_has_an_outcome_too(self) -> None:
         self.run_cli("add", "--pane", "51", "--kind", "job")
@@ -3187,6 +3193,20 @@ class FiredPrTests(Case):
         self.assertEqual(self.states(old), ["done", "done", "done"])
         self.assertEqual(self.states(new), ["waiting", "pending", "pending"])
         self.assertIn("Replaced by a new babysit: Ready", [item["text"] for item in self.session()["history"]])
+
+    def test_a_babysit_keeps_a_wait_of_its_own_on_that_pr(self) -> None:
+        released = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "released", "--prompt", "build on it")["id"]
+        self.chain()
+        self.assertEqual(self.states([released]), ["waiting"])
+
+    def test_every_chain_shows_in_the_line_and_the_next_step(self) -> None:
+        self.chain()
+        self.run_cli("babysit-pr", "--session", SID, "--repo", "o/r", "--number", "8", "--no-fix")
+        seen = self.session()
+        self.assertEqual(seen["threads"], ["⏳ PR#7 review on head", "⏳ PR#8 review on head"])
+        self.assertIn("+ ⏳ PR#8 review on head", seen["line"])
+        self.assertEqual(seen["next_step"], "PR#7 ready · PR#8 ready")
+        self.assertTrue(seen["status"].endswith(" +1"))
 
 
 class PinTests(Case):
