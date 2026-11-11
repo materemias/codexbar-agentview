@@ -3010,9 +3010,26 @@ local function closeBlock(b: Block)
 	pcall(b.cx.exit, b.cx, 0) -- the window half may have closed the pane already
 end
 
+-- Layout work belongs to the window half; the dashboard's window takes this up
+-- like `settingsRequest`, at once through the link, else on its poll.
+local function waitingRequest(b: Block, request: { [string]: any })
+	request.pane = b.cx.pane
+	request.seq = tern.now()
+	tern.kv.set("waitingRequest", request)
+	b.cx:open("codexbar-agentview://request")
+end
+
 -- Switching to a session closes the dashboard, like picking from a popup.
+-- `tern focus` reaches a pane in any window but refuses a parked one ("in no
+-- tab"): then the window holding it unparks it into a tab of its own, as the
+-- Waiting tab's Open does.
 local function focusRecord(b: Block, r: any)
 	python("codexbar_focus.py", { "--tern", "codexbar-agentview://focus/" .. str(r.sessionId) }, 15000, function(res)
+		local pane = tonumber(val(r.ternPane))
+		if res.status ~= 0 and str(r.host) == "tern" and pane then
+			waitingRequest(b, { op = "open", target = pane })
+			return
+		end
 		report(b.cx, "focus", res)
 		if res.status == 0 then
 			closeBlock(b)
@@ -3105,15 +3122,6 @@ local function teleport(b: Block, r: any)
 		scanAgents(true)
 		b.cx:render()
 	end)
-end
-
--- Layout work belongs to the window half; the dashboard's window takes this up
--- like `settingsRequest`, at once through the link, else on its poll.
-local function waitingRequest(b: Block, request: { [string]: any })
-	request.pane = b.cx.pane
-	request.seq = tern.now()
-	tern.kv.set("waitingRequest", request)
-	b.cx:open("codexbar-agentview://request")
 end
 
 -- `verb` aimed at the row's session, or at its pane for a non-omp one.
