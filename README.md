@@ -170,7 +170,7 @@ start, so run `/restart` in sessions that were already open.
 | Key | Action | Where |
 | --- | --- | --- |
 | `Super+A` | Open the popup on Agents | Plasma |
-| `Ctrl+Alt+A` / `Ctrl+Alt+U` / `Ctrl+Alt+W` | Toggle the dashboard on Agents / Usage / Waiting | Tern |
+| `Ctrl+Alt+A` / `Ctrl+Alt+U` / `Ctrl+Alt+W` / `Ctrl+Alt+H` | Toggle the dashboard on Agents / Usage / Waiting / History | Tern |
 | `Ctrl+Alt+B` | Set the focused session aside (in omp outside Tern too) | Tern, omp |
 | `Ctrl+Alt+I` | Show or hide the focused session's card (in omp outside Tern: its details above the composer) | Tern, omp |
 | `←` / `→` | Switch tabs | Both |

@@ -14,6 +14,7 @@
 - An omp extension adds `/wait` (one set-aside menu for omp sessions, opened by `Ctrl+Alt+B` in Tern and outside it and built from the same list as Tern's picker for other panes, one-line commands with completions, and `/wait help` and `/wait list` above the composer instead of in toasts), a `waitingfor` agent tool and a row above the composer showing what the session waits for; install it with the Plasma Install button, the Tern palette command `Install omp extension` or `install_integration.py --omp-extension`.
 - A session card floats over any omp session in Tern (`Ctrl+Alt+I`, a click on the row above the composer or on the status segment, or the Card buttons, `Shift+Enter`) with your sentence, folder, branch, model, the pull requests it waits on or created and, apart, the ones only mentioned, waits, schedules, what happened since you set it aside with times, and omp's recap with its time ("Earlier recap" when the session moved on since); it opens by itself the first time you focus a session whose wait fired. Outside Tern, `Ctrl+Alt+I` shows the same details above the composer. A status line segment and a colored tab show sessions back on you.
 - The Plasma widget's new Settings → Agents → Tern integration switch marks set-aside sessions in Agents and counts the ones back on you beside the panel dots.
+- `Ctrl+Alt+H` toggles the Tern dashboard on History.
 
 ### Fixes
 
