@@ -1683,6 +1683,8 @@ local function waitingRequest(cx: WindowCx)
 		return
 	end
 	local seq = request.seq
+	-- A failed `tern focus` from the host: only a parked pane makes it the refusal this opens.
+	local focusError = if type(request.error) == "string" then request.error else nil
 	if type(request.at) == "number" and os.time() - request.at > REQUEST_TTL_S then
 		lastWaitingRequest = seq
 		return
@@ -1731,9 +1733,17 @@ local function waitingRequest(cx: WindowCx)
 			-- The window holding it opens it; the host already said when it closed.
 			tern.timer(2000, function(cx3)
 				if cx3 and tern.kv.get("waitingRequestTaken") ~= seq then
-					cx3:toast("info", "CodexBar AgentView: no window shows that pane")
+					if focusError then
+						waitingFailed("focus", focusError, cx3)
+					else
+						cx3:toast("info", "CodexBar AgentView: no window shows that pane")
+					end
 				end
 			end)
+			return
+		end
+		if focusError and not shown.parked then
+			waitingFailed("focus", focusError, cx2)
 			return
 		end
 		if shown.parked then

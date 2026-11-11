@@ -3108,15 +3108,17 @@ end
 -- Switching to a session closes the dashboard, like picking from a popup.
 -- `tern focus` reaches a pane in any window but refuses a parked one ("in no
 -- tab"): then the window holding it unparks it into a tab of its own, as the
--- Waiting tab's Open does. codexbar_focus.py keeps Tern's message to itself
--- and answers that refusal with exit 4 (`couldn't focus … host=tern`); any
--- other failure is reported.
+-- Waiting tab's Open does. codexbar_focus.py keeps Tern's message to itself:
+-- exit 4 with `host=tern` is any failed `tern focus` (refusal, timeout, no
+-- Tern), so only the window, which knows whether the pane is parked, tells the
+-- refusal apart; it reports `error` for anything else. Other failures are
+-- reported here.
 local function focusRecord(b: Block, r: any)
 	python("codexbar_focus.py", { "--tern", "codexbar-agentview://focus/" .. str(r.sessionId) }, 15000, function(res)
 		local pane = tonumber(val(r.ternPane))
-		local refused = res.status == 4 and string.find(res.stderr, "host=tern", 1, true) ~= nil
-		if refused and str(r.host) == "tern" and pane then
-			waitingRequest(b, { op = "open", target = pane })
+		local ternFailed = res.status == 4 and string.find(res.stderr, "host=tern", 1, true) ~= nil
+		if ternFailed and str(r.host) == "tern" and pane then
+			waitingRequest(b, { op = "open", target = pane, error = firstLine(res.stderr) })
 			return
 		end
 		report(b.cx, "focus", res)
