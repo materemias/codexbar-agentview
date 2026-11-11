@@ -18,6 +18,9 @@
 
 ### Fixes
 
+- Tern: Resume can't start the same session twice, panes titled `-zsh` (or text starting with `-`) can be set aside, a Waiting row with a headline still lists its other threads, Open says when the pane has closed instead of "in another window", and actions the omp extension queues during a tick no longer wait up to 5 minutes.
+- Tern session cards keep their branch between refreshes, a shell pane's card closes when its waits end, and an auto-opened card opens once per firing.
+- omp: a prompt omp drops is reported as failed instead of delivered; `/wait check` stays your check after a steering message; `/wait check !cmd` works without a space; a `later` wait no longer offers +1 day; the implicit PR comes from the agent's latest messages and ignores paths like `docs/setup.md#3`; `/wait gh …` stays with the session it was typed in.
 - The Plasma Install button links the omp extension only where omp is set up, instead of creating `~/.omp`; uninstalling reports a link it can't remove instead of stopping with a traceback.
 - "not started · resets … after first use" shows only for a window measured at 0%, not for one with no reading.
 - A session card whose session got one thing but still waits for another, such as a PR merged but not yet released, no longer says ✅ Fulfilled: its banner says what came and what it still waits for, and every wait on the card shows its mark.
