@@ -400,13 +400,14 @@ function detailsPanel(card) {
 		const mentioned = prs.filter((pr) => pr.source === "mentioned");
 		return [
 			card.headline && theme.fg(TONES[card.outcome] ?? "muted", card.headline),
+			card.outcome && card.still_waiting?.length > 0 && `${muted("Still waiting for")} ${card.still_waiting.join("  ·  ")}`,
 			sentence && theme.bold(sentence),
 			card.suggested_note && `Suggested: ${card.suggested_note}`,
 			place && muted(place),
 			...prs.filter((pr) => pr.source !== "mentioned").map(prLine),
 			mentioned.length > 0 && muted("Mentioned"),
 			...mentioned.map((pr) => muted(prLine(pr))),
-			...waits.map((wait) => `${wait.id}  ${wait.summary || wait.label} (${waitFacts(wait)})`),
+			...waits.map((wait) => `${wait.id}  ${wait.mark ?? ""}${wait.summary || wait.label} (${waitFacts(wait)})`),
 			history.length > 0 && muted("Since set aside"),
 			...history.map(({ at, text }) => `${when(at)}  ${text}`),
 			card.next_step && `Next: ${card.next_step}`,

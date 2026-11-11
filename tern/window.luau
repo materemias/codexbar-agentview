@@ -652,6 +652,8 @@ local PR_REVIEW_TONE = { approved = "success", changes_requested = "error", revi
 local PR_CHECKS_TONE = { passing = "success", failing = "error", pending = "warning" }
 
 -- "✅ Fulfilled · PR#20 merged · 2h ago", "⚠️ Needs you · reason", "⏰ Overdue · label".
+-- While other threads still wait, a fired one isn't "Fulfilled": the banner says
+-- what came and, under it, what it still waits for.
 local function cardBanner(r: any, now: number): Node?
 	local tones = OUTCOME_TONES[r.outcome]
 	if not tones then
@@ -664,15 +666,26 @@ local function cardBanner(r: any, now: number): Node?
 			break
 		end
 	end
+	local open: { string } = {}
+	for _, t in (if type(r.still_waiting) == "table" then r.still_waiting else {}) do
+		table.insert(open, tostring(t))
+	end
 	local head, detail, tail = "⏰ Overdue", wait.label, nil
 	if r.outcome == "fulfilled" then
 		local at = epoch(wait.fired_at)
-		head, detail, tail = "✅ Fulfilled", wait.fired_text, if at then age(now - at) .. " ago" else nil
+		-- "Done" would read as the button: the banner just says what came.
+		head = if #open > 0 then "✅" else "✅ Fulfilled"
+		detail, tail = wait.fired_text, if at then age(now - at) .. " ago" else nil
 	elseif r.outcome == "attention" then
 		head, detail = "⚠️ Needs you", if wait.reason and wait.reason ~= "" then wait.reason else wait.label
 	end
-	local text = head .. (if detail and detail ~= "" then " · " .. clipped(tostring(detail), 120) else "") .. (if tail then " · " .. tail else "")
-	return ui.node("row", { role = "codexbar.banner", tone = tones.card }, { ui.text({ ui.span(text, tones.card) }) })
+	local sep = if head == "✅" then " " else " · "
+	local text = head .. (if detail and detail ~= "" then sep .. clipped(tostring(detail), 120) else "") .. (if tail then " · " .. tail else "")
+	local lines: { Node } = { ui.text({ ui.span(text, tones.card) }) }
+	if #open > 0 then
+		table.insert(lines, ui.text({ ui.span("Still waiting for ", "muted"), clipped(table.concat(open, "  ·  "), 160) }))
+	end
+	return ui.node("row", { role = "codexbar.banner", tone = tones.card }, { ui.lines(lines) })
 end
 
 -- Why a PR is on the card: the session waits on it, created it, or only mentioned it.
@@ -707,12 +720,18 @@ local function clockTime(t: number, now: number): string
 	return MONTHS[d.month] .. " " .. d.day .. ", " .. hhmm
 end
 
--- A chain's later steps are muted: nothing watches them yet.
+-- Each wait with its mark; a fulfilled one in green. A chain's later steps are
+-- muted: nothing watches them yet.
 local function waitRow(w: any, now: number): Node
 	local text = tostring(w.summary or w.label or w.kind)
-	local spans: { Span | string } = { if w.state == "pending" then ui.span("Then: " .. text, "muted") else text }
+	local spans: { Span | string } = {}
+	if w.state == "pending" then
+		table.insert(spans, ui.span("Then: " .. text, "muted"))
+	else
+		table.insert(spans, ui.span(tostring(w.mark or "") .. text, if w.outcome == "fulfilled" then "success" else nil))
+	end
 	if type(w.progress) == "string" and w.progress ~= "" then
-		table.insert(spans, ui.span("  🔧 " .. w.progress, "info"))
+		table.insert(spans, ui.span("  " .. w.progress, "info")) -- the mark is 🔧 already
 	end
 	local due = epoch(w.due_at)
 	if w.overdue == true then

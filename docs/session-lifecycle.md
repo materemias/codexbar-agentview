@@ -191,10 +191,13 @@ thread's next step.
 
 The row above the composer, the Waiting tab row and the status segment start
 with the mark. The session card opens with a banner such as
-`✅ Fulfilled · PR#20 merged · 2h ago`, and the fulfilling line in "Since
-then" is green. In On me, the ⚠️ sessions come first, then ⏰, then ✅. A tab
-holding a session that's on you turns green when all of them are fulfilled and
-yellow when one needs you.
+`✅ Fulfilled · PR#20 merged · 2h ago`. While another thread still waits, the
+banner drops "Fulfilled" and names it underneath:
+`✅ PR#18849 merged · 1h ago`, then `Still waiting for ⏳ PR#18849 released`.
+Each wait under "Waiting for" carries its mark, and the fulfilling line in
+"Since set aside" is green. In On me, the ⚠️ sessions come first, then ⏰,
+then ✅. A tab holding a session that's on you turns green when all of them
+are fulfilled and yellow when one needs you.
 
 When a babysat PR is merged early, the steps it skipped (review, ready) are
 closed and the merged step fires at once.

@@ -18,6 +18,7 @@
 
 ### Fixes
 
+- A session card whose session got one thing but still waits for another, such as a PR merged but not yet released, no longer says ✅ Fulfilled: its banner says what came and what it still waits for, and every wait on the card shows its mark.
 - Focus on an agent whose Tern pane is parked brings the pane back in a tab of its own instead of failing with "couldn't focus".
 - An open session card keeps itself current: changed waits show at once, times, agent state and the last exchange every minute, pull request states every 10 minutes. It used to show what it read when it opened.
 - A wait whose prompt the agent is still running shows 🔧 at work instead of ✅ Fulfilled.

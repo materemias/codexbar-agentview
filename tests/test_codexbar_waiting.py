@@ -1746,7 +1746,7 @@ class ViewTests(Case):
             set(wait),
             {
                 "id", "kind", "label", "summary", "state", "ball", "overdue", "outcome",
-                "fired_text", "fired_at", "progress", "reason", "created_at", "due_at", "deadline",
+                "fired_text", "fired_at", "progress", "mark", "reason", "created_at", "due_at", "deadline",
                 "condition", "has_prompt", "next", "by",
             },
         )
@@ -1758,7 +1758,7 @@ class ViewTests(Case):
                 "agent_state", "extension", "resume_command", "note", "suggested_note",
                 "size", "set_aside_at", "pinned", "ball", "unseen", "outcome", "headline",
                 "status", "line", "composer_row",
-                "next_step", "threads", "waiting_for", "recap", "recap_at", "recap_stale", "due_at", "prompts_queued", "waits",
+                "next_step", "threads", "still_waiting", "waiting_for", "recap", "recap_at", "recap_stale", "due_at", "prompts_queued", "waits",
                 "schedules", "history", "prs",
             },
         )
@@ -3207,6 +3207,17 @@ class FiredPrTests(Case):
         self.assertIn("+ ⏳ PR#8 review on head", seen["line"])
         self.assertEqual(seen["next_step"], "PR#7 ready · PR#8 ready")
         self.assertTrue(seen["status"].endswith(" +1"))
+
+    def test_a_fulfilled_session_names_what_it_still_waits_for(self) -> None:
+        ready = self.ready()
+        self.ticks(1)
+        self.assertEqual(self.states(ready), ["fired"])
+        self.assertEqual(self.session()["still_waiting"], [])
+        self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "released")
+        seen = self.session()
+        self.assertEqual(seen["outcome"], "fulfilled")
+        self.assertEqual(seen["still_waiting"], ["⏳ PR#7 released"])
+        self.assertEqual([w["mark"] for w in seen["waits"]], ["✅ ", "⏳ "])
 
 
 class PinTests(Case):

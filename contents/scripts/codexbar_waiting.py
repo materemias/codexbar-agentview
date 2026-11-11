@@ -1904,7 +1904,7 @@ def _wait_view(wait: dict, now: datetime) -> dict:
     due = _wait_due(wait)
     outcome = _outcome(wait)
     fulfilled = outcome == "fulfilled"
-    return {
+    view = {
         "id": wait["id"], "kind": wait["kind"], "label": wait["label"],
         "summary": _summary(wait, now), "state": wait["state"],
         "ball": _wait_ball(wait), "overdue": wait["overdue"],
@@ -1921,6 +1921,8 @@ def _wait_view(wait: dict, now: datetime) -> dict:
         "deadline": wait["deadline"], "condition": wait["condition"],
         "has_prompt": bool(wait["prompt"]), "next": wait["next"], "by": wait["by"],
     }
+    view["mark"] = _wait_mark(view)
+    return view
 
 
 def _active(views: list[dict]) -> list[dict]:
@@ -2019,6 +2021,16 @@ def _track_texts(views: list[dict]) -> list[str]:
     currents = [_primary(track) for track in _tracks(views)]
     currents.sort(key=lambda current: current is not primary)
     return [_wait_mark(current) + _track_text(current) for current in currents]
+
+
+def _still_waiting(views: list[dict]) -> list[str]:
+    """The threads nothing has come of yet, by their current step with its mark:
+    a fulfilled session that still waits on one isn't done."""
+    return [
+        _wait_mark(current) + _track_text(current)
+        for current in (_primary(track) for track in _tracks(views))
+        if current["outcome"] is None
+    ]
 
 
 def _status_lines(
@@ -2173,7 +2185,7 @@ def _session_view(
         "outcome": outcome, "headline": headline,
         "status": status, "line": line, "composer_row": composer_row,
         "next_step": _next_step(views),
-        "threads": _track_texts(views),
+        "threads": _track_texts(views), "still_waiting": _still_waiting(views),
         "waiting_for": _waiting_for(views),
         "recap": info["recap"], "recap_at": info["recap_at"], "recap_stale": info["recap_stale"],
         "due_at": min(dues, key=_stamp) if dues else None,
@@ -2195,6 +2207,7 @@ def _pane_view(record: dict, now: datetime) -> dict:
         "ball": min((view["ball"] for view in _active(views)), key=BALL_RANK.get),
         "outcome": outcome, "headline": headline,
         "status": status, "line": line, "waits": views, "threads": _track_texts(views),
+        "still_waiting": _still_waiting(views),
         "waiting_for": _waiting_for(views),
         "history": _history_view(record),
         "due_at": min(dues, key=_stamp) if dues else None,
