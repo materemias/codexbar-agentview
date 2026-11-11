@@ -399,7 +399,10 @@ def remove_omp_extension() -> str:
         return "omp extension: removed nothing"
     if not _is_our_omp_link(link):
         return f"omp extension: left {link}, it isn't ours"
-    link.unlink()
+    try:
+        link.unlink()
+    except OSError as exc:
+        return f"omp extension: can't remove {link}: {exc}"
     return f"omp extension: removed {link}"
 
 
@@ -446,10 +449,12 @@ def install_all() -> str:
             )
         except (FileNotFoundError, subprocess.TimeoutExpired):
             pass
-    try:
-        parts.append(install_omp_extension())
-    except RuntimeError as exc:
-        parts.append(f"omp extension: {exc}")
+    # Only where omp is set up: the Install button shouldn't create an ~/.omp tree.
+    if _omp_extension_link().parent.parent.is_dir():
+        try:
+            parts.append(install_omp_extension())
+        except RuntimeError as exc:
+            parts.append(f"omp extension: {exc}")
     return "\n".join(p for p in parts if p)
 
 

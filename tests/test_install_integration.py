@@ -199,6 +199,7 @@ class IntegrationPlatformTests(unittest.TestCase):
         state = self.home / "state"
         state.mkdir()
         (state / "agents.json").write_text("{}")
+        self.omp_link.parent.parent.mkdir(parents=True)
         with mock.patch.object(self.installer, "OMP_EXTENSION_SOURCE", missing), \
                 mock.patch.object(self.installer.sys, "platform", "linux"), \
                 mock.patch.object(self.installer.state_paths, "migrate", return_value=state), \
@@ -217,6 +218,9 @@ class IntegrationPlatformTests(unittest.TestCase):
         with mock.patch.object(self.installer.sys, "platform", "linux"), \
                 mock.patch.object(self.installer.state_paths, "migrate", return_value=state), \
                 mock.patch.object(self.installer.os, "chmod"):
+            self.assertEqual(self.run_main()[0], 0)
+            self.assertFalse((self.home / ".omp").exists())  # no omp, no ~/.omp tree
+            self.omp_link.parent.parent.mkdir(parents=True)
             self.assertEqual(self.run_main()[0], 0)
             self.assertTrue(self.omp_link.is_symlink())
             self.assertIn("omp extension:               yes", self.installer.status_all())

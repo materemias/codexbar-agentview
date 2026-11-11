@@ -227,7 +227,7 @@ ColumnLayout {
                     if (section.stale) return ""
                     // Claude reports an unused window as 0% without a reset:
                     // the next window opens on the first message.
-                    if (!rec.resetsAt && !rec.resetDescription && rec.windowMinutes && pct === 0)
+                    if (!rec.resetsAt && !rec.resetDescription && rec.windowMinutes && rec.usedPercent === 0)
                         return "not started · resets " + windowText + " after first use"
                     return root.formatReset(rec, root.nowMs)
                 }

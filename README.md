@@ -150,7 +150,8 @@ On macOS:
 
 The extension gives omp the `/wait` command and the `waitingfor` agent tool,
 draws the row above the composer and delivers wait prompts. On Linux the
-Plasma **Install** button links it; anywhere else, run the Tern palette
+Plasma **Install** button links it when omp's agent directory exists;
+anywhere else, run the Tern palette
 command `CodexBar AgentView: Install omp extension` or:
 
 ```sh

@@ -922,7 +922,7 @@ ColumnLayout {
                 + (record.host ? "  (" + record.host + ")" : "")
                 + "\nclick to focus · peek button or Space for recent messages"
             readonly property string waitingHoverText: waiting
-                ? waiting.line + (record.cwd ? "\n" + cwdHoverText : "") : ""
+                ? [waiting.line, record.cwd ? cwdHoverText : ""].filter(Boolean).join("\n") : ""
             PC3.ToolTip.visible: rowMouse.containsMouse && !waiting
                 && (record.cwd || "").length > 0
             PC3.ToolTip.text: cwdHoverText
