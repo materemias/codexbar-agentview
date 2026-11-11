@@ -34,7 +34,7 @@ const HEARTBEAT_MS = 5 * 60_000;
 const MENU_REQUEST_MS = 15_000;
 /** How many of the session's latest user messages a resend check looks through. */
 const RESEND_WINDOW = 10;
-/** How many of the session's latest messages the menu looks through for a PR. */
+/** How many of the agent's latest messages the menu looks through for a PR. */
 const PR_WINDOW = 4;
 /** How often a check runs when nothing says; the CLI's default too. */
 const CHECK_EVERY = "15m";
@@ -136,7 +136,7 @@ const choice = ({ word, alone, what, example }) => ({
 	description: example ? `${what}: ${example}` : what,
 });
 const TOP_CHOICES = [
-	{ word: "2d", what: "wait two days", example: "2d retry the migration -- Run the migration again and report what changed" },
+	{ word: "2d", what: "wait two days", example: FORMS.find((form) => form.usage.startsWith("/wait <duration>")).example },
 	{ word: "3h", what: "wait three hours", example: "3h check the deploy" },
 	{ word: "1w", what: "wait a week", example: "1w see whether the fix held" },
 	{ word: "gh", what: "a GitHub PR or release", example: "gh pr 42 ready waiting for review" },
@@ -145,8 +145,10 @@ const TOP_CHOICES = [
 const GH_CHOICES = FORMS.filter((form) => form.gh).map(choice);
 const BANG = { label: "!", description: "your own command line instead: ! curl -fsS https://example.com/health" };
 const CHECK_CHOICES = [{ label: "every", description: `how often to run it: every 10m (default ${CHECK_EVERY})` }, BANG];
-/** Their text may hold a `--` of its own, as they never fire a prompt. */
-const NO_PROMPT: Record<string, true> = { done: true, note: true, later: true, for: true };
+/** Their text may hold a `--` of its own, as they never fire a prompt; list and help take no text at all. */
+const NO_PROMPT: Record<string, true> = { done: true, note: true, later: true, for: true, list: true, help: true };
+
+const messageOf = (error) => (error instanceof Error ? error.message : String(error));
 
 /** Runs a program to its end without blocking the UI thread; never rejects. */
 function run(file: string, args: string[], options: { timeout: number; cwd?: string }) {
@@ -175,17 +177,22 @@ const GH_PR = ["pr", "view", "--json", "url", "-q", ".url"];
 
 /** One line from `gh` in `cwd`, empty with gh's reason when it has none: this repo, or this branch's PR. */
 async function ghValue(args: string[], cwd: string, timeout: number) {
-	const { failed, stdout, stderr } = await run("gh", args, { timeout, cwd });
-	return { value: failed ? "" : stdout.trim(), why: stderr.trim() || `gh ${args[0]} view failed` };
+	const { failed, stdout, stderr, message } = await run("gh", args, { timeout, cwd });
+	return { value: failed ? "" : stdout.trim(), why: stderr.trim() || message || `gh ${args[0]} view failed` };
+}
+
+/** This directory's GitHub repo; without one, gh's reason, `about` saying what wanted it. */
+async function cwdRepo(cwd: string, about = ""): Promise<string> {
+	const { value, why } = await ghValue(GH_REPO, cwd, GH_TIMEOUT_MS);
+	if (!value) throw new Error(`No GitHub repo here${about}: ${why}`);
+	return value;
 }
 
 /** The CLI's target options for a PR: a bare number takes its repo from `gh` in `cwd`. */
 async function prTarget(ref: string, cwd: string): Promise<string[]> {
 	const number = ref.replace(/^#/, "");
 	if (!/^\d+$/.test(number)) return [`--pr=${ref}`];
-	const { value: repo, why } = await ghValue(GH_REPO, cwd, GH_TIMEOUT_MS);
-	if (!repo) throw new Error(`No GitHub repo here for PR ${number}: ${why}`);
-	return [`--repo=${repo}`, `--number=${number}`];
+	return [`--repo=${await cwdRepo(cwd, ` for PR ${number}`)}`, `--number=${number}`];
 }
 
 function cut(text: string): [string, string] {
@@ -209,12 +216,12 @@ function checkOptions(argv: string, label: string, interval: string): string[] {
 }
 
 /**
- * A check, or `{error}`: `! command` runs as given; anything else is a description, and `check`
+ * A check, or `{error}`: `! command` (or `!command`) runs as given; anything else is a description, and `check`
  * asks the agent for its command.
  */
 function checkRequest(what: string, interval = CHECK_EVERY, prompt?: string, park = true) {
 	if (!DURATION.test(interval)) return { error: `Check every takes a duration such as 10m, not ${interval}.` };
-	const literal = what.match(/^!(?:\s+([\s\S]*))?$/);
+	const literal = what.match(/^!([\s\S]*)$/);
 	if (!literal) return { check: { description: what, interval, prompt: prompt || undefined, park } };
 	const command = literal[1]?.trim();
 	if (!command) return { error: "A command line must follow the !." };
@@ -298,12 +305,17 @@ export function parseWait(input: string) {
 			const at = `${word} ${rest}`.trimEnd().match(AT);
 			if (!at) return bad(`Not a date or time: ${word}`);
 			if (!at[4]) return bad("A sentence must follow the time.");
-			const clock = (at[2] ?? at[3])?.replace(/^\d:/, "0$&");
-			return add("time", [`--at=${at[1] ? `${at[1]}${clock ? `T${clock}` : ""}` : clock}`], at[4]);
+			return add("time", [`--at=${atValue(at)}`], at[4]);
 		}
 		default:
 			return first === "gh" ? bad("gh takes pr, babysit or release.", "gh") : bad(`Not a /wait form: ${word}`, "");
 	}
+}
+
+/** The `--at` value of an AT match: the clock padded to HH:MM, after the date and a T when there is one. */
+function atValue(at): string {
+	const clock = (at[2] ?? at[3])?.replace(/^\d:/, "0$&");
+	return at[1] ? `${at[1]}${clock ? `T${clock}` : ""}` : clock;
 }
 
 /** What can follow the finished words of a /wait line. */
@@ -334,6 +346,9 @@ export function waitCompletions(prefix: string, waits = []) {
 /** The theme color of an outcome: what a session's headline and row prefix are drawn in. */
 const TONES: Record<string, string> = { fulfilled: "success", attention: "warning", overdue: "warning" };
 
+/** theme.bold can come out plain, so the bold is written out. */
+const bold = (text: string) => `\x1b[1m${text}\x1b[22m`;
+
 /** The CLI's composer row: its prefix in the outcome's color, and what happened in bold when fulfilled. */
 function rowText(session, theme): string {
 	const row: string = session.composer_row;
@@ -343,9 +358,8 @@ function rowText(session, theme): string {
 	const prefix = row.slice(0, space);
 	const rest = row.slice(space + 1);
 	const headline = session.headline;
-	// theme.bold can come out plain, so the bold is written out.
 	const fired = session.outcome === "fulfilled" && headline && row.startsWith(headline) ? headline.slice(space + 1) : "";
-	return `${theme.fg(tone, prefix)} ${fired ? `\x1b[1m${fired}\x1b[22m${rest.slice(fired.length)}` : rest}`;
+	return `${theme.fg(tone, prefix)} ${fired ? `${bold(fired)}${rest.slice(fired.length)}` : rest}`;
 }
 
 /** An ISO time as the panel shows it, without seconds and year. */
@@ -401,7 +415,7 @@ function detailsPanel(card) {
 		return [
 			card.headline && theme.fg(TONES[card.outcome] ?? "muted", card.headline),
 			card.outcome && card.still_waiting?.length > 0 && `${muted("Still waiting for")} ${card.still_waiting.join("  ·  ")}`,
-			sentence && theme.bold(sentence),
+			sentence && bold(sentence),
 			card.suggested_note && `Suggested: ${card.suggested_note}`,
 			place && muted(place),
 			...prs.filter((pr) => pr.source !== "mentioned").map(prLine),
@@ -426,39 +440,46 @@ function messageText(message): string {
 		.join("\n");
 }
 
-/** The session's latest user messages, for a prompt whose earlier send may have landed. */
-function recentUserTexts(c): string[] {
-	return c.sessionManager
-		.getBranch()
-		.filter((entry) => entry.type === "message" && entry.message?.role === "user")
-		.slice(-RESEND_WINDOW)
-		.map((entry) => messageText(entry.message));
+/** The session's latest `count` messages from `role`, newest first, walking back from the end. */
+function latestMessages(c, role: string, count: number) {
+	const branch = c.sessionManager.getBranch();
+	const found = [];
+	for (let i = branch.length - 1; i >= 0 && found.length < count; i--) {
+		const entry = branch[i];
+		if (entry.type === "message" && entry.message?.role === role) found.push(entry.message);
+	}
+	return found;
 }
 
-/** The PR in the agent's latest message that names one: a URL, else a number. */
+/** Whether `text` is among the session's latest user messages, sent at `since` (ms) or later. */
+function landed(c, text: string, since: number): boolean {
+	return latestMessages(c, "user", RESEND_WINDOW).some((message) => !(Number(message.timestamp) < since) && messageText(message) === text);
+}
+
+const PR_URL = /https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/g;
+// owner/repo#N standing alone: not the tail of a longer path, the owner shaped like a GitHub
+// account (no dots), and not a document's anchor such as docs/setup.md#3.
+const PR_SHORT = /(?<![\w./-])[A-Za-z0-9][A-Za-z0-9-]*\/(?![\w.-]*\.(?:md|markdown|txt|rst|html?)#)[\w.-]+#\d+(?![\w-])/g;
+const PR_NUMBER = /\bpr\s*#(\d+)(?!\w)/gi;
+
+/** The PR in the agent's latest message that names one (a URL, owner/repo#N or PR #N), the message's last. */
 export function lastPr(c): string | undefined {
-	const messages = c.sessionManager
-		.getBranch()
-		.filter((entry) => entry.type === "message")
-		.slice(-PR_WINDOW)
-		.reverse();
-	for (const { message } of messages) {
-		if (message?.role !== "assistant") continue;
+	for (const message of latestMessages(c, "assistant", PR_WINDOW)) {
 		const text = messageText(message);
-		const pr =
-			text.match(/https:\/\/github\.com\/[\w.-]+\/[\w.-]+\/pull\/\d+/)?.[0] ?? text.match(/\b[\w.-]+\/[\w.-]+#\d+/)?.[0] ?? text.match(/\bpr\s*#(\d+)/i)?.[1];
-		if (pr) return pr;
+		let latest;
+		for (const pattern of [PR_URL, PR_SHORT, PR_NUMBER]) {
+			for (const match of text.matchAll(pattern)) {
+				if (!latest || match.index > latest.index) latest = { index: match.index, pr: match[1] ?? match[0] };
+			}
+		}
+		if (latest) return latest.pr;
 	}
 	return undefined;
 }
 
 /** The options for what a /wait line left out: a PR from the last messages or this branch, a repo from `cwd`. */
 async function targetOptions(parsed, c): Promise<string[]> {
-	if (parsed.needs === "repo") {
-		const { value: repo, why } = await ghValue(GH_REPO, c.cwd, GH_TIMEOUT_MS);
-		if (!repo) throw new Error(`No GitHub repo here: ${why}`);
-		return [`--repo=${repo}`];
-	}
+	if (parsed.needs === "repo") return [`--repo=${await cwdRepo(c.cwd)}`];
 	if (parsed.needs !== "pr") return [];
 	const named = parsed.pr ?? lastPr(c);
 	if (named) return prTarget(named, c.cwd);
@@ -502,7 +523,7 @@ async function toolAddArgs(params, session: string, cwd: string): Promise<string
 	}
 	if (params.argv) args.push(`--argv=${JSON.stringify(params.argv)}`);
 	if (params.kind === "pr") args.push(...(await toolPrTarget(params, cwd)));
-	if (params.kind === "release" && params.repo) args.push(`--repo=${params.repo}`);
+	if (params.kind === "release") args.push(`--repo=${params.repo ?? (await cwdRepo(cwd))}`);
 	return args;
 }
 
@@ -523,10 +544,12 @@ async function pick(c, title: string, items) {
 	return items.find((item) => item.label === label);
 }
 
-/** `--in=2d` for a duration, `--at=TIME` for anything else; the CLI checks both. */
+/** `--in=2d` for a duration, `--at=TIME` for anything else, a time as a /wait line has it; the CLI checks both. */
 function timeOptions(text: string): string[] {
 	const compact = text.replace(/\s+/g, "").toLowerCase();
-	return [DURATION.test(compact) ? `--in=${compact}` : `--at=${text}`];
+	if (DURATION.test(compact)) return [`--in=${compact}`];
+	const at = text.match(AT);
+	return [`--at=${at && !at[4] ? atValue(at) : text}`];
 }
 
 /** The PR step: `pr` from the last messages, else this branch's, is prefilled. */
@@ -637,7 +660,7 @@ function readMenu() {
 				})),
 		};
 	} catch (error) {
-		return { items: [], error: `Can't read the menu ${MENU_FILE}: ${error instanceof Error ? error.message : error}` };
+		return { items: [], error: `Can't read the menu ${MENU_FILE}: ${messageOf(error)}` };
 	}
 }
 const MENU = readMenu();
@@ -670,12 +693,13 @@ export default function (pi) {
 	let tail = Promise.resolve();
 	let claiming = false;
 	let claimAgain = false;
-	// Prompts this process sent: a follow-up stays out of the transcript until the turn ends.
+	// Prompts this process sent and the CLI has yet to hear about: a follow-up stays out of the
+	// transcript until the turn ends.
 	const sent = new Set<string>();
 	// Checks the user described and the agent is to write, by session, with the instruction it got.
 	const checks = new Map<string, { description: string; interval: string; prompt?: string; instruction: string; at: number }>();
 
-	const log = (error) => pi.logger?.debug("waitingfor", { error: error instanceof Error ? error.message : String(error) });
+	const log = (error) => pi.logger?.debug("waitingfor", { error: messageOf(error) });
 	const quietly = (task) => {
 		task().catch(log);
 	};
@@ -751,7 +775,7 @@ export default function (pi) {
 		try {
 			details = detailsPanel((await cli(["card", "--session", c.sessionManager.getSessionId()])).card);
 		} catch (error) {
-			const message = error instanceof Error ? error.message : String(error);
+			const message = messageOf(error);
 			// A session with no message yet has nothing for the card to read.
 			details = message.startsWith("unknown session") ? detailsPanel({}) : errorPanel(message);
 		}
@@ -785,23 +809,40 @@ export default function (pi) {
 		if (session === sessionId && applied === viewsApplied) applyView(view);
 	}
 
+	/**
+	 * A send omp drops rejects later (PromptDroppedError), after the ack said delivered; unless its
+	 * text reached the transcript after all, the prompt failed.
+	 */
+	function failIfDropped(c, session: string, prompt, since: number, sending) {
+		Promise.resolve(sending).catch((error) => {
+			if (error?.name !== "PromptDroppedError" && (session !== sessionId || landed(c, prompt.text, since))) return;
+			sent.delete(prompt.action);
+			inOrder(async () => applyView((await cli(["ack", "--action", prompt.action, "--result", "failed", `--error=${messageOf(error)}`])).view));
+		});
+	}
+
 	async function claimOne() {
 		const session = sessionId;
 		if (!ctx) return;
+		const claimedAt = Date.now();
 		const { prompts = [] } = await cli(["claim-prompts", "--session", session]);
 		for (const prompt of prompts) {
 			// Switched away: the prompt stays `sending`, and this session's next claim checks it.
 			if (!ctx || session !== sessionId) return;
-			if (!(prompt.resend_check && (sent.has(prompt.action) || recentUserTexts(ctx).includes(prompt.text)))) {
+			const c = ctx;
+			// The earlier claim's send may have landed; the same words from before it don't count.
+			const resent = prompt.resend_check && (sent.has(prompt.action) || landed(c, prompt.text, Date.parse(prompt.claimed_at)));
+			if (!resent) {
 				try {
-					pi.sendUserMessage(prompt.text, ctx.isIdle() ? undefined : { deliverAs: "followUp" });
+					failIfDropped(c, session, prompt, claimedAt, pi.sendUserMessage(prompt.text, c.isIdle() ? undefined : { deliverAs: "followUp" }));
 					sent.add(prompt.action);
 				} catch (error) {
-					applyView((await cli(["ack", "--action", prompt.action, "--result", "failed", `--error=${error?.message ?? error}`])).view);
+					applyView((await cli(["ack", "--action", prompt.action, "--result", "failed", `--error=${messageOf(error)}`])).view);
 					continue;
 				}
 			}
 			applyView((await cli(["ack", "--action", prompt.action, "--result", "delivered"])).view);
+			sent.delete(prompt.action);
 		}
 	}
 
@@ -840,7 +881,7 @@ export default function (pi) {
 				if (!ctx || (file && file !== VIEW_NAME)) return;
 				try {
 					if (debounce) ctx.clearTimer(debounce);
-					debounce = ctx.setTimeout(async () => applyView(await readViewFile()), VIEW_DEBOUNCE_MS);
+					debounce = ctx.setTimeout(() => quietly(async () => applyView(await readViewFile())), VIEW_DEBOUNCE_MS);
 				} catch (error) {
 					log(error);
 				}
@@ -882,7 +923,14 @@ export default function (pi) {
 			// On resume or switch omp replaces the transcript after this hook returns; a prompt
 			// sent before that would be lost, so the first claim runs on the next tick.
 			c.setTimeout(() => {
-				inOrder(heartbeat);
+				// Without the CLI nothing here works: the first failure shows, the rest only in the log.
+				const session = sessionId;
+				inOrder(() =>
+					heartbeat().catch((error) => {
+						if (ctx && session === sessionId) setPanel(ctx, errorPanel(`waitingfor can't reach codexbar_waiting.py: ${messageOf(error)}`));
+						throw error;
+					}),
+				);
 				quietly(refresh);
 				void claimPrompts();
 			}, 0),
@@ -926,8 +974,8 @@ export default function (pi) {
 		const items = open.map((wait) => ({ label: `${wait.id}  ${wait.label}`, description: waitFacts(wait), wait }));
 		const chosen = await pick(c, "This session's waits", items);
 		if (!chosen) return;
-		const { id, state } = chosen.wait;
-		const action = await c.ui.select(chosen.label, ["Done", ...(state === "pending" ? [] : ["+1 day"]), "Close"]);
+		const { id, state, kind } = chosen.wait;
+		const action = await c.ui.select(chosen.label, ["Done", ...(state === "pending" || kind === "later" ? [] : ["+1 day"]), "Back"]);
 		if (action === "Done") await act(c, ["done", "--session", session, `--wait=${id}`]);
 		else if (action === "+1 day") await act(c, ["snooze", "--session", session, `--wait=${id}`, "--for", "1d"]);
 	}
@@ -964,16 +1012,14 @@ export default function (pi) {
 	}
 
 	/**
-	 * The described check an agent call writes: an add of a command in the turn the check's
-	 * instruction started. A turn that was running when the user asked has an older last user message.
+	 * The described check an agent call writes: an add of a command once the check's instruction
+	 * reached the agent, steering messages after it or not. While it is still queued, the running
+	 * turn's command waits are the agent's own.
 	 */
 	function checkWritten(c, params) {
 		if (params.action !== "add" || params.kind !== "command" || !params.argv) return undefined;
 		const check = pendingCheck(c);
-		const last = c.sessionManager
-			.getBranch()
-			.findLast((entry) => entry.type === "message" && entry.message?.role === "user")?.message;
-		return check && last && messageText(last) === check.instruction ? check : undefined;
+		return check && checkStarted(c, check) !== undefined ? check : undefined;
 	}
 
 	/**
@@ -985,20 +1031,33 @@ export default function (pi) {
 		const pending = pendingCheck(c);
 		if (pending) throw new Error(`The agent is still on the check "${pending.description}"; ask for the next one after its turn.`);
 		const instruction = checkInstruction(check.description);
-		checks.set(session, { ...check, instruction, at: Date.now() });
+		const entry = { ...check, instruction, at: Date.now() };
+		checks.set(session, entry);
+		let sending;
 		try {
-			pi.sendUserMessage(instruction, c.isIdle() ? undefined : { deliverAs: "followUp" });
+			sending = pi.sendUserMessage(instruction, c.isIdle() ? undefined : { deliverAs: "followUp" });
 		} catch (error) {
 			checks.delete(session);
 			throw error;
 		}
+		setPanel(c, (theme) => theme.fg("muted", `Asked the agent for a command that checks: ${check.description}`));
+		// A dropped instruction rejects later; the agent never got it.
+		Promise.resolve(sending).catch((error) => {
+			if (error?.name !== "PromptDroppedError" && (session !== sessionId || checkStarted(c, entry) !== undefined)) return;
+			if (checks.get(session) === entry) checks.delete(session);
+			if (ctx && session === sessionId) setPanel(ctx, errorPanel(`The check didn't reach the agent: ${messageOf(error)}`));
+		});
 	}
 
-	/** Carries out a request from a /wait line or the menu for `c`'s session. */
-	async function perform(c, request) {
-		if (request.check) return requestCheck(c, request.check);
+	/** Carries out a request from a /wait line or the menu for `session`, the one open when it was asked. */
+	async function perform(c, request, session: string) {
+		if (request.check) {
+			// The instruction goes to whichever session is open now.
+			if (c.sessionManager.getSessionId() !== session) throw new Error("The session changed: ask for the check again.");
+			return requestCheck(c, request.check);
+		}
 		const target = await targetOptions(request, c);
-		await act(c, [request.command, "--session", c.sessionManager.getSessionId(), ...target, ...request.args]);
+		await act(c, [request.command, "--session", session, ...target, ...request.args]);
 	}
 
 	/**
@@ -1022,6 +1081,11 @@ export default function (pi) {
 		// The pin is what brings a closed session back: without it, stay open and say why.
 		if (answer?.pinned !== true) {
 			setPanel(c, errorPanel(`Not closed: the session couldn't be pinned (${answer?.pin_error ?? "no pin"}). Try /pin, then close it.`));
+			return;
+		}
+		// A prompt sent while the dialogs were open may have started a turn, and closing would cut it off.
+		if (!c.isIdle()) {
+			setPanel(c, errorPanel("Not closed: the agent started a turn meanwhile. The session stays pinned; close it once the turn ends."));
 			return;
 		}
 		await c.shutdown();
@@ -1051,10 +1115,10 @@ export default function (pi) {
 			else if (!chosen.flow.request) await setAside(c, session, chosen.flow, pr, record);
 			else {
 				const request = await chosen.flow.request(c, record);
-				if (request) await perform(c, request);
+				if (request) await perform(c, request, session);
 			}
 		} catch (error) {
-			setPanel(c, errorPanel(error instanceof Error ? error.message : String(error)));
+			setPanel(c, errorPanel(messageOf(error)));
 		} finally {
 			menuOpen = false;
 		}
@@ -1072,9 +1136,9 @@ export default function (pi) {
 			else if (parsed.command === "list") await showDetails(c);
 			else {
 				try {
-					await perform(c, parsed);
+					await perform(c, parsed, c.sessionManager.getSessionId());
 				} catch (error) {
-					setPanel(c, errorPanel(error instanceof Error ? error.message : String(error)));
+					setPanel(c, errorPanel(messageOf(error)));
 				}
 			}
 		},
@@ -1136,6 +1200,10 @@ export default function (pi) {
 			let args;
 			// The user's described check this call writes; a failed add keeps it for the agent's retry.
 			const check = checkWritten(c, params);
+			const extra = check ? Object.keys(params).filter((name) => params[name] !== undefined && !["action", "kind", "argv"].includes(name)) : [];
+			if (extra.length > 0) {
+				throw new Error(`This add writes the user's /wait check, which sets the rest: call it again with action, kind and argv only, without ${extra.join(", ")}. The command must exit 0 when it holds.`);
+			}
 			switch (params.action) {
 				case "add":
 					args = check
