@@ -18,6 +18,7 @@
 
 ### Fixes
 
+- An open session card keeps itself current: changed waits show at once, times, agent state and the last exchange every minute, pull request states every 10 minutes. It used to show what it read when it opened.
 - A wait whose prompt the agent is still running shows 🔧 at work instead of ✅ Fulfilled.
 - A session waiting for several things, such as two babysat PRs, shows each of them in its row, status and next step, not only the first.
 - Babysitting a PR no longer closes a separate wait on the same PR, such as one for its release.

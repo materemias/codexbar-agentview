@@ -240,7 +240,10 @@ session's pull requests with their state, its waits and schedules, what
 happened since you set it aside (each line with its time), the next step,
 and omp's latest recap of the session with the time omp wrote it. A recap
 written before the session's later turns is headed "Earlier recap" and
-dimmed. Focus the card to use its buttons and links.
+dimmed. Focus the card to use its buttons and links. An open card keeps itself
+current: it redraws as soon as the session's waits change, rereads times, agent
+state and the last exchange every minute, and its pull request states every
+10 minutes.
 Outside Tern, `Ctrl+Alt+I` shows the same details above the composer.
 
 **On the pane** a row above the omp composer says what the session waits for

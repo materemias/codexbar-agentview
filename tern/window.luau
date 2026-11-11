@@ -529,6 +529,13 @@ end
 
 local ui = tern.ui
 local cardAt: { [number]: number } = {} -- owner pane -> when its card last opened
+-- An open card's refresh state by canvas pane: what it last read and when.
+type CardLive = { sig: string, cachedAt: number, fullAt: number, busy: boolean }
+local cardLive: { [number]: CardLive } = {}
+-- How often an open card reads local files anyway (times, agent state, last
+-- exchange), and how often it also asks GitHub (the status cache's interval).
+local CARD_LOCAL_S = 60
+local CARD_FULL_S = 600
 
 -- The canvases carry their owner pane, and the session they show (none for a
 -- pane record), in `about`, so a plugin reload forgets nothing.
@@ -547,6 +554,23 @@ local function cardOf(cx: WindowCx, pane: number): number?
 		end
 	end
 	return nil
+end
+
+-- The view's entry for a card: its session's, or for a pane record its pane's,
+-- as JSON, so a card can tell when what it shows has changed.
+local function cardSig(session: string?, owner: number): string
+	local view = tern.kv.get("waitingView")
+	if type(view) ~= "table" then
+		return ""
+	end
+	for _, field in { "sessions", "panes" } do
+		for _, r in (if type(view[field]) == "table" then view[field] else {}) do
+			if (session and r.session_id == session) or (not session and field == "panes" and r.pane == owner) then
+				return tern.json.encode(r)
+			end
+		end
+	end
+	return ""
 end
 
 local function cardSection(head: string, rows: { Node }): Node
@@ -843,6 +867,15 @@ local function cardDock(pane: number, r: any): Node
 	return ui.row(kids)
 end
 
+-- Draws `card` into the open card `canvas` of `pane`.
+local function showCard(cx: WindowCx, canvas: number, pane: number, card: any, reading: boolean)
+	cx.canvas:set(canvas, {
+		title = cardTitle(cx, pane, card),
+		view = cardView(cx, pane, card, reading),
+		dock = cardDock(pane, card),
+	})
+end
+
 -- Floats the card over `pane`, one per pane, and marks the record seen. An omp
 -- session needs no record: the card opens at once on what the view knows, a
 -- skeleton without one, fills in from `card --cached`, local files only, and
@@ -894,12 +927,10 @@ local function openCard(cx: WindowCx, pane: number, known: string?)
 	local best = record -- what the card shows if the last read fails
 	local function show(cx2: WindowCx, card: any, reading: boolean)
 		best = card
-		cx2.canvas:set(canvas, {
-			title = cardTitle(cx2, pane, card),
-			view = cardView(cx2, pane, card, reading),
-			dock = cardDock(pane, card),
-		})
+		showCard(cx2, canvas, pane, card, reading)
 	end
+	-- What opened it counts as the first refresh of both kinds.
+	cardLive[canvas] = { sig = cardSig(session, pane), cachedAt = os.time(), fullAt = os.time(), busy = false }
 	local function closed(cx2: WindowCx?): boolean
 		return not cx2 or cardOf(cx2, pane) ~= canvas
 	end
@@ -940,6 +971,69 @@ local function openCard(cx: WindowCx, pane: number, known: string?)
 			settle(cx3)
 		end
 	end)
+end
+
+-- Rereads each open card: from local files when its view entry changed or a
+-- minute passed, and with GitHub every ten minutes. A pane record's card has no
+-- session to read and is drawn again from the view. Cards opened before a plugin
+-- reload are taken over as if just read.
+local function refreshCards(cx: WindowCx)
+	local now = os.time()
+	local open: { [number]: boolean } = {}
+	for _, c in cx.canvas:list() do
+		local owner = if c.owner == tern.plugin.id then cardOwner(c.about) else nil
+		if not owner then
+			continue
+		end
+		local canvas = c.pane
+		open[canvas] = true
+		local session = cardSession(c.about)
+		local sig = cardSig(session, owner)
+		local live = cardLive[canvas]
+		if not live then
+			cardLive[canvas] = { sig = sig, cachedAt = now, fullAt = now, busy = false }
+			continue
+		end
+		if live.busy then
+			continue
+		end
+		local full = session ~= nil and now - live.fullAt >= CARD_FULL_S
+		if sig == live.sig and not full and now - live.cachedAt < CARD_LOCAL_S then
+			continue
+		end
+		live.sig = sig
+		live.cachedAt = now
+		if not session then
+			local record = waitingRecord(owner)
+			if record then
+				showCard(cx, canvas, owner, record, false)
+			end
+			continue
+		end
+		local args = { "card", "--session", session }
+		if full then
+			live.fullAt = now
+		else
+			table.insert(args, "--cached")
+		end
+		live.busy = true
+		waitingRead(args, function(data, err, cx2)
+			live.busy = false
+			if not cx2 or cardOf(cx2, owner) ~= canvas then
+				return
+			end
+			if data then
+				showCard(cx2 :: WindowCx, canvas, owner, data.card, false)
+			else
+				tern.log.warn("codexbar: session card refresh failed", err)
+			end
+		end)
+	end
+	for canvas in cardLive do
+		if not open[canvas] then
+			cardLive[canvas] = nil
+		end
+	end
 end
 
 -- The focused pane; from the dashboard or a card, the pane focus came from.
@@ -1634,7 +1728,7 @@ local function poll(cx: WindowCx?)
 				openSettings(cx)
 			end
 		end
-		for _, step in { waitingRequest, dropOrphanCards, lead } do
+		for _, step in { waitingRequest, dropOrphanCards, lead, refreshCards } do
 			local ok, err = pcall(step, cx)
 			if not ok then
 				tern.log.error("codexbar:", err)
