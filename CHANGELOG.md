@@ -18,6 +18,7 @@
 
 ### Fixes
 
+- Pull request waits: `ready`'s 15-minute grace counts from when the push was first seen, not the commit date; a PR that already fails a check or conflicts says so on the first poll, and a conflict that survives a push is reported again; a workflow run cancelled for a newer one no longer blocks `ready`; checks and thread replies past the first 100 count; a roboomp review no longer counts twice; reviews seen while GraphQL is rate-limited are kept; transient failures retry after a minute.
 - Tern: Resume can't start the same session twice, panes titled `-zsh` (or text starting with `-`) can be set aside, a Waiting row with a headline still lists its other threads, Open says when the pane has closed instead of "in another window", and actions the omp extension queues during a tick no longer wait up to 5 minutes.
 - Tern session cards keep their branch between refreshes, a shell pane's card closes when its waits end, and an auto-opened card opens once per firing.
 - omp: a prompt omp drops is reported as failed instead of delivered; `/wait check` stays your check after a steering message; `/wait check !cmd` works without a space; a `later` wait no longer offers +1 day; the implicit PR comes from the agent's latest messages and ignores paths like `docs/setup.md#3`; `/wait gh …` stays with the session it was typed in.

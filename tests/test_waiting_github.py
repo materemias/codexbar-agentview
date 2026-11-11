@@ -91,10 +91,15 @@ def pr_answer(
     comments: list | None = None,
     threads: list | None = None,
     checks: list | None = None,
-    committed: str = "1970-01-01T00:00:00Z",
     author: str = "me",
     older_cursor: str | None = None,
+    more_checks: str | None = None,
+    merge_commit: bool = True,
 ) -> dict:
+    contexts = {
+        "pageInfo": {"hasNextPage": more_checks is not None, "endCursor": more_checks},
+        "nodes": checks or [],
+    }
     return {
         "data": {
             "viewer": {"login": "me"},
@@ -106,22 +111,13 @@ def pr_answer(
                     "mergeStateStatus": merge_state,
                     "mergedAt": MERGED_AT if state == "MERGED" else None,
                     "closedAt": MERGED_AT if state != "OPEN" else None,
-                    "mergeCommit": {"oid": MERGE_SHA} if state == "MERGED" else None,
+                    "mergeCommit": {"oid": MERGE_SHA} if state == "MERGED" and merge_commit else None,
                     "author": {"login": author},
                     "baseRef": {"target": {"oid": "e" * 40}},
                     "comments": {"nodes": comments or []},
                     "reviews": {"nodes": reviews or []},
                     "reviewThreads": threads_page(threads or [], older_cursor),
-                    "commits": {
-                        "nodes": [
-                            {
-                                "commit": {
-                                    "committedDate": committed,
-                                    "statusCheckRollup": {"contexts": {"nodes": checks or []}},
-                                }
-                            }
-                        ]
-                    },
+                    "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": contexts}}}]},
                 }
             },
         }
@@ -145,10 +141,15 @@ class FakeGh:
         self.rules: Any = []
         self.releases: list = []
         self.older_threads: dict[str, dict] = {}
+        # Later pages of check contexts and of one thread's comments, by cursor.
+        self.more_checks: dict[str, list] = {}
+        self.more_comments: dict[str, list] = {}
         self.compare: dict[str, Any] = {}
         self.rest_pr: dict = {}
         self.rest_reviews: list = []
-        # The head's workflow runs: (name, status, conclusion), or a gh answer.
+        self.user: Any = ok("me\n")
+        # The head's workflow runs, newest first: (name, status, conclusion[, workflow]),
+        # or a gh answer.
         self.runs: Any = []
 
     def count(self, needle: str) -> int:
@@ -166,12 +167,21 @@ class FakeGh:
                 return self.remaining
             return ok(f"{self.remaining}\n")
         if target == "user":
-            return ok("me\n")
+            return self.user
         if target.startswith("query="):
+            variables = dict(arg.split("=", 1) for arg in args if "=" in arg and not arg.startswith("query="))
             if "before: $before" in target:
-                cursor = next(arg for arg in args if arg.startswith("before=")).split("=", 1)[1]
-                page = {"reviewThreads": self.older_threads[cursor]}
+                page = {"reviewThreads": self.older_threads[variables["before"]]}
                 return ok(json.dumps({"data": {"repository": {"pullRequest": page}}}))
+            if "contexts(first: 100, after: $after)" in target:
+                contexts = {"pageInfo": {"hasNextPage": False}, "nodes": self.more_checks[variables["after"]]}
+                commit = {"statusCheckRollup": {"contexts": contexts}}
+                pull = {"commits": {"nodes": [{"commit": commit}]}}
+                return ok(json.dumps({"data": {"repository": {"pullRequest": pull}}}))
+            if "node(id: $id)" in target:
+                assert "owner" not in variables, "a node query declares no $owner"
+                comments = {"pageInfo": {"hasNextPage": False}, "nodes": self.more_comments[variables["after"]]}
+                return ok(json.dumps({"data": {"node": {"comments": comments}}}))
             if isinstance(self.pr, subprocess.CompletedProcess):
                 return self.pr
             return ok(json.dumps(self.pr))
@@ -192,7 +202,7 @@ class FakeGh:
         if "/actions/runs" in target:
             if isinstance(self.runs, subprocess.CompletedProcess):
                 return self.runs
-            return ok("".join(f"{name}\t{status}\t{conclusion}\n" for name, status, conclusion in self.runs))
+            return ok("".join("\t".join((*run, "")[:4]) + "\n" for run in self.runs))
         if "/compare/" in target:
             tag = target.split("...", 1)[1]
             answer = self.compare.get(tag, NOT_FOUND)
@@ -398,6 +408,11 @@ class ReviewOnHeadTest(PollTestCase):
         review["author"]["__typename"] = "User"
         self.assertTrue(self.poll(FakeGh(pr_answer(reviews=[review])))["fired"])
 
+    def test_merged_pr_reads_no_branch_rules(self) -> None:
+        gh = FakeGh(pr_answer(state="MERGED", reviews=[bot_review()]))
+        self.poll(gh)
+        self.assertEqual(gh.count("/rules/"), 0)
+
     def test_copilot_that_could_not_run_did_not_review(self) -> None:
         review = bot_review(login="copilot-pull-request-reviewer")
         review["body"] = "Copilot was unable to review this pull request because ..."
@@ -528,9 +543,13 @@ class EventsTest(PollTestCase):
             {"key": f"fail:{HEAD}:lint", "text": "check failed: lint", "on_me": True},
         )
 
-    def test_failure_at_baseline_is_recorded_not_reported(self) -> None:
-        gh = FakeGh(pr_answer(checks=[check("ci", "FAILURE", required=True)]))
-        self.assertEqual(self.poll(gh)["events"], [])
+    def test_failure_at_baseline_is_reported_once(self) -> None:
+        # A state that needs you: a wait created on a red PR says why it can't fire.
+        gh = FakeGh(pr_answer(checks=[check("ci", "FAILURE", required=True)], merge_state="DIRTY"))
+        self.assertEqual(
+            [event["key"] for event in self.poll(gh)["events"]],
+            [f"fail:{HEAD}:ci", f"merge:DIRTY:{HEAD}:{'e' * 40}"],
+        )
         self.assertEqual(self.poll(gh)["events"], [])
 
     def test_duplicate_check_names_take_the_worst_result(self) -> None:
@@ -540,6 +559,14 @@ class EventsTest(PollTestCase):
             checks=[check("ci", "FAILURE", required=True), check("ci", "SUCCESS", required=True)]
         )
         self.assertEqual(len(self.poll(gh)["events"]), 1)
+
+    def test_conflict_that_survives_a_push_is_reported_again(self) -> None:
+        gh = FakeGh(pr_answer(merge_state="DIRTY"))
+        self.assertEqual(len(self.poll(gh)["events"]), 1)
+        gh.pr = pr_answer(head=NEW_HEAD, merge_state="DIRTY")
+        self.assertIn(
+            f"merge:DIRTY:{NEW_HEAD}:{'e' * 40}", [event["key"] for event in self.poll(gh)["events"]]
+        )
 
     def test_behind_and_dirty_report_once_each(self) -> None:
         gh = FakeGh()
@@ -619,9 +646,9 @@ class ReadyTest(PollTestCase):
         self.assert_ready(gh, False)
 
     def test_head_without_a_bot_gets_the_settle_time(self) -> None:
-        gh = FakeGh(pr_answer(committed="1970-01-01T00:17:00Z"))  # 1020 s, first poll at 1180 s
-        self.assert_ready(gh, False)
-        self.clock = 1020 + github.BOT_SETTLE_S - 180
+        gh = FakeGh()
+        self.assert_ready(gh, False)  # head first seen at 1180
+        self.clock = 1180 + github.BOT_SETTLE_S - 180
         result = self.assert_ready(gh, True)
         self.assertEqual(
             result["fire_text"], "ready on aaaaaaa: no checks, no bot reviewed aaaaaaa in 15 min, no open threads"
@@ -629,15 +656,31 @@ class ReadyTest(PollTestCase):
 
     def test_review_on_an_earlier_head_gets_the_settle_time_and_is_named(self) -> None:
         review = bot_review(OLD_HEAD, "copilot-pull-request-reviewer")
-        gh = FakeGh(pr_answer(reviews=[review], committed="1970-01-01T00:17:00Z"))
+        gh = FakeGh(pr_answer(reviews=[review]))
         self.assert_ready(gh, False)
-        self.clock = 1020 + github.BOT_SETTLE_S - 180
+        self.clock = 1180 + github.BOT_SETTLE_S - 180
         result = self.assert_ready(gh, True)
         self.assertIn("no bot reviewed aaaaaaa in 15 min (copilot reviewed an earlier head)", result["fire_text"])
 
     def test_settle_time_never_outruns_a_pending_bot_check(self) -> None:
         pending = check("CodeRabbit", None, status="IN_PROGRESS", app="coderabbitai")
         self.assert_ready(FakeGh(pr_answer(checks=[pending])), False)
+
+    def test_settle_time_runs_from_the_push_not_the_commit(self) -> None:
+        # The poller can't see when a commit was pushed, only when it first saw it.
+        gh = FakeGh()
+        self.assert_ready(gh, False)
+        self.clock += github.BOT_SETTLE_S
+        gh.pr = pr_answer(head=NEW_HEAD)
+        self.assert_ready(gh, False)
+        self.clock += github.BOT_SETTLE_S - 180
+        self.assert_ready(gh, True)
+
+    def test_check_past_the_first_hundred_still_gates(self) -> None:
+        gh = FakeGh(pr_answer(reviews=[bot_review()], checks=[check("ci")], more_checks="p2"))
+        gh.more_checks = {"p2": [check("slow", "FAILURE")]}
+        result = self.assert_ready(gh, False)
+        self.assertIn(f"fail:{HEAD}:slow", [event["key"] for event in result["events"]])
 
     def test_settle_time_does_not_apply_to_review_on_head(self) -> None:
         self.assertFalse(self.poll(FakeGh())["fired"])
@@ -661,7 +704,7 @@ class ReadyTest(PollTestCase):
         )
 
     def test_review_on_a_fresh_push_needs_no_settling(self) -> None:
-        gh = FakeGh(pr_answer(reviews=[bot_review()], committed="1970-01-01T00:20:00Z"))
+        gh = FakeGh(pr_answer(reviews=[bot_review()]))
         self.assert_ready(gh, True)
 
     def test_poll_with_an_empty_memo_fires_on_a_settled_head(self) -> None:
@@ -677,7 +720,7 @@ class ReadyTest(PollTestCase):
         self.assert_ready(gh, True)
 
     def test_review_on_old_head_blocks_a_young_head(self) -> None:
-        gh = FakeGh(pr_answer(reviews=[bot_review(OLD_HEAD)], committed="1970-01-01T00:17:00Z"))
+        gh = FakeGh(pr_answer(reviews=[bot_review(OLD_HEAD)]))
         self.assert_ready(gh, False)
 
     def test_gating_bots_pending_check_blocks(self) -> None:
@@ -716,6 +759,20 @@ class ReadyTest(PollTestCase):
         gh.runs = [("CI", "queued", "")]
         self.assert_ready(gh, False)
 
+    def test_a_failed_run_blocks_and_needs_me_beside_green_checks(self) -> None:
+        gh = FakeGh(pr_answer(reviews=[bot_review()], checks=[check("lint")]))
+        gh.runs = [("CI", "completed", "failure")]
+        result = self.assert_ready(gh, False)
+        self.assertEqual(
+            [(event["text"], event["on_me"]) for event in result["events"]],
+            [("CI failed on aaaaaaa (CI)", True)],
+        )
+
+    def test_a_run_cancelled_for_a_newer_one_does_not_block(self) -> None:
+        gh = FakeGh(pr_answer(reviews=[bot_review()]))
+        gh.runs = [("CI", "completed", "success", "1/pull_request"), ("CI", "completed", "cancelled", "1/pull_request")]
+        self.assert_ready(gh, True)
+
     def test_a_ci_run_that_failed_before_any_job_blocks_and_needs_me(self) -> None:
         gh = FakeGh(pr_answer(reviews=[bot_review()]))
         gh.runs = [("CI", "completed", "failure")]
@@ -732,20 +789,20 @@ class ReadyTest(PollTestCase):
 
     def test_a_once_bot_on_the_head_does_not_stand_in_for_an_every_push_bot(self) -> None:
         reviews = [bot_review(OLD_HEAD, "roboomp", "PRR_old"), bot_review(login="copilot-pull-request-reviewer")]
-        gh = FakeGh(pr_answer(reviews=reviews, committed="1970-01-01T00:17:00Z"))
+        gh = FakeGh(pr_answer(reviews=reviews))
         self.assert_ready(gh, False)
-        self.clock = 1020 + github.BOT_SETTLE_S
+        self.clock = 1180 + github.BOT_SETTLE_S
         self.assert_ready(gh, False)
         gh.pr = pr_answer(reviews=[*reviews, bot_review(login="roboomp", rid="PRR_new")])
         self.assertIn("reviewed", self.assert_ready(gh, True)["fire_text"])
 
     def test_a_bot_that_reviews_every_push_is_waited_for_and_reported_after_an_hour(self) -> None:
         review = bot_review(OLD_HEAD, "roboomp")
-        gh = FakeGh(pr_answer(reviews=[review], committed="1970-01-01T00:17:00Z"))
-        self.assert_ready(gh, False)
-        self.clock = 1020 + github.BOT_SETTLE_S
+        gh = FakeGh(pr_answer(reviews=[review]))
+        self.assert_ready(gh, False)  # head first seen at 1180
+        self.clock = 1180 + github.BOT_SETTLE_S
         self.assertEqual(self.assert_ready(gh, False)["events"], [])
-        self.clock = 1020 + github.BOT_STUCK_S + 1
+        self.clock = 1180 + github.BOT_STUCK_S - 179
         self.assertEqual(
             [(event["text"], event["on_me"]) for event in self.assert_ready(gh, False)["events"]],
             [("roboomp hasn't reviewed aaaaaaa in an hour", True)],
@@ -824,6 +881,16 @@ class ActivityTest(PollTestCase):
         result = self.poll(gh, until="activity")
         self.assertTrue(result["fired"])
         self.assertEqual(result["fire_text"], "PR#7 merged")
+
+    def test_a_gating_bots_user_account_review_counts_once(self) -> None:
+        review = bot_review(login="roboomp")
+        review["author"]["__typename"] = "User"
+        review["body"] = "found two issues"
+        gh = FakeGh()
+        self.poll(gh, until="activity")
+        gh.pr = pr_answer(reviews=[review])
+        result = self.poll(gh, until="activity")
+        self.assertEqual(result["fire_text"], "roboomp finished on aaaaaaa")
 
     def test_closed_fires_even_on_the_first_poll(self) -> None:
         result = self.poll(FakeGh(pr_answer(state="CLOSED")), until="activity")
@@ -939,6 +1006,31 @@ class ReleasedTest(PollTestCase):
         result = self.poll(gh, until="released")
         self.assertIsNone(result["error"])
         self.assertTrue(result["confirm"])
+
+    def test_merged_without_a_merge_commit_compares_the_head(self) -> None:
+        gh = FakeGh(pr_answer(state="MERGED", merge_commit=False))
+        gh.releases = [release("v1", "2026-11-02T00:00:00Z")]
+        gh.compare = {"v1": "ahead"}
+        result = self.poll(gh, until="released")
+        self.assertIsNone(result["error"])
+        self.assertTrue(result["fired"])
+        self.assertEqual(gh.count(f"compare/{HEAD}...v1"), 1)
+
+    def test_unknown_merge_time_reads_one_page(self) -> None:
+        self.memo = {"merged": {"sha": MERGE_SHA, "at": None}}
+        gh = FakeGh()
+        gh.releases = [release(f"r{i}", "2026-11-02T00:00:00Z") for i in range(github.RELEASE_PAGE + 1)]
+        gh.compare = {item["tag_name"]: "behind" for item in gh.releases}
+        self.poll(gh, until="released")
+        self.assertEqual(gh.count("/releases"), 1)
+
+    def test_transient_release_failure_retries_soon(self) -> None:
+        gh = FakeGh(pr_answer(state="MERGED"))
+        gh.releases = [release("v1", "2026-11-02T00:00:00Z")]
+        gh.compare = {"v1": ok(code=1, stderr="gh: Bad Gateway (HTTP 502)\n")}
+        result = self.poll(gh, until="released")
+        self.assertTrue(result["transient"])
+        self.assertEqual(result["next_poll_s"], github.RETRY_POLL_S)
 
     def test_tag_is_escaped_in_the_compare_path(self) -> None:
         gh = FakeGh(pr_answer(state="MERGED"))
@@ -1085,13 +1177,13 @@ class RateLimitTest(PollTestCase):
         self.assertEqual(result["next_poll_s"], 180)
         self.assertEqual(gh.count("query="), 1)
 
-    def test_rest_polls_leave_the_baseline_to_graphql(self) -> None:
+    def test_rest_polls_leave_the_rest_of_the_baseline_to_graphql(self) -> None:
         gh = FakeGh(remaining=100)
         gh.rest_pr = self.rest()
         self.poll(gh)
         gh.remaining = 4000
         self.clock += github.RATE_CHECK_S
-        gh.pr = pr_answer(comments=[comment("C1", "someone")])
+        gh.pr = pr_answer(comments=[comment("C1", "someone")], checks=[check("ci", required=True)])
         self.assertEqual(self.poll(gh)["events"], [])
 
     def test_viewer_is_read_once_on_a_rest_only_start(self) -> None:
@@ -1126,12 +1218,50 @@ class RateLimitTest(PollTestCase):
         self.assertEqual(result["next_poll_s"], github.RATE_LIMITED_POLL_S)
         self.assertEqual(self.memo["rate"]["remaining"], 0)
 
-    def test_transient_failure_keeps_the_long_interval(self) -> None:
+    def test_transient_failure_on_rest_retries_soon(self) -> None:
         gh = FakeGh(remaining=100)
         gh.rest_pr = {}
         result = self.poll(gh)
         self.assertTrue(result["transient"])
+        self.assertEqual(result["next_poll_s"], github.RETRY_POLL_S)
+
+    def test_rate_limited_rest_keeps_the_long_interval(self) -> None:
+        gh = FakeGh(remaining=100)
+        gh.rest_pr = {"head": {"sha": HEAD}}
+        gh.rest_reviews = []
+        gh.user = ok(code=1, stderr="gh: API rate limit exceeded (HTTP 403)\n")
+        result = self.poll(gh)
+        self.assertTrue(result["transient"])
         self.assertEqual(result["next_poll_s"], github.RATE_LIMITED_POLL_S)
+
+    def test_unknown_viewer_on_rest_is_an_error_not_activity(self) -> None:
+        gh = FakeGh(pr_answer(author="someone"))
+        self.poll(gh, until="activity")
+        gh.remaining = 100
+        self.clock += github.RATE_CHECK_S
+        gh.rest_pr = {**self.rest(), "user": {"login": "someone"}, "head": {"sha": NEW_HEAD}}
+        self.memo.pop("viewer")
+        gh.user = ok(code=1, stderr="gh: Bad Gateway (HTTP 502)\n")
+        result = self.poll(gh, until="activity")
+        self.assertFalse(result["fired"])
+        self.assertTrue(result["transient"])
+
+    def test_a_review_during_a_rest_only_start_is_not_lost(self) -> None:
+        gh = FakeGh(remaining=100)
+        gh.rest_pr = {**self.rest(), "user": {"login": "someone"}}
+        self.assertFalse(self.poll(gh, until="activity")["fired"])
+        gh.rest_reviews = [
+            {
+                "node_id": "R1",
+                "state": "CHANGES_REQUESTED",
+                "body": "no",
+                "commit_id": HEAD,
+                "user": {"login": "alice", "type": "User"},
+            }
+        ]
+        result = self.poll(gh, until="activity")
+        self.assertTrue(result["fired"])
+        self.assertEqual(result["fire_text"], "review from alice (changes requested): no")
 
 
 class VerifyFixTest(unittest.TestCase):
@@ -1189,12 +1319,25 @@ class VerifyFixTest(unittest.TestCase):
         before = github.snapshot(REPO, 7, run=FakeGh())
         self.assertEqual(github.verify_fix(REPO, 7, before, run=FakeGh()), (True, "no open threads"))
 
-    def test_gh_failure_fails_with_a_reason(self) -> None:
-        passed, reason = github.verify_fix(
-            REPO, 7, {"head": HEAD, "threads": []}, run=FakeGh(ok(code=1, stderr="gh: boom\n"))
+    def test_gh_failure_raises(self) -> None:
+        # The caller tells a check that couldn't run from a fix that failed.
+        with self.assertRaises(github.GhError) as caught:
+            github.verify_fix(
+                REPO, 7, {"head": HEAD, "threads": []}, run=FakeGh(ok(code=1, stderr="gh: boom\n"))
+            )
+        self.assertIn("gh: boom", str(caught.exception))
+
+    def test_reply_past_the_first_hundred_comments_counts(self) -> None:
+        long_thread = thread("T1", comments=100)
+        long_thread["comments"]["pageInfo"] = {"hasNextPage": True, "endCursor": "k1"}
+        gh = FakeGh(pr_answer(threads=[long_thread]))
+        gh.more_comments = {"k1": []}
+        before = github.snapshot(REPO, 7, run=gh)
+        self.assertEqual(before["threads"][0]["replies"], 99)
+        gh.more_comments = {"k1": [comment("T1-100", "me", "fixed")]}
+        self.assertEqual(
+            github.verify_fix(REPO, 7, before, run=gh), (True, "all 1 open threads answered or resolved")
         )
-        self.assertFalse(passed)
-        self.assertIn("gh: boom", reason)
 
 
 class PrStatusTest(unittest.TestCase):

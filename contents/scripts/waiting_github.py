@@ -7,9 +7,12 @@ exists and reports none of it.
 
 `fired` and `confirm` describe the PR's state, so a condition that already holds
 fires on the first poll. Only events are held back by the baseline, except the
-ones that end the wait's chance of firing (closed, a release that needs
-confirming): those have no later poll to report them. `merged` says the PR is
-merged, which settles any wait on it: the caller decides how.
+ones that need you or end the wait's chance of firing (a failed check, a
+conflict, CI awaiting approval, a close or merge, a release that needs
+confirming): those are states, and no later poll would report them. A REST
+poll baselines what REST shows (the head and reviews), so news there isn't lost
+while GraphQL is starved. `merged` says the PR is merged, which settles any
+wait on it: the caller decides how.
 
 GraphQL has a separate budget from REST. When it runs low, polls read REST,
 which has no review threads and no checks, so `ready` can't fire and
@@ -24,7 +27,6 @@ import json
 import re
 import subprocess
 import time
-from datetime import datetime
 from typing import Any, Callable
 from urllib.parse import quote
 
@@ -76,6 +78,7 @@ TRANSIENT = re.compile(
     r"network is unreachable|TLS handshake|Something went wrong",
     re.IGNORECASE,
 )
+RATE_LIMITED = re.compile(r"HTTP 429|rate limit", re.IGNORECASE)
 REPO_RE = re.compile(r"[\w.-]+/[\w.-]+")
 PR_URL_RE = re.compile(r"https?://(?:www\.)?github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)(?:[/?#]\S*)?")
 PR_SHORT_RE = re.compile(r"([\w.-]+/[\w.-]+)#(\d+)")
@@ -102,12 +105,37 @@ PR_STATES = {"OPEN": "open", "MERGED": "merged", "CLOSED": "closed"}
 CODEX_STATE = re.compile(r"<!-- codex-review-state:v1 (.*?) -->", re.DOTALL)
 
 # Fragments go last: a GraphQL document may define them after their use.
+COMMENTS_FRAGMENT = """
+fragment Comments on PullRequestReviewCommentConnection {
+  pageInfo { hasNextPage endCursor }
+  nodes { id body author { login __typename } }
+}
+"""
+
 THREADS_FRAGMENT = """
 fragment Threads on PullRequestReviewThreadConnection {
   pageInfo { hasPreviousPage startCursor }
   nodes {
     id isResolved path line
-    comments(first: 100) { nodes { id body author { login __typename } } }
+    comments(first: 100) { ...Comments }
+  }
+}
+""" + COMMENTS_FRAGMENT
+
+CONTEXTS_FRAGMENT = """
+fragment Contexts on StatusCheckRollupContextConnection {
+  pageInfo { hasNextPage endCursor }
+  nodes {
+    ... on CheckRun {
+      name status conclusion
+      checkSuite { app { slug } }
+      isRequired(pullRequestNumber: $number)
+    }
+    ... on StatusContext {
+      context state
+      creator { login }
+      isRequired(pullRequestNumber: $number)
+    }
   }
 }
 """
@@ -129,30 +157,14 @@ query($owner: String!, $name: String!, $number: Int!) {
       commits(last: 1) {
         nodes {
           commit {
-            committedDate
-            statusCheckRollup {
-              contexts(first: 100) {
-                nodes {
-                  ... on CheckRun {
-                    name status conclusion
-                    checkSuite { app { slug } }
-                    isRequired(pullRequestNumber: $number)
-                  }
-                  ... on StatusContext {
-                    context state
-                    creator { login }
-                    isRequired(pullRequestNumber: $number)
-                  }
-                }
-              }
-            }
+            statusCheckRollup { contexts(first: 100) { ...Contexts } }
           }
         }
       }
     }
   }
 }
-""" + THREADS_FRAGMENT
+""" + THREADS_FRAGMENT + CONTEXTS_FRAGMENT
 
 OLDER_THREADS_QUERY = """
 query($owner: String!, $name: String!, $number: Int!, $before: String!) {
@@ -163,6 +175,31 @@ query($owner: String!, $name: String!, $number: Int!, $before: String!) {
   }
 }
 """ + THREADS_FRAGMENT
+
+MORE_CONTEXTS_QUERY = """
+query($owner: String!, $name: String!, $number: Int!, $after: String!) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      commits(last: 1) {
+        nodes {
+          commit {
+            statusCheckRollup { contexts(first: 100, after: $after) { ...Contexts } }
+          }
+        }
+      }
+    }
+  }
+}
+""" + CONTEXTS_FRAGMENT
+
+# A node query has no repository, so it declares no $owner or $name.
+MORE_COMMENTS_QUERY = """
+query($id: ID!, $after: String!) {
+  node(id: $id) {
+    ... on PullRequestReviewThread { comments(first: 100, after: $after) { ...Comments } }
+  }
+}
+""" + COMMENTS_FRAGMENT
 
 FIX_PROMPT = """\
 A review landed on {repo}#{number} at head {head}. Triage it:
@@ -213,16 +250,23 @@ def _json(text: str, expected: type) -> Any:
     return value
 
 
-def _graphql(run: Run, repo: str, query: str, **variables: int | str) -> Json:
-    owner, name = repo.split("/")
-    args = ["api", "graphql", "-f", f"query={query}", "-f", f"owner={owner}", "-f", f"name={name}"]
+def _graphql(run: Run, repo: str | None, query: str, **variables: int | str) -> Json:
+    """`repo` fills the query's $owner and $name; a node query has neither."""
+    args = ["api", "graphql", "-f", f"query={query}"]
+    if repo:
+        owner, name = repo.split("/")
+        args += ["-f", f"owner={owner}", "-f", f"name={name}"]
     for key, value in variables.items():
         args += ["-f" if isinstance(value, str) else "-F", f"{key}={value}"]
     return _json(_gh(run, args), dict)
 
 
+def _page(connection: Json | None) -> list[Json]:
+    return [node for node in (connection or {}).get("nodes") or [] if node]
+
+
 def _nodes(parent: Json | None, key: str) -> list[Json]:
-    return [node for node in ((parent or {}).get(key) or {}).get("nodes") or [] if node]
+    return _page((parent or {}).get(key))
 
 
 def _login(node: Json, key: str = "author") -> str:
@@ -230,28 +274,42 @@ def _login(node: Json, key: str = "author") -> str:
     return login.removesuffix("[bot]")  # REST spells bots with it, GraphQL without
 
 
-def _epoch(text: str | None) -> float:
-    try:
-        return datetime.fromisoformat((text or "").replace("Z", "+00:00")).timestamp()
-    except ValueError:
-        return 0.0
+
+def _row(node: Json) -> Json:
+    """A GraphQL comment or review: who wrote it and what it says."""
+    return {
+        "id": node.get("id"),
+        "login": _login(node),
+        "is_bot": (node.get("author") or {}).get("__typename") == "Bot",
+        "body": node.get("body") or "",
+    }
 
 
-def _thread(thread: Json) -> Json:
+def _later_pages(connection: Json | None, fetch: Callable[[str], Json | None]) -> list[Json]:
+    """The nodes of `connection` and of every page after it. `fetch(cursor)`
+    answers the next page's connection. Only a long list costs another query."""
+    nodes = _page(connection)
+    page = (connection or {}).get("pageInfo") or {}
+    while page.get("hasNextPage") and page.get("endCursor"):
+        connection = fetch(page["endCursor"])
+        nodes += _page(connection)
+        page = (connection or {}).get("pageInfo") or {}
+    return nodes
+
+
+def _thread(thread: Json, run: Run) -> Json:
+    """A review thread with every comment: a reply past the first 100 is still news."""
+
+    def more(cursor: str) -> Json | None:
+        answer = _graphql(run, None, MORE_COMMENTS_QUERY, id=thread.get("id") or "", after=cursor)
+        return ((answer.get("data") or {}).get("node") or {}).get("comments")
+
     line = thread.get("line")
     return {
         "id": thread.get("id"),
         "resolved": bool(thread.get("isResolved")),
         "where": f"{thread.get('path')}:{line}" if line else str(thread.get("path")),
-        "comments": [
-            {
-                "id": comment.get("id"),
-                "login": _login(comment),
-                "is_bot": (comment.get("author") or {}).get("__typename") == "Bot",
-                "body": comment.get("body") or "",
-            }
-            for comment in _nodes(thread, "comments")
-        ],
+        "comments": [_row(comment) for comment in _later_pages(thread.get("comments"), more)],
     }
 
 
@@ -264,7 +322,7 @@ def _all_threads(repo: str, number: int, pr: Json, run: Run) -> list[Json]:
         older = ((answer.get("data") or {}).get("repository") or {}).get("pullRequest")
         threads = _nodes(older, "reviewThreads") + threads
         page = ((older or {}).get("reviewThreads") or {}).get("pageInfo") or {}
-    return threads
+    return [_thread(thread, run) for thread in threads]
 
 
 def _bucket(check: Json) -> str:
@@ -275,13 +333,26 @@ def _bucket(check: Json) -> str:
     return BUCKETS.get(result or "", "pending")
 
 
-def _rollup(pr: Json) -> dict[str, Json]:
+def _contexts(repo: str, number: int, pr: Json, run: Run) -> list[Json]:
+    """The head commit's check runs and statuses, every page of them."""
+
+    def rollup(pull: Json | None) -> Json | None:
+        commits = _nodes(pull, "commits")
+        commit = (commits[-1].get("commit") or {}) if commits else {}
+        return (commit.get("statusCheckRollup") or {}).get("contexts")
+
+    def more(cursor: str) -> Json | None:
+        answer = _graphql(run, repo, MORE_CONTEXTS_QUERY, number=number, after=cursor)
+        return rollup(((answer.get("data") or {}).get("repository") or {}).get("pullRequest"))
+
+    return _later_pages(rollup(pr), more)
+
+
+def _rollup(contexts: list[Json]) -> dict[str, Json]:
     """The head commit's checks by name, each with its worst bucket and the app
     or account that reports it."""
-    commits = _nodes(pr, "commits")
-    rollup = ((commits[-1].get("commit") or {}).get("statusCheckRollup") or {}) if commits else {}
     checks: dict[str, Json] = {}
-    for node in _nodes(rollup, "contexts"):
+    for node in contexts:
         name = node.get("name") or node.get("context")
         if not name:
             continue
@@ -303,7 +374,6 @@ def _fetch_graphql(repo: str, number: int, run: Run) -> Json:
     head = pr.get("headRefOid")
     if not head:
         raise GhError(f"{repo}#{number}: GitHub gave no head commit", True)
-    head_commit = (_nodes(pr, "commits") or [{}])[-1]
     return {
         "full": True,
         "state": pr.get("state"),
@@ -318,31 +388,19 @@ def _fetch_graphql(repo: str, number: int, run: Run) -> Json:
         "viewer": _login(data, "viewer"),
         "reviews": [
             {
-                "id": review.get("id"),
-                "login": _login(review),
-                "is_bot": (review.get("author") or {}).get("__typename") == "Bot",
+                **_row(review),
                 "state": review.get("state"),
-                "body": review.get("body") or "",
                 "commit": (review.get("commit") or {}).get("oid"),
             }
             for review in _nodes(pr, "reviews")
         ],
-        "comments": [
-            {
-                "id": comment.get("id"),
-                "login": _login(comment),
-                "is_bot": (comment.get("author") or {}).get("__typename") == "Bot",
-                "body": comment.get("body") or "",
-            }
-            for comment in _nodes(pr, "comments")
-        ],
-        "threads": [_thread(thread) for thread in _all_threads(repo, number, pr, run)],
-        "checks": _rollup(pr),
-        "committed_at": (head_commit.get("commit") or {}).get("committedDate"),
+        "comments": [_row(comment) for comment in _nodes(pr, "comments")],
+        "threads": _all_threads(repo, number, pr, run),
+        "checks": _rollup(_contexts(repo, number, pr, run)),
     }
 
 
-def _fetch_rest(repo: str, number: int, run: Run, viewer: str | None) -> Json:
+def _fetch_rest(repo: str, number: int, run: Run, viewer: str) -> Json:
     pr = _json(_gh(run, ["api", f"repos/{repo}/pulls/{number}"]), dict)
     head = (pr.get("head") or {}).get("sha")
     if not head:
@@ -394,13 +452,14 @@ def _graphql_starved(memo: Json, run: Run, now: float) -> bool:
     return rate.get("remaining", RATE_FLOOR) < RATE_FLOOR
 
 
-def _rest_viewer(memo: Json, run: Run) -> str | None:
+def _rest_viewer(memo: Json, run: Run) -> str:
+    """Your login. Unknown, your own pushes and reviews would read as someone else's."""
     if not memo.get("viewer"):
-        try:
-            memo["viewer"] = _gh(run, ["api", "user", "--jq", ".login"]).strip().removesuffix("[bot]")
-        except GhError:
-            pass  # only costs filtering out the viewer's own reviews
-    return memo.get("viewer")
+        login = _gh(run, ["api", "user", "--jq", ".login"]).strip().removesuffix("[bot]")
+        if not login:
+            raise GhError("gh gave no login for you", True)
+        memo["viewer"] = login
+    return memo["viewer"]
 
 
 def _fetch(repo: str, number: int, memo: Json, result: Json, run: Run, now: float) -> Json:
@@ -453,22 +512,30 @@ def _ci_runs(repo: str, head: str, run: Run) -> dict[str, list[str]]:
     """The head's workflow runs by what they mean for `ready`: `approval` (a
     maintainer has to approve them first), `running`, `failed`. A fork's CI
     shows no checks before approval, and a run that fails before its first job
-    shows none at all, so the rollup can't tell either from a repo without CI."""
+    shows none at all, so the rollup can't tell either from a repo without CI.
+    Only each workflow's newest run per event counts: a run that concurrency
+    cancelled for a later one is not a failure."""
     runs: dict[str, list[str]] = {"approval": [], "running": [], "failed": []}
     try:
         lines = _gh(
             run,
             [
                 "api", f"repos/{repo}/actions/runs?head_sha={head}&per_page=100",
-                "--jq", '.workflow_runs[] | [.name, .status, .conclusion // ""] | @tsv',
+                "--jq",
+                '.workflow_runs[] | [.name, .status, .conclusion // "", "\\(.workflow_id)/\\(.event)"]'
+                " | @tsv",
             ],
         ).splitlines()
     except GhError as error:
         if error.transient:
             raise
         return runs  # Actions off, or not readable: the rollup is all there is.
-    for line in lines:
-        name, status, conclusion = (line.split("\t") + ["", "", ""])[:3]
+    newest: set[str] = set()
+    for line in lines:  # GitHub lists the newest run first
+        name, status, conclusion, workflow = (line.split("\t") + ["", "", "", ""])[:4]
+        if (workflow or name) in newest:
+            continue
+        newest.add(workflow or name)
         if conclusion == "action_required" or status == "action_required":
             runs["approval"].append(name)
         elif status != "completed":
@@ -528,8 +595,9 @@ def _codex_unfinished(body: str) -> bool:
     return isinstance(review, dict) and review.get("status") != "completed"
 
 
-def _bot_activity(pr: Json, bot: str) -> tuple[bool, bool, list[str], str]:
-    """(has reviewed an earlier head, finished on the head, its pending checks, verdict).
+def _bot_activity(pr: Json, bot: str) -> tuple[bool, bool, list[str], str, bool]:
+    """(has reviewed an earlier head, finished on the head, its pending checks,
+    verdict, left a review on the head).
     A bot with checks is done when they finish: clean, or failed with a review or
     summary on the head to show for it. Without checks it is done once that review
     or summary exists. A summary counts when it names the head: Macroscope and Codex
@@ -554,9 +622,10 @@ def _bot_activity(pr: Json, bot: str) -> tuple[bool, bool, list[str], str]:
         if head[:7] in summary["body"] and not _codex_unfinished(summary["body"])
     ]
     # Copilot posts a review on the head when it couldn't run.
-    evidence = bool(on_head) or any(
+    by_review = any(
         review["commit"] == head and "unable to review" not in review["body"] for review in reviews
     )
+    evidence = bool(on_head) or by_review
     pending = [name for name, check in checks.items() if check["bucket"] == "pending"]
     if checks:
         done = not pending and (
@@ -568,23 +637,28 @@ def _bot_activity(pr: Json, bot: str) -> tuple[bool, bool, list[str], str]:
     earlier = any(review["commit"] != head for review in reviews) or any(
         head[:7] not in summary["body"] for summary in summaries
     )
-    return earlier, done, pending, verdict
+    return earlier, done, pending, verdict, by_review
 
 
 class _Events:
-    """Reports each key once, across polls. Holds reports back during a baseline."""
+    """Reports each key once, across polls. Holds reports back during a baseline.
+    A REST poll baselines what REST shows, so an event `rest` can see is news
+    once any poll has run, even before GraphQL has baselined the rest."""
 
     def __init__(self, memo: Json, out: list[Json]) -> None:
         self.memo = memo
         self.out = out
         self.seen = set(memo.get("seen") or [])
         self.baseline = not memo.get("baselined")
+        self.rest_baseline = self.baseline and not memo.get("rest_baselined")
 
-    def emit(self, key: str, text: str, on_me: bool = False, always: bool = False) -> None:
+    def emit(
+        self, key: str, text: str, on_me: bool = False, always: bool = False, rest: bool = False
+    ) -> None:
         if key in self.seen:
             return
         self.seen.add(key)
-        if always or not self.baseline:
+        if always or not (self.rest_baseline if rest else self.baseline):
             self.out.append({"key": key, "text": text, "on_me": on_me})
 
     def drop(self, keys: set[str]) -> None:
@@ -609,12 +683,15 @@ def _talk_events(pr: Json, events: _Events, known_bots: tuple[str, ...], mine: s
         events.emit(f"c:{comment['id']}", f"comment from {login}: {_snippet(comment['body'])}")
     for review in pr["reviews"]:
         login = review["login"]
-        if login in mine or review["is_bot"]:
+        # A gating bot's review is its bot: event; roboomp posts from a user account.
+        if login in mine or review["is_bot"] or any(_is_bot(review, bot) for bot in known_bots):
             continue
         if review["state"] in ("APPROVED", "CHANGES_REQUESTED") or review["body"].strip():
             state = str(review["state"]).lower().replace("_", " ")
             events.emit(
-                f"c:{review['id']}", f"review from {login} ({state}): {_snippet(review['body'])}"
+                f"c:{review['id']}",
+                f"review from {login} ({state}): {_snippet(review['body'])}",
+                rest=True,
             )
     for thread in pr["threads"]:
         for index, comment in enumerate(thread["comments"]):
@@ -653,7 +730,8 @@ def _reference(repo: str, number: int) -> re.Pattern[str]:
 
 def _releases_since(repo: str, merged_at: str, run: Run) -> list[Json]:
     """Published releases from the merge on, oldest first. GitHub lists newest
-    first, so paging stops at the first release older than the merge."""
+    first, so paging stops at the first release older than the merge. Without a
+    merge time only the first page is read."""
     found: list[Json] = []
     for page in itertools.count(1):
         path = f"repos/{repo}/releases?per_page={RELEASE_PAGE}&page={page}"
@@ -664,7 +742,11 @@ def _releases_since(repo: str, merged_at: str, run: Run) -> list[Json]:
             for release in published
             if release.get("tag_name") and release["published_at"] >= merged_at
         ]
-        if len(batch) < RELEASE_PAGE or any(release["published_at"] < merged_at for release in published):
+        if (
+            not merged_at
+            or len(batch) < RELEASE_PAGE
+            or any(release["published_at"] < merged_at for release in published)
+        ):
             break
     return sorted(found, key=lambda release: release["published_at"])
 
@@ -672,10 +754,8 @@ def _releases_since(repo: str, merged_at: str, run: Run) -> list[Json]:
 def _check_release(
     repo: str, number: int, merged: Json, memo: Json, result: Json, events: _Events, run: Run
 ) -> None:
-    sha, merged_at = merged.get("sha"), merged.get("at") or ""
+    sha, merged_at = merged["sha"], merged.get("at") or ""
     result["next_poll_s"] = RELEASE_POLL_S
-    if not sha:
-        raise GhError(f"{repo}#{number}: GitHub gave no merge commit", True)
     candidates = _releases_since(repo, merged_at, run)
     # A tag's relation to the merge commit doesn't change, so each is asked once.
     compared = memo.setdefault("compared", {})
@@ -710,22 +790,21 @@ def _check_release(
         )
 
 
-def _gates_open(pr: Json, gate: set[str]) -> bool:
+def _gates_open(pr: Json, gate: set[str], open_threads: int) -> bool:
     """Everything `ready` needs except a bot's review. BEHIND and DIRTY block it,
     because neither can be merged."""
-    if not pr["full"] or pr["merge_state"] in ("BEHIND", "DIRTY"):
-        return False
-    if any(not thread["resolved"] and thread["comments"] for thread in pr["threads"]):
+    if not pr["full"] or open_threads or pr["merge_state"] in ("BEHIND", "DIRTY"):
         return False
     return all(pr["checks"].get(name, {}).get("bucket", "pending") in GREEN for name in gate)
 
 
-def _fire_on_activity(pr: Json, start: int, result: Json, events: _Events) -> None:
+def _fire_on_activity(pr: Json, result: Json, events: _Events) -> None:
     """`activity` fires on this poll's first word from someone else: a comment,
     review or reply, a bot's finished review, a push by another author, a merge
-    or a close. The baseline poll reports nothing, so nothing old fires it."""
+    or a close. The baseline poll reports nothing old, except a close or merge:
+    a wait created on a closed or merged PR fires at once, as no later poll would."""
     prefixes = ACTIVITY + (("head:",) if pr["author"] != pr["viewer"] else ())
-    new = [event for event in events.out[start:] if event["key"].startswith(prefixes)]
+    new = [event for event in events.out if event["key"].startswith(prefixes)]
     if not new:
         return
     result["fired"] = True
@@ -746,10 +825,10 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
     pr = _fetch(repo, number, memo, result, run, now)
     # What a fired wait is checked against later: a new head or a conflict takes it back.
     result.update(head=pr["head"], merge_state=pr["merge_state"], base=pr["base"])
-    start = len(events.out)
 
     if pr["state"] == "MERGED":
-        memo["merged"] = {"sha": pr["merge_sha"], "at": pr["merged_at"]}
+        # A PR merged by pushing its commits to the base has no merge commit; its head is in the base.
+        memo["merged"] = {"sha": pr["merge_sha"] or pr["head"], "at": pr["merged_at"]}
         result["merged"] = True
         if until == "merged":
             result["fired"] = True
@@ -764,11 +843,14 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
     is_open = pr["state"] == "OPEN"
     gating = _bots(cond)
     open_threads = sum(1 for thread in pr["threads"] if not thread["resolved"] and thread["comments"])
+    # When the poller first saw the head: a commit can be pushed long after it was made.
+    head_seen = (memo.get("head_seen") or {}).get(head, now)
+    memo["head_seen"] = {head: head_seen}
 
     # Before any event, so a failure here doesn't report half a poll.
     required: set[str] = set()
     gate: set[str] = set()
-    if pr["full"] and pr["state"] != "CLOSED":
+    if pr["full"] and is_open:
         checks = pr["checks"]
         required = set(_required_names(repo, pr["base"], memo, run, now))
         required.update(name for name, check in checks.items() if check["required"])
@@ -778,7 +860,7 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
             if not any(_bot_check(name, check, bot) for bot in gating)
         }
 
-    events.emit(f"head:{head}", f"new head {short}")
+    events.emit(f"head:{head}", f"new head {short}", rest=True)
     # `activity` counts the author's own words unless the author is you.
     _talk_events(pr, events, gating, {pr["viewer"]} if until == "activity" else {pr["author"], pr["viewer"]})
 
@@ -789,7 +871,7 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
     # shows no checks at all, so an open PR's are unknown.
     bot_pending = is_open and not pr["full"]
     for bot in gating:
-        earlier, done, pending, verdict = _bot_activity(pr, bot)
+        earlier, done, pending, verdict, by_review = _bot_activity(pr, bot)
         pending_checks.extend(pending)
         bot_pending = bot_pending or bool(pending)
         finished = f"bot:{bot}:{head}"
@@ -801,7 +883,11 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
             details = ", ".join(
                 filter(None, (verdict, f"{open_threads} open threads" if open_threads else ""))
             )
-            events.emit(finished, f"{bot} finished on {short}{': ' + details if details else ''}")
+            events.emit(
+                finished,
+                f"{bot} finished on {short}{': ' + details if details else ''}",
+                rest=by_review,  # REST shows reviews, not checks or summaries
+            )
         _bot_comment_events(pr, events, bot, counted=first_report)
 
     if pr["full"] and is_open:
@@ -815,19 +901,24 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
         label = "required check" if required else "check"
         for name in sorted(gate):
             if pr["checks"].get(name, {}).get("bucket") in FAILED:
-                events.emit(f"fail:{head}:{name}", f"{label} failed: {name}", on_me=True)
+                # A state that needs you: also on the first poll.
+                events.emit(f"fail:{head}:{name}", f"{label} failed: {name}", on_me=True, always=True)
 
     merge_state = pr["merge_state"]
     if is_open and merge_state and merge_state != "UNKNOWN":
-        if merge_state in ("BEHIND", "DIRTY") and memo.get("merge_state") != merge_state:
+        # Once per head: a conflict a push didn't fix is news about the new head.
+        if merge_state in ("BEHIND", "DIRTY") and memo.get("merge_state") != f"{head}:{merge_state}":
             text = (
                 f"conflicts with {pr['base']}, rebase it"
                 if merge_state == "DIRTY"
                 else f"behind {pr['base']}, update the branch"
             )
-            events.emit(f"merge:{merge_state}:{head}:{pr['base_oid']}", text, on_me=True)
-        memo["merge_state"] = merge_state
+            events.emit(
+                f"merge:{merge_state}:{head}:{pr['base_oid']}", text, on_me=True, always=True
+            )
+        memo["merge_state"] = f"{head}:{merge_state}"
 
+    memo["rest_baselined"] = True
     if pr["full"]:
         memo["baselined"] = True
 
@@ -840,23 +931,23 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
         )
         result["next_poll_s"] = ENDED_POLL_S
         if until == "activity":
-            _fire_on_activity(pr, start, result, events)
+            _fire_on_activity(pr, result, events)
         return
 
     if until == "activity":
         if pr["state"] == "MERGED":
-            events.emit(f"merged:{pr['merge_sha']}", f"PR#{number} merged", always=True)
+            events.emit(f"merged:{memo['merged']['sha']}", f"PR#{number} merged", always=True)
             result["next_poll_s"] = ENDED_POLL_S
-        _fire_on_activity(pr, start, result, events)
+        _fire_on_activity(pr, result, events)
         return
 
     fire_text = None
     if until == "review_on_head" and reviewed and not bot_pending:
         threads = f", {open_threads} open threads" if open_threads else ""
         fire_text = f"{', '.join(reviewed)} reviewed {short}{threads}"
-    elif until == "ready" and not bot_pending and _gates_open(pr, gate):
+    elif until == "ready" and not bot_pending and _gates_open(pr, gate, open_threads):
         bots = None
-        age = now - _epoch(pr["committed_at"])
+        age = now - head_seen
         # A bot that reviews every push and reviewed this PR before must review this
         # push too, whoever else did: Copilot on the head doesn't stand in for roboomp.
         every_push = [bot for bot in earlier_bots if bot not in ONCE_BOTS]
@@ -883,8 +974,8 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
                 )
                 bots = None
             elif not required and (runs["running"] or runs["failed"]):
-                if runs["failed"] and not pr["checks"]:
-                    # No check in the rollup reports it, so nothing else will.
+                if runs["failed"]:
+                    # The rollup is green, so nothing else reports it.
                     events.emit(
                         f"runfail:{head}",
                         f"CI failed on {short} ({', '.join(runs['failed'])})",
@@ -974,8 +1065,10 @@ def poll(cond: Json, memo: Json, *, run: Run = subprocess.run, now: float | None
     except GhError as error:
         result["error"] = str(error)
         result["transient"] = error.transient
-        if error.transient and result["next_poll_s"] == DEFAULT_POLL_S:
-            result["next_poll_s"] = RETRY_POLL_S
+        # A hiccup on a slow path (REST fallback, a release check) still retries soon;
+        # running out of budget doesn't.
+        if error.transient and not RATE_LIMITED.search(str(error)):
+            result["next_poll_s"] = min(result["next_poll_s"], RETRY_POLL_S)
     events.save()
     return result
 
@@ -998,11 +1091,8 @@ def snapshot(repo: str, number: int, *, run: Run = subprocess.run) -> Json:
 
 def verify_fix(repo: str, number: int, before: Json, *, run: Run = subprocess.run) -> tuple[bool, str]:
     """A fix turn succeeded when the head moved, or when every thread open before
-    it got a new reply or was resolved."""
-    try:
-        after = snapshot(repo, number, run=run)
-    except GhError as error:
-        return False, f"could not read {repo}#{number}: {error}"
+    it got a new reply or was resolved. Raises GhError when the PR can't be read."""
+    after = snapshot(repo, number, run=run)
     if after["head"] != before.get("head"):
         return True, f"new head {after['head'][:7]}"
     current = {thread["id"]: thread for thread in after["threads"]}
