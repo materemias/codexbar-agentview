@@ -2660,6 +2660,17 @@ do
 		elseif onMe or val(r.unseen) == true then
 			table.insert(label, ui.span("● ", "warning"))
 		end
+		-- The project leads: session titles alone don't tell sessions apart.
+		local project = oneLine(r.project)
+		if project == "" then
+			project = cwdLabel(r.cwd)
+		end
+		if project ~= "" then
+			for _, s in highlighted(project, q) do
+				table.insert(label, if type(s) == "string" then ui.span(s, "accent strong") else s)
+			end
+			table.insert(label, "  ")
+		end
 		for _, s in highlighted(waitTitle(r), q) do
 			table.insert(label, s)
 		end
