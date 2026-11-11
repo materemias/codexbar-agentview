@@ -686,8 +686,30 @@ export default function (pi) {
 		if (!ctx || shown === shownLine) return;
 		shownLine = shown;
 		// In Tern a click on the row opens the session's card.
-		const [open, close] = process.env.TERN_PANE ? [`\x1b]8;;codexbar-agentview://card/${sessionId}\x1b\\`, "\x1b]8;;\x1b\\"] : ["", ""];
-		const widget = (_tui, theme) => panelComponent((t) => open + rowText(session, t) + close, theme);
+		const href = process.env.TERN_PANE ? `codexbar-agentview://card/${sessionId}` : undefined;
+		const [open, close] = href ? [`\x1b]8;;${href}\x1b\\`, "\x1b]8;;\x1b\\"] : ["", ""];
+		const widget = (_tui, theme) => {
+			const text = new pi.pi.Text("", 1, 0);
+			let plain;
+			let linked;
+			return {
+				...panelComponent((t) => open + rowText(session, t) + close, theme),
+				// Tern's native view paints an undescribed widget as terminal cells, where the link
+				// shows no pointer and no hover. Described, the row opens its card on a plain click
+				// (a span link would want Ctrl), and codexbar.css underlines it on hover. The same
+				// node object while the text holds lets omp skip it.
+				describe(cx) {
+					text.setText(rowText(session, theme));
+					const node = text.describe(cx);
+					if (!href) return node;
+					if (node !== plain) {
+						plain = node;
+						linked = { ...node, p: { ...node.p, href, actions: { click: "open" } } };
+					}
+					return linked;
+				},
+			};
+		};
 		ctx.ui.setWidget(WIDGET, line ? widget : undefined, { placement: "aboveEditor" });
 		// omp draws widgets in the order they were set, and the panel belongs under the row.
 		if (panel) drawPanel(ctx);

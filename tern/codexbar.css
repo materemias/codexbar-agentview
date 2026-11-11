@@ -150,6 +150,18 @@
 	}
 }
 
+/* The waitingfor row over an omp composer (omp-extension/waitingfor.ts), which
+   opens the session card on a click: indented a cell, as the details panel drawn
+   under it in terminal cells, and underlined on hover, as Tern's links are. */
+.sf-text[data-href^='codexbar-agentview://card/'] {
+	padding-left: var(--sf-cw);
+
+	&:hover {
+		text-decoration: underline;
+		text-decoration-color: rgb(from var(--accent) r g b / 45%);
+	}
+}
+
 @keyframes codexbar-pulse {
 	0%, 100% { opacity: 1; }
 	50% { opacity: .35; }
