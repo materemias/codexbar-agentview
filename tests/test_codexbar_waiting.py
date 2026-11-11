@@ -298,6 +298,18 @@ class ConditionTests(Case):
         self.tick()
         self.assertEqual(self.wait_of(wait)["state"], "waiting")
 
+    def test_json_eq_tells_true_from_one_at_any_depth(self) -> None:
+        for stdout, expected in (
+            ('{"result": {"ready": 1}}', '{"ready":true}'),
+            ('{"result": [1]}', "[true]"),
+            ('{"result": {"ready": true, "extra": 1}}', '{"ready":true}'),
+        ):
+            with self.subTest(stdout=stdout, expected=expected):
+                self.assertEqual(waiting._predicate(f"json_eq:result={expected}", 0, stdout), (False, ""))
+        self.assertEqual(
+            waiting._predicate('json_eq:result={"n":[1.0,true]}', 0, '{"result": {"n": [1, true]}}'), (True, ""),
+        )
+
     def test_a_running_check_is_not_started_again(self) -> None:
         self.command("pass", "--interval", "30s")
         started = []
@@ -443,6 +455,29 @@ class ConditionTests(Case):
         for bad in (("--repo", "nope"), ("--repo", "a/b", "--number", "3"), ()):
             self.run_cli("add", "--session", SID, "--kind", "release", *bad, expect=2)
 
+    def test_release_wait_on_a_repo_without_a_release(self) -> None:
+        wait = self.add("--kind", "release", "--repo", "a/b", "--interval", "1m")["id"]
+        missing = (1, '{"message":"Not Found"}', "gh: Not Found (HTTP 404)")
+        with mock.patch.object(waiting, "_run_argv", return_value=missing):
+            for _ in range(waiting.MAX_ERRORS + 1):
+                self.tick()
+                self.advance(minutes=2)
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["ball"]), ("waiting", "on_machine"))
+        self.assertEqual(self.session()["history"][0]["text"], "Baseline: no release yet")
+        with mock.patch.object(waiting, "_run_argv", return_value=(0, "v1.0.0\n", "")):
+            self.tick()
+        self.assertEqual(self.wait_of(wait)["fired_text"], "v1.0.0 released")
+
+    def test_a_release_that_disappears_fires_nothing(self) -> None:
+        wait = self.add("--kind", "release", "--repo", "a/b", "--interval", "1m")["id"]
+        with mock.patch.object(waiting, "_run_argv", return_value=(0, "v1.0.0\n", "")):
+            self.tick()
+        self.advance(minutes=2)
+        with mock.patch.object(waiting, "_run_argv", return_value=(1, "", "gh: Not Found (HTTP 404)")):
+            self.tick()
+        self.assertEqual(self.wait_of(wait)["state"], "waiting")
+
     def test_command_runs_in_the_session_folder(self) -> None:
         folder = self.root / "project"
         folder.mkdir()
@@ -566,6 +601,11 @@ class ConditionTests(Case):
         self.assertEqual(
             [action["level"] for action in actions if action["type"] == "toast"], ["success"],
         )
+
+    def test_a_job_that_closed_its_pane_marks_the_session_unseen(self) -> None:
+        self.add("--kind", "job", "--pane", "51", "--close-on-success")
+        self.run_cli("event", "--type", "job_finished", "--pane", "51", "--status", "0")
+        self.assertTrue(self.state()["sessions"][SID]["unseen"])
 
     def test_job_failure_keeps_the_pane_and_comes_to_me_in_red(self) -> None:
         self.run_cli("add", "--pane", "51", "--kind", "job", "--close-on-success")
@@ -929,13 +969,12 @@ class PrTests(Case):
 
         reads = iter(["down", "up"])
 
-        def snapshot(repo, number):
+        def verify_fix(repo, number, before):
             if next(reads) == "down":
                 raise GhError("gh timed out")
-            return {"head": "abc123", "threads": []}
+            return True, "new head"
 
-        first = self.fix_chain(lambda repo, number, before: (True, "new head"))
-        sys.modules["waiting_github"].snapshot = snapshot
+        first = self.fix_chain(verify_fix)
         action = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]["action"]
         self.run_cli("ack", "--action", action, "--result", "delivered")
         self.run_cli("event", "--type", "turn_finished", "--session", SID)
@@ -1042,10 +1081,121 @@ class DeadlineTests(Case):
         wait = self.add("--kind", "job", "--pane", "51")["id"]
         self.run_cli("event", "--type", "job_finished", "--pane", "51", "--status", "0")
         self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1h")
-        self.assertEqual(self.wait_of(wait)["ball"], "on_machine")
+        self.assertEqual(self.wait_of(wait)["ball"], "on_timer")
         self.advance(hours=2)
         self.tick()
         self.assertEqual(self.wait_of(wait)["state"], "fired")
+
+
+class SnoozeTests(Case):
+    """+1 day: a wait still waiting is watched again from the new time; one whose
+    event happened is hidden until then and comes back as it was."""
+
+    def snooze(self, wait: str, expect: int = 0) -> dict:
+        return self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d", expect=expect)
+
+    def states(self) -> dict:
+        return {wait["id"]: wait["state"] for wait in self.state()["sessions"][SID]["waits"]}
+
+    def ran_prompt(self, *argv: str) -> str:
+        """A command wait whose prompt the agent ran: it waits for my look."""
+        self.agents(SID)
+        self.heartbeat()
+        wait = self.add(
+            "--kind", "command", "--argv", json.dumps([sys.executable, "-c", "pass"]),
+            "--prompt", "go", *argv,
+        )["id"]
+        self.tick()
+        action = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]["action"]
+        self.run_cli("ack", "--action", action, "--result", "delivered")
+        return wait
+
+    def test_a_snoozed_job_no_longer_watches_its_pane(self) -> None:
+        wait = self.add("--kind", "job", "--pane", "51", "--label", "Build")["id"]
+        self.run_cli("event", "--type", "job_finished", "--pane", "51", "--status", "0")
+        self.snooze(wait)
+        self.run_cli("event", "--type", "job_finished", "--pane", "51", "--status", "3")
+        self.run_cli("event", "--type", "pane_closed", "--pane", "51")
+        self.assertEqual(self.states()[wait], "snoozed")
+        self.advance(days=1)
+        self.tick()
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["fired_text"]), ("fired", "Build: finished"))
+
+    def test_a_job_whose_pane_closed_comes_back_as_it_was(self) -> None:
+        wait = self.add("--kind", "job", "--pane", "51")["id"]
+        self.run_cli("event", "--type", "pane_closed", "--pane", "51")
+        self.snooze(wait)
+        self.assertIsNone(self.wait_of(wait)["outcome"])
+        self.advance(days=1)
+        self.tick()
+        seen = self.wait_of(wait)
+        self.assertEqual(
+            (seen["state"], seen["reason"]), ("needs_attention", "Pane closed before the job finished"),
+        )
+
+    def test_an_overdue_job_whose_pane_closed_is_hidden_too(self) -> None:
+        wait = self.add("--kind", "job", "--pane", "51", "--deadline-in", "1h")["id"]
+        self.advance(hours=2)
+        self.tick()
+        self.run_cli("event", "--type", "pane_closed", "--pane", "51")
+        self.snooze(wait)
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["ball"], seen["overdue"]), ("snoozed", "on_timer", False))
+        self.advance(days=1)
+        self.tick()
+        seen = self.wait_of(wait)
+        self.assertEqual(
+            (seen["state"], seen["reason"]), ("needs_attention", "Pane closed before the job finished"),
+        )
+
+    def test_a_prompt_that_ran_does_not_run_again(self) -> None:
+        wait = self.ran_prompt()
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.assertEqual(self.states()[wait], "review")
+        self.snooze(wait)
+        self.advance(days=1)
+        self.tick()
+        self.assertEqual(self.states()[wait], "review")
+        self.assertEqual(self.state()["sessions"][SID]["prompt_queue"], [])
+
+    def test_a_prompt_the_agent_runs_is_not_snoozed(self) -> None:
+        wait = self.ran_prompt()
+        self.assertIn("runs its prompt", self.snooze(wait, expect=2)["error"])
+        self.assertEqual(self.states()[wait], "acting")
+
+    def test_a_check_that_kept_failing_is_watched_again(self) -> None:
+        wait = self.add(
+            "--kind", "command", "--argv", json.dumps([sys.executable, "-c", "pass"]),
+            "--predicate", "json_eq:a=1", "--interval", "1m",
+        )["id"]
+        for _ in range(waiting.MAX_ERRORS):
+            self.tick()
+            self.advance(minutes=2)
+        self.assertEqual(self.states()[wait], "needs_attention")
+        self.snooze(wait)
+        saved = self.state()["sessions"][SID]["waits"][0]
+        self.assertEqual((saved["state"], saved["errors"]), ("waiting", 0))
+        self.assertEqual(saved["next_check_at"], (self.clock + timedelta(days=1)).isoformat())
+
+    def test_a_fired_chain_step_keeps_one_step_armed(self) -> None:
+        first = self.add("--kind", "time", "--in", "1s")["id"]
+        second = self.add("--kind", "time", "--in", "1h", "--after", first)["id"]
+        self.advance(seconds=2)
+        self.tick()
+        self.snooze(first)
+        self.assertEqual(self.states(), {first: "snoozed", second: "waiting"})
+        self.assertEqual(len(self.session()["threads"]), 1)
+        self.advance(days=1)
+        self.tick()
+        self.assertEqual(self.states(), {first: "fired", second: "fired"})
+
+    def test_a_snooze_that_changes_nothing_is_refused(self) -> None:
+        later = self.add("--kind", "later")["id"]
+        job = self.add("--kind", "job", "--pane", "51")["id"]
+        for wait in (later, job):
+            self.snooze(wait, expect=2)
+        self.assertNotIn("Snoozed", " ".join(item["text"] for item in self.session()["history"]))
 
 
 class NoteTests(Case):
@@ -1075,21 +1225,19 @@ class NoteTests(Case):
         self.run_cli("note", "--session", SID, expect=2)
         self.run_cli("note", "--session", SID, "--accept-suggested", expect=2)
 
-    def test_a_note_after_done_starts_the_next_record(self) -> None:
-        wait = self.add("--kind", "later", "--note", "old")["id"]
+    def test_a_note_needs_something_set_aside(self) -> None:
+        self.run_cli("note", "--session", SID, "--text", "forgotten", expect=2)
+        self.run_cli("note", "--pane", "51", "--text", "forgotten", expect=2)
+        self.assertFalse((self.state_dir / "waiting.json").exists())
+        wait = self.add("--kind", "time", "--in", "1h", "--note", "old")["id"]
         self.run_cli("done", "--session", SID, "--wait", wait)
-        self.run_cli("note", "--session", SID, "--text", "new")
-        self.add("--kind", "later")
-        seen = self.session()
-        self.assertEqual(seen["note"], "new")
-        self.assertEqual(seen["history"], [])
-        self.assertEqual(len(seen["waits"]), 1)
+        self.run_cli("note", "--session", SID, "--text", "new", expect=2)
 
-    def test_a_note_without_a_wait_does_not_stay_forever(self) -> None:
-        self.run_cli("note", "--session", SID, "--text", "forgotten")
-        self.advance(days=8)
-        self.tick()
-        self.assertNotIn(SID, self.state()["sessions"])
+    def test_a_pinned_session_takes_a_note_without_a_wait(self) -> None:
+        (self.omp / "session-pins.json").write_text(json.dumps([SID]))
+        self.run_cli("note", "--session", SID, "--text", "for later")
+        seen = self.session()
+        self.assertEqual((seen["note"], seen["ball"], seen["waits"]), ("for later", "on_my_time", []))
 
     def test_a_new_set_aside_does_not_inherit_the_old_sentence(self) -> None:
         wait = self.add("--kind", "later", "--note", "old")["id"]
@@ -1099,10 +1247,10 @@ class NoteTests(Case):
         self.assertIsNone(seen["note"])
         self.assertEqual(seen["history"], [])
 
-    def test_note_before_the_wait_survives(self) -> None:
-        self.run_cli("note", "--session", SID, "--text", "first")
-        self.add("--kind", "later")
-        self.assertEqual(self.session()["note"], "first")
+    def test_note_on_a_pane_wait(self) -> None:
+        self.run_cli("add", "--pane", "51", "--kind", "something", "--what", "x")
+        pane = self.run_cli("note", "--pane", "51", "--text", "first")["view"]["panes"][0]
+        self.assertEqual(pane["note"], "first")
 
 
 class MenuRequestTests(Case):
@@ -1356,6 +1504,8 @@ class PromptTests(Case):
         prompt = claimed["prompts"][0]
         self.assertEqual(len(claimed["prompts"]), 1)
         self.assertEqual((prompt["wait"], prompt["text"], prompt["resend_check"]), (first, "one", False))
+        self.assertIsNone(prompt["claimed_at"])
+        claimed_at = self.clock.isoformat()
         self.assertEqual(claimed["view"]["sessions"][0]["prompts_queued"], 0)
 
         # The extension died between send and ack: its next run must look first.
@@ -1363,6 +1513,8 @@ class PromptTests(Case):
         self.assertEqual(self.session()["prompts_queued"], 2)
         again = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]
         self.assertEqual((again["action"], again["resend_check"]), (prompt["action"], True))
+        # The resend check looks only at messages since that earlier claim.
+        self.assertEqual(again["claimed_at"], claimed_at)
 
         self.run_cli("ack", "--action", prompt["action"], "--result", "delivered")
         self.assertEqual(self.run_cli("claim-prompts", "--session", SID)["prompts"], [])
@@ -1646,6 +1798,18 @@ class TickTests(Case):
     def test_unacked_actions_tick_soon(self) -> None:
         self.add("--kind", "later", "--park")
         self.assertEqual(self.tick()["next_tick_s"], 30)
+
+    def test_verifications_count_toward_what_one_tick_takes(self) -> None:
+        state = waiting._empty_state()
+        record = state["sessions"][SID] = waiting._new_record(SID, None)
+        for _ in range(2):
+            wait = waiting._new_wait(
+                state, T0, kind="time", condition={"type": "time", "at": None}, by="user", label="x",
+            )
+            wait.update(state="acting", verify_pending=True, verify={"type": "command"})
+            record["waits"].append(wait)
+        with mock.patch.object(waiting, "MAX_CHECKS_PER_TICK", 1):
+            self.assertEqual(len(waiting._claim_checks(state, T0)), 1)
 
     def test_result_of_a_changed_wait_is_dropped(self) -> None:
         wait = self.add(
@@ -2022,6 +2186,13 @@ class ClosedSessionTests(Case):
         self.add("--kind", "later")
         self.assertIsNone(self.session()["recap_at"])
 
+    def test_a_recap_time_out_of_range_is_no_time(self) -> None:
+        self.transcript(SID)
+        self.history_db([(SID, "newest", 1_793_958_276_000_000)])  # microseconds, not seconds
+        self.add("--kind", "later")
+        seen = self.session()
+        self.assertEqual((seen["recap"], seen["recap_at"]), ("newest", None))
+
     def test_title_table_wins_over_the_session_file(self) -> None:
         self.transcript(SID)
         self.history_db([], {SID: "From the table"})
@@ -2049,6 +2220,7 @@ class ClosedSessionTests(Case):
         self.assertIsNone(seen["resume_command"])
 
     def test_resume(self) -> None:
+        self.agents()
         self.transcript(SID)
         answer = self.run_cli("resume", "--session", SID)
         self.assertEqual(answer["command"], f"cd -- /w/project && omp --resume {SID}")
@@ -2059,9 +2231,18 @@ class ClosedSessionTests(Case):
         self.assertEqual(self.run_cli("resume", "--session", SID)["command"], "omp --resume saved")
 
     def test_resume_errors(self) -> None:
-        self.run_cli("resume", "--session", SID, expect=2)
         self.agents(SID)
         self.run_cli("resume", "--session", SID, expect=2)
+        self.run_cli("resume", "--session", OTHER, expect=2)
+
+    def test_resume_refuses_while_liveness_is_unknown_or_newer_than_agents_json(self) -> None:
+        self.transcript(SID)
+        self.run_cli("resume", "--session", SID, expect=2)
+        sweep = {"agents": [], "history": [], "updatedAt": (T0 - timedelta(minutes=1)).timestamp() * 1000}
+        (self.state_dir / "agents.json").write_text(json.dumps(sweep))
+        self.run_cli("resume", "--session", SID)
+        self.heartbeat()
+        self.assertIn("running", self.run_cli("resume", "--session", SID, expect=2)["error"])
 
     def test_resume_text_matches_the_one_launch_checks_against(self) -> None:
         path = SCRIPT_PATH.with_name("codexbar_agents.py")
@@ -3125,19 +3306,51 @@ class MergedPrTests(Case):
             (seen["outcome"], seen["headline"]), ("attention", "⚠️ PR#7 closed without merging"),
         )
 
+    def test_a_merged_wait_back_on_me_after_its_prompt_is_not_fired_again(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        self.github(
+            poll=lambda cond, memo, **kwargs: poll_result(memo, merged=True, fired=True, fire_text="PR#7 merged"),
+            pr_status=lambda repo, number, run=None: {
+                "title": "A PR", "state": "merged", "review": None, "checks": None,
+            },
+        )
+        verify = json.dumps({"type": "command", "argv": [sys.executable, "-c", "raise SystemExit(1)"]})
+        wait = self.add(
+            "--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "merged",
+            "--prompt", "go", "--verify", verify,
+        )["id"]
+        self.tick()
+        action = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]["action"]
+        self.run_cli("ack", "--action", action, "--result", "delivered")
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.tick()
+        self.assertEqual(self.waits()[wait]["state"], "needs_attention")
+        self.assertEqual(self.run_cli("claim-prompts", "--session", SID)["prompts"], [])
+
+    def test_a_snoozed_merged_wait_stays_snoozed(self) -> None:
+        self.merged(fired=True, fire_text="PR#7 merged")
+        wait = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "merged")["id"]
+        self.tick()
+        self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
+        self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "activity", session=OTHER)
+        self.tick()
+        self.assertEqual(self.waits()[wait]["state"], "snoozed")
+
 
 class FiredPrTests(Case):
     """A fired `review_on_head` or `ready` is taken back when the PR moves under it."""
 
     def setUp(self) -> None:
         super().setUp()
-        self.pr = {"head": "a" * 40, "merge_state": "CLEAN", "holds": True}
+        self.pr = {"head": "a" * 40, "merge_state": "CLEAN", "holds": True, "events": []}
 
         def poll(cond, memo, **kwargs):
             holds = self.pr["holds"] and cond["until"] in ("review_on_head", "ready")
             return poll_result(
                 memo, fired=holds, fire_text=f"{cond['until']} on {self.pr['head'][:7]}" if holds else None,
                 head=self.pr["head"], merge_state=self.pr["merge_state"], base="main",
+                events=self.pr["events"],
             )
 
         self.github(poll=poll)
@@ -3218,6 +3431,59 @@ class FiredPrTests(Case):
         self.assertEqual(seen["outcome"], "fulfilled")
         self.assertEqual(seen["still_waiting"], ["⏳ PR#7 released"])
         self.assertEqual([w["mark"] for w in seen["waits"]], ["✅ ", "⏳ "])
+
+    def test_a_review_holds_when_the_base_moves(self) -> None:
+        review = [self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "review_on_head")["id"]]
+        self.ticks(1)
+        self.pr["merge_state"] = "BEHIND"
+        self.ticks(3)
+        self.assertEqual(self.states(review), ["fired"])
+        self.assertFalse([item for item in self.session()["history"] if "no longer" in item["text"]])
+
+    def test_a_pr_closed_without_merging_brings_a_fulfilled_wait_back_to_me(self) -> None:
+        ready = self.ready()
+        self.ticks(1)
+        self.pr.update(holds=False, events=[
+            {"key": "closed:x", "text": "PR#7 closed without merging", "on_me": True},
+        ])
+        self.ticks(1)
+        self.assertEqual(self.states(ready), ["needs_attention"])
+        self.assertEqual(self.session()["headline"], "⚠️ PR#7 closed without merging")
+
+    def test_a_fulfilled_wait_is_rechecked_on_time(self) -> None:
+        self.ready()
+        self.tick()
+        self.advance(minutes=6)
+        self.assertEqual(self.tick()["next_tick_s"], 180)
+
+    def test_a_step_taken_back_counts_its_times_anew(self) -> None:
+        ready = self.ready()[0]
+        timer = self.add("--kind", "time", "--in", "1h", "--deadline-in", "2h", "--after", ready)["id"]
+        self.tick()
+        self.pr.update(head="b" * 40, holds=False)
+        self.advance(minutes=4)
+        self.tick()
+        waits = {wait["id"]: wait for wait in self.state()["sessions"][SID]["waits"]}
+        self.assertEqual(
+            (waits[timer]["state"], waits[timer]["condition"]["at"], waits[timer]["deadline"]),
+            ("pending", None, None),
+        )
+        self.advance(hours=3)
+        self.pr["holds"] = True
+        self.tick()
+        waits = {wait["id"]: wait for wait in self.state()["sessions"][SID]["waits"]}
+        self.assertEqual(
+            (waits[timer]["state"], waits[timer]["condition"]["at"], waits[timer]["deadline"]),
+            ("waiting", (self.clock + timedelta(hours=1)).isoformat(), (self.clock + timedelta(hours=2)).isoformat()),
+        )
+
+    def test_a_new_babysit_carries_on_to_a_step_chained_after_the_old_one(self) -> None:
+        old = self.chain()
+        timer = self.add("--kind", "time", "--in", "1h", "--after", old[-1])["id"]
+        new = self.chain()
+        waits = {wait["id"]: wait for wait in self.state()["sessions"][SID]["waits"]}
+        self.assertEqual(self.states(old), ["done", "done", "done"])
+        self.assertEqual((waits[new[-1]]["next"], waits[timer]["state"]), (timer, "pending"))
 
 
 class PinTests(Case):

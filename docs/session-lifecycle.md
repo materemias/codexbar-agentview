@@ -58,7 +58,7 @@ Type `/wait ` for completions. `/wait help` lists them above the composer.
 | `/wait later [S\|M\|L] <sentence>` | the time you have for it; pins the session |
 | `/wait list` | this session's details |
 | `/wait done [w1]` | close one wait, or all of them |
-| `/wait note <text>` | replace your sentence |
+| `/wait note <text>` | replace your sentence (on a session with waits or pinned) |
 
 The text after a standalone `--` is the prompt sent into the session when the
 wait fires. `/wait` answers in the area above the composer, under the
@@ -75,7 +75,7 @@ one.
 | Time | the clock | the time comes |
 | GitHub PR | `gh`, every 3 minutes | the PR reaches the state you picked |
 | Babysit | `gh`, every 3 minutes | each step of the chain is done (below) |
-| GitHub release | `gh api …/releases/latest`, hourly | the latest tag changes |
+| GitHub release | `gh api …/releases/latest`, hourly | the latest tag changes; a repo with no release yet keeps waiting |
 | Command check | the command, every 15 minutes, without a shell | it exits 0 |
 | Something else | nothing | you mark it done |
 | When I have time | nothing | never; it's a list |
@@ -94,25 +94,28 @@ review, merge or close from someone other than you, and on a push when the PR
 isn't yours. Failed checks, conflicts and a PR closed without merging bring
 the wait back to you at once.
 
-A fulfilled `ready` or `review` holds for one push. A new push, a conflict or
-a branch behind its base takes it back: the wait is watched again, the
-history says why (`PR#42 no longer ready: new head 1a2b3c4`), and in a chain
-the next step waits for it again.
+A fulfilled `ready` holds for one push. A new push, a conflict or a branch
+behind its base takes it back; a fulfilled `review` is taken back only by a
+new push. The wait is watched again, the history says why
+(`PR#42 no longer ready: new head 1a2b3c4`), and in a chain the next step
+waits for it again, counting its time from when the chain gets back to it.
+A fulfilled one on a PR closed without merging comes back to you.
 
 The review bots are Greptile, Macroscope, CodeRabbit, Codex, Copilot, Gemini,
 Cursor Bugbot, Sourcery and roboomp. Copilot, Codex and Gemini review a PR once
 and skip later pushes, so when only they have reviewed it, `ready` goes ahead
-15 minutes after a push none of them reviews. A bot that reviews every push
-and reviewed this PR before is waited for on the new push; after an hour
-without its review, the wait tells you once. A bot check that runs for over an
-hour is reported once.
+15 minutes after the poller first saw a push none of them reviews. A bot that
+reviews every push and reviewed this PR before is waited for on the new push;
+after an hour without its review, the wait tells you once. A bot check that
+runs for over an hour is reported once.
 
 **Babysit** is a chain of waits: a bot review on the latest push, then a
 prompt that asks the agent to fix the real findings and answer the rest, then
 a code check that something happened (a new push, or every thread answered),
 then `ready`, then `merged`. It never merges. Babysitting a PR again replaces
-the session's earlier chain on it; a wait of its own on that PR, such as one for
-its release, stays.
+the session's earlier chain on it, and steps you chained after the old one
+move onto the new one; a wait of its own on that PR, such as one for its
+release, stays.
 
 **Command check from a description.** `/wait check the nightly job passed`
 sends one prompt to the session's agent: write a command that exits 0 exactly
@@ -227,11 +230,11 @@ had queued is cancelled until it fires again.
 | Wait | +1 day |
 |---|---|
 | Time | moves the time to 24 hours from now; the prompt runs then |
-| GitHub PR, release, command check | pauses the checks for 24 hours |
+| GitHub PR, release, command check still waiting | pauses the checks for 24 hours |
 | Something else | reminds you in 24 hours |
-| Job that already ended | brings it back in 24 hours |
+| Anything that already happened: a job that ended, a fulfilled PR or check, a fired chain step | hides it for 24 hours (⏲, On a timer), then brings it back as it was; its prompt doesn't run again |
 | Anything overdue | moves the deadline to 24 hours from now |
-| When I have time, a chain step not started yet | not offered |
+| When I have time, a chain step not started yet, a job still running, a wait whose prompt the agent has | not offered |
 
 **Done** closes the wait. On a session set aside for later it also unpins it.
 

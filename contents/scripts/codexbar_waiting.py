@@ -544,7 +544,8 @@ class Facts:
             "cwd": cwd or None,
             "project": Path(cwd).name or None,
             "recap": recap or None,
-            "recap_at": _iso(datetime.fromtimestamp(seconds).astimezone()) if dated and seconds else None,
+            # history.db's seconds; one out of range is no time, not a failed view.
+            "recap_at": _from_ms(seconds * 1000) if dated else None,
             # omp's recap of an earlier exchange: the session has had turns since it was written.
             "recap_stale": bool(recap) and row.get("recapStale") is True,
             "live": live is not None,
@@ -1094,6 +1095,7 @@ def _new_wait(state: dict, now: datetime, **fields: object) -> dict:
         "refire_at": None, "errors": 0, "memo": {}, "snapshot": None,
         "verify_pending": False, "verify_claim_until": None, "verify_memo": {},
         "event_flag": False, "armed_at": None, "fired_text": None, "fired_at": None,
+        "snoozed_from": None,
     }
     wait.update(fields)
     return wait
@@ -1101,20 +1103,30 @@ def _new_wait(state: dict, now: datetime, **fields: object) -> dict:
 
 def _arm(wait: dict, now: datetime) -> None:
     """Start watching: times given relative to the start become absolute here,
-    so a step in a chain counts from when the chain reaches it."""
+    so a step in a chain counts from when the chain reaches it. The relative
+    ones stay, for when the chain reaches it again (`_disarm`)."""
     condition = wait["condition"]
-    in_s = condition.pop("in_s", None)
-    if in_s is not None:
-        condition["at"] = _iso(now + timedelta(seconds=in_s))
-    clock = condition.pop("clock", None)
-    if clock is not None:
-        condition["at"] = _next_clock(clock, now)
+    if condition.get("in_s") is not None:
+        condition["at"] = _iso(now + timedelta(seconds=condition["in_s"]))
+    if condition.get("clock") is not None:
+        condition["at"] = _next_clock(condition["clock"], now)
     if wait["deadline_in_s"] is not None:
         wait["deadline"] = _iso(now + timedelta(seconds=wait["deadline_in_s"]))
-        wait["deadline_in_s"] = None
     if wait["kind"] in ("command", "pr"):
         wait["next_check_at"] = _iso(now)
     wait.update(state="waiting", armed_at=_iso(now))
+    _touch(wait)
+
+
+def _disarm(wait: dict) -> None:
+    """Back to a chain step not reached yet: the times `_arm` counted from that
+    moment are counted again when the chain reaches it."""
+    condition = wait["condition"]
+    if condition.get("in_s") is not None or condition.get("clock") is not None:
+        condition["at"] = None
+    if wait["deadline_in_s"] is not None:
+        wait["deadline"] = None
+    wait.update(state="pending", next_check_at=None, armed_at=None)
     _touch(wait)
 
 
@@ -1154,9 +1166,10 @@ def _complete(state: dict, record: dict, wait: dict, now: datetime) -> None:
     _settle(state, record, now)
 
 
-def _finish(record: dict, wait: dict, now: datetime) -> None:
+def _finish(record: dict, wait: dict, now: datetime, activate: bool = True) -> None:
     """Close one wait without settling the record: callers that keep another
-    wait open need no `state`."""
+    wait open need no `state`. `activate=False` closes it without moving its
+    chain on."""
     started = wait["state"] != "pending"
     wait["state"] = "done"
     wait.update(on_me=False, overdue=False, reason=None, verify_pending=False)
@@ -1164,7 +1177,7 @@ def _finish(record: dict, wait: dict, now: datetime) -> None:
     _cancel_prompts(record, wait)
     # A pending step that ends early only drops out: the step before it still
     # decides when the chain moves on.
-    if started:
+    if started and activate:
         _activate_next(record, wait, now)
 
 
@@ -1290,19 +1303,14 @@ def _delivery_pass(state: dict, agents: Agents, now: datetime) -> None:
             wait = _wait_in(record, entry["wait"])
             if wait is not None:
                 _attention(state, record, wait, now, "session closed before the prompt's turn ended")
-        reason = None
-        if not live:
-            reason = REASON_CLOSED
-        elif not _extension_fresh(state, session, now):
-            reason = REASON_NO_EXTENSION
+        if live and _extension_fresh(state, session, now):
+            _clear_delivery_flags(record)
+            continue
+        reason = REASON_NO_EXTENSION if live else REASON_CLOSED
         for entry in list(record["prompt_queue"]):
             wait = _wait_in(record, entry["wait"])
-            if wait is None:
-                continue
-            if reason:
+            if wait is not None:
                 _flag_on_me(state, record, wait, now, reason)
-            elif wait["reason"] in (REASON_CLOSED, REASON_NO_EXTENSION):
-                wait.update(on_me=False, reason=None)
 
 
 # Conditions ------------------------------------------------------------------
@@ -1383,10 +1391,22 @@ def _predicate(predicate: str, code: int, stdout: str) -> tuple[bool, str]:
     except ValueError:
         return False, "command printed no JSON"
     found, actual = _json_path(data, path)
-    expected = json.loads(value)
-    # Python's 1 == True is not JSON's.
-    same_type = isinstance(actual, bool) == isinstance(expected, bool)
-    return found and same_type and actual == expected, ""
+    return found and _json_equal(actual, json.loads(value)), ""
+
+
+def _json_equal(actual: object, expected: object) -> bool:
+    """JSON's equality at every depth: Python's 1 == True is not JSON's."""
+    if isinstance(actual, bool) or isinstance(expected, bool):
+        return type(actual) is type(expected) and actual == expected
+    if isinstance(expected, dict):
+        return isinstance(actual, dict) and actual.keys() == expected.keys() and all(
+            _json_equal(actual[key], item) for key, item in expected.items()
+        )
+    if isinstance(expected, list):
+        return isinstance(actual, list) and len(actual) == len(expected) and all(
+            map(_json_equal, actual, expected)
+        )
+    return not isinstance(actual, (dict, list)) and actual == expected
 
 
 def _run_command(condition: dict) -> dict:
@@ -1397,6 +1417,9 @@ def _run_command(condition: dict) -> dict:
     if code is None:
         return {"holds": False, "error": detail}
     if condition["predicate"] == "changed":
+        if condition.get("repo") and code != 0 and detail.endswith("(HTTP 404)"):
+            # A repo without a release yet: nothing to compare, not a failure.
+            return {"holds": False, "output": "", "error": ""}
         # The baseline lives on the wait; _apply_command compares against it.
         error = "" if code == 0 else f"exit {code}"
         return {
@@ -1418,16 +1441,13 @@ def _run_verify(job: dict) -> dict:
         return {"ok": result["holds"], "reason": reason, "transient": False}
     github = _github()
     if verify["type"] == "pr_fix":
-        # verify_fix reports a gh failure as a plain "no"; reading first tells
-        # a fix that failed from a check that couldn't run.
         try:
-            github.snapshot(verify["repo"], verify["number"])
-        except Exception as error:
+            ok, reason = github.verify_fix(verify["repo"], verify["number"], job["snapshot"])
+        except Exception as error:  # a check that couldn't run, not a failed fix
             return {
                 "ok": False, "reason": str(error),
                 "transient": getattr(error, "transient", True),
             }
-        ok, reason = github.verify_fix(verify["repo"], verify["number"], job["snapshot"])
         return {"ok": ok, "reason": reason, "transient": False}
     polled = github.poll(verify, job["memo"])
     memo = polled.get("memo", job["memo"])
@@ -1485,23 +1505,18 @@ def _verify_job(wait: dict, now: datetime) -> dict:
     }
 
 
-def _claim_verifies(record: dict, now: datetime) -> list[dict]:
-    return [
-        _verify_job(wait, now) for wait in record["waits"]
-        if wait["state"] == "acting" and wait["verify_pending"]
-        and (_stamp(wait["verify_claim_until"]) or 0) <= now.timestamp()
-    ]
-
-
 def _claim_checks(state: dict, now: datetime) -> list[dict]:
     """Take the due checks out of the next tick's way before running them."""
     jobs = []
     stamp = now.timestamp()
     for record in _records(state):
-        jobs.extend(_claim_verifies(record, now))
         for wait in record["waits"]:
             if len(jobs) >= MAX_CHECKS_PER_TICK:
                 return jobs
+            if wait["state"] == "acting" and wait["verify_pending"]:
+                if (_stamp(wait["verify_claim_until"]) or 0) <= stamp:
+                    jobs.append(_verify_job(wait, now))
+                continue
             recheck = _revocable(wait)
             if not recheck and (wait["state"] != "waiting" or wait["kind"] not in ("command", "pr")):
                 continue
@@ -1533,13 +1548,16 @@ def _apply_command(state: dict, record: dict, wait: dict, result: dict, now: dat
     condition = wait["condition"]
     if condition["predicate"] == "changed":
         baseline, output = condition.get("baseline"), result["output"]
+        # A release check sees "" while the repo has none; that never fires it.
+        release = bool(condition.get("repo"))
         if baseline is None:
             condition["baseline"] = output
-            _log(record, now, wait, f"Baseline: {output or '(empty)'}")
-        elif output != baseline:
+            _log(record, now, wait, f"Baseline: {output or ('no release yet' if release else '(empty)')}")
+        elif output != baseline and (output or not release):
             _fire(
-                state, record, wait, now, f"{baseline} → {output}",
-                fired=f"{output} released" if condition.get("repo") else None,
+                state, record, wait, now,
+                f"{baseline or ('no release' if release else '(empty)')} → {output}",
+                fired=f"{output} released" if release else None,
             )
         return
     if result["holds"]:
@@ -1551,8 +1569,11 @@ def _apply_command(state: dict, record: dict, wait: dict, result: dict, now: dat
 
 
 def _merge_fires(wait: dict) -> bool:
-    return wait["condition"]["until"] == "merged" and wait["state"] in (
-        "pending", "waiting", "needs_attention",
+    """A merge fires a `merged` wait that hasn't fired: one back on me after
+    its prompt ran stays there, and a snoozed one stays snoozed."""
+    return wait["condition"]["until"] == "merged" and (
+        wait["state"] in ("pending", "waiting")
+        or wait["state"] == "needs_attention" and not wait.get("fired_at")
     )
 
 
@@ -1566,38 +1587,49 @@ def _revocable(wait: dict) -> bool:
 
 
 def _apply_recheck(state: dict, record: dict, wait: dict, result: dict, now: datetime) -> None:
-    """Take a fired wait back when the PR moved under it: a new head, or a branch
-    that can't merge. Its events are left to the poll that runs next."""
+    """Take a fired wait back when the PR moved under it: a new head, or, for
+    `ready`, a branch that can't merge. A review stays true of its head however
+    the base moves. A PR closed without merging brings the wait back to me.
+    Other events are left to the poll that runs next."""
     wait["next_check_at"] = _iso(now + timedelta(seconds=result.get("next_poll_s") or PR_POLL_S))
     if result.get("merged"):
         _pr_merged(state, wait["condition"], now)
+        return
+    closed = next((
+        event for event in result.get("events") or []
+        if str(event.get("key", "")).startswith("closed:")
+    ), None)
+    if closed is not None:
+        _attention(state, record, wait, now, closed["text"])
         return
     if result.get("error") or not result.get("head"):
         return
     head, merge_state = result["head"], result.get("merge_state")
     base = result.get("base") or "its base"
+    ready = wait["condition"]["until"] == "ready"
     if head != wait["fired_head"]:
         why = f"new head {head[:7]}"
-    elif merge_state == "DIRTY":
+    elif ready and merge_state == "DIRTY":
         why = f"conflicts with {base}"
-    elif merge_state == "BEHIND":
+    elif ready and merge_state == "BEHIND":
         why = f"behind {base}"
     else:
         return
     number = wait["condition"]["number"]
-    what = "ready" if wait["condition"]["until"] == "ready" else "reviewed"
-    line = f"PR#{number} no longer {what}: {why}"
+    line = f"PR#{number} no longer {'ready' if ready else 'reviewed'}: {why}"
     wait.update(
         state="waiting", fired_text=None, fired_at=None, fired_head=None,
         on_me=False, reason=None, next_check_at=_iso(now),
     )
     _touch(wait)
     _log(record, now, wait, line)
-    # The chain's next step waits for this one again.
+    # The chain's next step waits for this one again, its times counted anew.
     following = _wait_in(record, wait["next"]) if wait["next"] else None
-    if following is not None and following["state"] == "waiting" and not following["on_me"]:
-        following.update(state="pending", next_check_at=None)
-        _touch(following)
+    if (
+        following is not None and following["state"] == "waiting"
+        and not following["on_me"] and not following["overdue"]
+    ):
+        _disarm(following)
     _toast(state, record, wait, now, "info", line)
 
 
@@ -1628,12 +1660,13 @@ def _pr_merged(state: dict, pr: dict, now: datetime) -> None:
         _complete(state, record, wait, now)
 
 
-def _merged_prs(cache: PrCache, view: dict) -> list[dict]:
+def _merged_prs(cache: PrCache, state: dict) -> list[dict]:
     """The open PR waits a merge has yet to settle, by GitHub's last word. Nothing
-    polls a PR while its chain's step runs a prompt or waits for me."""
+    polls a PR while its chain's step runs a prompt or waits for me. `state` may
+    be read without the lock: `_pr_merged` decides again under it."""
     return [
         wait["condition"]
-        for target in (*view["sessions"], *view["panes"]) for wait in target["waits"]
+        for record in _records(state) for wait in _open_waits(record)
         if wait["kind"] == "pr" and (_merge_fires(wait) or _merge_ends(wait))
         and cache.statuses.get(_pr_key(wait["condition"]), {}).get("state") == "merged"
     ]
@@ -1732,6 +1765,7 @@ def _finish_job(state: dict, record: dict, wait: dict, status: int | None, now: 
         })
         if not wait["prompt"]:
             _log(record, now, wait, f"{wait['label']}: finished", "fired")
+            record["unseen"] = True
             _toast(state, record, wait, now, "success", f"{wait['label']}: finished")
             _complete(state, record, wait, now)
             return
@@ -1793,19 +1827,35 @@ def _timer_text(wait: dict) -> str:
     return f"{_compact(seconds) if seconds % 60 else _interval_text(seconds)} passed"
 
 
+def _unsnooze(state: dict, record: dict, wait: dict, now: datetime) -> None:
+    """A snoozed wait whose event had happened comes back as it was. One whose
+    prompt the snooze cancelled before the agent got it fires again."""
+    back = wait["snoozed_from"]
+    wait.update(state=back, snoozed_from=None, refire_at=None)
+    if back == "needs_attention":
+        _attention(state, record, wait, now, wait["reason"])
+    elif back == "review":
+        wait["reason"] = REASON_REVIEW
+        _touch(wait)
+        _log(record, now, wait, f"{wait['label']}: {REASON_REVIEW}", "fired")
+        record["unseen"] = True
+        _toast(state, record, wait, now, "info", f"{wait['label']}: {REASON_REVIEW}")
+    else:
+        _fire(state, record, wait, now, fired=wait.get("fired_text"))
+
+
 def _evaluate(state: dict, now: datetime) -> None:
     """Everything that needs only the clock."""
     stamp = now.timestamp()
     for record in _records(state):
         for wait in list(record["waits"]):
+            if wait["state"] == "snoozed" and _stamp(wait["refire_at"]) <= stamp:
+                _unsnooze(state, record, wait, now)
             if wait["state"] != "waiting":
                 continue
             condition = wait["condition"]
-            refire = _stamp(wait["refire_at"])
             if wait["kind"] == "time" and _stamp(condition["at"]) <= stamp:
                 _fire(state, record, wait, now, fired=_timer_text(wait))
-            elif refire is not None and refire <= stamp:
-                _fire(state, record, wait, now, fired=wait.get("fired_text"))
             else:
                 deadline = _stamp(wait["deadline"])
                 if deadline is not None and deadline <= stamp and not wait["overdue"]:
@@ -1823,9 +1873,13 @@ def _next_tick_s(state: dict, now: datetime) -> int:
         for wait in record["waits"]:
             if wait["state"] == "acting" and wait["verify_pending"]:
                 times.append(_stamp(wait["verify_claim_until"]) or stamp)
+            if wait["state"] == "snoozed":
+                times.append(_stamp(wait["refire_at"]))
+            if _revocable(wait):
+                times.append(_stamp(wait["next_check_at"]))
             if wait["state"] != "waiting":
                 continue
-            times.extend((_stamp(wait["next_check_at"]), _stamp(wait["refire_at"])))
+            times.append(_stamp(wait["next_check_at"]))
             if not wait["overdue"]:
                 times.append(_stamp(wait["deadline"]))
             if wait["kind"] == "time":
@@ -1861,6 +1915,9 @@ def _wait_ball(wait: dict) -> str:
         return "on_me"
     if wait["state"] == "acting":
         return "on_machine"
+    # Nothing watches a snoozed wait: only time brings it back.
+    if wait["state"] == "snoozed":
+        return "on_timer"
     return {
         "something": "on_someone", "later": "on_my_time", "time": "on_timer",
     }.get(wait["kind"], "on_machine")
@@ -1982,7 +2039,8 @@ def _outcome_headline(views: list[dict]) -> tuple[str | None, str | None]:
 def _wait_mark(view: dict) -> str:
     if view["outcome"] is None and view["state"] == "acting":
         return WORKING_MARK
-    return OUTCOME_MARKS.get(view["outcome"]) or ("⏲ " if view["kind"] == "time" else "⏳ ")
+    waits_for_time = view["kind"] == "time" or view["state"] == "snoozed"
+    return OUTCOME_MARKS.get(view["outcome"]) or ("⏲ " if waits_for_time else "⏳ ")
 
 
 def _tracks(views: list[dict]) -> list[list[dict]]:
@@ -2148,29 +2206,42 @@ def _extension_panes(state: dict, agents: Agents, now: datetime) -> dict:
     return panes
 
 
+def _target_view(record: dict | None, now: datetime) -> dict:
+    """What a session row and a pane row both say about the target's waits."""
+    views = [_wait_view(wait, now) for wait in _open_waits(record)] if record else []
+    outcome, headline = _outcome_headline(views)
+    dues = [view["due_at"] for view in _active(views) if view["due_at"]]
+    return {
+        "ball": min((view["ball"] for view in _active(views)), key=BALL_RANK.get) if views else None,
+        "outcome": outcome, "headline": headline,
+        "threads": _track_texts(views), "still_waiting": _still_waiting(views),
+        "waiting_for": _waiting_for(views),
+        "due_at": min(dues, key=_stamp) if dues else None,
+        "waits": views, "history": _history_view(record),
+    }
+
+
 def _session_view(
     session: str, record: dict | None, facts: Facts, pinned: bool,
     schedules: list[dict], state: dict, now: datetime, prs: PrCache,
 ) -> dict:
     info = facts.describe(session)
-    views = [_wait_view(wait, now) for wait in _open_waits(record)] if record else []
+    target = _target_view(record, now)
+    views = target["waits"]
     live = facts.agents.live.get(session) or {}
     agent_state = live.get("state")
     note = record["note"] if record else None
-    if views:
-        ball = min((view["ball"] for view in _active(views)), key=BALL_RANK.get)
-    else:
+    if not views:
         # Listed only for its /schedule jobs: those run on their own.
-        ball = "on_my_time" if pinned else "on_timer" if schedules else "on_machine"
+        target["ball"] = "on_my_time" if pinned else "on_timer" if schedules else "on_machine"
     status, line, composer_row = _status_lines(
         views, note, pinned, _schedule_text(schedules, now), now,
     )
-    outcome, headline = _outcome_headline(views)
-    dues = [view["due_at"] for view in _active(views) if view["due_at"]]
     pane = info["pane"]
     if pane is None:
         pane = _reported_pane(state, facts.agents, session, now)
     return {
+        **target,
         "session_id": session, "title": info["title"], "cwd": info["cwd"],
         "project": info["project"], "live": info["live"], "pane": pane,
         "tern_session": _text(live.get("ternSession")) or None,
@@ -2181,36 +2252,25 @@ def _session_view(
         "suggested_note": record["suggested_note"] if record else None,
         "size": record["size"] if record else None,
         "set_aside_at": record["set_aside_at"] if record else None,
-        "pinned": pinned, "ball": ball, "unseen": bool(record and record["unseen"]),
-        "outcome": outcome, "headline": headline,
+        "pinned": pinned, "unseen": bool(record and record["unseen"]),
         "status": status, "line": line, "composer_row": composer_row,
         "next_step": _next_step(views),
-        "threads": _track_texts(views), "still_waiting": _still_waiting(views),
-        "waiting_for": _waiting_for(views),
         "recap": info["recap"], "recap_at": info["recap_at"], "recap_stale": info["recap_stale"],
-        "due_at": min(dues, key=_stamp) if dues else None,
         "prompts_queued": _prompts_queued(record, now),
-        "waits": views, "schedules": schedules, "history": _history_view(record),
+        "schedules": schedules,
         "prs": prs.session_prs(session, facts.omp.transcript(session), record),
     }
 
 
 def _pane_view(record: dict, now: datetime) -> dict:
-    views = [_wait_view(wait, now) for wait in _open_waits(record)]
-    status, line, _ = _status_lines(views, record["note"], False, "", now)
-    outcome, headline = _outcome_headline(views)
-    dues = [view["due_at"] for view in _active(views) if view["due_at"]]
+    target = _target_view(record, now)
+    status, line, _ = _status_lines(target["waits"], record["note"], False, "", now)
     return {
+        **target,
         "pane": record["pane"],
-        "label": _primary(views)["label"] if views else None,
+        "label": _primary(target["waits"])["label"],
         "note": record["note"],
-        "ball": min((view["ball"] for view in _active(views)), key=BALL_RANK.get),
-        "outcome": outcome, "headline": headline,
-        "status": status, "line": line, "waits": views, "threads": _track_texts(views),
-        "still_waiting": _still_waiting(views),
-        "waiting_for": _waiting_for(views),
-        "history": _history_view(record),
-        "due_at": min(dues, key=_stamp) if dues else None,
+        "status": status, "line": line,
         "set_aside_at": record["set_aside_at"],
     }
 
@@ -2604,23 +2664,24 @@ def cmd_add(args: argparse.Namespace) -> dict:
     return _mutate(apply, agents=agents, omp=facts.omp)
 
 
-def _drop_old_chain(record: dict, repo: str, number: int, now: datetime) -> None:
+def _drop_old_chain(record: dict, repo: str, number: int, now: datetime) -> list[dict]:
     """A new babysit of a PR replaces the session's earlier one: its open steps
     close at once, none of them arming the next. Only chain steps (linked by
     `next`) go; a wait of its own on that PR, such as one for its release with a
-    prompt to send then, stays."""
+    prompt to send then, stays. Returns the steps chained after the old chain
+    that it never reached (`--after`), for the new chain to carry on to."""
     key = _pr_key({"repo": repo, "number": number})
     linked = {wait["next"] for wait in record["waits"] if wait["next"]}
-    for wait in _open_waits(record):
-        if (
-            wait["kind"] == "pr" and _pr_key(wait["condition"]) == key
-            and (wait["next"] or wait["id"] in linked)
-        ):
-            _log(record, now, wait, f"Replaced by a new babysit: {wait['label']}")
-            wait["state"] = "done"
-            wait.update(on_me=False, overdue=False, reason=None, verify_pending=False)
-            _touch(wait)
-            _cancel_prompts(record, wait)
+    dropped = [
+        wait for wait in _open_waits(record)
+        if wait["kind"] == "pr" and _pr_key(wait["condition"]) == key
+        and (wait["next"] or wait["id"] in linked)
+    ]
+    for wait in dropped:
+        _log(record, now, wait, f"Replaced by a new babysit: {wait['label']}")
+        _finish(record, wait, now, activate=False)
+    following = (_wait_in(record, wait["next"]) for wait in dropped if wait["next"])
+    return [wait for wait in following if wait is not None and wait["state"] == "pending"]
 
 
 def cmd_babysit_pr(args: argparse.Namespace) -> dict:
@@ -2632,7 +2693,7 @@ def cmd_babysit_pr(args: argparse.Namespace) -> dict:
     def apply(state: dict, now: datetime) -> dict:
         record = _ensure(state, args.session, None)
         _begin(record, omp, now)
-        _drop_old_chain(record, repo, number, now)
+        orphans = _drop_old_chain(record, repo, number, now)
         steps = ["review_on_head", "ready", "merged"]
         if args.released:
             steps.append("released")
@@ -2652,6 +2713,12 @@ def cmd_babysit_pr(args: argparse.Namespace) -> dict:
                 verify={"type": "pr_fix", "repo": repo, "number": number},
             )
         record["waits"].extend(waits)
+        tail = waits[-1]
+        for orphan in orphans:
+            tail["next"] = orphan["id"]
+            tail = orphan
+            while tail["next"] and _wait_in(record, tail["next"]) is not None:
+                tail = _wait_in(record, tail["next"])
         _arm(waits[0], now)
         _apply_note(record, args.note, args.by)
         _add_pr(record, repo, number)
@@ -2673,6 +2740,10 @@ def cmd_note(args: argparse.Namespace) -> dict:
 
     def apply(state: dict, now: datetime) -> dict:
         record = _lookup(state, session, pane)
+        # Only a set-aside target, or a pinned session in the inventory, shows
+        # its sentence; one anywhere else would sit unseen.
+        if not (record and _open_waits(record)) and not (session and session in omp.pins()):
+            raise BadInput("nothing is set aside here: add a wait first")
         if args.accept_suggested:
             if not record or not record["suggested_note"]:
                 raise BadInput("no suggested note")
@@ -2746,7 +2817,33 @@ def cmd_done(args: argparse.Namespace) -> dict:
     return _mutate(apply, omp=omp)
 
 
+def _prompt_handed_over(record: dict, wait: dict) -> bool:
+    """The agent has the wait's prompt, or ran it and its check is queued."""
+    return wait["verify_pending"] or any(
+        entry["wait"] == wait["id"] and entry["state"] != "queued"
+        for entry in record["prompt_queue"]
+    )
+
+
+def _snooze_hides(wait: dict) -> bool:
+    """Whether +1 day only hides the wait until then. Its event already
+    happened: watching for it again would wait for it twice, run a prompt that
+    ran again, or arm the chain's next step a second time. A Time wait is the
+    exception: it waits for the new time and its prompt runs then, unless it
+    already moved its chain on."""
+    if wait["kind"] == "time":
+        return wait["state"] == "fired" and bool(wait["next"])
+    if wait["kind"] == "job" or wait["state"] in ("fired", "review"):
+        return True
+    # A check that failed comes back to its checks; a prompt that went wrong
+    # comes back to me.
+    return wait["state"] == "needs_attention" and bool(wait.get("fired_at"))
+
+
 def cmd_snooze(args: argparse.Namespace) -> dict:
+    """+1 day: the wait comes off me until `--for` from now. A waiting one is
+    watched again from then; one whose event happened is hidden until then and
+    comes back as it was (`_unsnooze`)."""
     session, pane = _target(args)
     delay = timedelta(seconds=_parse_duration(args.for_))
 
@@ -2755,25 +2852,40 @@ def cmd_snooze(args: argparse.Namespace) -> dict:
         wait = _target_wait(record, args.wait)
         if wait["state"] == "pending":
             raise BadInput(f"{args.wait} has not started yet")
+        if wait["kind"] == "later":
+            raise BadInput(f"{args.wait} waits for my time: nothing brings it back")
+        if wait["kind"] == "job" and wait["state"] == "waiting" and not wait["overdue"]:
+            raise BadInput(f"{args.wait} is a job that still runs: it comes back when it ends")
+        if wait["kind"] != "time" and _prompt_handed_over(record, wait):
+            raise BadInput(f"{args.wait}: the agent runs its prompt now")
         until = _iso(now + delay)
         condition = wait["condition"]
-        if wait["overdue"]:
-            wait.update(deadline=until, overdue=False)
-        elif wait["kind"] == "time":
-            condition["at"] = until
-            wait["armed_at"] = _iso(now)
-        elif wait["kind"] == "something":
-            # A deadline is the only time it has, so a snooze sets one.
-            wait["deadline"] = until
-        elif wait["kind"] in ("command", "pr"):
-            wait["next_check_at"] = until
-        elif wait["kind"] == "job" and wait["state"] != "waiting":
-            # Nothing would bring it back: its event already happened.
+        if wait["state"] == "snoozed":
             wait["refire_at"] = until
+        elif wait["overdue"] and wait["state"] == "waiting":
+            wait.update(deadline=until, deadline_in_s=None, overdue=False, on_me=False, reason=None)
+        elif _snooze_hides(wait):
+            # Its reason stays for when it comes back; a deadline that passed
+            # moves below.
+            wait.update(
+                snoozed_from=wait["state"], state="snoozed", refire_at=until,
+                on_me=False, overdue=False, verify_pending=False,
+            )
+        else:
+            if wait["kind"] == "time":
+                condition["at"] = until
+                wait["armed_at"] = _iso(now)
+            elif wait["kind"] == "something":
+                # A deadline is the only time it has, so a snooze sets one.
+                wait.update(deadline=until, deadline_in_s=None)
+            else:
+                wait["next_check_at"] = until
+            wait.update(
+                state="waiting", on_me=False, overdue=False, reason=None, errors=0, verify_pending=False,
+            )
         if (_stamp(wait["deadline"]) or math.inf) <= now.timestamp():
-            wait["deadline"] = until
+            wait.update(deadline=until, deadline_in_s=None)
         _cancel_prompts(record, wait)
-        wait.update(state="waiting", on_me=False, reason=None, errors=0, verify_pending=False)
         _touch(wait)
         _log(record, now, wait, f"Snoozed until {_clock(_parse_time(until), now)}")
         return {}
@@ -2915,13 +3027,15 @@ def cmd_claim_prompts(args: argparse.Namespace) -> dict:
         if head is None:
             return {"prompts": []}
         resend_check = head["state"] == "sending"
+        # A resend check looks only at messages since the earlier claim.
+        claimed_at = head["claimed_at"] if resend_check else None
         head.update(state="sending", claimed_at=_iso(now))
         wait = _wait_in(record, head["wait"])
         if wait is not None:
             wait.update(on_me=False, reason=None)
         return {"prompts": [{
             "action": head["action"], "wait": head["wait"], "text": head["text"],
-            "resend_check": resend_check,
+            "resend_check": resend_check, "claimed_at": claimed_at,
         }]}
 
     return _mutate(apply)
@@ -2973,7 +3087,10 @@ def cmd_ack(args: argparse.Namespace) -> dict:
 
 
 def cmd_tick(args: argparse.Namespace) -> dict:
-    now = _parse_time(args.now) if args.now else _now()
+    def moment() -> datetime:
+        return _parse_time(args.now) if args.now else _now()
+
+    now = moment()
     agents = _read_agents()
     omp = Omp()
 
@@ -2994,8 +3111,10 @@ def cmd_tick(args: argparse.Namespace) -> dict:
         answer = None if jobs else finish(state, agents)
     if jobs:
         finished = _run_jobs(jobs, now)
-        # The slow checks may have taken a minute: a session can have come back.
+        # The slow checks may have taken minutes: a session can have come back,
+        # and what they found is counted from now (`finish` reads the new `now`).
         agents = _read_agents()
+        now = moment()
         with _transaction() as state:
             _merge(state, finished, now)
             _delivery_pass(state, agents, now)
@@ -3007,7 +3126,8 @@ def cmd_tick(args: argparse.Namespace) -> dict:
     if stale:
         _refresh_prs(stale, now)
         cache = PrCache()
-    merged = _merged_prs(cache, answer["view"])
+        now = moment()
+    merged = _merged_prs(cache, _load_state())
     if stale or merged:
         with _transaction() as state:
             for pr in merged:
@@ -3018,7 +3138,9 @@ def cmd_tick(args: argparse.Namespace) -> dict:
 
 def cmd_resume(args: argparse.Namespace) -> dict:
     facts = Facts(_read_agents())
-    if args.session in facts.agents.live:
+    if not facts.agents.known:
+        raise BadInput("agents.json is unreadable: can't tell whether the session runs")
+    if _running(_load_state(), facts.agents, args.session):
         # A session file has one live writer.
         raise BadInput("session is running")
     facts.prefetch([args.session])
