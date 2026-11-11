@@ -367,14 +367,17 @@ local store = {
 	waiting = nil :: any, -- the CLI's last view
 	waitingError = nil :: string?,
 	waitingActions = nil :: any, -- the outbox as last published
-	waitingAcking = {} :: { [string]: boolean },
+	waitingAcking = {} :: { [string]: number }, -- action id -> no ack of it before then (math.huge: sent)
 	waitingRaw = "", -- waiting.json as our last tick left it
 	waitingSig = "",
 	waitingActionsSig = "",
 	waitingAgents = "",
 	waitingTicking = false,
 	waitingAgain = false,
+	waitingRecheck = false, -- the next tick runs for another writer's change
 	waitingAt = 0, -- when the next timed tick is due
+	jobEventAt = {} :: { [number]: number }, -- pane -> when its last job event went to the CLI
+	waitingMemo = nil :: any, -- waitingGroups' last answer, for one view and filter
 	lastPoke = nil :: any,
 	menuRetryAt = nil :: number?, -- when a failed `menu` load runs again
 	loadMenu = nil :: (() -> ())?,
@@ -680,7 +683,7 @@ local function windowRow(key: string, label: string, w: any, now: number, stale:
 			-- Claude reports an unused window as 0% without a reset: the next
 			-- window opens on the first message.
 			local minutes = tonumber(val(w.windowMinutes)) or 0
-			if pct == 0 and minutes > 0 and not epoch(w.resetsAt) and str(w.resetDescription) == "" then
+			if tonumber(val(w.usedPercent)) == 0 and minutes > 0 and not epoch(w.resetsAt) and str(w.resetDescription) == "" then
 				local length = if minutes == 300 then "5h" elseif minutes == 1440 then "1d"
 					elseif minutes == 10080 then "7d" else span(minutes * 60)
 				reset = "not started · resets " .. length .. " after first use"
@@ -1279,6 +1282,15 @@ end
 
 local function publishActions(actions: any)
 	store.waitingActions = actions
+	local listed: { [string]: boolean } = {}
+	for _, a in actions do
+		listed[str(a.id)] = true
+	end
+	for id in store.waitingAcking do
+		if not listed[id] then
+			store.waitingAcking[id] = nil
+		end
+	end
 	local sig = tern.json.encode(actions)
 	if sig ~= store.waitingActionsSig then
 		store.waitingActionsSig = sig
@@ -1298,7 +1310,8 @@ local function waitingTick()
 		store.waitingTicking = false
 		local okj, data = pcall(tern.json.decode, res.stdout)
 		local nextIn = WAITING_RETRY_S
-		if res.status == 0 and okj and type(data) == "table" and type(val(data.view)) == "table" then
+		local ticked = res.status == 0 and okj and type(data) == "table" and type(val(data.view)) == "table"
+		if ticked then
 			applyWaiting(val(data.view))
 			publishActions(if type(val(data.actions)) == "table" then val(data.actions) else tern.json.array())
 			nextIn = tonumber(val(data.next_tick_s)) or nextIn
@@ -1312,6 +1325,28 @@ local function waitingTick()
 			end
 		end
 		store.waitingRaw = readWaiting(WAITING_FILE)
+		-- Another writer (the omp extension, tern-awui) may have written after the
+		-- tick's last transaction: the poll would take that change as seen, and a
+		-- window action it queued would wait for the next timed tick. Its view or
+		-- an action the tick didn't return tells; one recheck, so no tick loop.
+		local recheck = false
+		if ticked and not store.waitingAgain and not store.waitingRecheck then
+			local okv, file = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
+			if okv and type(file) == "table" then
+				file.now = nil
+				recheck = tern.json.encode(file) ~= store.waitingSig
+			end
+			local listed: { [string]: boolean } = {}
+			for _, a in (if type(store.waitingActions) == "table" then store.waitingActions else {}) do
+				listed[str(a.id)] = true
+			end
+			local okr, state = pcall(tern.json.decode, store.waitingRaw)
+			for _, a in (if okr and type(state) == "table" then val(state.actions) else nil) or {} do
+				recheck = recheck or not listed[str(a.id)]
+			end
+			store.waitingAgain = recheck
+		end
+		store.waitingRecheck = recheck
 		store.waitingAt = os.time() + nextIn
 		if store.waitingAgain then
 			waitingTick()
@@ -1350,19 +1385,27 @@ local function waitingRun(cx: BlockCx?, what: string, args: { string }, done: ((
 end
 
 -- A window sees only its own panes; this half alone can tell that a pane
--- action's target is gone from every window.
+-- action's target is gone from every window. The outbox is the last tick's, so
+-- an ack that landed stays marked until a tick drops its action, and a failed
+-- one waits before the next try. An empty listing is no evidence, as while the
+-- daemon starts: those actions wait for a listing, or for the CLI to expire them.
 local function ackGonePanes()
 	local live: { [number]: boolean } = {}
 	for _, p in tern.pane.list() do
 		live[p.pane] = true
 	end
+	if next(live) == nil then
+		return
+	end
 	for _, a in (if type(store.waitingActions) == "table" then store.waitingActions else {}) do
 		local pane = tonumber(val(a.pane))
 		local id = str(a.id)
-		if a.type ~= "toast" and pane and not live[pane] and not store.waitingAcking[id] then
-			store.waitingAcking[id] = true
-			waitingRun(nil, "ack", { "ack", "--action", id, "--result", "done" }, function()
-				store.waitingAcking[id] = nil
+		if a.type ~= "toast" and pane and not live[pane] and os.time() >= (store.waitingAcking[id] or 0) then
+			store.waitingAcking[id] = math.huge
+			waitingRun(nil, "ack", { "ack", "--action", id, "--result", "done" }, function(data)
+				if not data and store.waitingAcking[id] then
+					store.waitingAcking[id] = os.time() + 30
+				end
 			end)
 		end
 	end
@@ -1392,21 +1435,33 @@ local function noteAgents()
 end
 
 -- `pane_exited` reaches only this half, which also runs with no window open.
--- The view file, not the last tick: a job can end right after its `add`, and
--- its one event must not be lost. Most panes watch nothing, so the view decides
--- before a Python process starts.
-local function jobFinished(pane: number, status: number)
-	local okj, view = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
-	if okj and type(view) == "table" and jobPanes(view)[pane] then
+-- A job can end right after its `add`, and its one event must not be lost: when
+-- the last tick's view doesn't watch the pane, the view file decides, but only
+-- if waiting.json changed since that tick. Most panes watch nothing, so this
+-- decides before a Python process starts. A pane ending with its job sends
+-- both events; the CLI took the first.
+local function jobFinished(pane: number, status: number, exited: boolean)
+	local now = os.time()
+	if exited and now - (store.jobEventAt[pane] or -math.huge) <= 2 then
+		return
+	end
+	local watched = type(store.waiting) == "table" and jobPanes(store.waiting)[pane] == true
+	if not watched and (store.waitingTicking or readWaiting(WAITING_FILE) ~= store.waitingRaw) then
+		local okj, view = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
+		watched = okj and type(view) == "table" and jobPanes(view)[pane] == true
+	end
+	if watched then
+		store.jobEventAt[pane] = now
 		waitingRun(nil, "job event", { "event", "--type", "job_finished", "--pane", tostring(pane), "--status", tostring(status) })
 	end
 end
 
 tern.on("command_finished", function(ev: CommandFinishedEvent)
-	jobFinished(ev.pane, ev.status)
+	jobFinished(ev.pane, ev.status, false)
 end)
 tern.on("pane_exited", function(ev: PaneExitedEvent)
-	jobFinished(ev.pane, ev.status)
+	jobFinished(ev.pane, ev.status, true)
+	store.jobEventAt[ev.pane] = nil
 end)
 
 -- Newest measurement in a snapshot, in epoch seconds.
@@ -2287,15 +2342,19 @@ end
 
 -- What the row waits for: each thread's current step from the CLI (`threads`), with
 -- their marks when there are several. A free-text wait has a line of its own
--- (`waiting_for`), so it is left out here.
-local function waitSummary(r: any): string
+-- (`waiting_for`), so it is left out here. `rest` leaves out the first thread,
+-- the one the row's headline already tells, and keeps the others' marks.
+local function waitSummary(r: any, rest: boolean?): string
 	local own = oneLine(r.waiting_for)
 	local threads: { string } = {}
-	for _, t in val(r.threads) or {} do
+	for i, t in val(r.threads) or {} do
 		local text = oneLine(t)
-		if own == "" or string.sub(text, -#own) ~= own then
+		if not (rest and i == 1) and (own == "" or string.sub(text, -#own) ~= own) then
 			table.insert(threads, text)
 		end
+	end
+	if rest then
+		return table.concat(threads, "  ·  ")
 	end
 	if #threads == 1 then
 		return (string.gsub(threads[1], "^[^ ]+ ", "", 1)) -- the row's own mark says the outcome
@@ -2307,8 +2366,12 @@ local function waitSummary(r: any): string
 end
 
 local function waitMatches(r: any, q: string): boolean
+	local words = queryWords(q)
+	if #words == 0 then
+		return true
+	end
 	local fields = { waitTitle(r), oneLine(r.note), oneLine(r.project), waitSummary(r), oneLine(r.waiting_for), oneLine(r.headline) }
-	for _, w in queryWords(q) do
+	for _, w in words do
 		local ok = false
 		for _, text in fields do
 			if matchPositions(text, w, true) then
@@ -2324,8 +2387,13 @@ local function waitMatches(r: any, q: string): boolean
 end
 
 -- The view's order within each group, sessions before panes; a group with a
--- `rank` sorts by outcome first, in that same order within each.
+-- `rank` sorts by outcome first, in that same order within each. A render asks
+-- twice (the selection, the list), so the last answer is kept per view and query.
 local function waitingGroups(q: string): { { ball: any, rows: { any } } }
+	local memo = store.waitingMemo
+	if memo and memo.view == store.waiting and memo.q == q then
+		return memo.out
+	end
 	local out = {}
 	for _, ball in BALLS do
 		local rows = {}
@@ -2349,6 +2417,7 @@ local function waitingGroups(q: string): { { ball: any, rows: { any } } }
 			table.insert(out, { ball = ball, rows = rows })
 		end
 	end
+	store.waitingMemo = { view = store.waiting, q = q, out = out }
 	return out
 end
 
@@ -2688,10 +2757,12 @@ do
 			headline = string.sub(headline, #outcome.prefix + 1)
 		end
 		local time, token = waitingTime(r, now)
+		-- The headline tells the first thread; the others still show beside it.
+		local detail = waitSummary(r, headline ~= "")
 		table.insert(kids, ui.node("item", {
 			key = waitKey(r),
 			label = label,
-			detail = if headline ~= "" then nil else waitSummary(r),
+			detail = if detail ~= "" then detail else nil,
 			value = { ui.span(string.format("%7s", time), token) },
 			icon = if str(r.session_id) ~= "" then AGENT_ICONS.omp else "terminal",
 			tone = if outcome then outcome.tone elseif onMe then "warning" else nil,
@@ -2758,7 +2829,8 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	if live then
 		table.insert(buttons, button("Open", "wait_open", { variant = "primary", keys = { "enter" } }))
 	else
-		table.insert(buttons, button("Resume", "wait_open", { variant = "primary", keys = { "enter" }, busy = b.busy == rowKey }))
+		local busy = b.busy == rowKey or (b.launched[rowKey] ~= nil and os.time() - b.launched[rowKey] < 60)
+		table.insert(buttons, button("Resume", "wait_open", { variant = "primary", keys = { "enter" }, busy = busy }))
 	end
 	table.insert(buttons, button("+1 day", "wait_snooze", {
 		keys = if b.filter == "" then { "+" } else nil,
@@ -2915,7 +2987,8 @@ local function dockView(b: Block, now: number): Node
 		} do
 			table.insert(hints, n)
 		end
-		if b.tab ~= "history" then
+		local row = if b.tab ~= "history" then selected(b) else nil
+		if row and cardPane(row.record, row.waiting == true) then
 			table.insert(hints, key("shift+enter"))
 			table.insert(hints, ui.span("\u{a0}card   ", "dim"))
 		end
@@ -3011,10 +3084,23 @@ local function closeBlock(b: Block)
 end
 
 -- Layout work belongs to the window half; the dashboard's window takes this up
--- like `settingsRequest`, at once through the link, else on its poll.
+-- like `settingsRequest`, at once through the link, else on its poll. A target
+-- gone from every window is said here, where every pane is known; `at` lets a
+-- window that sees the request late drop it.
 local function waitingRequest(b: Block, request: { [string]: any })
+	if request.target then
+		local live = false
+		for _, p in tern.pane.list() do
+			live = live or p.pane == request.target
+		end
+		if not live then
+			b.cx:toast("info", "CodexBar AgentView: that pane has closed")
+			return
+		end
+	end
 	request.pane = b.cx.pane
 	request.seq = tern.now()
+	request.at = os.time()
 	tern.kv.set("waitingRequest", request)
 	b.cx:open("codexbar-agentview://request")
 end
@@ -3022,11 +3108,14 @@ end
 -- Switching to a session closes the dashboard, like picking from a popup.
 -- `tern focus` reaches a pane in any window but refuses a parked one ("in no
 -- tab"): then the window holding it unparks it into a tab of its own, as the
--- Waiting tab's Open does.
+-- Waiting tab's Open does. codexbar_focus.py keeps Tern's message to itself
+-- and answers that refusal with exit 4 (`couldn't focus … host=tern`); any
+-- other failure is reported.
 local function focusRecord(b: Block, r: any)
 	python("codexbar_focus.py", { "--tern", "codexbar-agentview://focus/" .. str(r.sessionId) }, 15000, function(res)
 		local pane = tonumber(val(r.ternPane))
-		if res.status ~= 0 and str(r.host) == "tern" and pane then
+		local refused = res.status == 4 and string.find(res.stderr, "host=tern", 1, true) ~= nil
+		if refused and str(r.host) == "tern" and pane then
 			waitingRequest(b, { op = "open", target = pane })
 			return
 		end
@@ -3134,6 +3223,8 @@ local function waitArgs(verb: string, r: any, extra: { string }?): { string }
 	return args
 end
 
+-- Resume, like History's Launch, holds a minute: until the agents scan lists the
+-- session as live, a second press would start a second writer of its file.
 local function waitingOpen(b: Block, r: any)
 	local pane = tonumber(val(r.pane))
 	if waitLive(r) and pane then
@@ -3141,10 +3232,16 @@ local function waitingOpen(b: Block, r: any)
 	elseif waitLive(r) then -- running outside Tern
 		focusRecord(b, { sessionId = r.session_id })
 	else
-		b.busy = waitKey(r)
+		local key = waitKey(r)
+		if b.busy == key or (b.launched[key] and os.time() - b.launched[key] < 60) then
+			return
+		end
+		b.busy = key
+		b.cx:render()
 		waitingRun(b.cx, "resume", waitArgs("resume", r), function(data)
 			b.busy = nil
 			if data then
+				b.launched[key] = os.time()
 				waitingRequest(b, { op = "launch", command = str(data.command), cwd = str(data.cwd) })
 			end
 			b.cx:render()

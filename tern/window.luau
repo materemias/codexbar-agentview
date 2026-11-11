@@ -485,13 +485,14 @@ local function waitingEntry(pane: number): any
 	return if type(entry) == "table" then entry else nil
 end
 
--- A pane's full record in the view.
-local function waitingRecord(pane: number): any
+-- A pane's full record in the view: a live session's in the pane, else the
+-- pane record's; `paneOnly` asks for the pane record alone.
+local function waitingRecord(pane: number, paneOnly: boolean?): any
 	local view = tern.kv.get("waitingView")
 	if type(view) ~= "table" then
 		return nil
 	end
-	for _, field in { "sessions", "panes" } do
+	for _, field in (if paneOnly then { "panes" } else { "sessions", "panes" }) do
 		for _, r in (if type(view[field]) == "table" then view[field] else {}) do
 			if r.pane == pane and (field == "panes" or r.live == true) then
 				return r
@@ -528,10 +529,18 @@ end
 -- Waiting: the session card --------------------------------------------------------
 
 local ui = tern.ui
-local cardAt: { [number]: number } = {} -- owner pane -> when its card last opened
--- An open card's refresh state by canvas pane: what it last read and when.
-type CardLive = { sig: string, cachedAt: number, fullAt: number, busy: boolean }
+-- Owner panes whose unseen session the card was opened for on focus; cleared once
+-- the host publishes the pane as seen, so the card opens once per firing.
+local seenAsked: { [number]: boolean } = {}
+-- An open card's refresh state by canvas pane: what it last read and when, and
+-- the branch, which only the full read (`card` without `--cached`) brings.
+type CardLive = { sig: string, cachedAt: number, fullAt: number, busy: boolean, branch: any }
 local cardLive: { [number]: CardLive } = {}
+
+-- JSON null (`tern.json.null`, truthy) as nil, as in the host half.
+local function val(x: any): any
+	return if x == tern.json.null then nil else x
+end
 -- How often an open card reads local files anyway (times, agent state, last
 -- exchange), and how often it also asks GitHub (the status cache's interval).
 local CARD_LOCAL_S = 60
@@ -543,8 +552,9 @@ local function cardOwner(about: string?): number?
 	return tonumber(string.match(about or "", "^" .. CARD_ABOUT .. "(%d+)"))
 end
 
+-- The CLI's session ids: alphanumerics, `.`, `_` and `-`; `about` goes on with ". ".
 local function cardSession(about: string?): string?
-	return string.match(about or "", " for session ([%w%-]+)")
+	return string.match(about or "", " for session (%w[%w%._%-]*)%. ")
 end
 
 local function cardOf(cx: WindowCx, pane: number): number?
@@ -635,7 +645,7 @@ local function cardFacts(r: any, now: number): string
 	if type(r.model) == "string" then
 		add((string.gsub(string.match(r.model, "[^/]*$") or r.model, "^claude%-", "")))
 	end
-	add(r.agent_state or r.agent_state_raw)
+	add(val(r.agent_state) or val(r.agent_state_raw))
 	local started, active = epoch(r.started_at), epoch(r.active_at)
 	if started then
 		add("started " .. age(now - started) .. " ago")
@@ -670,14 +680,15 @@ local function cardBanner(r: any, now: number): Node?
 	for _, t in (if type(r.still_waiting) == "table" then r.still_waiting else {}) do
 		table.insert(open, tostring(t))
 	end
-	local head, detail, tail = "⏰ Overdue", wait.label, nil
+	local head, detail, tail = "⏰ Overdue", val(wait.label), nil
 	if r.outcome == "fulfilled" then
 		local at = epoch(wait.fired_at)
 		-- "Done" would read as the button: the banner just says what came.
 		head = if #open > 0 then "✅" else "✅ Fulfilled"
-		detail, tail = wait.fired_text, if at then age(now - at) .. " ago" else nil
+		detail, tail = val(wait.fired_text), if at then age(now - at) .. " ago" else nil
 	elseif r.outcome == "attention" then
-		head, detail = "⚠️ Needs you", if wait.reason and wait.reason ~= "" then wait.reason else wait.label
+		local reason = val(wait.reason)
+		head, detail = "⚠️ Needs you", if reason and reason ~= "" then reason else val(wait.label)
 	end
 	local sep = if head == "✅" then " " else " · "
 	local text = head .. (if detail and detail ~= "" then sep .. clipped(tostring(detail), 120) else "") .. (if tail then " · " .. tail else "")
@@ -692,8 +703,8 @@ end
 local PR_SOURCE_TEXT = { wait = "waiting on", created = "created" }
 
 local function prRow(pr: any): Node
-	local text = "PR#" .. tostring(pr.number) .. " " .. clipped(tostring(pr.title or pr.repo), 60)
-	local kids: { Node } = { ui.text({ ui.link(text, pr.url, if pr.source == "mentioned" then "muted" else nil) }) }
+	local text = "PR#" .. tostring(pr.number) .. " " .. clipped(tostring(val(pr.title) or val(pr.repo) or ""), 60)
+	local kids: { Node } = { ui.text({ ui.link(text, tostring(val(pr.url) or ""), if pr.source == "mentioned" then "muted" else nil) }) }
 	if PR_SOURCE_TEXT[pr.source] then
 		table.insert(kids, ui.badge(PR_SOURCE_TEXT[pr.source], "muted"))
 	end
@@ -723,12 +734,12 @@ end
 -- Each wait with its mark; a fulfilled one in green. A chain's later steps are
 -- muted: nothing watches them yet.
 local function waitRow(w: any, now: number): Node
-	local text = tostring(w.summary or w.label or w.kind)
+	local text = tostring(val(w.summary) or val(w.label) or w.kind)
 	local spans: { Span | string } = {}
 	if w.state == "pending" then
 		table.insert(spans, ui.span("Then: " .. text, "muted"))
 	else
-		table.insert(spans, ui.span(tostring(w.mark or "") .. text, if w.outcome == "fulfilled" then "success" else nil))
+		table.insert(spans, ui.span(tostring(val(w.mark) or "") .. text, if w.outcome == "fulfilled" then "success" else nil))
 	end
 	if type(w.progress) == "string" and w.progress ~= "" then
 		table.insert(spans, ui.span("  " .. w.progress, "info")) -- the mark is 🔧 already
@@ -863,7 +874,7 @@ end
 
 local function cardTitle(cx: WindowCx, pane: number, r: any): string
 	local info = paneInfo(cx, pane)
-	local title = r.title or r.label or (info and info.title)
+	local title = val(r.title) or val(r.label) or (info and info.title)
 	return clipped(if type(title) == "string" and title ~= "" then title else "Session", 70)
 end
 
@@ -915,7 +926,6 @@ local function openCard(cx: WindowCx, pane: number, known: string?)
 		cx:toast("info", "CodexBar AgentView: this pane has no session card")
 		return
 	end
-	cardAt[pane] = os.time()
 	local shown = record or {}
 	local canvas, err = cx.canvas:open({
 		title = cardTitle(cx, pane, shown),
@@ -974,13 +984,18 @@ local function openCard(cx: WindowCx, pane: number, known: string?)
 			settle(cx2 :: WindowCx)
 		end
 	end)
-	waitingCli({ "card", "--session", session }, function(data, readErr, cx2)
+	-- `card` writes no state, so no host tick follows it.
+	waitingRead({ "card", "--session", session }, function(data, readErr, cx2)
 		fresh = data ~= nil
 		if closed(cx2) then
 			return
 		end
 		local cx3 = cx2 :: WindowCx
 		if data then
+			local live = cardLive[canvas]
+			if live then
+				live.branch = val(data.card.branch)
+			end
 			show(cx3, data.card, false)
 			return
 		end
@@ -993,9 +1008,10 @@ local function openCard(cx: WindowCx, pane: number, known: string?)
 end
 
 -- Rereads each open card: from local files when its view entry changed or a
--- minute passed, and with GitHub every ten minutes. A pane record's card has no
--- session to read and is drawn again from the view. Cards opened before a plugin
--- reload are taken over as if just read.
+-- minute passed, and with GitHub every ten minutes; the branch of the last full
+-- read stays in between. A pane record's card has no session to read and is
+-- drawn again from the view, and closes with the record. Cards opened before a
+-- plugin reload are taken over as if just read.
 local function refreshCards(cx: WindowCx)
 	local now = os.time()
 	local open: { [number]: boolean } = {}
@@ -1023,9 +1039,11 @@ local function refreshCards(cx: WindowCx)
 		live.sig = sig
 		live.cachedAt = now
 		if not session then
-			local record = waitingRecord(owner)
+			local record = waitingRecord(owner, true)
 			if record then
 				showCard(cx, canvas, owner, record, false)
+			elseif type(tern.kv.get("waitingView")) == "table" then
+				cx.layout:close(canvas)
 			end
 			continue
 		end
@@ -1042,6 +1060,11 @@ local function refreshCards(cx: WindowCx)
 				return
 			end
 			if data then
+				if full then
+					live.branch = val(data.card.branch)
+				elseif val(data.card.branch) == nil then
+					data.card.branch = live.branch
+				end
 				showCard(cx2 :: WindowCx, canvas, owner, data.card, false)
 			else
 				tern.log.warn("codexbar: session card refresh failed", err)
@@ -1145,7 +1168,8 @@ local function leading(cx: WindowCx): boolean
 	return mine
 end
 
-type Acted = { result: string, error: string?, sending: boolean, acked: boolean }
+-- `retryAt` and `tries` space out a failing ack: 5 s, doubling up to a minute.
+type Acted = { result: string, error: string?, sending: boolean, acked: boolean, retryAt: number, tries: number }
 local acted: { [string]: Acted } = {} -- by action id: the outbox repeats an action until its ack lands
 
 local function carryOut(cx: WindowCx, a: any, info: PaneInfo?): (string, string?)
@@ -1196,28 +1220,32 @@ local function runActions(cx: WindowCx, leader: boolean)
 				error = if ok then err else tostring(result),
 				sending = false,
 				acked = false,
+				retryAt = 0,
+				tries = 0,
 			}
 			acted[id] = state
 		end
-		if state and not state.sending and not state.acked then
+		if state and not state.sending and not state.acked and os.time() >= state.retryAt then
 			local sent = state
 			sent.sending = true
 			local args = { "ack", "--action", id, "--result", state.result }
 			if state.error then
-				table.insert(args, "--error")
-				table.insert(args, state.error)
+				table.insert(args, "--error=" .. state.error)
 			end
 			waitingCli(args, function(data, err)
 				sent.sending = false
 				sent.acked = data ~= nil
 				if not data then
+					sent.tries += 1
+					sent.retryAt = os.time() + math.min(60, 5 * 2 ^ (sent.tries - 1))
 					tern.log.warn("codexbar: ack failed", id, err)
 				end
 			end)
 		end
 	end
-	for id, state in acted do
-		if state.acked and not listed[id] then
+	-- An action gone from the outbox needs nothing more: acked here, by the host, or expired.
+	for id, state in (if type(actions) == "table" then acted else {}) do
+		if not listed[id] and not state.sending then
 			acted[id] = nil
 		end
 	end
@@ -1321,7 +1349,7 @@ local function timeArgs(text: string): { string }
 	if rest == "" and compact ~= "" then
 		return { "--in", compact }
 	end
-	return { "--at", text }
+	return { "--at=" .. text }
 end
 
 -- Runs the CLI command that sets the pane aside, then parks the pane if asked to.
@@ -1369,13 +1397,13 @@ local function finishSetAside(cx: WindowCx, t: SetAside, kind: string, args: { s
 		table.insert(args, cwd)
 	end
 	ask(cx, { value = t.note, placeholder = "Why set it aside, what next?", action = "next" }, function(note, cx2)
-		local full = { "add", "--pane", tostring(t.pane), "--kind", kind, "--by", "user", "--label", t.label }
+		-- Free text as `--flag=value`: argparse takes a separate "-zsh" for an option.
+		local full = { "add", "--pane", tostring(t.pane), "--kind", kind, "--by", "user", "--label=" .. t.label }
 		for _, a in args do
 			table.insert(full, a)
 		end
 		if note ~= "" then
-			table.insert(full, "--note")
-			table.insert(full, note)
+			table.insert(full, "--note=" .. note)
 		end
 		askPark(cx2, function(park)
 			commitSetAside(t, full, park)
@@ -1424,7 +1452,7 @@ end
 local function prTarget(text: string, t: SetAside, done: ({ string }?, string?, WindowCx?) -> ())
 	local number = string.match(text, "^#?(%d+)$")
 	if not number then
-		done({ "--pr", text }, nil, nil)
+		done({ "--pr=" .. text }, nil, nil)
 		return
 	end
 	paneRepo(t, 10000, function(repo, err, cx)
@@ -1471,7 +1499,7 @@ local SET_ASIDE_FLOWS: { [string]: (WindowCx, SetAside) -> () } = {
 		paneRepo(t, 3000, function(repo, _err, cx2)
 			ask(cx2 or cx, { value = repo, placeholder = "owner/repo", action = "next" }, function(text, cx3)
 				if string.match(text, "^[%w%._%-]+/[%w%._%-]+$") then
-					finishSetAside(cx3, t, "release", { "--repo", text })
+					finishSetAside(cx3, t, "release", { "--repo=" .. text })
 				else
 					waitingFailed("wait for a release", "give owner/repo", cx3)
 				end
@@ -1481,7 +1509,7 @@ local SET_ASIDE_FLOWS: { [string]: (WindowCx, SetAside) -> () } = {
 	check = function(cx, t) -- a literal command: no agent writes it here
 		ask(cx, { placeholder = "Command line; done when it exits 0", action = "next" }, function(argv, cx2)
 			ask(cx2, { value = "15m", placeholder = "Check every", action = "next" }, function(interval, cx3)
-				finishSetAside(cx3, t, "command", { "--argv", argv, "--interval", interval })
+				finishSetAside(cx3, t, "command", { "--argv=" .. argv, "--interval=" .. interval })
 			end)
 		end)
 	end,
@@ -1492,7 +1520,7 @@ local SET_ASIDE_FLOWS: { [string]: (WindowCx, SetAside) -> () } = {
 				waitingFailed("set aside", "say what you wait for", cx2)
 			else
 				askPark(cx2, function(park)
-					commitSetAside(t, { "what", "--pane", tostring(t.pane), "--text", what }, park)
+					commitSetAside(t, { "what", "--pane", tostring(t.pane), "--text=" .. what }, park)
 				end)
 			end
 		end)
@@ -1606,10 +1634,11 @@ tern.on("focus", function(ev, cx)
 			closePane(cx, p.pane)
 		end
 	end
-	-- The first focus after a wait fired brings the session card. Until the host
-	-- publishes the `seen`, `cardAt` keeps a refocus from opening it again.
+	-- The first focus after a wait fired brings the session card, once: `poll`
+	-- forgets the pane when the host publishes it as seen.
 	local entry = waitingEntry(ev.pane)
-	if entry and entry.unseen and os.time() - (cardAt[ev.pane] or 0) > 10 then
+	if entry and entry.unseen and not seenAsked[ev.pane] then
+		seenAsked[ev.pane] = true
 		afterRestore(cx, function(cx2)
 			openCard(cx2, ev.pane)
 		end)
@@ -1639,14 +1668,23 @@ local initialSettingsRequest = tern.kv.get("settingsRequest")
 local lastSettingsRequest = if type(initialSettingsRequest) == "table" then initialSettingsRequest.seq else nil
 local initialWaitingRequest = tern.kv.get("waitingRequest")
 local lastWaitingRequest = if type(initialWaitingRequest) == "table" then initialWaitingRequest.seq else nil
+-- A request no window took up within this long is dropped: the target may come
+-- to this window much later, and opening it then would steal focus.
+local REQUEST_TTL_S = 15
 
 -- Dashboard buttons that need a window: like picking from a popup, they close
 -- the dashboard, and what they do waits for its layout to come back. The list
--- spans windows, so the window holding the target answers too. "Waiting for…"
--- asks over the dashboard instead, which shows the new text once the CLI answers.
+-- spans windows, so the window holding the target answers too, and marks it
+-- taken in `waitingRequestTaken`. "Waiting for…" asks over the dashboard
+-- instead, which shows the new text once the CLI answers.
 local function waitingRequest(cx: WindowCx)
 	local request = tern.kv.get("waitingRequest")
 	if type(request) ~= "table" or type(request.pane) ~= "number" or request.seq == lastWaitingRequest then
+		return
+	end
+	local seq = request.seq
+	if type(request.at) == "number" and os.time() - request.at > REQUEST_TTL_S then
+		lastWaitingRequest = seq
 		return
 	end
 	local info = paneInfo(cx, request.pane)
@@ -1655,15 +1693,17 @@ local function waitingRequest(cx: WindowCx)
 	if not ours and not held then
 		return
 	end
-	lastWaitingRequest = request.seq
+	lastWaitingRequest = seq
+	if held then
+		tern.kv.set("waitingRequestTaken", seq)
+	end
 	if request.op == "what" then
 		local args: { string } = {} -- kv tables are read-only proxies
 		for _, a in (if type(request.args) == "table" then request.args else {}) do
 			table.insert(args, tostring(a))
 		end
 		ask(cx, { value = tostring(request.text or ""), placeholder = "What are you waiting for? Empty clears it", action = "save" }, function(text)
-			table.insert(args, "--text")
-			table.insert(args, text)
+			table.insert(args, "--text=" .. text)
 			waitingCli(args, function(data, err, cx2)
 				if not data then
 					waitingFailed("set what you wait for", err, cx2)
@@ -1688,7 +1728,12 @@ local function waitingRequest(cx: WindowCx)
 		local target = tonumber(request.target)
 		local shown = if target then paneInfo(cx2, target) else nil
 		if not target or not shown then
-			cx2:toast("info", "CodexBar AgentView: that pane is in another window")
+			-- The window holding it opens it; the host already said when it closed.
+			tern.timer(2000, function(cx3)
+				if cx3 and tern.kv.get("waitingRequestTaken") ~= seq then
+					cx3:toast("info", "CodexBar AgentView: no window shows that pane")
+				end
+			end)
 			return
 		end
 		if shown.parked then
@@ -1736,6 +1781,12 @@ local function poll(cx: WindowCx?)
 	if sig ~= summarySig then
 		summarySig = sig
 		tern.chrome.refresh()
+		for pane in seenAsked do
+			local entry = waitingEntry(pane)
+			if not (entry and entry.unseen) then
+				seenAsked[pane] = nil
+			end
+		end
 	end
 	if cx then
 		restoreLayout(cx)
