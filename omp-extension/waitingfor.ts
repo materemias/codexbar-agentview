@@ -277,7 +277,7 @@ function seconds(duration: string): number {
 /** Why the CLI would refuse a repeat every `every` for `span`, before anyone typed the rest; undefined when it wouldn't. */
 function repeatError(every: string, span?: string): string | undefined {
 	if (seconds(every) < 60 || seconds(every) > 365 * 86_400) return `A repeat runs every 1m to 365d, not every ${every}.`;
-	if (span && seconds(span) < seconds(every)) return `For ${span} ends before the first run, ${every} from now.`;
+	if (span && seconds(span) <= seconds(every)) return `For ${span} ends by the first run, ${every} from now.`;
 	return undefined;
 }
 
@@ -1572,7 +1572,7 @@ export default function (pi) {
 				.optional()
 				.describe("pr: review_on_head, ready (default), merged, released, or activity for any feedback from others; repeat: when to stop, in words you judge"),
 			every: z.string().optional().describe("repeat, command, pr, release: send prompt every this long (30m, 2h, 1d; at least 1m); prompt is then required"),
-			for: z.string().optional().describe("with every: end the repeat after this long"),
+			for: z.string().optional().describe("with every: end the repeat after this long, longer than every"),
 			times: z.number().int().optional().describe("with every: end the repeat after this many runs"),
 			bots: z.string().optional().describe("pr: review bots, comma separated"),
 			size: z.enum(["S", "M", "L"]).optional().describe("later: how big the task is"),

@@ -3541,8 +3541,9 @@ def _repeat_options(args: argparse.Namespace) -> dict | None:
     if not REPEAT_MIN_S <= every <= REPEAT_MAX_S:
         raise BadInput("--every must be between 1m and 365d")
     for_s = None if args.for_ is None else _parse_duration(args.for_)
-    if for_s is not None and for_s < every:
-        raise BadInput("--for must be at least --every")
+    # The first run is due when a window of exactly --every closes, and a closed window ends it first.
+    if for_s is not None and for_s <= every:
+        raise BadInput("--for must be longer than --every")
     if args.times is not None and args.times < 1:
         raise BadInput("--times must be at least 1")
     prompt = _text(args.prompt)

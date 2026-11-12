@@ -4275,6 +4275,7 @@ class RepeatTests(Case):
             ["--kind", "repeat", "--every", "366d", "--prompt", "x"],
             ["--kind", "repeat", "--every", "1h"],
             ["--kind", "repeat", "--every", "1h", "--for", "30m", "--prompt", "x"],
+            ["--kind", "repeat", "--every", "1h", "--for", "1h", "--prompt", "x"],
             ["--kind", "repeat", "--every", "1h", "--times", "0", "--prompt", "x"],
             ["--kind", "repeat", "--every", "1h", "--prompt", "x",
              "--verify", '{"type": "command", "argv": ["true"]}'],
