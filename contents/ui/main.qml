@@ -887,15 +887,17 @@ PlasmoidItem {
             if (root.waitingRequest !== xhr) return
             root.waitingRequest = null
             if (!root.ternIntegration) return
-            // A read that fails keeps the last view, judged again by the
-            // clock so its health can still turn stale.
+            // Qt answers a file:// read with status 0 whether or not the
+            // file exists, so this guard only catches a non-file URL.
             if (xhr.status !== 0 && xhr.status !== 200) {
                 root.applyWaitingView(root._waitingView)
                 return
             }
-            // No file yet: nothing is waiting. The CLI replaces it
-            // atomically, so a parse error is a broken file; keep the
-            // last view rather than blinking the markers off.
+            // No file yet (or one Qt can't read, which looks the same):
+            // nothing is waiting. The CLI replaces it atomically, so a parse
+            // error is a broken file; keep the last view, judged again by
+            // the clock so its health can still turn stale, rather than
+            // blinking the markers off.
             var text = (xhr.responseText || "").trim()
             if (text === "") {
                 root.applyWaitingView(null)
