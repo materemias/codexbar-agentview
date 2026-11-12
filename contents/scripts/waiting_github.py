@@ -83,6 +83,8 @@ TRANSIENT = re.compile(
 # 404 on o/temporary-fix is not a network failure. Other quotes stay: they may be prose.
 _NAMES = re.compile(r"https?://\S+|(['\"])[\w.-]+/[\w./-]+\1")
 RATE_LIMITED = re.compile(r"HTTP 429|rate limit", re.IGNORECASE)
+# How many keys memo.seen keeps, or every key a poll met when it met more.
+SEEN_KEPT = 500
 REPO_RE = re.compile(r"[\w.-]+/[\w.-]+")
 PR_URL_RE = re.compile(r"https?://(?:www\.)?github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)(?:[/?#]\S*)?")
 PR_SHORT_RE = re.compile(r"([\w.-]+/[\w.-]+)#(\d+)")
@@ -658,16 +660,28 @@ class _Events:
     def __init__(self, memo: Json, out: list[Json]) -> None:
         self.memo = memo
         self.out = out
-        self.seen = set(memo.get("seen") or [])
+        # Oldest first: a key met again moves to the end. Memos saved before the cap
+        # stored their keys sorted, so the order of keys no poll met since means nothing.
+        self.seen: dict[str, None] = dict.fromkeys(memo.get("seen") or [])
+        self.met: set[str] = set()
+        # Set once this poll met every comment, review and thread the PR has.
+        self.whole = False
         self.baseline = not memo.get("baselined")
         self.rest_baseline = self.baseline and not memo.get("rest_baselined")
+
+    def mark(self, key: str) -> bool:
+        """Note that this poll met `key`. True when it is news."""
+        new = key not in self.seen
+        self.seen.pop(key, None)
+        self.seen[key] = None
+        self.met.add(key)
+        return new
 
     def emit(
         self, key: str, text: str, on_me: bool = False, always: bool = False, rest: bool = False
     ) -> None:
-        if key in self.seen:
+        if not self.mark(key):
             return
-        self.seen.add(key)
         if always or not (self.rest_baseline if rest else self.baseline):
             self.out.append({"key": key, "text": text, "on_me": on_me})
 
@@ -675,7 +689,13 @@ class _Events:
         self.out[:] = [event for event in self.out if event["key"] not in keys]
 
     def save(self) -> None:
-        self.memo["seen"] = sorted(self.seen)
+        """A whole poll keeps the newest SEEN_KEPT keys and every key it met, so talk
+        GitHub still returns isn't reported again. Issue comments and reviews come
+        as the last 100: one that fell out of that window and was trimmed comes back
+        as news if a newer one is deleted. Any other poll keeps every key: a REST or
+        failed one didn't meet the rest of the PR."""
+        keys = list(self.seen)
+        self.memo["seen"] = keys[-max(SEEN_KEPT, len(self.met)):] if self.whole else keys
 
 
 def _talk_events(pr: Json, events: _Events, known_bots: tuple[str, ...], mine: set[str]) -> None:
@@ -719,15 +739,14 @@ def _bot_comment_events(pr: Json, events: _Events, bot: str, counted: bool) -> N
     """A review bot's new inline comments, as one event so its findings don't
     flood the history. `counted`: this poll's bot event already covers them."""
     mine = {pr["author"], pr["viewer"]}
-    new = [
-        f"c:{comment['id']}"
-        for thread in pr["threads"]
-        for comment in thread["comments"]
-        if _is_bot(comment, bot)
-        and comment["login"] not in mine
-        and f"c:{comment['id']}" not in events.seen
-    ]
-    events.seen.update(new)
+    new = []
+    for thread in pr["threads"]:
+        for comment in thread["comments"]:
+            if _is_bot(comment, bot) and comment["login"] not in mine:
+                key = f"c:{comment['id']}"
+                # Known ones are marked too, so they stay among the newest keys.
+                if events.mark(key):
+                    new.append(key)
     if new and not counted:
         events.emit(f"bot-comments:{new[0]}", f"new {bot} review comments on {pr['head'][:7]}: {len(new)}")
 
@@ -899,6 +918,9 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
                 rest=by_review,  # REST shows reviews, not checks or summaries
             )
         _bot_comment_events(pr, events, bot, counted=first_report)
+
+    # REST shows no inline comments or summaries, so only GraphQL met them all.
+    events.whole = pr["full"]
 
     if pr["full"] and is_open:
         since = memo.get("pending_since") or {}
@@ -1073,6 +1095,7 @@ def poll(cond: Json, memo: Json, *, run: Run = subprocess.run, now: float | None
     try:
         _poll(cond, memo, result, events, run, now)
     except GhError as error:
+        events.whole = False
         result["error"] = str(error)
         result["transient"] = error.transient
         # A hiccup on a slow path (REST fallback, a release check) still retries soon;

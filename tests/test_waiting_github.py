@@ -602,6 +602,47 @@ class EventsTest(PollTestCase):
         )
 
 
+class SeenCapTest(PollTestCase):
+    def test_keeps_the_newest_keys(self) -> None:
+        old = [f"old:{index}" for index in range(github.SEEN_KEPT + 100)]
+        self.memo = {"seen": old, "baselined": True, "rest_baselined": True}
+        gh = FakeGh(pr_answer(comments=[comment("C1", "someone")]))
+        self.assertEqual([event["key"] for event in self.poll(gh)["events"]], [f"head:{HEAD}", "c:C1"])
+        seen = self.memo["seen"]
+        self.assertEqual(len(seen), github.SEEN_KEPT)
+        self.assertEqual(seen[-2:], [f"head:{HEAD}", "c:C1"])
+        self.assertEqual(seen[0], "old:102")
+
+    def test_a_key_met_again_is_newest(self) -> None:
+        old = [f"old:{index}" for index in range(github.SEEN_KEPT)]
+        self.memo = {"seen": ["c:C1", *old], "baselined": True, "rest_baselined": True}
+        gh = FakeGh(pr_answer(comments=[comment("C1", "someone")]))
+        self.assertEqual([event["key"] for event in self.poll(gh)["events"]], [f"head:{HEAD}"])
+        self.assertIn("c:C1", self.memo["seen"])
+        self.assertNotIn("old:0", self.memo["seen"])
+
+    def test_more_talk_than_the_cap_is_not_reported_again(self) -> None:
+        many = github.SEEN_KEPT + 100
+        gh = FakeGh(pr_answer(threads=[thread("T1", comments=many, author="someone")]))
+        self.poll(gh)
+        gh.pr = pr_answer(threads=[thread("T1", comments=many + 1, author="someone")])
+        self.assertEqual([event["key"] for event in self.poll(gh)["events"]], [f"c:T1-{many}"])
+        self.assertEqual(self.poll(gh)["events"], [])
+
+    def test_more_bot_findings_than_the_cap_are_not_reported_again(self) -> None:
+        threads = [thread("T1", comments=github.SEEN_KEPT + 100)]
+        gh = FakeGh(pr_answer(reviews=[bot_review()], threads=threads))
+        self.poll(gh, until="merged")
+        self.assertEqual(self.poll(gh, until="merged")["events"], [])
+        self.assertEqual(self.poll(gh, until="merged")["events"], [])
+
+    def test_a_failed_poll_trims_nothing(self) -> None:
+        old = [f"old:{index}" for index in range(github.SEEN_KEPT + 100)]
+        self.memo = {"seen": old, "baselined": True, "rest_baselined": True}
+        self.poll(FakeGh(ok(code=1, stderr="gh: Bad Gateway (HTTP 502)\n")))
+        self.assertEqual(self.memo["seen"], old)
+
+
 class ReadyTest(PollTestCase):
     def assert_ready(self, gh: FakeGh, ready: bool) -> dict:
         result = self.poll(gh, until="ready")
@@ -1158,6 +1199,19 @@ class RateLimitTest(PollTestCase):
             "commit_id": oid,
             "user": {"login": "greptile-apps[bot]", "type": "Bot"},
         }
+
+    def test_a_rest_poll_forgets_none_of_a_big_prs_talk(self) -> None:
+        talk = [thread("T1", comments=github.SEEN_KEPT + 100, author="someone")]
+        gh = FakeGh(pr_answer(threads=talk))
+        self.poll(gh, until="activity")
+        gh.remaining = 100
+        self.clock += github.RATE_CHECK_S
+        gh.rest_pr = self.rest()
+        self.assertFalse(self.poll(gh, until="activity")["fired"])
+        gh.remaining = 5000
+        self.clock += github.RATE_CHECK_S
+        result = self.poll(gh, until="activity")
+        self.assertEqual((result["fired"], result["events"]), (False, []))
 
     def test_review_on_rest_waits_for_the_checks_graphql_shows(self) -> None:
         gh = FakeGh(remaining=100)
