@@ -2005,7 +2005,7 @@ class ViewTests(Case):
             {
                 "id", "kind", "label", "summary", "state", "ball", "overdue", "outcome",
                 "fired_text", "fired_at", "progress", "mark", "reason", "created_at", "due_at", "deadline",
-                "condition", "has_prompt", "next", "by", "repeat", "retryable",
+                "condition", "has_prompt", "next", "by", "repeat", "retryable", "daemon",
             },
         )
         seen = self.session()
@@ -5002,6 +5002,30 @@ class DaemonTests(Case):
         self.tick("--daemon", "999999999-1")  # no such process
         self.advance(minutes=1)
         self.assertNotIn("skipped", self.tick("--daemon", "b"))
+
+    def test_a_pane_event_with_daemon_reaches_only_that_daemons_items(self) -> None:
+        self.tick("--daemon", "a")
+        self.creator = "b"
+        theirs = self.add("--kind", "job", "--pane", "51")["id"]
+        self.run_cli("add", "--pane", "51", "--kind", "later")
+        self.creator = None
+        legacy = self.add("--kind", "job", "--pane", "51")["id"]  # stamped a, the ticker, until:
+        state = self.state()
+        unstamped = next(wait for wait in state["sessions"][SID]["waits"] if wait["id"] == legacy)
+        del unstamped["daemon"]
+        (self.state_dir / "waiting.json").write_text(json.dumps(state))
+        self.assertEqual(self.wait_of(theirs)["daemon"], "b")
+        self.assertEqual(self.run_cli("list")["panes"][0]["daemon"], "b")
+        # Daemon c doesn't tick: its pane 51 is neither b's nor the unstamped one's.
+        self.run_cli("event", "--type", "pane_closed", "--pane", "51", "--daemon", "c")
+        self.assertEqual([self.wait_of(theirs)["state"], self.wait_of(legacy)["state"]], ["waiting", "waiting"])
+        self.assertEqual(len(self.run_cli("list")["panes"]), 1)
+        # The ticking daemon a: the unstamped wait is its own, b's aren't.
+        self.run_cli("event", "--type", "job_finished", "--pane", "51", "--status", "1", "--daemon", "a")
+        self.assertEqual([self.wait_of(theirs)["state"], self.wait_of(legacy)["state"]], ["waiting", "needs_attention"])
+        self.run_cli("event", "--type", "pane_closed", "--pane", "51", "--daemon", "b")
+        self.assertEqual(self.wait_of(theirs)["state"], "needs_attention")
+        self.assertEqual(self.run_cli("list")["panes"], [])
 
     def test_a_pane_event_reaches_only_its_daemons_waits(self) -> None:
         self.creator = "b"

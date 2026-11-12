@@ -2422,11 +2422,15 @@ def _pane_closed(state: dict, pane: int, now: datetime, keep=None) -> None:
                 _attention(state, record, wait, now, "Pane closed before the job finished")
 
 
-def _other_daemons(item: dict) -> bool:
-    """A pane-scoped item another daemon made: a pane event of this command's
-    daemon is about another pane of that number."""
-    daemon = _ancestor_daemon()
-    return daemon is not None and item.get("daemon") not in (None, daemon)
+def _reached_by(state: dict, daemon: str | None):
+    """Which pane-scoped items a pane event of `daemon` is about: those it
+    stamped, and unstamped ones only when it ticks the state. Any other names
+    another pane of that number. Without a daemon, every item."""
+    def reached(item: dict) -> bool:
+        stamp = item.get("daemon")
+        return daemon is None or stamp == daemon or (stamp is None and daemon == _ticking_daemon(state))
+
+    return reached
 
 
 def _panes_gone(state: dict, now: datetime, daemon: str | None = None) -> None:
@@ -2953,6 +2957,8 @@ def _wait_view(wait: dict, now: datetime) -> dict:
         "deadline": wait["deadline"], "condition": wait["condition"],
         "has_prompt": bool(wait["prompt"] or wait.get("repeat")), "next": wait["next"], "by": wait["by"],
         "repeat": repeat,
+        # A job wait's Tern daemon, whose pane it watches (`event --daemon`).
+        "daemon": wait.get("daemon"),
     }
     view["mark"] = _wait_mark(view)
     return view
@@ -3267,6 +3273,8 @@ def _pane_view(record: dict, now: datetime) -> dict:
         "note": record["note"],
         "status": status, "line": line,
         "set_aside_at": record["set_aside_at"],
+        # The Tern daemon whose pane this is (`event --daemon`).
+        "daemon": record.get("daemon"),
     }
 
 
@@ -4090,6 +4098,9 @@ def cmd_event(args: argparse.Namespace) -> dict:
         raise BadInput(f"{kind} needs --session or --pane")
 
     def apply(state: dict, now: datetime) -> dict:
+        # The Tern daemon whose pane the event is about: `--daemon`, else the one
+        # this command runs under.
+        reached = _reached_by(state, args.daemon or _ancestor_daemon())
         record = state["sessions"].get(session) if session else None
         if kind == "turn_finished" and record:
             _turn_finished(state, record, now)
@@ -4106,12 +4117,12 @@ def cmd_event(args: argparse.Namespace) -> dict:
         elif kind == "job_finished":
             finished_jobs = [
                 (held, wait) for held in _records(state) for wait in held["waits"]
-                if _watches_job(wait, args.pane) and not _other_daemons(wait)
+                if _watches_job(wait, args.pane) and reached(wait)
             ]
             for held, wait in finished_jobs:
                 _finish_job(state, held, wait, args.status, now)
         elif kind == "pane_closed":
-            _pane_closed(state, args.pane, now, keep=_other_daemons)
+            _pane_closed(state, args.pane, now, keep=lambda item: not reached(item))
         return {}
 
     return _mutate(apply, agents=agents)
@@ -4665,6 +4676,8 @@ def _parser() -> argparse.ArgumentParser:
     )
     _add_target(event)
     event.add_argument("--status", type=int)
+    # Whose pane `--pane` is: pane events reach only that daemon's items.
+    event.add_argument("--daemon")
 
     ack = command("ack", cmd_ack)
     ack.add_argument("--action", required=True)
