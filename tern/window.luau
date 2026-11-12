@@ -24,6 +24,10 @@ local KIND = "codexbar-agentview.dashboard"
 local SETTINGS_KIND = "codexbar-agentview.settings"
 local CANVAS_KIND = "tern.canvas"
 local SCRIPTS = tern.plugin.dir .. "/../contents/scripts"
+-- The leader lease runs on os.clock(), Luau's seconds on the system's monotonic
+-- clock (not CPU time), as do the waits here: every VM on the machine, the host
+-- half's included, reads the same one, and the wall clock can't move it. Both
+-- halves read a lease further out than LEASE_S as none.
 local LEASE_S = 30
 local CARD_ABOUT = "Session card of pane "
 
@@ -1219,13 +1223,15 @@ end
 
 -- Waiting: the leader window ---------------------------------------------------------
 
--- Holds the lease in `tern.kv`. A claim acts from the next poll on, once a
--- window that claimed at the same moment has overwritten it.
+-- Holds the lease in `tern.kv`, on os.clock(). A claim acts from the next poll
+-- on, once a window that claimed at the same moment has overwritten it. A lease
+-- further out than LEASE_S is from before a reboot (the clock starts over) or an
+-- older build's wall-clock one: it counts as none.
 local function leading(cx: WindowCx): boolean
 	local key = cx:window_key()
 	local lease = tern.kv.get("waitingLeader")
-	local now = os.time()
-	local held = type(lease) == "table" and type(lease.expires) == "number"
+	local now = os.clock()
+	local held = type(lease) == "table" and type(lease.expires) == "number" and lease.expires - now <= LEASE_S
 	local mine = held and lease.key == key
 	if not held or lease.expires <= now or (mine and lease.expires - now < LEASE_S - 10) then
 		tern.kv.set("waitingLeader", { key = key, expires = now + LEASE_S })
@@ -1320,8 +1326,8 @@ local function ownsAction(a: any, info: PaneInfo?, leader: boolean): boolean
 	end
 	if a.type == "resume" and opened then
 		local id = tostring(a.id)
-		heldSince[id] = heldSince[id] or os.time()
-		return os.time() - heldSince[id] >= RESUME_HOLD_S
+		heldSince[id] = heldSince[id] or os.clock()
+		return os.clock() - heldSince[id] >= RESUME_HOLD_S
 	end
 	return true
 end
@@ -1396,7 +1402,7 @@ local function runActions(cx: WindowCx, leader: boolean)
 			}
 			acted[id] = state
 		end
-		if state and not state.sending and not state.acked and os.time() >= state.retryAt then
+		if state and not state.sending and not state.acked and os.clock() >= state.retryAt then
 			local sent = state
 			sent.sending = true
 			local args = { "ack", "--action", id, "--result", state.result }
@@ -1408,7 +1414,7 @@ local function runActions(cx: WindowCx, leader: boolean)
 				sent.acked = data ~= nil
 				if not data then
 					sent.tries += 1
-					sent.retryAt = os.time() + math.min(60, 5 * 2 ^ (sent.tries - 1))
+					sent.retryAt = os.clock() + math.min(60, 5 * 2 ^ (sent.tries - 1))
 					tern.log.warn("codexbar: ack failed", id, err)
 				end
 			end)

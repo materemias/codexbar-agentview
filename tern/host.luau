@@ -367,7 +367,12 @@ local store = {
 	waiting = nil :: any, -- the CLI's last view
 	waitingError = nil :: string?, -- the last tick's failure, cleared by a tick that succeeds
 	waitingActions = nil :: any, -- the outbox as last published
-	waitingAcking = {} :: { [string]: number }, -- action id -> no ack of it before then (math.huge: sent)
+	-- os.clock() below is Luau's: seconds on the system's monotonic clock
+	-- (CLOCK_MONOTONIC on Linux, mach_absolute_time on macOS), not CPU time. The
+	-- wall clock can't move it and, unlike tern.now(), which starts at 0 in each
+	-- VM, every VM on the machine reads the same one, so the window half's leader
+	-- lease uses it too. It stands still in sleep and starts over at a reboot.
+	waitingAcking = {} :: { [string]: number }, -- action id -> no ack of it before then, os.clock() (math.huge: sent)
 	waitingRaw = "", -- waiting.json as our last tick left it
 	waitingSig = "",
 	waitingActionsSig = "",
@@ -375,11 +380,14 @@ local store = {
 	waitingTicking = false,
 	waitingAgain = false,
 	waitingRecheck = false, -- the next tick runs for another writer's change
-	waitingAt = 0, -- when the next timed tick is due
-	jobEventAt = {} :: { [number]: number }, -- pane -> when its last job event went to the CLI
+	-- When the next timed tick is due, by the wall clock and by os.clock(): the first
+	-- to come runs it, so neither a sleep nor a wall clock set back holds it up.
+	waitingAt = 0,
+	waitingAtMono = 0,
+	jobEventAt = {} :: { [number]: number }, -- pane -> os.clock() when its last job event went to the CLI
 	waitingMemo = nil :: any, -- waitingGroups' last answer, for one view and filter
 	lastPoke = nil :: any,
-	menuRetryAt = nil :: number?, -- when a failed `menu` load runs again
+	menuRetryAt = nil :: number?, -- os.clock() when a failed `menu` load runs again
 	loadMenu = nil :: (() -> ())?,
 }
 
@@ -1483,10 +1491,16 @@ local function waitingTick()
 	store.waitingTicking = true
 	store.waitingAgain = false
 	-- A leader window holds a lease (window.luau `lead`): only then can a resume
-	-- be carried out, so only then does the CLI count down to giving one up.
+	-- be carried out, so only then does the CLI count down to giving one up. A
+	-- lease runs LEASE_S = 30 s on os.clock(); one further out is from before a
+	-- reboot (or a wall-clock lease of an older build) and counts as none.
 	local lease = tern.kv.get("waitingLeader")
-	local window = type(lease) == "table" and type(lease.expires) == "number" and lease.expires > os.time()
-	python(WAITING_CLI, if window then { "tick", "--window" } else { "tick" }, WAITING_TIMEOUT_MS, function(res)
+	local left = if type(lease) == "table" and type(lease.expires) == "number" then lease.expires - os.clock() else 0
+	local args = { "tick" }
+	if left > 0 and left <= 30 then
+		table.insert(args, "--window")
+	end
+	python(WAITING_CLI, args, WAITING_TIMEOUT_MS, function(res)
 		store.waitingTicking = false
 		local okj, data = pcall(tern.json.decode, res.stdout)
 		local nextIn = WAITING_RETRY_S
@@ -1534,6 +1548,7 @@ local function waitingTick()
 		end
 		store.waitingRecheck = recheck
 		store.waitingAt = os.time() + nextIn
+		store.waitingAtMono = os.clock() + nextIn
 		if store.waitingAgain then
 			waitingTick()
 		end
@@ -1586,11 +1601,11 @@ local function ackGonePanes()
 	for _, a in (if type(store.waitingActions) == "table" then store.waitingActions else {}) do
 		local pane = tonumber(val(a.pane))
 		local id = str(a.id)
-		if a.type ~= "toast" and pane and not live[pane] and os.time() >= (store.waitingAcking[id] or 0) then
+		if a.type ~= "toast" and pane and not live[pane] and os.clock() >= (store.waitingAcking[id] or 0) then
 			store.waitingAcking[id] = math.huge
 			waitingRun(nil, "ack", { "ack", "--action", id, "--result", "done" }, function(data)
 				if not data and store.waitingAcking[id] then
-					store.waitingAcking[id] = os.time() + 30
+					store.waitingAcking[id] = os.clock() + 30
 				end
 			end)
 		end
@@ -1627,7 +1642,7 @@ end
 -- decides before a Python process starts. A pane ending with its job sends
 -- both events; the CLI took the first.
 local function jobFinished(pane: number, status: number, exited: boolean)
-	local now = os.time()
+	local now = os.clock()
 	if exited and now - (store.jobEventAt[pane] or -math.huge) <= 2 then
 		return
 	end
@@ -1902,7 +1917,7 @@ local function tick()
 			if not store.waitingTicking and readWaiting(WAITING_FILE) ~= store.waitingRaw then
 				waitingTick()
 			end
-			if store.menuRetryAt and os.time() >= store.menuRetryAt and store.loadMenu then
+			if store.menuRetryAt and os.clock() >= store.menuRetryAt and store.loadMenu then
 				store.menuRetryAt = nil
 				store.loadMenu()
 			end
@@ -1912,7 +1927,7 @@ local function tick()
 			store.lastPoke = poke
 			waitingTick()
 		end
-		if not store.waitingTicking and os.time() >= store.waitingAt then
+		if not store.waitingTicking and (os.time() >= store.waitingAt or os.clock() >= store.waitingAtMono) then
 			waitingTick()
 		end
 		local now = os.time()
@@ -4131,7 +4146,7 @@ store.loadMenu = function()
 		detail = if detail ~= "" then detail else firstLine(res.stderr)
 		tern.kv.set("waitingMenu", { error = if detail ~= "" then detail else "exit " .. res.status })
 		tern.log.warn("codexbar: waiting menu failed", detail)
-		store.menuRetryAt = os.time() + 60
+		store.menuRetryAt = os.clock() + 60
 	end)
 end
 store.loadMenu()
