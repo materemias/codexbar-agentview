@@ -479,18 +479,20 @@ end
 -- Resume commands this machine started lately, by when (`waitingLaunches` in
 -- `tern.kv`, which every window here shares). One started again before
 -- agents.json lists it would be a second writer of its session file: Resume
--- pressed while the automatic resume opens it, or the other way round.
+-- pressed while the automatic resume opens it, or the other way round. Times
+-- are os.clock()'s (see LEASE_S): setting the wall clock back can't stretch a
+-- hold. One ahead of now is from before a reboot, or an older build's wall time.
 local LAUNCH_HOLD_S = 60
 
 -- Opens a tab that runs `command` as History's Launch does: an interactive
 -- shell loads the user's PATH and stays when the agent exits. Nil and true when
 -- `command` started within LAUNCH_HOLD_S.
 local function launchTab(cx: WindowCx, command: string, cwd: string?, reveal: Reveal?): (number?, boolean)
-	local now = os.time()
+	local now = os.clock()
 	local stored = tern.kv.get("waitingLaunches")
 	local launches: { [string]: number } = {}
 	for c, at in (if type(stored) == "table" then stored else {}) do
-		if type(at) == "number" and now - at < LAUNCH_HOLD_S then
+		if type(at) == "number" and at <= now and now - at < LAUNCH_HOLD_S then
 			launches[c] = at
 		end
 	end
