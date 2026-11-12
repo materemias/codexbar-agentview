@@ -511,6 +511,31 @@ def launch(provider: str, session_id: str) -> int:
     return _session_operation(provider, session_id, "launch", _launch)
 
 
+def reserve(provider: str, session_id: str) -> int:
+    """Take a session's startup ownership for a caller that starts the writer
+    itself, such as the Tern plugin reopening a closed session in a tab of its
+    choosing: refused (5) while it runs, starts or may be written elsewhere,
+    and Launch, Teleport or another reserve are refused for the reservation's
+    lifetime after it."""
+    return _session_operation(provider, session_id, "launch", _reserve)
+
+
+def _reserve(provider: str, session_id: str, payload: dict) -> int:
+    if any(agents._record_key(r) == (provider, session_id) for r in payload["agents"]):
+        sys.stderr.write("codexbar_focus: session is already running\n")
+        return 5
+    record = next(
+        (r for r in payload["history"] if agents._record_key(r) == (provider, session_id)), {}
+    )
+    cwd = agents._text(record.get("cwd"))
+    status = _session_writer_status(provider, session_id, cwd)
+    if status != "absent":
+        sys.stderr.write(f"codexbar_focus: a running {provider} may be writing this session\n")
+        return 5
+    return 0
+
+
+
 def _launch(provider: str, session_id: str, payload: dict) -> int:
     key = (provider, session_id)
     if any(agents._record_key(r) == key for r in payload["agents"]):
@@ -896,10 +921,10 @@ def main(argv: list[str]) -> int:
     if not argv:
         return 1
     state_paths.migrate()
-    if argv[0] in ("--launch", "--teleport"):
+    if argv[0] in ("--launch", "--teleport", "--reserve"):
         if len(argv) != 3:
             return 1
-        action = launch if argv[0] == "--launch" else teleport
+        action = {"--launch": launch, "--teleport": teleport, "--reserve": reserve}[argv[0]]
         return action(argv[1], argv[2])
     if argv[0] == "--launch-all":
         if len(argv) != 2:

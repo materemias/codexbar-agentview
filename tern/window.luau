@@ -1279,9 +1279,6 @@ local function carryOut(cx: WindowCx, a: any, info: PaneInfo?): (string, string?
 		cx:toast(level, tostring(a.text), if type(a.sub) == "string" then a.sub else nil)
 		return "done"
 	end
-	if a.type == "resume" then
-		return resumeSession(cx, a)
-	end
 	if not info then
 		return "done" -- the session has no Tern pane
 	end
@@ -1322,6 +1319,35 @@ local function ownsAction(a: any, info: PaneInfo?, leader: boolean): boolean
 	return true
 end
 
+-- A session file has one live writer. Before a tab starts omp on it, the focus
+-- helper takes the session's startup ownership, the one History's Launch and
+-- Teleport use: it refuses (5) while omp runs it, starts it, or may write it,
+-- and holds off every other launcher for a minute after. A refusal means
+-- someone else has the session, so the resume is done; the CLI puts the wait
+-- on me if it still doesn't run within its grace.
+local function reserveThenResume(a: any, state: any)
+	local id = tostring(a.id)
+	local function settle(result: string, err: string?)
+		state.result, state.error, state.sending = result, err, false
+		local stored = tern.kv.get("waitingResumes")
+		local resumes = if type(stored) == "table" then stored else {}
+		resumes[id] = { result = result, error = err }
+		tern.kv.set("waitingResumes", resumes)
+	end
+	python("codexbar_focus.py", { "--tern", "--reserve", "omp", tostring(val(a.session)) }, function(res, cx2)
+		if res.status == 5 then
+			settle("done")
+		elseif res.status ~= 0 then
+			settle("failed", firstLine(res.stderr) ~= "" and firstLine(res.stderr) or "couldn't reserve the session")
+		elseif not cx2 then
+			settle("failed", "the Tern window closed before it could open the session")
+		else
+			local ok, result, err = pcall(resumeSession, cx2 :: WindowCx, a)
+			settle(if ok then result else "failed", if ok then err else tostring(result))
+		end
+	end)
+end
+
 local function runActions(cx: WindowCx, leader: boolean)
 	local actions = tern.kv.get("waitingActions")
 	-- A resume isn't idempotent as the other actions are, and `acted` dies with
@@ -1340,7 +1366,12 @@ local function runActions(cx: WindowCx, leader: boolean)
 		local state = acted[id]
 		local pane = if a.type ~= "toast" then tonumber(a.pane) else nil
 		local info = if pane then paneInfo(cx, pane) else nil
-		if not state and ownsAction(a, info, leader) then
+		if not state and ownsAction(a, info, leader) and a.type == "resume" and not resumes[id] then
+			-- Held (`sending`) until the helper answers, so nothing acks it meanwhile.
+			state = { result = "failed", error = nil, sending = true, acked = false, retryAt = 0, tries = 0 }
+			acted[id] = state
+			reserveThenResume(a, state)
+		elseif not state and ownsAction(a, info, leader) then
 			local before = if a.type == "resume" then resumes[id] else nil
 			local ok, result, err = true, nil, nil
 			if before then
@@ -1357,10 +1388,6 @@ local function runActions(cx: WindowCx, leader: boolean)
 				tries = 0,
 			}
 			acted[id] = state
-			if a.type == "resume" and not before then
-				resumes[id] = { result = state.result, error = state.error }
-				resumesChanged = true
-			end
 		end
 		if state and not state.sending and not state.acked and os.time() >= state.retryAt then
 			local sent = state
@@ -1870,10 +1897,28 @@ local function waitingRequest(cx: WindowCx)
 	end
 	afterRestore(cx, function(cx2)
 		if request.op == "launch" then
-			local _, held = launchTab(cx2, tostring(request.command), request.cwd)
-			if held then
-				cx2:toast("info", "CodexBar AgentView: that session is opening already")
+			local function open(cx3: WindowCx)
+				local _, held = launchTab(cx3, tostring(request.command), request.cwd)
+				if held then
+					cx3:toast("info", "CodexBar AgentView: that session is opening already")
+				end
 			end
+			if type(request.session) ~= "string" or request.session == "" then
+				open(cx2)
+				return
+			end
+			-- The same startup ownership as an automatic resume and History's Launch.
+			python("codexbar_focus.py", { "--tern", "--reserve", "omp", request.session }, function(res, cx3)
+				if not cx3 then
+					return
+				elseif res.status == 0 then
+					open(cx3 :: WindowCx)
+				elseif res.status == 5 then
+					cx3:toast("info", "CodexBar AgentView: that session is running or opening already")
+				else
+					waitingFailed("resume", firstLine(res.stderr), cx3)
+				end
+			end)
 			return
 		end
 		local target = tonumber(request.target)

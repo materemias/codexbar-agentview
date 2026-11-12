@@ -3393,7 +3393,7 @@ local function waitingOpen(b: Block, r: any)
 			b.busy = nil
 			if data then
 				b.launched[key] = os.time()
-				waitingRequest(b, { op = "launch", command = str(data.command), cwd = str(data.cwd) })
+				waitingRequest(b, { op = "launch", command = str(data.command), cwd = str(data.cwd), session = str(r.session_id) })
 			end
 			b.cx:render()
 		end)

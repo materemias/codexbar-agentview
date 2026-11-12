@@ -455,6 +455,24 @@ class SessionOperationOwnershipTests(unittest.TestCase):
                          "helper exit released ownership before writer discovery")
         self.assertEqual(result[0], 5, result[1])
 
+    def test_a_reserve_and_a_launch_never_both_start_the_session(self) -> None:
+        reserved, _ = self.start_helper(action="--reserve")
+        self.assertEqual(self.finish_helper(reserved)[0], 0)
+        launched, _ = self.start_helper()
+        self.assertEqual(self.finish_helper(launched)[0], 5)
+        self.assertEqual(self.dispatches(), [], "a launch dispatched while a reopen owned the startup")
+
+    def test_a_reserve_after_a_launch_is_refused(self) -> None:
+        launched, _ = self.start_helper()
+        self.assertEqual(self.finish_helper(launched)[0], 0)
+        reserved, _ = self.start_helper(action="--reserve")
+        self.assertEqual(self.finish_helper(reserved)[0], 5)
+
+    def test_a_reserve_refuses_a_running_session(self) -> None:
+        self.snapshot(live=True)
+        reserved, _ = self.start_helper(action="--reserve")
+        self.assertEqual(self.finish_helper(reserved)[0], 5)
+
     def test_first_teleport_after_successful_launch_reconciles_discovered_writer(self) -> None:
         launched, _ = self.start_helper()
         result = self.finish_helper(launched)
