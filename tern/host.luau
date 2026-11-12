@@ -365,7 +365,7 @@ local store = {
 	openSig = "",
 	lastGoto = nil :: any,
 	waiting = nil :: any, -- the CLI's last view
-	waitingError = nil :: string?,
+	waitingError = nil :: string?, -- the last tick's failure, cleared by a tick that succeeds
 	waitingActions = nil :: any, -- the outbox as last published
 	waitingAcking = {} :: { [string]: number }, -- action id -> no ack of it before then (math.huge: sent)
 	waitingRaw = "", -- waiting.json as our last tick left it
@@ -1426,14 +1426,22 @@ local function readWaiting(path: string): string
 end
 
 -- Republishes only what changed: kv.json is one file every VM rereads. `now`
--- moves on every call and nothing here shows it.
+-- and `health.checked_at` move on every tick; the warning line reads the
+-- latter from `store.waiting`, rendered once a minute.
 local function applyWaiting(view: any)
 	store.waiting = view
-	store.waitingError = nil
 	local at = view.now
+	local health = val(view.health)
+	local checked = if type(health) == "table" then health.checked_at else nil
 	view.now = nil
+	if checked then
+		health.checked_at = nil
+	end
 	local sig = tern.json.encode(view)
 	view.now = at
+	if checked then
+		health.checked_at = checked
+	end
 	if sig ~= store.waitingSig then
 		store.waitingSig = sig
 		tern.kv.set("waitingView", view)
@@ -1478,17 +1486,20 @@ local function waitingTick()
 		local nextIn = WAITING_RETRY_S
 		local ticked = res.status == 0 and okj and type(data) == "table" and type(val(data.view)) == "table"
 		if ticked then
+			local hadError = store.waitingError ~= nil
+			store.waitingError = nil
 			applyWaiting(val(data.view))
 			publishActions(if type(val(data.actions)) == "table" then val(data.actions) else tern.json.array())
 			nextIn = tonumber(val(data.next_tick_s)) or nextIn
+			if hadError then
+				renderAll() -- the warning line goes, though the view may be the same
+			end
 		else
 			local detail = if okj and type(data) == "table" then str(data.error) else ""
 			detail = if detail ~= "" then detail else firstLine(res.stderr)
 			store.waitingError = if detail ~= "" then detail else "exit " .. res.status
 			tern.log.warn("codexbar: waiting tick failed", store.waitingError)
-			if not store.waiting then
-				renderAll()
-			end
+			renderAll() -- the Waiting tab's warning line, or its empty state without a view
 		end
 		store.waitingRaw = readWaiting(WAITING_FILE)
 		-- Another writer (the omp extension, tern-awui) may have written after the
@@ -1500,6 +1511,9 @@ local function waitingTick()
 			local okv, file = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
 			if okv and type(file) == "table" then
 				file.now = nil
+				if type(file.health) == "table" then
+					file.health.checked_at = nil
+				end
 				recheck = tern.json.encode(file) ~= store.waitingSig
 			end
 			local listed: { [string]: boolean } = {}
@@ -3047,9 +3061,33 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	return withp(ui.col(kids), { key = "peek-" .. rowKey, role = "codexbar.peek", gap = "sm" })
 end
 
-local function waitingView(b: Block, now: number): Node
+-- A line above the groups while the waits may be out of date: the last tick
+-- failed (this half saw it, or the CLI noted it in `health`), no tick finished
+-- for 15 minutes, or the session scan the ticks read is stale. Without a view
+-- the empty state tells the failure instead.
+local function waitingView(b: Block, now: number, into: { Node })
 	if not store.waiting and not store.waitingError then
-		return ui.node("skeleton", { key = "list", shape = "rows", rows = 8, aria = "Reading waits" })
+		table.insert(into, ui.node("skeleton", { key = "list", shape = "rows", rows = 8, aria = "Reading waits" }))
+		return
+	end
+	if store.waiting then
+		local health = val(store.waiting.health)
+		health = if type(health) == "table" then health else {}
+		local checked = epoch(val(health.checked_at))
+		local since = if checked then absoluteTime(checked, now) else "never"
+		local err = store.waitingError or oneLine(health.error)
+		local scan = epoch(val(health.agents_stale_since))
+		local text, tone = nil, "warning"
+		if err ~= "" then
+			text, tone = "⚠️ Waits not checked since " .. since .. ": " .. oneLine(err), "error"
+		elseif checked and now - checked > 15 * 60 then
+			text = "⚠️ Waits not checked since " .. since
+		elseif scan then
+			text = "⚠️ Session scan stale since " .. absoluteTime(scan, now)
+		end
+		if text then
+			table.insert(into, withp(ui.text({ ui.span(clip(text, 200), tone) }), { key = "health", role = "codexbar.health" }))
+		end
 	end
 	local q = string.lower(b.filter)
 	local sel = selected(b)
@@ -3074,7 +3112,7 @@ local function waitingView(b: Block, now: number): Node
 	local empty = if b.filter ~= "" then noMatch(b, "wait")
 		elseif not store.waiting then emptyNode("warn", "Waits unavailable", store.waitingError)
 		else emptyNode("clock", "Nothing is set aside", "Ctrl+Alt+B sets the focused session aside.")
-	return listView(b, kids, empty)
+	table.insert(into, listView(b, kids, empty))
 end
 
 local function key(text: string): Span
@@ -3542,7 +3580,7 @@ tern.block.define("dashboard", {
 		else
 			table.insert(main, filterNode(b))
 			if b.tab == "waiting" then
-				table.insert(main, waitingView(b, now))
+				waitingView(b, now, main)
 			elseif not store.agents then
 				table.insert(main, ui.node("skeleton", { key = "list", shape = "rows", rows = 8, aria = "Scanning agents" }))
 			elseif b.tab == "agents" then
