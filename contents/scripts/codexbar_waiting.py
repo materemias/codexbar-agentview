@@ -360,12 +360,14 @@ def _last_health() -> dict:
     return health if isinstance(health, dict) else {}
 
 
-def _health(state: dict, now: datetime, ticked: bool) -> dict:
+def _health(state: dict, now: datetime, error: str | None, ticked: bool) -> dict:
     """The view's `health`. Only a tick clears the error a failed tick left;
     any other view carries it over."""
     last = _last_health()
     last_error = last.get("error") if isinstance(last.get("error"), str) else None
-    error = None if ticked else last_error
+    if last_error and not ticked:
+        # Rows this view couldn't build don't hide that ticks fail.
+        error = last_error
     since = last.get("error_since") if last_error and isinstance(last.get("error_since"), str) else None
     return {
         "checked_at": state.get("last_tick_at"),
@@ -1410,6 +1412,43 @@ def _flag_on_me(
     _toast(state, record, wait, now, level, f"{wait['label']}: {reason}")
 
 
+INTERNAL_ERROR = "internal error: "
+# The time fields `_quarantine` clears when they don't parse, so the record can
+# still be shown.
+_WAIT_TIMES = ("deadline", "refire_at", "next_check_at", "verify_claim_until", "armed_at", "fired_at")
+
+
+@contextlib.contextmanager
+def _isolated(state: dict, record: dict, now: datetime):
+    """One record's step: a record that raises is put on me, and the tick goes on."""
+    try:
+        yield
+    except Exception as error:  # a bad record, not a reason to stop every other one
+        _quarantine(state, record, now, error)
+
+
+def _quarantine(state: dict, record: dict, now: datetime, error: Exception) -> None:
+    """Each open wait goes on me, once: a record that keeps raising says so only
+    the first time."""
+    reason = f"{INTERNAL_ERROR}{_error_line(error)}"
+    waits = [wait for wait in record.get("waits") or [] if isinstance(wait, dict)]
+    for wait in waits:
+        # One whose text changes from tick to tick is still the same failure.
+        if wait.get("state") == "done" or str(wait.get("reason")).startswith(INTERNAL_ERROR):
+            continue
+        for key in _WAIT_TIMES:
+            try:
+                _stamp(wait.get(key))
+            except Exception:
+                wait[key] = None
+        try:
+            _attention(state, record, wait, now, reason)
+        except Exception:  # the record is too broken for its prompts to be cancelled
+            wait.update(state="needs_attention", reason=reason, on_me=False)
+            with contextlib.suppress(Exception):
+                _log(record, now, wait, reason, "attention")
+
+
 def _clear_delivery_flags(record: dict) -> None:
     for wait in _open_waits(record):
         if wait["reason"] in DELIVERY_REASONS:
@@ -1534,41 +1573,50 @@ def _delivery_pass(state: dict, agents: Agents, now: datetime, window: bool) -> 
         return
     facts = Facts(agents)
     for session, record in state["sessions"].items():
-        queue = record["prompt_queue"]
-        live = _running(state, agents, session)
-        if live and _extension_fresh(state, session, now):
-            # Back for good: a later close may be resumed again at once.
-            record["resume_opened_at"] = None
-        if not live and queue and queue[0]["state"] == "delivered":
-            entry = queue.pop(0)
-            wait = _wait_in(record, entry["wait"])
-            if entry.get("repeat"):
-                # The repeat goes on: its next run resumes the session.
-                if wait is not None:
-                    _log(record, now, wait, "The session closed during a run")
-                _run_over(state, record, entry, now)
-            elif wait is not None:
-                _attention(state, record, wait, now, "session closed before the prompt's turn ended")
-        # Cancelling prompts replaces the list.
-        queue = record["prompt_queue"]
-        if live or not queue:
-            _drop_resume(state, session)
-        if not queue:
-            continue
-        if live and _extension_fresh(state, session, now):
-            _clear_delivery_flags(record)
-            continue
-        if live and _resume_opened_lately(record, now):
-            # Up again, its extension about to say so.
-            _mark_resuming(record)
-            continue
-        if not live and _resume(state, record, facts, now, window):
-            continue
-        reason = REASON_NO_EXTENSION if live else REASON_CLOSED
-        for entry in list(queue):
-            wait = _wait_in(record, entry["wait"])
-            if wait is not None and (live or wait["reason"] in CLOSED_REPLACES):
-                _flag_on_me(state, record, wait, now, reason)
+        with _isolated(state, record, now):
+            _deliver(state, record, agents, facts, now, window)
+
+
+def _deliver(
+    state: dict, record: dict, agents: Agents, facts: Facts, now: datetime, window: bool,
+) -> None:
+    session = record["session"]
+    queue = record["prompt_queue"]
+    live = _running(state, agents, session)
+    fresh = live and _extension_fresh(state, session, now)
+    if fresh:
+        # Back for good: a later close may be resumed again at once.
+        record["resume_opened_at"] = None
+    if not live and queue and queue[0]["state"] == "delivered":
+        entry = queue.pop(0)
+        wait = _wait_in(record, entry["wait"])
+        if entry.get("repeat"):
+            # The repeat goes on: its next run resumes the session.
+            if wait is not None:
+                _log(record, now, wait, "The session closed during a run")
+            _run_over(state, record, entry, now)
+        elif wait is not None:
+            _attention(state, record, wait, now, "session closed before the prompt's turn ended")
+    # Cancelling prompts replaces the list.
+    queue = record["prompt_queue"]
+    if live or not queue:
+        _drop_resume(state, session)
+    if not queue:
+        return
+    if fresh:
+        _clear_delivery_flags(record)
+        return
+    if live and _resume_opened_lately(record, now):
+        # Up again, its extension about to say so.
+        _mark_resuming(record)
+        return
+    if not live and _resume(state, record, facts, now, window):
+        return
+    reason = REASON_NO_EXTENSION if live else REASON_CLOSED
+    for entry in list(queue):
+        wait = _wait_in(record, entry["wait"])
+        if wait is not None and (live or wait["reason"] in CLOSED_REPLACES):
+            _flag_on_me(state, record, wait, now, reason)
 
 
 # Conditions ------------------------------------------------------------------
@@ -1768,30 +1816,31 @@ def _claim_checks(state: dict, now: datetime) -> list[dict]:
     jobs = []
     stamp = now.timestamp()
     for record in _records(state):
-        for wait in record["waits"]:
-            if len(jobs) >= MAX_CHECKS_PER_TICK:
-                return jobs
-            if wait["state"] == "acting" and wait["verify_pending"]:
-                if (_stamp(wait["verify_claim_until"]) or 0) <= stamp:
-                    jobs.append(_verify_job(wait, now))
-                continue
-            recheck = _revocable(wait)
-            if not recheck and (wait["state"] != "waiting" or wait["kind"] not in ("command", "pr")):
-                continue
-            if (_stamp(wait["next_check_at"]) or 0) > stamp:
-                continue
-            _touch(wait)
-            job = {"wait": wait["id"], "rev": wait["rev"], "condition": wait["condition"]}
-            if wait["kind"] == "command":
-                job["type"] = "command"
-                interval = wait["condition"]["interval_s"]
-            else:
-                job.update(type="recheck" if recheck else "pr", memo=wait["memo"], fix=wait["fix"])
-                interval = PR_POLL_S
-            # The result sets the real next check; this only holds the claim.
-            claim = max(interval, CHECK_CLAIM_S)
-            wait["next_check_at"] = _iso(now + timedelta(seconds=claim))
-            jobs.append(job)
+        with _isolated(state, record, now):
+            for wait in record["waits"]:
+                if len(jobs) >= MAX_CHECKS_PER_TICK:
+                    return jobs
+                if wait["state"] == "acting" and wait["verify_pending"]:
+                    if (_stamp(wait["verify_claim_until"]) or 0) <= stamp:
+                        jobs.append(_verify_job(wait, now))
+                    continue
+                recheck = _revocable(wait)
+                if not recheck and (wait["state"] != "waiting" or wait["kind"] not in ("command", "pr")):
+                    continue
+                if (_stamp(wait["next_check_at"]) or 0) > stamp:
+                    continue
+                _touch(wait)
+                job = {"wait": wait["id"], "rev": wait["rev"], "condition": wait["condition"]}
+                if wait["kind"] == "command":
+                    job["type"] = "command"
+                    interval = wait["condition"]["interval_s"]
+                else:
+                    job.update(type="recheck" if recheck else "pr", memo=wait["memo"], fix=wait["fix"])
+                    interval = PR_POLL_S
+                # The result sets the real next check; this only holds the claim.
+                claim = max(interval, CHECK_CLAIM_S)
+                wait["next_check_at"] = _iso(now + timedelta(seconds=claim))
+                jobs.append(job)
     return jobs
 
 
@@ -1987,15 +2036,16 @@ def _merge(state: dict, finished: list[dict], now: datetime) -> None:
         if found is None:
             continue
         record, wait = found
-        if job["type"] == "verify":
-            if wait["rev"] == job["rev"] and wait["state"] == "acting" and wait["verify_pending"]:
-                _apply_verify(state, record, wait, job["result"], now)
-        elif job["type"] == "recheck":
-            if wait["rev"] == job["rev"] and _revocable(wait):
-                _apply_recheck(state, record, wait, job["result"], now)
-        elif wait["rev"] == job["rev"] and wait["state"] == "waiting":
-            apply = _apply_command if job["type"] == "command" else _apply_poll
-            apply(state, record, wait, job["result"], now)
+        with _isolated(state, record, now):
+            if job["type"] == "verify":
+                if wait["rev"] == job["rev"] and wait["state"] == "acting" and wait["verify_pending"]:
+                    _apply_verify(state, record, wait, job["result"], now)
+            elif job["type"] == "recheck":
+                if wait["rev"] == job["rev"] and _revocable(wait):
+                    _apply_recheck(state, record, wait, job["result"], now)
+            elif wait["rev"] == job["rev"] and wait["state"] == "waiting":
+                apply = _apply_command if job["type"] == "command" else _apply_poll
+                apply(state, record, wait, job["result"], now)
 
 
 def _pane_closed(state: dict, pane: int, now: datetime) -> None:
@@ -2177,53 +2227,39 @@ def _repeat_step(state: dict, record: dict, wait: dict, now: datetime) -> None:
 
 def _evaluate(state: dict, now: datetime) -> None:
     """Everything that needs only the clock."""
-    stamp = now.timestamp()
     for record in _records(state):
-        for wait in list(record["waits"]):
-            if wait["state"] == "snoozed" and _stamp(wait["refire_at"]) <= stamp:
-                _unsnooze(state, record, wait, now)
-            if wait["state"] == "waiting" and wait.get("repeat"):
-                _repeat_step(state, record, wait, now)
-            if wait["state"] != "waiting":
-                continue
-            condition = wait["condition"]
-            if wait["kind"] == "time" and _stamp(condition["at"]) <= stamp:
-                _fire(state, record, wait, now, fired=_timer_text(wait))
-            else:
-                deadline = _stamp(wait["deadline"])
-                if deadline is not None and deadline <= stamp and not wait["overdue"]:
-                    wait["overdue"] = True
-                    wait["reason"] = wait["reason"] or REASON_OVERDUE
-                    _log(record, now, wait, f"{wait['label']}: {REASON_OVERDUE}", "attention")
-                    record["unseen"] = True
-                    _toast(state, record, wait, now, "error", f"{wait['label']}: {REASON_OVERDUE}")
+        with _isolated(state, record, now):
+            _evaluate_record(state, record, now)
+
+
+def _evaluate_record(state: dict, record: dict, now: datetime) -> None:
+    stamp = now.timestamp()
+    for wait in list(record["waits"]):
+        if wait["state"] == "snoozed" and _stamp(wait["refire_at"]) <= stamp:
+            _unsnooze(state, record, wait, now)
+        if wait["state"] == "waiting" and wait.get("repeat"):
+            _repeat_step(state, record, wait, now)
+        if wait["state"] != "waiting":
+            continue
+        condition = wait["condition"]
+        if wait["kind"] == "time" and _stamp(condition["at"]) <= stamp:
+            _fire(state, record, wait, now, fired=_timer_text(wait))
+        else:
+            deadline = _stamp(wait["deadline"])
+            if deadline is not None and deadline <= stamp and not wait["overdue"]:
+                wait["overdue"] = True
+                wait["reason"] = wait["reason"] or REASON_OVERDUE
+                _log(record, now, wait, f"{wait['label']}: {REASON_OVERDUE}", "attention")
+                record["unseen"] = True
+                _toast(state, record, wait, now, "error", f"{wait['label']}: {REASON_OVERDUE}")
 
 
 def _next_tick_s(state: dict, now: datetime) -> int:
     stamp = now.timestamp()
     times: list[float | None] = []
     for record in _records(state):
-        if _resume_opened_lately(record, now):
-            times.append(_stamp(record["resume_opened_at"]) + RESUME_GRACE_S)
-        if record["prompt_queue"] and _heard_lately(state, record["session"] or "", now):
-            # When a closed session's extension has been quiet long enough to resume it.
-            times.append(_stamp(state["extensions"][record["session"]]) + RESUME_QUIET_S)
-        for wait in record["waits"]:
-            if wait["state"] == "acting" and wait["verify_pending"]:
-                times.append(_stamp(wait["verify_claim_until"]) or stamp)
-            if wait["state"] == "snoozed":
-                times.append(_stamp(wait["refire_at"]))
-            if _revocable(wait):
-                times.append(_stamp(wait["next_check_at"]))
-            if wait["state"] != "waiting":
-                continue
-            times.append(_stamp(wait["next_check_at"]))
-            if wait.get("repeat"):
-                times += [_stamp(wait["repeat"]["next_at"]), _stamp(wait["repeat"]["ends_at"])]
-            if not wait["overdue"]:
-                times.append(_stamp(wait["deadline"]))
-            if wait["kind"] == "time":
-                times.append(_stamp(wait["condition"]["at"]))
+        with _isolated(state, record, now):
+            times += _record_times(state, record, now)
     delay = min((moment - stamp for moment in times if moment is not None), default=TICK_MAX_S)
     delay = min(max(math.ceil(delay), TICK_MIN_S), TICK_MAX_S)
     if any(
@@ -2232,6 +2268,34 @@ def _next_tick_s(state: dict, now: datetime) -> int:
     ):
         return min(delay, TICK_OUTBOX_S)
     return delay
+
+
+def _record_times(state: dict, record: dict, now: datetime) -> list[float | None]:
+    """When the record next needs a tick."""
+    stamp = now.timestamp()
+    times: list[float | None] = []
+    if _resume_opened_lately(record, now):
+        times.append(_stamp(record["resume_opened_at"]) + RESUME_GRACE_S)
+    if record["prompt_queue"] and _heard_lately(state, record["session"] or "", now):
+        # When a closed session's extension has been quiet long enough to resume it.
+        times.append(_stamp(state["extensions"][record["session"]]) + RESUME_QUIET_S)
+    for wait in record["waits"]:
+        if wait["state"] == "acting" and wait["verify_pending"]:
+            times.append(_stamp(wait["verify_claim_until"]) or stamp)
+        if wait["state"] == "snoozed":
+            times.append(_stamp(wait["refire_at"]))
+        if _revocable(wait):
+            times.append(_stamp(wait["next_check_at"]))
+        if wait["state"] != "waiting":
+            continue
+        times.append(_stamp(wait["next_check_at"]))
+        if wait.get("repeat"):
+            times += [_stamp(wait["repeat"]["next_at"]), _stamp(wait["repeat"]["ends_at"])]
+        if not wait["overdue"]:
+            times.append(_stamp(wait["deadline"]))
+        if wait["kind"] == "time":
+            times.append(_stamp(wait["condition"]["at"]))
+    return times
 
 
 def _public_action(action: dict) -> dict:
@@ -2707,14 +2771,29 @@ def _build_view(
             chosen.append((session, record))
     facts.prefetch([session for session, _ in chosen])
     prs = PrCache()
+    errors: list[str] = []
+
+    def shown(name: str, build) -> list[dict]:
+        """`build()`'s rows; one that can't be built is left out, and the view's
+        health says so."""
+        try:
+            return build()
+        except Exception as error:
+            errors.append(f"{name} can't be shown: {_error_line(error)}")
+            return []
+
     sessions = [
-        _session_view(session, record, facts, session in pins, state, now, prs)
-        for session, record in chosen
+        row for session, record in chosen for row in shown(
+            f"session {session[:8]}",
+            lambda: [_session_view(session, record, facts, session in pins, state, now, prs)],
+        )
     ]
     prs.save()
     sessions.sort(key=_sort_key)
     panes = [
-        _pane_view(record, now) for record in state["panes"].values() if _open_waits(record)
+        row for key, record in state["panes"].items() for row in shown(
+            f"pane {key}", lambda: [_pane_view(record, now)] if _open_waits(record) else [],
+        )
     ]
     panes.sort(key=_sort_key)
     counts = dict.fromkeys(BALLS, 0)
@@ -2727,7 +2806,7 @@ def _build_view(
         "ok": True, "now": _iso(now), "counts": counts, "sessions": sessions, "panes": panes,
         "menu_requests": _fresh_menu_requests(state, now),
         "extension_panes": _extension_panes(state, agents, now),
-        "health": _health(state, now, ticked),
+        "health": _health(state, now, "; ".join(errors) or None, ticked),
     }
 
 

@@ -123,6 +123,15 @@ class Case(unittest.TestCase):
     def tick(self, *extra: str) -> dict:
         return self.run_cli("tick", "--now", self.clock.isoformat(), *extra)
 
+    def tick_through(self, *extra: str, **delta) -> dict:
+        """Ticks as the host makes them, every TICK_MAX_S at most, for `delta`."""
+        end = self.clock + timedelta(**delta)
+        while True:
+            self.clock = min(self.clock + timedelta(seconds=waiting.TICK_MAX_S), end)
+            answer = self.tick(*extra)
+            if self.clock >= end:
+                return answer
+
     def session(self, sid: str = SID) -> dict:
         view = self.run_cli("list")
         return next(item for item in view["sessions"] if item["session_id"] == sid)
@@ -4550,6 +4559,61 @@ class HealthTests(Case):
         self.assertIsNone(view["health"]["checked_at"])
         self.assertIn("unreadable", view["health"]["error"])
         self.assertEqual((self.state_dir / "waiting.json").read_text(), "{broken")
+
+
+class IsolationTests(Case):
+    def edit_state(self, change) -> None:
+        state = self.state()
+        change(state)
+        (self.state_dir / "waiting.json").write_text(json.dumps(state))
+
+    def test_a_bad_record_comes_to_me_once_and_the_others_go_on(self) -> None:
+        bad = self.add("--kind", "later", session=OTHER)["id"]
+        good = self.add("--kind", "time", "--in", "1m")["id"]
+        self.edit_state(lambda state: state["sessions"][OTHER]["waits"][0].update(deadline="not a time"))
+        self.advance(minutes=2)
+        self.tick()
+        self.assertEqual(self.wait_of(good)["state"], "fired")
+        seen = self.wait_of(bad, OTHER)
+        self.assertEqual(
+            (seen["state"], seen["reason"]),
+            ("needs_attention", "internal error: BadInput: bad time: 'not a time'"),
+        )
+        lines = len(self.session(OTHER)["history"])
+        self.advance(minutes=5)
+        self.tick()
+        self.assertEqual(len(self.session(OTHER)["history"]), lines)
+
+    def test_an_error_whose_text_changes_is_still_said_once(self) -> None:
+        wait = self.add("--kind", "later")["id"]
+        count = iter(range(100))
+
+        def failing(state, record, now):
+            raise RuntimeError(f"try {next(count)}")
+
+        with mock.patch.object(waiting, "_evaluate_record", failing):
+            self.tick()
+            lines = len(self.session()["history"])
+            self.advance(minutes=5)
+            self.tick()
+        self.assertEqual(len(self.session()["history"]), lines)
+        self.assertEqual(self.wait_of(wait)["reason"], "internal error: RuntimeError: try 0")
+
+    def test_a_record_that_keeps_failing_says_so_once(self) -> None:
+        self.agents(OTHER)
+        wait = self.add("--kind", "later", session=OTHER)["id"]
+        self.edit_state(lambda state: state["sessions"][OTHER].update(prompt_queue=[{"bogus": 1}]))
+        health = self.tick_through(minutes=10)["view"]["health"]
+        # Too broken to show: the view's health says which row is missing.
+        self.assertTrue(health["error"].startswith(f"session {OTHER[:8]} can't be shown: KeyError"))
+        record = self.state()["sessions"][OTHER]
+        self.assertEqual(
+            (record["waits"][0]["state"], record["waits"][0]["reason"]),
+            ("needs_attention", "internal error: KeyError: 'wait'"),
+        )
+        lines = len(record["history"])
+        self.tick_through(minutes=10)
+        self.assertEqual(len(self.state()["sessions"][OTHER]["history"]), lines)
 
 
 if __name__ == "__main__":
