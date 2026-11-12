@@ -30,7 +30,7 @@ class MainLifecycleTest(unittest.TestCase):
                 path.write_text(text)
 
             (root / "ui").mkdir()
-            for name in ("main.qml", "Command.js", "Usage.js", "Notifications.js"):
+            for name in ("main.qml", "Command.js", "Usage.js", "Notifications.js", "Filter.js"):
                 shutil.copy2(ROOT / "contents/ui" / name,
                              root / "ui" / ("Main.qml" if name == "main.qml" else name))
             (root / "ui/process").symlink_to(PLUGIN, target_is_directory=True)
@@ -38,7 +38,7 @@ class MainLifecycleTest(unittest.TestCase):
                 # The real panel item and Agents rows, hosted in a bare popup.
                 (root / "icons").symlink_to(ROOT / "contents/icons", target_is_directory=True)
                 for name in ("CompactRepresentation.qml", "AgentsSection.qml", "SectionCard.qml",
-                             "AgentTitle.qml", "TurnBubble.qml", "Filter.js"):
+                             "AgentTitle.qml", "TurnBubble.qml"):
                     shutil.copy2(ROOT / "contents/ui" / name, root / "ui" / name)
                 put("ui/FullRepresentation.qml", "import QtQuick\nItem {\n"
                     "property bool tooltipHovered: false\n"

@@ -8,6 +8,7 @@ import "process" as Process
 import org.kde.taskmanager as TaskManager
 import org.kde.kirigami as Kirigami
 import "Command.js" as Command
+import "Filter.js" as Filter
 import "Usage.js" as Usage
 import "Notifications.js" as Notifications
 
@@ -208,15 +209,12 @@ PlasmoidItem {
         zai:    ["primary", "secondary"],
         opencodego: ["primary", "secondary"]
     })
-    function _html(text) {
-        return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
-    }
     toolTipSubText: {
         var arr = root.snapshot.providers || []
         // The waitingfor health line rides along under the usage rows.
-        var waitingWarning = root._html(root.waitingWarning)
+        var waitingWarning = Filter.escape(root.waitingWarning)
         if (arr.length === 0)
-            return root._html(root.lastError || (root.loading ? "Loading…" : "No providers enabled"))
+            return Filter.escape(root.lastError || (root.loading ? "Loading…" : "No providers enabled"))
                 + (waitingWarning ? "<br>" + waitingWarning : "")
         var labels = { codex: "Codex", claude: "Claude", zai: "z.ai", opencodego: "OpenCode Go" }
         // width="240" widens the tooltip a touch so the columns don't crowd.
@@ -235,7 +233,7 @@ PlasmoidItem {
             if (!allowedSlots) continue
             var name = labels[rec.id] || rec.id
             if (rec.accountEmail && (rec.id === "codex" || (rec.id === "claude" && claudeAccounts > 1))) {
-                var account = root._html(root.accountDisplayName(rec))
+                var account = Filter.escape(root.accountDisplayName(rec))
                 name += " · " + account
             }
             if (rec.stale === true) {
