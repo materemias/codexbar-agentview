@@ -389,18 +389,22 @@ def _last_health() -> dict:
 
 
 def _health(state: dict, now: datetime, error: str | None, ticked: bool) -> dict:
-    """The view's `health`. Only a tick clears the error a failed tick left;
-    any other view carries it over."""
+    """The view's `health`. Only a tick sets or clears `error` and `error_since`;
+    any other view carries them over as they are, rows it couldn't build
+    included (the next tick reports those)."""
     last = _last_health()
     last_error = last.get("error") if isinstance(last.get("error"), str) else None
-    if last_error and not ticked:
-        # Rows this view couldn't build don't hide that ticks fail.
-        error = last_error
-    since = last.get("error_since") if last_error and isinstance(last.get("error_since"), str) else None
+    last_since = last.get("error_since") if isinstance(last.get("error_since"), str) else None
+    if not ticked:
+        error, since = last_error, last_since
+    elif error:
+        since = (last_error and last_since) or _iso(now)
+    else:
+        since = None
     return {
         "checked_at": state.get("last_tick_at"),
         "error": error,
-        "error_since": (since or _iso(now)) if error else None,
+        "error_since": since,
         "agents_stale_since": state.get("agents_stale_since"),
     }
 

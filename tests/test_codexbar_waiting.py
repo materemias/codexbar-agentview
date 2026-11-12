@@ -4611,6 +4611,21 @@ class HealthTests(Case):
         health = self.tick()["view"]["health"]
         self.assertEqual((health["error"], health["error_since"]), (None, None))
 
+    def test_only_a_tick_sets_the_error(self) -> None:
+        self.add("--kind", "later", session=OTHER)
+        state = self.state()
+        state["sessions"][OTHER]["prompt_queue"] = [{"bogus": 1}]
+        (self.state_dir / "waiting.json").write_text(json.dumps(state))
+        self.add("--kind", "later")
+        self.assertIsNone(self.view_file()["health"]["error"])
+        health = self.tick()["view"]["health"]
+        self.assertTrue(health["error"].startswith(f"session {OTHER[:8]} can't be shown"))
+        self.assertEqual(health["error_since"], self.clock.isoformat())
+        since = self.clock.isoformat()
+        self.advance(minutes=5)
+        self.add("--kind", "later")
+        self.assertEqual(self.view_file()["health"]["error_since"], since)
+
     def test_an_unreadable_session_scan_counts_as_stale(self) -> None:
         (self.state_dir / "agents.json").write_text("{torn")
         self.assertEqual(self.tick()["view"]["health"]["agents_stale_since"], self.clock.isoformat())
