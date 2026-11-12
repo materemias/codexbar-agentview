@@ -452,25 +452,27 @@ class Agents:
     """agents.json, by session id. `known` is False without a readable file:
     liveness is then unknown, which is not the same as every session closed."""
 
-    def __init__(self, payload: object = None, foreign: bool = False):
-        """`foreign`: the file is from another boot, so every session it lists has
-        ended, and when it was swept says nothing about this boot."""
-        self.foreign = foreign
+    def __init__(self, payload: object = None):
+        self.foreign = False  # from another boot (`from_another_boot`)
         self.known = isinstance(payload, dict)
         data = payload if isinstance(payload, dict) else {}
         self.boot_id = _text(data.get("bootId"))
         updated = data.get("updatedAt")
-        self.updated_at = updated / 1000 if type(updated) in (int, float) and not foreign else None
+        self.updated_at = updated / 1000 if type(updated) in (int, float) else None
         self.live = self._by_session(data.get("agents"))
         self.closed = self._by_session(data.get("history"))
-        if foreign:
-            self.closed.update(self.live)
-            self.live = {}
 
     def untrusted(self) -> "Agents":
         """These rows with no session taken for running: for a stale file."""
         agents = copy.copy(self)
         agents.live, agents.closed = {}, {**self.closed, **self.live}
+        return agents
+
+    def from_another_boot(self) -> "Agents":
+        """Every session the file lists has ended, and when it was swept says
+        nothing about this boot."""
+        agents = self.untrusted()
+        agents.foreign, agents.updated_at = True, None
         return agents
 
     @staticmethod
@@ -501,7 +503,7 @@ def _read_agents() -> Agents:
         return Agents()
     agents = Agents(payload)
     boot = _system_boot_id()
-    return Agents(payload, foreign=True) if boot and agents.boot_id and agents.boot_id != boot else agents
+    return agents.from_another_boot() if boot and agents.boot_id and agents.boot_id != boot else agents
 
 
 def _system_boot_id() -> str:
@@ -1691,21 +1693,26 @@ def _resume_opened_lately(record: dict, now: datetime) -> bool:
     return opened is not None and now.timestamp() - opened < RESUME_GRACE_S
 
 
+def _resuming_waits(record: dict) -> list[dict]:
+    """The waits whose queued prompts a resume carries that may say so. An
+    overdue one keeps saying it is overdue: it is on me either way."""
+    waits = (_wait_in(record, entry["wait"]) for entry in record["prompt_queue"])
+    return [
+        wait for wait in waits
+        if wait is not None and not wait["overdue"] and wait["reason"] in RESUMING_REPLACES
+    ]
+
+
 def _mark_resuming(record: dict) -> None:
-    """An overdue wait keeps saying so: it is on me either way."""
-    for entry in record["prompt_queue"]:
-        wait = _wait_in(record, entry["wait"])
-        if wait is not None and not wait["overdue"] and wait["reason"] in RESUMING_REPLACES:
-            wait.update(on_me=False, reason=REASON_RESUMING)
+    for wait in _resuming_waits(record):
+        wait.update(on_me=False, reason=REASON_RESUMING)
 
 
 def _flag_no_window(state: dict, record: dict, now: datetime) -> None:
     """Like `_mark_resuming`, but on me: the resume can't run without a window."""
-    for entry in record["prompt_queue"]:
-        wait = _wait_in(record, entry["wait"])
-        if wait is not None and not wait["overdue"] and wait["reason"] in RESUMING_REPLACES:
-            # No toast: only a window could show it, and by then it says otherwise.
-            _flag_on_me(state, record, wait, now, REASON_NO_WINDOW, toast=False)
+    for wait in _resuming_waits(record):
+        # No toast: only a window could show it, and by then it says otherwise.
+        _flag_on_me(state, record, wait, now, REASON_NO_WINDOW, toast=False)
 
 
 def _heard_lately(state: dict, session: str, now: datetime) -> bool:
