@@ -1641,7 +1641,7 @@ def _window_runs(runs: list[list], seconds: int, now: _dt.datetime) -> list[list
     base = 0
     while base + 1 < len(runs) and runs[base + 1][0] <= start:
         base += 1
-    return [list(run) for run in runs[base:]]
+    return runs[base:]
 
 
 def _attach_recent_usage(records: list[dict], history: dict[str, list[list]], now: _dt.datetime) -> None:
