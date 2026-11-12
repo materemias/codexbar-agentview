@@ -46,6 +46,8 @@ COMMAND_TIMEOUT_S = 60
 DEFAULT_INTERVAL_S = 15 * 60
 RELEASE_INTERVAL_S = 60 * 60
 PR_POLL_S = 3 * 60
+# How long GitHub or a release check may stay unreachable before the wait says so.
+TRANSIENT_REPORT_S = 60 * 60
 # How long a claimed check stays with the process that claimed it. A tick takes
 # only what its workers can finish in that time; a check that still overruns is
 # claimed again, and the claim's new `rev` drops the older result.
@@ -1219,6 +1221,8 @@ def _new_wait(state: dict, now: datetime, **fields: object) -> dict:
         "verify_pending": False, "verify_claim_until": None, "verify_memo": {},
         "event_flag": False, "armed_at": None, "fired_text": None, "fired_at": None,
         "snoozed_from": None, "repeat": None,
+        # Since when checks fail for a reason that passes (`_note_transient`).
+        "transient_since": None, "transient_logged": False,
     }
     wait.update(fields)
     return wait
@@ -1404,6 +1408,7 @@ def _fire(
     wait.update(
         on_me=False, overdue=False, reason=None, refire_at=None,
         fired_text=fired or text, fired_at=_iso(now),
+        transient_since=None, transient_logged=False,
     )
     _touch(wait)
     _log(record, now, wait, text, "fired")
@@ -1795,10 +1800,15 @@ def _run_command(condition: dict) -> dict:
     if not isinstance(cwd, str) or not cwd or not os.path.isabs(cwd):
         return {"holds": False, "error": "Command cwd is not a saved absolute directory; recreate this wait"}
     code, stdout, detail = _run_argv(condition["argv"], cwd)
+    # A release check asks GitHub: a network or rate-limit failure passes.
+    release = condition["predicate"] == "changed" and bool(condition.get("repo"))
     if code is None:
-        return {"holds": False, "error": detail}
+        return {
+            "holds": False, "error": detail,
+            "transient": release and _github().is_transient(detail),
+        }
     if condition["predicate"] == "changed":
-        if condition.get("repo") and code != 0 and detail.endswith("(HTTP 404)"):
+        if release and code != 0 and detail.endswith("(HTTP 404)"):
             # A repo without a release yet: nothing to compare, not a failure.
             return {"holds": False, "output": "", "error": ""}
         # The baseline lives on the wait; _apply_command compares against it.
@@ -1806,6 +1816,7 @@ def _run_command(condition: dict) -> dict:
         return {
             "holds": False, "output": stdout.strip(),
             "error": f"{error}: {detail}" if error and detail else error,
+            "transient": release and code != 0 and _github().is_transient(f"{detail}\n{stdout}"),
         }
     holds, error = _predicate(condition["predicate"], code, stdout)
     return {"holds": holds, "error": f"{error}: {detail}" if error and detail else error}
@@ -1825,9 +1836,10 @@ def _run_verify(job: dict) -> dict:
         try:
             ok, reason = github.verify_fix(verify["repo"], verify["number"], job["snapshot"])
         except Exception as error:  # a check that couldn't run, not a failed fix
+            # Only GitHub's own failures pass; anything else is a bug that stays.
             return {
-                "ok": False, "reason": str(error),
-                "transient": getattr(error, "transient", True),
+                "ok": False, "reason": str(error) or type(error).__name__,
+                "transient": isinstance(error, github.GhError) and bool(error.transient),
             }
         return {"ok": ok, "reason": reason, "transient": False}
     polled = github.poll(verify, job["memo"])
@@ -1864,9 +1876,9 @@ def _run_job(job: dict, now: datetime) -> dict:
         return {**job, "result": result}
     except Exception as error:
         if job["type"] == "verify":
-            result = {"ok": False, "reason": str(error), "transient": False}
+            result = {"ok": False, "reason": _error_line(error), "transient": False}
         else:
-            result = {"error": str(error), "transient": False, "holds": False}
+            result = {"error": _error_line(error), "transient": False, "holds": False}
         return {**job, "result": result}
 
 
@@ -1919,13 +1931,43 @@ def _claim_checks(state: dict, now: datetime) -> list[dict]:
     return jobs
 
 
+def _transient_text(wait: dict, now: datetime) -> str:
+    since = _clock(_parse_time(wait["transient_since"]), now)
+    condition = wait["condition"]
+    if wait["kind"] == "command":
+        return f"{Path(condition['argv'][0]).name} failing since {since}"
+    return f"GitHub unreachable since {since}"
+
+
+def _transient_reported(wait: dict, now: datetime) -> bool:
+    since = _stamp(wait.get("transient_since"))
+    return since is not None and now.timestamp() - since >= TRANSIENT_REPORT_S
+
+
+def _note_transient(record: dict, wait: dict, now: datetime) -> None:
+    """A failure that passes: retried, and told once when it has lasted."""
+    if wait.get("transient_since") is None:
+        wait["transient_since"] = _iso(now)
+    elif not wait.get("transient_logged") and _transient_reported(wait, now):
+        wait["transient_logged"] = True
+        _log(record, now, wait, f"{wait['label']}: {_transient_text(wait, now)}")
+
+
+def _checks_work(wait: dict) -> None:
+    wait.update(transient_since=None, transient_logged=False)
+
+
 def _apply_command(state: dict, record: dict, wait: dict, result: dict, now: datetime) -> None:
     wait["next_check_at"] = _iso(now + timedelta(seconds=wait["condition"]["interval_s"]))
+    if result.get("transient"):
+        _note_transient(record, wait, now)
+        return
     if result["error"]:
         wait["errors"] += 1
         if wait["errors"] >= MAX_ERRORS:
             _attention(state, record, wait, now, f"Command failed {MAX_ERRORS} times: {result['error']}")
         return
+    _checks_work(wait)
     wait["errors"] = 0
     condition = wait["condition"]
     if condition["predicate"] == "changed":
@@ -2074,11 +2116,14 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
             _log(record, now, wait, event["text"])
     error = result.get("error")
     if error:
-        if not result.get("transient"):
-            wait["errors"] += 1
-            if wait["errors"] >= MAX_ERRORS:
-                _attention(state, record, wait, now, f"GitHub failed {MAX_ERRORS} times: {error}")
+        if result.get("transient"):
+            _note_transient(record, wait, now)
+            return
+        wait["errors"] += 1
+        if wait["errors"] >= MAX_ERRORS:
+            _attention(state, record, wait, now, f"GitHub failed {MAX_ERRORS} times: {error}")
         return
+    _checks_work(wait)
     wait["errors"] = 0
     # `confirm` needs nothing here: its on_me event told me, and the wait stays
     # watched, so a compare that later proves the release fires it.
@@ -2095,7 +2140,10 @@ def _apply_verify(state: dict, record: dict, wait: dict, result: dict, now: date
         # Not counted, like a transient poll error; the next try backs off.
         wait["verify_memo"] = result.get("memo", wait["verify_memo"])
         wait["verify_claim_until"] = _iso(now + timedelta(seconds=PR_POLL_S))
-    elif result["ok"]:
+        _note_transient(record, wait, now)
+        return
+    _checks_work(wait)
+    if result["ok"]:
         _log(record, now, wait, f"Verified: {result['reason']}", "fired")
         record["unseen"] = True
         _toast(state, record, wait, now, "success", wait["label"])
@@ -2483,6 +2531,18 @@ def _condition_summary(wait: dict, now: datetime) -> str:
     return "when I have time"
 
 
+def _progress(wait: dict, outcome: str | None, now: datetime) -> str | None:
+    """What the wait does right now, beyond waiting: Tern resumes the session for
+    it, its checks have failed a while for a reason that passes, or the agent
+    runs its prompt."""
+    if wait["reason"] == REASON_RESUMING:
+        return REASON_RESUMING
+    checked = wait["state"] == "waiting" or wait["state"] == "acting" and wait["verify_pending"]
+    if checked and _transient_reported(wait, now):
+        return _transient_text(wait, now)
+    return WORKING_TEXT if wait["state"] == "acting" and outcome is None else None
+
+
 def _wait_view(wait: dict, now: datetime) -> dict:
     due = _wait_due(wait)
     outcome = _outcome(wait)
@@ -2499,10 +2559,7 @@ def _wait_view(wait: dict, now: datetime) -> dict:
         "fired_text": (wait.get("fired_text") or (summary if wait["kind"] == "pr" else wait["label"]))
         if fulfilled else None,
         "fired_at": (wait.get("fired_at") or wait["created_at"]) if fulfilled else None,
-        # What the wait does right now, beyond waiting: the agent runs its prompt,
-        # or Tern resumes the session for it.
-        "progress": REASON_RESUMING if wait["reason"] == REASON_RESUMING
-        else WORKING_TEXT if wait["state"] == "acting" and outcome is None else None,
+        "progress": _progress(wait, outcome, now),
         "reason": wait["reason"], "created_at": wait["created_at"],
         "due_at": None if due is None else _iso(datetime.fromtimestamp(due).astimezone()),
         "deadline": wait["deadline"], "condition": wait["condition"],

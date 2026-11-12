@@ -38,9 +38,17 @@ OTHER = "01a1abf1-0000-748b-b9fa-126ebc0b88e6"
 T0 = datetime(2026, 11, 5, 12, 0, 0).astimezone()
 
 
+class FakeGhError(Exception):
+    def __init__(self, message: str, transient: bool) -> None:
+        super().__init__(message)
+        self.transient = transient
+
+
 def fake_github(**overrides) -> types.SimpleNamespace:
     """waiting_github's contract, answering "nothing happened yet"."""
     defaults = dict(
+        GhError=FakeGhError,
+        is_transient=lambda text: "connect" in text or "HTTP 502" in text,
         FIX_PROMPT="fix {repo}#{number} at {head}",
         parse_pr=lambda text: ("o/r", 7) if "7" in text else None,
         poll=lambda cond, memo, **kwargs: {
@@ -1020,14 +1028,11 @@ class PrTests(Case):
         self.assertEqual(self.wait_of(wait)["state"], "needs_attention")
 
     def test_gh_failure_during_a_fix_verify_is_retried(self) -> None:
-        class GhError(Exception):
-            transient = True
-
         reads = iter(["down", "up"])
 
         def verify_fix(repo, number, before):
             if next(reads) == "down":
-                raise GhError("gh timed out")
+                raise FakeGhError("gh timed out", True)
             return True, "new head"
 
         first = self.fix_chain(verify_fix)
@@ -4725,6 +4730,52 @@ class StaleAgentsTests(Case):
         self.advance(seconds=1)
         self.heartbeat()
         self.run_cli("resume", "--session", SID, expect=2)
+
+
+class TransientTests(Case):
+    def test_an_outage_is_told_once_after_an_hour_and_a_success_clears_it(self) -> None:
+        down = [True]
+        self.github(poll=lambda cond, memo, **kwargs: poll_result(
+            memo, error="error connecting to api.github.com", transient=True, next_poll_s=60,
+        ) if down[0] else poll_result(memo))
+        wait = self.add("--kind", "pr", "--repo", "o/r", "--number", "7")["id"]
+        self.tick()
+        self.tick_through(minutes=55)
+        self.assertIsNone(self.wait_of(wait)["progress"])
+        self.tick_through(minutes=5)
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["progress"]), ("waiting", "GitHub unreachable since 12:00"))
+        self.tick_through(minutes=30)
+        told = [line for line in self.session()["history"] if "unreachable" in line["text"]]
+        self.assertEqual(len(told), 1)
+        down[0] = False
+        self.tick_through(minutes=5)
+        self.assertIsNone(self.wait_of(wait)["progress"])
+
+    def test_a_release_check_passes_over_network_failures(self) -> None:
+        self.github()
+        script = "import sys; sys.stderr.write(sys.argv[1] + '\\n'); sys.exit(1)"
+        condition = {"cwd": str(self.root), "predicate": "changed", "repo": "o/r"}
+        offline = waiting._run_command({**condition, "argv": [sys.executable, "-c", script, "error connecting to api.github.com"]})
+        refused = waiting._run_command({**condition, "argv": [sys.executable, "-c", script, "Bad credentials (HTTP 401)"]})
+        self.assertEqual((offline["transient"], refused["transient"]), (True, False))
+
+    def test_a_failing_release_check_says_since_when_instead_of_failing(self) -> None:
+        self.github()
+        script = "import sys; sys.stderr.write('error connecting to api.github.com\\n'); sys.exit(1)"
+        wait = self.add(
+            "--kind", "command", "--argv", json.dumps([sys.executable, "-c", script]),
+            "--predicate", "changed", "--cwd", str(self.root),
+        )["id"]
+        state = self.state()
+        state["sessions"][SID]["waits"][0]["condition"]["repo"] = "o/r"
+        (self.state_dir / "waiting.json").write_text(json.dumps(state))
+        self.tick_through(minutes=95)
+        seen = self.wait_of(wait)
+        self.assertEqual(
+            (seen["state"], seen["progress"]),
+            ("waiting", f"{Path(sys.executable).name} failing since 12:05"),
+        )
 
 
 if __name__ == "__main__":
