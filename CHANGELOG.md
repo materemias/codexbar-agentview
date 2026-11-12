@@ -22,6 +22,7 @@
 - `Ctrl+Alt+H` toggles the Tern dashboard on History.
 - Waits say when they can't be checked: the Waiting tab, the row above the omp composer, `/wait list` and the Plasma Agents section show "⚠ Waits not checked since HH:MM" (with the error when a check failed) or "⚠ Session scan stale since HH:MM", and the panel's back-on-you count reads `N?`. A recent check that couldn't do part of its work shows "⚠ Last check: …" and leaves the count plain. A GitHub or check outage of an hour shows "GitHub unreachable since HH:MM" on the wait.
 - Retry (`F5` on the Waiting tab, on the card, in the omp menu, `retry --wait`) watches a wait its failing checks or an internal error stopped; such waits are also retried every hour.
+- Each Waiting tab row says whether its session is running, parked or closed in Tern (or runs elsewhere), beside its time; typing `parked` in the filter lists the parked ones.
 
 ### Fixes
 

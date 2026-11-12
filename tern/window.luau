@@ -27,8 +27,8 @@ local SCRIPTS = tern.plugin.dir .. "/../contents/scripts"
 -- The leader lease runs on os.clock(), Luau's seconds on the system's monotonic
 -- clock (not CPU time), as do the waits here: every VM on the machine, the host
 -- half's included, reads the same one, and the wall clock can't move it. Both
--- halves read a lease further out than LEASE_S as none; host.luau's
--- waitingTick has its own LEASE_S: change both together.
+-- halves read a lease further out than LEASE_S as none, and so does publishPanes.
+-- host.luau's waitingTick and tick each have their own LEASE_S: change all three together.
 local LEASE_S = 30
 local CARD_ABOUT = "Session card of pane "
 
@@ -1609,6 +1609,46 @@ local function lead(cx: WindowCx)
 	colorTabs(cx)
 end
 
+-- Parked is the window's alone (`PaneInfo.parked`), and windows don't share
+-- panes, so every window publishes its own under its key in `waitingPanes`, for
+-- the host's Waiting rows: { [window key] = { at = os.clock(), panes = { id },
+-- parked = { id } } }. It writes when they change and renews every LEASE_S / 2;
+-- the host reads an entry older than LEASE_S as a closed window's, and the next
+-- writer drops it. Two windows writing at once may lose one entry: the next
+-- poll finds it missing and writes it again.
+local function publishPanes(cx: WindowCx)
+	local panes, parked = {}, {}
+	for _, p in cx.session:panes() do
+		table.insert(panes, p.pane)
+		if p.parked then
+			table.insert(parked, p.pane)
+		end
+	end
+	table.sort(panes)
+	table.sort(parked)
+	local key = cx:window_key()
+	local now = os.clock()
+	local stored = tern.kv.get("waitingPanes")
+	local all = if type(stored) == "table" then stored else {}
+	local mine = all[key]
+	if
+		type(mine) == "table"
+		and type(mine.at) == "number"
+		and mine.at <= now
+		and now - mine.at < LEASE_S / 2
+		and tern.json.encode({ mine.panes, mine.parked }) == tern.json.encode({ panes, parked })
+	then
+		return
+	end
+	local out = { [key] = { at = now, panes = panes, parked = parked } }
+	for k, w in all do
+		if k ~= key and type(w) == "table" and type(w.at) == "number" and w.at <= now and now - w.at <= LEASE_S then
+			out[k] = w
+		end
+	end
+	tern.kv.set("waitingPanes", out)
+end
+
 tern.on("agent_state", function(ev: AgentStateEvent, _cx: WindowCx)
 	local entry = if ev.new == "waiting_input" then waitingEntry(ev.pane) else nil
 	if entry and entry.session then
@@ -2138,7 +2178,7 @@ local function poll(cx: WindowCx?)
 				openSettings(cx)
 			end
 		end
-		for _, step in { waitingRequest, dropOrphanCards, lead, refreshCards } do
+		for _, step in { waitingRequest, dropOrphanCards, lead, publishPanes, refreshCards } do
 			local ok, err = pcall(step, cx)
 			if not ok then
 				tern.log.error("codexbar:", err)

@@ -391,6 +391,11 @@ local store = {
 	daemonKnown = false, -- whether that answer came, with an id or without one
 	paneGoneAt = {} :: { [number]: number }, -- watched job pane -> os.clock() when the pane list lost it (math.huge: told)
 	panesListed = false, -- whether this daemon's pane list has named a pane: only then is an empty one evidence
+	livePanes = {} :: { [number]: boolean }, -- this daemon's panes at the last listing
+	-- Each live pane's state for the Waiting rows: running or parked as a window
+	-- published it, else open (tick, from window.luau's publishPanes).
+	paneStates = {} :: { [number]: string },
+	paneStatesSig = "",
 	jobEventAt = {} :: { [number]: number }, -- pane -> os.clock() when its last job event went to the CLI
 	waitingMemo = nil :: any, -- waitingGroups' last answer, for one view and filter
 	lastPoke = nil :: any,
@@ -1719,6 +1724,7 @@ local function reconcilePanes()
 		live[p.pane] = true
 		store.panesListed = true
 	end
+	store.livePanes = live
 	if not store.panesListed then
 		return
 	end
@@ -2102,6 +2108,36 @@ local function tick()
 		end
 		if not store.waitingTicking and (os.time() >= store.waitingAt or os.clock() >= store.waitingAtMono) then
 			waitingTick()
+		end
+		-- The Waiting rows' pane states: what a window published within LEASE_S
+		-- (window.luau's publishPanes; an older entry is a closed window's), else
+		-- open. Read on every tick, so a park shows within one.
+		local LEASE_S = 30 -- window.luau's LEASE_S: change both together
+		local clock = os.clock()
+		local shown: { [number]: string } = {}
+		local published = tern.kv.get("waitingPanes")
+		for _, w in (if type(published) == "table" then published else {}) do
+			if type(w) == "table" and type(w.at) == "number" and w.at <= clock and clock - w.at <= LEASE_S then
+				for _, p in (if type(w.panes) == "table" then w.panes else {}) do
+					shown[p] = shown[p] or "running"
+				end
+				for _, p in (if type(w.parked) == "table" then w.parked else {}) do
+					shown[p] = "parked"
+				end
+			end
+		end
+		local states: { [number]: string } = {}
+		local parts = {}
+		for pane in store.livePanes do
+			states[pane] = shown[pane] or "open"
+			table.insert(parts, tostring(pane) .. states[pane])
+		end
+		table.sort(parts)
+		local sig = table.concat(parts, ",")
+		if sig ~= store.paneStatesSig then
+			store.paneStatesSig = sig
+			store.paneStates = states
+			renderAll()
 		end
 		local now = os.time()
 		if now - store.cacheReadAt >= CACHE_EVERY_S then
@@ -2740,12 +2776,12 @@ local function waitSummary(r: any, rest: boolean?): string
 	return if own ~= "" then "" else oneLine(r.status)
 end
 
-local function waitMatches(r: any, q: string): boolean
+local function waitMatches(r: any, q: string, state: string): boolean
 	local words = queryWords(q)
 	if #words == 0 then
 		return true
 	end
-	local fields = { waitTitle(r), oneLine(r.note), oneLine(r.project), waitSummary(r), oneLine(r.waiting_for), oneLine(r.headline) }
+	local fields = { waitTitle(r), oneLine(r.note), oneLine(r.project), waitSummary(r), oneLine(r.waiting_for), oneLine(r.headline), state }
 	for _, w in words do
 		local ok = false
 		for _, text in fields do
@@ -2762,20 +2798,47 @@ local function waitMatches(r: any, q: string): boolean
 end
 
 -- The view's order within each group, sessions before panes; a group with a
--- `rank` sorts by outcome first, in that same order within each. A render asks
--- twice (the selection, the list), so the last answer is kept per view and query.
-local function waitingGroups(q: string): { { ball: any, rows: { any } } }
+-- `rank` sorts by outcome first, in that same order within each. Each row also
+-- gets where its session is in Tern (`states`), which the filter matches too.
+-- A render asks twice (the selection, the list), so the last answer is kept per
+-- view, query and pane states.
+local function waitingGroups(q: string): { { ball: any, rows: { any }, states: { [any]: string } } }
 	local memo = store.waitingMemo
-	if memo and memo.view == store.waiting and memo.q == q then
+	if memo and memo.view == store.waiting and memo.q == q and memo.panes == store.paneStates then
 		return memo.out
 	end
+	-- closed: the session's agent stopped, or a shell row's pane is gone from
+	-- this daemon; elsewhere: the agent runs outside Tern; running or parked:
+	-- as its window says; open: no window says, or the pane is another daemon's.
+	local function stateOf(r: any): string
+		local session = str(r.session_id) ~= ""
+		local pane = tonumber(val(r.pane))
+		if session and val(r.live) ~= true then
+			return "closed"
+		elseif session and not pane then
+			return "elsewhere"
+		end
+		local state = if pane then store.paneStates[pane] else nil
+		if state then
+			return state
+		end
+		local daemon = val(r.daemon)
+		if not session and store.panesListed and (daemon == nil or daemon == store.daemonId) then
+			return "closed"
+		end
+		return "open"
+	end
 	local out = {}
+	local states: { [any]: string } = {}
 	for _, ball in BALLS do
 		local rows = {}
 		for _, field in { "sessions", "panes" } do
 			for _, r in waitingList(field) do
-				if r.ball == ball.id and waitMatches(r, q) then
-					table.insert(rows, r)
+				if r.ball == ball.id then
+					states[r] = stateOf(r)
+					if waitMatches(r, q, states[r]) then
+						table.insert(rows, r)
+					end
 				end
 			end
 		end
@@ -2789,10 +2852,10 @@ local function waitingGroups(q: string): { { ball: any, rows: { any } } }
 			end)
 		end
 		if #rows > 0 then
-			table.insert(out, { ball = ball, rows = rows })
+			table.insert(out, { ball = ball, rows = rows, states = states })
 		end
 	end
-	store.waitingMemo = { view = store.waiting, q = q, out = out }
+	store.waitingMemo = { view = store.waiting, q = q, panes = store.paneStates, out = out }
 	return out
 end
 
@@ -3094,16 +3157,18 @@ local function waitingTime(r: any, now: number): (string, string)
 end
 
 -- A do block: the main chunk is at Luau's 200-local limit.
-local addWaitingRow: (kids: { Node }, r: any, now: number, q: string) -> ()
+local addWaitingRow: (kids: { Node }, r: any, now: number, q: string, state: string) -> ()
 do
 	local OUTCOMES = {
 		fulfilled = { prefix = "✅ ", tone = "success" },
 		attention = { prefix = "⚠️ ", tone = "warning" },
 		overdue = { prefix = "⏰ ", tone = "warning" },
 	}
+	-- waitingGroups' states; open and elsewhere stay plain.
+	local STATE_TONE = { running = "success", parked = "info", closed = "muted" }
 
 	-- The row, then what happened under it, in the outcome's tone.
-	addWaitingRow = function(kids, r, now, q)
+	addWaitingRow = function(kids, r, now, q, state)
 		local onMe = r.ball == "on_me"
 		local outcome = OUTCOMES[r.outcome]
 		local label: { Span | string } = {}
@@ -3134,11 +3199,17 @@ do
 		local time, token = waitingTime(r, now)
 		-- The headline tells the first thread; the others still show beside it.
 		local detail = waitSummary(r, headline ~= "")
+		-- Where the session is, left of the time: as wide as `elsewhere` and a space, so the times line up.
+		local value: { Span } = {}
+		for _, s in highlighted(pad(state, 10), q) do
+			table.insert(value, if type(s) == "string" then ui.span(s, STATE_TONE[state]) else s)
+		end
+		table.insert(value, ui.span(string.format("%7s", time), token))
 		table.insert(kids, ui.node("item", {
 			key = waitKey(r),
 			label = label,
 			detail = if detail ~= "" then detail else nil,
-			value = { ui.span(string.format("%7s", time), token) },
+			value = value,
 			icon = if str(r.session_id) ~= "" then AGENT_ICONS.omp else "terminal",
 			tone = if outcome then outcome.tone elseif onMe then "warning" else nil,
 			role = "codexbar.waiting",
@@ -3283,7 +3354,7 @@ local function waitingView(b: Block, now: number, into: { Node })
 	for _, g in waitingGroups(q) do
 		table.insert(kids, groupHead("w-" .. g.ball.id, { ui.span(g.ball.title, "strong"), ui.span("  " .. #g.rows, "muted") }))
 		for _, r in g.rows do
-			addWaitingRow(kids, r, now, q)
+			addWaitingRow(kids, r, now, q, g.states[r])
 			local waitingFor = oneLine(r.waiting_for)
 			if waitingFor ~= "" and waitingFor ~= waitTitle(r) then -- a pane record named by the text says it already
 				local spans: { any } = { ui.span("Waiting for: ", "muted") }
@@ -3439,7 +3510,7 @@ local function filterNode(b: Block): Node
 		key = "filter",
 		text = b.filter,
 		cursor = #b.filter,
-		placeholder = if b.tab == "waiting" then "Type to filter by title, note, project or wait"
+		placeholder = if b.tab == "waiting" then "Type to filter by title, note, project, wait or state"
 			else "Type to filter by title, prompt, folder, provider or model",
 		icon = "search",
 		clear = true,

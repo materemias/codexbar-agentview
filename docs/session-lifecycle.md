@@ -271,6 +271,21 @@ you. A job wait on a shell pane comes back to you, since the pane is gone.
 | `F5` | Retry a wait its failing checks stopped (when shown) |
 | `Delete` | Done |
 
+Beside its time, each row says where the session is in Tern:
+
+| State | Means |
+|---|---|
+| `running` | its pane is open in a Tern window |
+| `parked` | its pane is parked |
+| `closed` | the agent stopped (`Enter` resumes it), or a shell row's pane is gone |
+| `elsewhere` | the agent runs outside Tern |
+| `open` | the session runs in Tern, but no window said whether its pane is parked: no window is open, or the pane is another Tern daemon's |
+
+Parked belongs to a window, so every Tern window publishes its panes and which
+of them are parked; a window that hasn't renewed that in 30 seconds counts as
+closed. The filter matches the state too: typing `parked` lists the parked
+sessions.
+
 A row shows what the session waits for in your words when it has a manual wait
 (`/wait for`), and `F2` or the row's **Manual wait…** button edits it. A
 session has one manual wait; setting it again replaces it, and an empty text
