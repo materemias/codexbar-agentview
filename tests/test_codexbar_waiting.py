@@ -4034,6 +4034,15 @@ class RepeatTests(Case):
             if line["text"].startswith(("Run ", "Skipped"))
         ]
 
+    def test_snoozing_an_overdue_repeat_keeps_its_queued_run(self) -> None:
+        wait = self.repeat("--deadline-in", "30m")
+        self.at(hours=1)
+        self.assertEqual(self.wait_of(wait)["outcome"], "overdue")
+        self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
+        self.assertEqual(self.wait_of(wait)["outcome"], None)
+        self.assertEqual([prompt["action"] for prompt in self.claim()], [mock.ANY])
+        self.assertEqual(self.state()["sessions"][SID]["waits"][0]["repeat"]["runs"], 1)
+
     def test_runs_at_the_interval_and_says_so(self) -> None:
         wait = self.repeat()
         seen = self.wait_of(wait)

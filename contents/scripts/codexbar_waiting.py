@@ -3952,13 +3952,18 @@ def cmd_snooze(args: argparse.Namespace) -> dict:
         if wait["kind"] != "time" and not wait.get("repeat") and _prompt_handed_over(record, wait):
             raise BadInput(f"{args.wait}: the agent runs its prompt now")
         until = _iso(now + delay)
+        snoozed = f"Snoozed until {_clock(_parse_time(until), now)}"
+        if wait["overdue"] and wait["state"] == "waiting":
+            # Only the deadline moves: its checks, and a repeat's runs, go on.
+            wait.update(deadline=until, deadline_in_s=None, overdue=False, on_me=False, reason=None)
+            _touch(wait)
+            _log(record, now, wait, snoozed)
+            return {}
         condition = wait["condition"]
         # How far ahead `_clamp` lets the times this sets lie.
         wait["snooze_s"] = int(delay.total_seconds())
         if wait["state"] == "snoozed":
             wait["refire_at"] = until
-        elif wait["overdue"] and wait["state"] == "waiting":
-            wait.update(deadline=until, deadline_in_s=None, overdue=False, on_me=False, reason=None)
         elif _snooze_hides(wait):
             # Its reason stays for when it comes back; a deadline that passed
             # moves below.
@@ -3989,7 +3994,7 @@ def cmd_snooze(args: argparse.Namespace) -> dict:
         else:
             _cancel_prompts(record, wait)
         _touch(wait)
-        _log(record, now, wait, f"Snoozed until {_clock(_parse_time(until), now)}")
+        _log(record, now, wait, snoozed)
         return {}
 
     return _mutate(apply)
