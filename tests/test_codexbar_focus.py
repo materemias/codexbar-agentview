@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+import fcntl
 import io
 import json
 import os
@@ -10,6 +11,8 @@ import socket
 import subprocess
 import tempfile
 import textwrap
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -1009,6 +1012,65 @@ class MacFocusTests(unittest.TestCase):
         ):
             self.assertEqual(focus.launch("omp", "sid-1"), 8)
             tern.assert_not_called()
+
+
+class StartupLockTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        patch = mock.patch.object(focus, "AGGREGATE_PATH", self.root / "agents.json")
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def lock_file(self, name: str, age_s: float) -> Path:
+        path = self.root / f"agents.json.{name}.startup.lock"
+        path.touch()
+        stamp = time.time() - age_s
+        os.utime(path, (stamp, stamp))
+        return path
+
+    def test_only_unheld_locks_unused_for_a_day_go(self) -> None:
+        day = focus.STARTUP_LOCK_KEPT_SECONDS
+        old = self.lock_file("old", day + 60)
+        fresh = self.lock_file("fresh", day - 60)
+        held = self.lock_file("held", day + 60)
+        mine = self.lock_file("mine", day + 60)
+        holder = os.open(held, os.O_RDWR)
+        self.addCleanup(os.close, holder)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        focus._prune_startup_locks(self.root, keep=mine)
+        self.assertEqual([path.exists() for path in (old, fresh, held, mine)], [False, True, True, True])
+
+    def test_a_waiter_on_a_removed_lock_takes_the_new_one(self) -> None:
+        path = self.lock_file("s", 0)
+        holder = os.open(path, os.O_RDWR)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        entered = threading.Event()
+        leave = threading.Event()
+
+        def waiter() -> None:
+            with focus._startup_lock(path):
+                entered.set()
+                leave.wait(5)
+
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        self.assertFalse(entered.wait(0.2))
+        # A prune between the waiter's open and its flock: the path is gone.
+        path.unlink()
+        os.close(holder)
+        self.assertTrue(entered.wait(5))
+        # The waiter holds the file the path names now, so nobody else gets it.
+        probe = os.open(path, os.O_RDWR)
+        try:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(probe)
+            leave.set()
+            thread.join(5)
+
 
 
 if __name__ == "__main__":

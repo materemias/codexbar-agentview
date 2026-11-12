@@ -35,6 +35,8 @@ launches open on the current desktop, and other hosts fail.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import hashlib
 import json
 import os
@@ -386,6 +388,61 @@ def _kwin_place(pid: int, desktop: str) -> bool:
 # A terminal can accept a command before its agent becomes discoverable.
 # Keep that startup gap owned even after the helper exits or crashes.
 SESSION_START_RESERVATION_SECONDS = 60.0
+# A session's startup lock file nobody has taken for this long is removed.
+STARTUP_LOCK_KEPT_SECONDS = 24 * 3600.0
+
+
+def _names_inode(fd: int, path: Path) -> bool:
+    """Whether `path` still names the file open as `fd`."""
+    try:
+        current = os.stat(path)
+    except FileNotFoundError:
+        return False
+    held = os.fstat(fd)
+    return (current.st_dev, current.st_ino) == (held.st_dev, held.st_ino)
+
+
+@contextlib.contextmanager
+def _startup_lock(path: Path):
+    """The flock serializing one session's startups. `_prune_startup_locks` may
+    unlink the file meanwhile: a lock that ends up on an inode the path no
+    longer names is let go and taken again on the path's file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    while True:
+        fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            if _names_inode(fd, path):
+                os.utime(fd)  # its last use, for `_prune_startup_locks`
+                yield
+                return
+        finally:
+            os.close(fd)
+
+
+def _prune_startup_locks(directory: Path, keep: Path) -> None:
+    """Remove the startup lock files of other sessions unused for a day. One
+    goes only while nobody holds it and its path still names the inode locked,
+    so a waiter on it notices (`_startup_lock`)."""
+    cutoff = time.time() - STARTUP_LOCK_KEPT_SECONDS
+    for path in directory.glob(f"{AGGREGATE_PATH.name}.*.startup.lock"):
+        if path == keep:
+            continue
+        try:
+            if path.stat().st_mtime > cutoff:
+                continue
+            fd = os.open(path, os.O_RDWR)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if _names_inode(fd, path):
+                path.unlink()
+        except OSError:
+            pass
+        finally:
+            os.close(fd)
 
 
 class _DispatchAckUnknown(Exception):
@@ -448,8 +505,9 @@ def _session_operation(
     """Own validation through dispatch, then reserve the writer's startup."""
     digest = hashlib.sha256(json.dumps([provider, session_id]).encode()).hexdigest()
     reservation = AGGREGATE_PATH.with_name(f"{AGGREGATE_PATH.name}.{digest}.startup.json")
-    # Never unlink the flock file: a waiter must keep sharing the same inode.
-    with agents._aggregate_lock(AGGREGATE_PATH, reservation.with_suffix(".lock")):
+    lock = reservation.with_suffix(".lock")
+    with _startup_lock(lock):
+        _prune_startup_locks(lock.parent, keep=lock)
         payload = agents._load_payload(AGGREGATE_PATH)
         record = next(
             (r for r in payload["agents"] + payload["history"]
