@@ -4250,7 +4250,9 @@ tern.timer(0, function()
 			store.daemonId = if res.status == 0 and string.match(id, "^%d+%-%S") then id else nil
 			store.daemonKnown = true
 		end)
-		store.daemonKnown = not started
+		if not started then -- else the callback says, whenever it runs
+			store.daemonKnown = true
+		end
 	else
 		store.daemonKnown = true
 	end
