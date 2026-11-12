@@ -4319,10 +4319,20 @@ class ResumeTests(Case):
     def test_a_resume_waits_for_a_window_before_it_can_expire(self) -> None:
         wait = self.fired_prompt()
         self.assertEqual(len(self.resumes(window=False)), 1)
-        self.advance(seconds=3 * waiting.RESUME_GRACE_S)
+        self.advance(seconds=waiting.RESUME_GRACE_S - 1)
         self.assertEqual(len(self.resumes(window=False)), 1)
         self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_RESUMING)
+        # Without a window it can't run: that comes to me, and the resume stays.
+        self.advance(seconds=2 * waiting.RESUME_GRACE_S)
+        actions = self.tick()["actions"]
+        self.assertEqual([action["type"] for action in actions if action["type"] == "resume"], ["resume"])
+        # Only a window could show a toast, and by then it says otherwise.
+        self.assertFalse([action for action in actions if waiting.REASON_NO_WINDOW in action.get("text", "")])
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["ball"], seen["reason"]), ("on_me", waiting.REASON_NO_WINDOW))
         self.assertEqual(len(self.resumes()), 1)  # a window is up from here
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["ball"], seen["reason"]), ("on_machine", waiting.REASON_RESUMING))
         self.advance(seconds=waiting.RESUME_GRACE_S)
         self.assertEqual(self.resumes(), [])
         self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_CLOSED)

@@ -161,6 +161,8 @@ MENU_TARGETS = ("session", "pane")
 
 REASON_CLOSED = "session closed: resume it to deliver the prompt"
 REASON_RESUMING = "resuming the session in Tern"
+# A resume waits for a Tern window to carry it out.
+REASON_NO_WINDOW = "open a Tern window to reopen it"
 # Leads a prompt sent again because a reboot cut its turn off.
 REBOOT_NOTE = "(A reboot cut this prompt's earlier turn off. Check what was already done before you go on.)"
 REASON_NO_EXTENSION = "omp extension not loaded"
@@ -171,7 +173,7 @@ REASON_MENU_NO_EXTENSION = "omp extension not loaded in this session"
 REASON_MENU_OLD_EXTENSION = "this session runs an older waitingfor extension: /restart it"
 REASON_MENU_NO_PANE = "no omp extension in this pane"
 # Who can take a queued prompt: these go away once the session can take it.
-DELIVERY_REASONS = (REASON_CLOSED, REASON_NO_EXTENSION, REASON_RESUMING)
+DELIVERY_REASONS = (REASON_CLOSED, REASON_NO_EXTENSION, REASON_RESUMING, REASON_NO_WINDOW)
 # What "resuming" may say over; a closed session also over the deadline note.
 # Anything else on me (an error, a PR's news) says more than either.
 RESUMING_REPLACES = (None, REASON_QUESTION, *DELIVERY_REASONS)
@@ -1515,6 +1517,7 @@ def _attention(
 
 def _flag_on_me(
     state: dict, record: dict, wait: dict, now: datetime, reason: str, level: str = "info",
+    toast: bool = True,
 ) -> None:
     """The ball comes to me while the wait keeps its state."""
     if wait["on_me"] and wait["reason"] == reason:
@@ -1522,7 +1525,8 @@ def _flag_on_me(
     wait.update(on_me=True, reason=reason)
     _log(record, now, wait, reason, "attention")
     record["unseen"] = True
-    _toast(state, record, wait, now, level, f"{wait['label']}: {reason}")
+    if toast:
+        _toast(state, record, wait, now, level, f"{wait['label']}: {reason}")
 
 
 INTERNAL_ERROR = "internal error: "
@@ -1641,6 +1645,15 @@ def _mark_resuming(record: dict) -> None:
             wait.update(on_me=False, reason=REASON_RESUMING)
 
 
+def _flag_no_window(state: dict, record: dict, now: datetime) -> None:
+    """Like `_mark_resuming`, but on me: the resume can't run without a window."""
+    for entry in record["prompt_queue"]:
+        wait = _wait_in(record, entry["wait"])
+        if wait is not None and not wait["overdue"] and wait["reason"] in RESUMING_REPLACES:
+            # No toast: only a window could show it, and by then it says otherwise.
+            _flag_on_me(state, record, wait, now, REASON_NO_WINDOW, toast=False)
+
+
 def _heard_lately(state: dict, session: str, now: datetime) -> bool:
     seen = _stamp(state["extensions"].get(session))
     return seen is not None and now.timestamp() - seen < RESUME_QUIET_S
@@ -1658,8 +1671,16 @@ def _resume(state: dict, record: dict, facts: Facts, now: datetime, window: bool
         # a window going away restarts it from the next one.
         if not window:
             pending["window_since"] = None
-        elif pending.get("window_since") is None:
-            pending["window_since"] = _iso(now)
+            pending["windowless_since"] = pending.get("windowless_since") or _iso(now)
+        else:
+            pending["windowless_since"] = None
+            if pending.get("window_since") is None:
+                pending["window_since"] = _iso(now)
+        windowless = _stamp(pending["windowless_since"])
+        if windowless is not None and now.timestamp() - windowless >= RESUME_GRACE_S:
+            # It stays queued for the window that comes up; until then I'm told.
+            _flag_no_window(state, record, now)
+            return True
     since = _stamp(pending.get("window_since")) if pending is not None else None
     if pending is not None and since is not None and now.timestamp() - since >= RESUME_GRACE_S:
         # A window was up all that time and didn't carry it out. One that comes
@@ -1690,6 +1711,7 @@ def _resume(state: dict, record: dict, facts: Facts, now: datetime, window: bool
         "type": "resume", "session": session, "command": info["resume_command"],
         "cwd": info["cwd"], "tern_session": record.get("tern_session"), "wait": head,
         "window_since": _iso(now) if window else None,
+        "windowless_since": None if window else _iso(now),
     })
     record.update(resume_prompts=queued, resume_opened_at=None)
     wait = _wait_in(record, head)
@@ -2622,7 +2644,7 @@ def _record_times(state: dict, record: dict, now: datetime) -> list[float | None
 def _public_action(action: dict) -> dict:
     return {
         key: value for key, value in action.items()
-        if key not in ("wait", "created_at", "window_since", "daemon")
+        if key not in ("wait", "created_at", "window_since", "windowless_since", "daemon")
     }
 
 
