@@ -1489,7 +1489,7 @@ class TernHostTests(unittest.TestCase):
         ):
             self.assertEqual(agents._parent_walk_for_host(10), ("tern", [10, 9, 8, 7]))
 
-    def test_visible_pane_is_focused_block_of_shown_or_only_tab(self) -> None:
+    def test_visible_pane_is_focused_block_of_shown_or_only_tab_and_every_pane_has_a_home(self) -> None:
         def tab(shown, *blocks):
             return {"shown": shown, "blocks": [
                 {"id": block, "focused": focused} for block, focused in blocks
@@ -1505,7 +1505,9 @@ class TernHostTests(unittest.TestCase):
         ]}
         out = subprocess.CompletedProcess([], 0, stdout=json.dumps(listing))
         with mock.patch.object(agents.subprocess, "run", return_value=out):
-            self.assertEqual(agents._tern_visible_panes(""), {3: "work", 4: "solo"})
+            visible, home = agents._tern_panes("")
+        self.assertEqual(visible, {3: "work", 4: "solo"})
+        self.assertEqual(home, {1: "work", 2: "work", 3: "work", 4: "solo", 5: "many", 6: "many"})
 
     def test_every_tern_record_carries_its_pane_and_only_visible_ones_a_session(self) -> None:
         env = {
@@ -1519,12 +1521,12 @@ class TernHostTests(unittest.TestCase):
         ]
         with (
             mock.patch.object(agents, "_environ_value", side_effect=lambda pid, name: env.get((pid, name), "")),
-            mock.patch.object(agents, "_tern_visible_panes", return_value={3: "work"}),
+            mock.patch.object(agents, "_tern_panes", return_value=({3: "work"}, {3: "work", 2: "side"})),
         ):
             agents._mark_tern_panes(records)
         self.assertEqual(records, [
-            {"pid": 10, "host": "tern", "ternPane": 3, "ternSession": "work"},
-            {"pid": 11, "host": "tern", "ternPane": 2},
+            {"pid": 10, "host": "tern", "ternPane": 3, "ternHome": "work", "ternSession": "work"},
+            {"pid": 11, "host": "tern", "ternPane": 2, "ternHome": "side"},
             {"pid": 12, "host": "kitty"},
         ])
 

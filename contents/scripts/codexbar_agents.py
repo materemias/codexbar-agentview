@@ -1513,11 +1513,12 @@ def _attach_omp_recaps(
                 record["recapStale"] = stale
 
 
-def _tern_visible_panes(socket: str) -> dict[int, str]:
-    """Map each Tern session's visible pane to the session name, which a
-    Tern window shows as its caption. The visible tab is the one Tern's
-    first window shows, else a session's only tab; the pane is that tab's
-    focused block."""
+def _tern_panes(socket: str) -> tuple[dict[int, str], dict[int, str]]:
+    """Two maps from one `tern ls`: each Tern session's visible pane to the
+    session name, which a Tern window shows as its caption, and every pane in
+    a tab to the session holding it. The visible tab is the one Tern's first
+    window shows, else a session's only tab; the pane is that tab's focused
+    block."""
     env = dict(os.environ, TERN_DAEMON_SOCKET=socket) if socket else None
     try:
         proc = subprocess.run(
@@ -1526,14 +1527,21 @@ def _tern_visible_panes(socket: str) -> dict[int, str]:
         )
         data = json.loads(proc.stdout) if proc.returncode == 0 else {}
     except (OSError, subprocess.TimeoutExpired, json.JSONDecodeError):
-        return {}
+        return {}, {}
     sessions = data.get("sessions") if isinstance(data, dict) else None
-    panes: dict[int, str] = {}
+    visible: dict[int, str] = {}
+    home: dict[int, str] = {}
     for session in sessions if isinstance(sessions, list) else []:
         if not isinstance(session, dict) or not isinstance(session.get("name"), str):
             continue
+        name = session["name"][:256]
         tabs = session.get("tabs")
         tabs = [t for t in tabs if isinstance(t, dict)] if isinstance(tabs, list) else []
+        for tab in tabs:
+            blocks = tab.get("blocks")
+            for block in blocks if isinstance(blocks, list) else []:
+                if isinstance(block, dict) and isinstance(block.get("id"), int):
+                    home[block["id"]] = name
         shown = [t for t in tabs if t.get("shown") is True] or (tabs if len(tabs) == 1 else [])
         blocks = shown[0].get("blocks") if shown else None
         for block in blocks if isinstance(blocks, list) else []:
@@ -1542,15 +1550,16 @@ def _tern_visible_panes(socket: str) -> dict[int, str]:
                 and block.get("focused") is True
                 and isinstance(block.get("id"), int)
             ):
-                panes[block["id"]] = session["name"][:256]
-    return panes
+                visible[block["id"]] = name
+    return visible, home
 
 
 def _mark_tern_panes(records: list[dict]) -> None:
-    """Set `ternPane` (the agent's Tern block id) on Tern records, and
-    `ternSession` on those whose pane is visible, so the popup can tell
-    which session the focused Tern window shows. Agents inherit TERN_PANE
-    and TERN_PANE_SOCKET from the pane's shell."""
+    """Set `ternPane` (the agent's Tern block id) on Tern records, `ternHome`
+    (the Tern session whose tab holds it), and `ternSession` on those whose
+    pane is visible, so the popup can tell which session the focused Tern
+    window shows. Agents inherit TERN_PANE and TERN_PANE_SOCKET from the
+    pane's shell."""
     by_socket: dict[str, list[tuple[dict, int]]] = {}
     for record in records:
         if record["host"] != "tern":
@@ -1561,8 +1570,10 @@ def _mark_tern_panes(records: list[dict]) -> None:
             socket = _environ_value(record["pid"], "TERN_PANE_SOCKET")
             by_socket.setdefault(socket, []).append((record, int(pane)))
     for socket, rows in by_socket.items():
-        visible = _tern_visible_panes(socket)
+        visible, home = _tern_panes(socket)
         for record, pane in rows:
+            if pane in home:
+                record["ternHome"] = home[pane]
             if pane in visible:
                 record["ternSession"] = visible[pane]
 
