@@ -77,6 +77,18 @@ const FORMS = [
 		example: "2026-11-07 09:00 send the invoice",
 	},
 	{
+		word: "every",
+		usage: "/wait every <dur> [for <dur>|N times] -- <prompt>",
+		what: "repeat the prompt until Done, for a while or N times; a sentence may go before the --",
+		example: "every 1d 5 times triage new issues -- Summarize the issues opened since the last run",
+	},
+	{
+		usage: "/wait every <dur> until <end> -- <prompt>",
+		what: "<end>: ! command, check <what>, gh pr [N] [state], gh release [repo], or words the agent judges",
+		example: "every 2h until the migration finished -- Check the migration and report its progress",
+		featured: true,
+	},
+	{
 		word: "pr",
 		gh: true,
 		usage: "/wait gh pr [N|URL] [until] <sentence> [-- prompt]",
@@ -109,7 +121,6 @@ const FORMS = [
 		usage: "/wait check [every <dur>] ! <command line> [-- prompt]",
 		what: "your own command, run until it exits 0",
 		example: "check ! curl -fsS https://example.com/health -- Tell me it is back",
-		featured: true,
 	},
 	{
 		word: "for",
@@ -145,6 +156,26 @@ const TOP_CHOICES = [
 const GH_CHOICES = FORMS.filter((form) => form.gh).map(choice);
 const BANG = { label: "!", description: "your own command line instead: ! curl -fsS https://example.com/health" };
 const CHECK_CHOICES = [{ label: "every", description: `how often to run it: every 10m (default ${CHECK_EVERY})` }, BANG];
+const EVERY_CHOICES = [
+	{ label: "30m", description: "every half hour" },
+	{ label: "1h", description: "every hour" },
+	{ label: "2h", description: "every two hours" },
+	{ label: "1d", description: "once a day" },
+];
+const EVERY_ENDS = [
+	{ label: "for", description: "stop after a while: for 1d (or say 5 times)" },
+	{ label: "until", description: "stop when it holds: ! command, check <what>, gh pr …, gh release …, or words the agent judges" },
+];
+const FOR_CHOICES = [
+	{ label: "1d", description: "for a day" },
+	{ label: "1w", description: "for a week" },
+];
+const TIMES = { label: "times", description: "stop after this many runs" };
+const UNTIL_CHOICES = [
+	{ ...BANG, description: "your command exits 0: ! curl -fsS https://example.com/health" },
+	{ label: "check", description: "say what holds; the agent writes the command: check the deploy is green" },
+	{ label: "gh", description: "a PR state or a repo's next release: gh pr 42 merged" },
+];
 /** Their text may hold a `--` of its own, as they never fire a prompt; list and help take no text at all. */
 const NO_PROMPT: Record<string, true> = { done: true, note: true, later: true, for: true, list: true, help: true };
 
@@ -215,17 +246,78 @@ function checkOptions(argv: string, label: string, interval: string): string[] {
 	return ["--kind", "command", `--argv=${argv}`, "--predicate=exit0", `--label=${label}`, `--interval=${interval}`];
 }
 
+/** A check's own command line, `! command` (or `!command`), rather than a description for the agent. */
+const LITERAL_CHECK = /^!([\s\S]*)$/;
+
 /**
- * A check, or `{error}`: `! command` (or `!command`) runs as given; anything else is a description, and `check`
- * asks the agent for its command.
+ * A check, or `{error}`: a LITERAL_CHECK runs as given; anything else is a description, and `check`
+ * asks the agent for its command. `repeat`: the options of a prompt the check's wait repeats until it passes.
  */
-function checkRequest(what: string, interval = CHECK_EVERY, prompt?: string, park = true) {
+function checkRequest(what: string, { interval = CHECK_EVERY, prompt = "", sentence = "", park = true, close = false, repeat = [] } = {}) {
 	if (!DURATION.test(interval)) return { error: `Check every takes a duration such as 10m, not ${interval}.` };
-	const literal = what.match(/^!([\s\S]*)$/);
-	if (!literal) return { check: { description: what, interval, prompt: prompt || undefined, park } };
+	const literal = what.match(LITERAL_CHECK);
+	if (!literal) return { check: { description: what, interval, prompt: prompt || undefined, sentence, park, close, repeat } };
 	const command = literal[1]?.trim();
 	if (!command) return { error: "A command line must follow the !." };
-	return { command: "add", args: [...checkOptions(command, command, interval), ...userArgs("", prompt, park)] };
+	return { command: "add", args: [...checkOptions(command, command, interval), ...repeat, ...userArgs(sentence, prompt, park)], close };
+}
+
+const UNIT_SECONDS = { s: 1, m: 60, h: 3600, d: 86_400, w: 604_800 };
+
+/** A DURATION's length in seconds. */
+function seconds(duration: string): number {
+	let total = 0;
+	for (const [, count, unit] of duration.matchAll(/(\d+)([smhdw])/g)) total += Number(count) * UNIT_SECONDS[unit];
+	return total;
+}
+
+/** Why the CLI would refuse a repeat every `every` for `span`, before anyone typed the rest; undefined when it wouldn't. */
+function repeatError(every: string, span?: string): string | undefined {
+	if (seconds(every) < 60 || seconds(every) > 365 * 86_400) return `A repeat runs every 1m to 365d, not every ${every}.`;
+	if (span && seconds(span) < seconds(every)) return `For ${span} ends before the first run, ${every} from now.`;
+	return undefined;
+}
+
+/** The PR reference, its `--until` options and the sentence of what follows `gh pr`. */
+function prParts(text: string) {
+	const [head, tail] = cut(text);
+	const ref = PR_REF.test(head) ? head : undefined;
+	const [next, after] = cut(ref ? tail : text);
+	const until = UNTILS.find((item) => item.label === next)?.until;
+	return { ref, options: until ? [`--until=${until}`] : [], sentence: until ? after : ref ? tail : text };
+}
+
+/** The `--repo` options and the sentence of what follows `gh release`; without a repo, `needs` it from this directory. */
+function releaseParts(text: string) {
+	const [head, tail] = cut(text);
+	return REPO.test(head) ? { options: [`--repo=${head}`], sentence: tail } : { options: [], sentence: text, needs: "repo" };
+}
+
+/**
+ * What follows `every`: `<dur> [for <dur>] [<N> times] [until <end> | <sentence>]`, or `{error}`.
+ * `repeat` holds the CLI options; a `for` or `times` not followed by its value, or given twice,
+ * starts the sentence.
+ */
+function everyParts(text: string) {
+	const [every, tail] = cut(text);
+	if (!DURATION.test(every)) return { error: `every takes a duration such as 2h${every ? `, not ${every}` : ""}.` };
+	let rest = tail;
+	let span: string | undefined;
+	let times: string | undefined;
+	for (;;) {
+		const lasting = span === undefined && rest.match(/^for\s+(\S+)(?:\s+([\s\S]*))?$/);
+		const count = times === undefined && rest.match(/^(\d+)\s+times(?:\s+([\s\S]*))?$/);
+		if (lasting && DURATION.test(lasting[1])) [, span, rest = ""] = lasting;
+		else if (count) [, times, rest = ""] = count;
+		else break;
+	}
+	if (times !== undefined && Number(times) < 1) return { error: "times takes 1 run or more." };
+	const invalid = repeatError(every, span);
+	if (invalid) return { error: invalid };
+	const until = rest.match(/^until(?:\s+([\s\S]*))?$/);
+	if (until && !until[1]) return { error: "until needs what ends it: ! a command, check <what>, gh pr, gh release, or words the agent judges." };
+	const repeat = [`--every=${every}`, ...(span ? [`--for=${span}`] : []), ...(times ? [`--times=${times}`] : [])];
+	return { every, repeat, until: until?.[1], sentence: until ? "" : rest };
 }
 
 /** The free-text wait set to `text`, which parks the session unless told not to; empty clears it. */
@@ -274,17 +366,36 @@ export function parseWait(input: string) {
 			const timed = every && DURATION.test(every[1]);
 			const what = timed ? every[2] : rest;
 			if (!what) return bad("check needs what to check, or ! and a command line.");
-			const request = checkRequest(what, timed ? every[1] : undefined, prompt);
+			const request = checkRequest(what, { interval: timed ? every[1] : undefined, prompt });
 			return request.error ? bad(request.error) : request;
 		}
+		case "every": {
+			if (prompt === undefined) return bad("every needs the prompt to repeat, after --.");
+			const parts = everyParts(rest);
+			if (parts.error) return bad(parts.error);
+			const { repeat, until } = parts;
+			if (until === undefined) return add("repeat", repeat, parts.sentence);
+			const [head, tail] = cut(until);
+			if (LITERAL_CHECK.test(until) || head === "check") {
+				const what = head === "check" ? tail : until;
+				if (!what) return bad("until check needs what to check, or ! and a command line.");
+				const request = checkRequest(what, { interval: parts.every, prompt, repeat });
+				return request.error ? bad(request.error) : request;
+			}
+			if (head !== "gh") return add("repeat", [...repeat, `--until=${until}`], "");
+			const [sub, ghText] = cut(tail);
+			if (sub === "pr") {
+				const pr = prParts(ghText);
+				return { ...add("pr", [...pr.options, ...repeat], pr.sentence), needs: "pr", pr: pr.ref };
+			}
+			if (sub !== "release") return bad("until gh takes pr or release.");
+			const release = releaseParts(ghText);
+			return { ...add("release", [...release.options, ...repeat], release.sentence), needs: release.needs };
+		}
 		case "gh pr": {
-			const [head, tail] = cut(rest);
-			const ref = PR_REF.test(head) ? head : undefined;
-			const [next, after] = cut(ref ? tail : rest);
-			const until = UNTILS.find((item) => item.label === next)?.until;
-			const sentence = until ? after : ref ? tail : rest;
-			if (!sentence) return bad("gh pr needs a sentence.");
-			return { ...add("pr", until ? [`--until=${until}`] : [], sentence), needs: "pr", pr: ref };
+			const pr = prParts(rest);
+			if (!pr.sentence) return bad("gh pr needs a sentence.");
+			return { ...add("pr", pr.options, pr.sentence), needs: "pr", pr: pr.ref };
 		}
 		case "gh babysit": {
 			if (prompt !== undefined) return bad("gh babysit takes no prompt: its review step already has the fix prompt.");
@@ -293,11 +404,9 @@ export function parseWait(input: string) {
 			return { command: "babysit-pr", args: userArgs(ref ? tail : rest), needs: "pr", pr: ref };
 		}
 		case "gh release": {
-			const [head, tail] = cut(rest);
-			const named = REPO.test(head);
-			const sentence = named ? tail : rest;
-			if (!sentence) return bad("gh release needs a sentence.");
-			return { ...add("release", named ? [`--repo=${head}`] : [], sentence), needs: named ? undefined : "repo" };
+			const release = releaseParts(rest);
+			if (!release.sentence) return bad("gh release needs a sentence.");
+			return { ...add("release", release.options, release.sentence), needs: release.needs };
 		}
 		case "<duration>":
 			return rest ? add("time", [`--in=${word}`], rest) : bad("A sentence must follow the time.");
@@ -318,10 +427,34 @@ function atValue(at): string {
 	return at[1] ? `${at[1]}${clock ? `T${clock}` : ""}` : clock;
 }
 
+/** What can follow the finished words after `every`: the interval, then `for`/`times`, then `until` and its kinds. */
+function everyChoices(words: string[]) {
+	if (words.length === 0) return EVERY_CHOICES;
+	if (!DURATION.test(words[0])) return [];
+	let rest = words.slice(1);
+	// Each of `for <dur>` and `<N> times` counts once, as the parser takes them.
+	const used = new Set<string>();
+	for (;;) {
+		if (!used.has("for") && rest[0] === "for" && DURATION.test(rest[1] ?? "")) used.add("for");
+		else if (!used.has("times") && /^\d+$/.test(rest[0] ?? "") && rest[1] === "times") used.add("times");
+		else break;
+		rest = rest.slice(2);
+	}
+	if (rest.length === 0) return EVERY_ENDS.filter((item) => !used.has(item.label));
+	if (rest.length === 1 && rest[0] === "for" && !used.has("for")) return FOR_CHOICES;
+	if (rest.length === 1 && /^\d+$/.test(rest[0]) && !used.has("times")) return [TIMES];
+	if (rest[0] !== "until") return [];
+	if (rest.length === 1) return UNTIL_CHOICES;
+	if (rest[1] !== "gh") return [];
+	const gh = choicesAfter(rest.slice(1), []);
+	return rest.length === 2 ? gh.filter((item) => item.label !== "babysit") : gh;
+}
+
 /** What can follow the finished words of a /wait line. */
 function choicesAfter(words: string[], waits) {
 	const path = words.join(" ");
 	if (!path) return TOP_CHOICES;
+	if (words[0] === "every") return everyChoices(words.slice(1));
 	if (path === "gh") return GH_CHOICES;
 	if (path === "gh pr" || (words.length === 3 && path.startsWith("gh pr ") && PR_REF.test(words[2]))) return UNTILS;
 	if (path === "later") return SIZES;
@@ -385,7 +518,8 @@ function helpPanel(theme, width: number): string {
 	return [
 		columns(FORMS, theme, width),
 		"",
-		"A prompt after -- goes into the session when the wait fires. A command with its own -- goes through the menu.",
+		"A prompt after -- goes into the session when the wait fires; with every, at each run.",
+		"A run due while the last run's turn still goes is skipped. A command with its own -- goes through the menu.",
 		"Without a PR, /wait takes the one in the last messages or on this branch; without a repo, this directory's.",
 		"",
 		theme.fg("muted", "Examples"),
@@ -512,6 +646,9 @@ const TOOL_FLAGS = {
 	prompt: "prompt",
 	verify: "verify",
 	after: "after",
+	every: "every",
+	for: "for",
+	times: "times",
 };
 
 /** The CLI options of an agent's own `add`; never `--park`, as only the user sets a session aside. */
@@ -544,9 +681,14 @@ async function pick(c, title: string, items) {
 	return items.find((item) => item.label === label);
 }
 
+/** A duration as typed in a dialog: `1h 30M` → `1h30m`. */
+function durationOf(text: string): string {
+	return text.replace(/\s+/g, "").toLowerCase();
+}
+
 /** `--in=2d` for a duration, `--at=TIME` for anything else, a time as a /wait line has it; the CLI checks both. */
 function timeOptions(text: string): string[] {
-	const compact = text.replace(/\s+/g, "").toLowerCase();
+	const compact = durationOf(text);
 	if (DURATION.test(compact)) return [`--in=${compact}`];
 	const at = text.match(AT);
 	return [`--at=${at && !at[4] ? atValue(at) : text}`];
@@ -559,28 +701,106 @@ async function askPr(c, pr: string | undefined) {
 }
 
 const PROMPT_TITLE = "Prompt to send when it fires (empty: only tell me)";
+const CHECK_TITLE = "What should be checked? Describe it, or ! and a command";
+const SENTENCE_TITLE = "Why set it aside, what next?";
 
 const PARK_CHOICES = [
 	{ label: "Park it", description: "off the screen until you open it", park: true },
 	{ label: "Keep it open", description: "stays where it is", park: false },
 ];
 
-// "When I have time" sessions stay away a long while; the pin brings them back.
-const CLOSE_CHOICE = { label: "Close the session", description: "it stays pinned; resume it from When I have time", park: false, close: true };
+/** What Close the session says will bring the session back. */
+const CLOSE_NOTES = {
+	prompt: "it reopens in Tern when the wait fires",
+	quiet: "resume it from the Waiting tab when the wait fires",
+	repeat: "it reopens in Tern for each run",
+	something: "resume it from the Waiting tab",
+	// "When I have time" sessions stay away a long while; the pin brings them back.
+	later: "it stays pinned; resume it from When I have time",
+};
 
-/** The menu's last step: the chosen `{park, close?}`, undefined on Esc. `canClose` offers closing first. */
-async function askPark(c, canClose = false) {
-	return canClose
-		? pick(c, "Close or park the session?", [CLOSE_CHOICE, ...PARK_CHOICES])
-		: pick(c, "Park the session?", PARK_CHOICES);
+/**
+ * The menu's last step: the chosen `{park, close?}`, undefined on Esc. With `closeNote`, what brings the
+ * session back, closing is offered first, but only while the agent is idle: closing mid-turn would cut it off.
+ * A check the agent is to write (`what`) closes once its turn wrote it.
+ */
+async function askPark(c, closeNote?: string, what?: string) {
+	if (!closeNote || !c.isIdle()) return pick(c, "Park the session?", PARK_CHOICES);
+	const described = what !== undefined && !LITERAL_CHECK.test(what);
+	const description = described ? `${closeNote}; it closes once the agent wrote the command` : closeNote;
+	return pick(c, "Close or park the session?", [{ label: "Close the session", description, park: false, close: true }, ...PARK_CHOICES]);
 }
+
+/**
+ * How a repeat ends, in the menu: `ask` gives the wait's `{kind, options}`, or `{check}` with a
+ * check's text; undefined ends the flow (Esc, or a required line left empty).
+ */
+const ENDS = [
+	{ label: "Keep going", description: "until you mark it done", ask: async () => ({ kind: "repeat", options: [] }) },
+	{
+		label: "Until the agent says so",
+		description: "you say what; each run asks the agent, and it ends the repeat once that holds",
+		async ask(c) {
+			const until = await ask(c, "Until what holds? The agent judges it");
+			return until ? { kind: "repeat", options: [`--until=${until}`] } : undefined;
+		},
+	},
+	{
+		label: "Until a command passes",
+		description: "describe it and the agent writes the command, or ! and your own",
+		async ask(c) {
+			const what = await ask(c, CHECK_TITLE);
+			return what ? { check: what } : undefined;
+		},
+	},
+	{
+		label: "Until a PR state",
+		description: "ready, review, merged, released or new activity",
+		async ask(c, pr) {
+			const options = await FLOWS.pr.options(c, pr);
+			return options && { kind: "pr", options };
+		},
+	},
+	{
+		label: "Until a release",
+		description: "a repo's next release",
+		async ask(c) {
+			const options = await FLOWS.release.options(c);
+			return options && { kind: "release", options };
+		},
+	},
+	{
+		label: "For a while",
+		description: "then it ends: 1d, 1w",
+		async ask(c, _pr, every) {
+			const typed = await ask(c, "For how long? 1d, 1w", "1d");
+			if (!typed) return undefined;
+			const span = durationOf(typed);
+			if (!DURATION.test(span)) throw new Error(`For a while takes a duration such as 1d, not ${typed}.`);
+			const invalid = repeatError(every, span);
+			if (invalid) throw new Error(invalid);
+			return { kind: "repeat", options: [`--for=${span}`] };
+		},
+	},
+	{
+		label: "N times",
+		description: "then it ends",
+		async ask(c) {
+			const times = await ask(c, "How many runs?", "5");
+			if (!times) return undefined;
+			if (!/^[1-9]\d*$/.test(times)) throw new Error(`N times takes a whole number from 1, not ${times}.`);
+			return { kind: "repeat", options: [`--times=${times}`] };
+		},
+	},
+];
 
 /**
  * The steps of the menu's items, keyed by the item ids of MENU_FILE, which holds their text.
  * `options` asks what the form needs and gives its CLI options; undefined ends the flow (Esc, or a
  * required line left empty). The sentence and the prompt come after it, unless the flow turns
- * them off. `request` instead asks everything and gives a request as parseWait does. Shell panes
- * get Tern's own picker from the same file.
+ * them off; `closeNote` replaces the park step's own. `request` instead asks everything, the park
+ * step included, and gives a request as parseWait does, with `close` when the user chose to close.
+ * Shell panes get Tern's own picker from the same file.
  */
 const FLOWS = {
 	time: {
@@ -588,6 +808,33 @@ const FLOWS = {
 		async options(c) {
 			const due = await ask(c, "When? 2d, 3h, 18:00 or 2026-11-07 09:00", "1d");
 			return due ? timeOptions(due) : undefined;
+		},
+	},
+	every: {
+		async request(c, record, pr) {
+			const typed = await ask(c, "Repeat every? 30m, 2h, 1d", "1h");
+			if (!typed) return undefined;
+			const every = durationOf(typed);
+			if (!DURATION.test(every)) throw new Error(`Repeat every takes a duration such as 2h, not ${typed}.`);
+			const invalid = repeatError(every);
+			if (invalid) throw new Error(invalid);
+			const end = await pick(c, "When does it end?", ENDS);
+			const ends = end && (await end.ask(c, pr, every));
+			if (!ends) return undefined;
+			const prompt = await ask(c, "Prompt to repeat");
+			if (prompt === undefined) return undefined;
+			if (!prompt) throw new Error("Repeat a prompt needs the prompt to repeat.");
+			const sentence = await ask(c, SENTENCE_TITLE, record?.note ?? "");
+			if (sentence === undefined) return undefined;
+			const choice = await askPark(c, CLOSE_NOTES.repeat, ends.check);
+			if (!choice) return undefined;
+			const repeat = [`--every=${every}`];
+			if (ends.check === undefined) {
+				return { command: "add", args: ["--kind", ends.kind, ...ends.options, ...repeat, ...userArgs(sentence, prompt, choice.park)], close: choice.close };
+			}
+			const request = checkRequest(ends.check, { interval: every, prompt, sentence, park: choice.park, close: choice.close, repeat });
+			if (request.error) throw new Error(request.error);
+			return request;
 		},
 	},
 	pr: {
@@ -601,6 +848,8 @@ const FLOWS = {
 	babysit: {
 		command: "babysit-pr",
 		prompt: false,
+		// Its review step has the fix prompt.
+		closeNote: CLOSE_NOTES.prompt,
 		options: askPr,
 	},
 	release: {
@@ -614,15 +863,15 @@ const FLOWS = {
 	},
 	check: {
 		async request(c) {
-			const what = await ask(c, "What should be checked? Describe it, or ! and a command");
+			const what = await ask(c, CHECK_TITLE);
 			if (!what) return undefined;
 			const every = await ask(c, "Check every", CHECK_EVERY);
 			if (every === undefined) return undefined;
 			const prompt = await ask(c, PROMPT_TITLE);
 			if (prompt === undefined) return undefined;
-			const choice = await askPark(c);
+			const choice = await askPark(c, prompt ? CLOSE_NOTES.prompt : CLOSE_NOTES.quiet, what);
 			if (!choice) return undefined;
-			const request = checkRequest(what, every.replace(/\s+/g, "").toLowerCase() || CHECK_EVERY, prompt, choice.park);
+			const request = checkRequest(what, { interval: durationOf(every) || CHECK_EVERY, prompt, park: choice.park, close: choice.close });
 			if (request.error) throw new Error(request.error);
 			return request;
 		},
@@ -631,14 +880,16 @@ const FLOWS = {
 		async request(c, record) {
 			const what = await ask(c, "What do you wait for? (empty: nothing any more)", record?.waiting_for ?? "");
 			if (what === undefined) return undefined;
-			const choice = what ? await askPark(c) : PARK_CHOICES[1];
-			return choice ? whatRequest(what, choice.park) : undefined;
+			const choice = what ? await askPark(c, CLOSE_NOTES.something) : PARK_CHOICES[1];
+			return choice ? { ...whatRequest(what, choice.park), close: choice.close } : undefined;
 		},
 	},
 	later: {
 		kind: "later",
 		prompt: false,
-		close: true,
+		closeNote: CLOSE_NOTES.later,
+		// Closing needs the pin: it is what brings the session back.
+		pin: true,
 		async options(c) {
 			const size = await pick(c, "How big?", SIZES);
 			return size ? [`--size=${size.label}`] : undefined;
@@ -685,6 +936,7 @@ export default function (pi) {
 	let shownLine: string | undefined | null = null; // what drawRow last drew; null: draw next time, whatever it is
 	let waits = []; // this session's open waits, as the last applied view had them
 	let menuOpen = false;
+	let closeAfterTurn: string | undefined; // the session to close once the turn writing its described check ends
 	let menuSeq = 0; // the last menu request seen
 	let activatedAt = 0; // in whole seconds, as a request's time has no finer ones
 	let viewsApplied = 0;
@@ -697,7 +949,20 @@ export default function (pi) {
 	// transcript until the turn ends.
 	const sent = new Set<string>();
 	// Checks the user described and the agent is to write, by session, with the instruction it got.
-	const checks = new Map<string, { description: string; interval: string; prompt?: string; instruction: string; at: number }>();
+	const checks = new Map<
+		string,
+		{
+			description: string;
+			interval: string;
+			prompt?: string;
+			sentence: string;
+			park: boolean;
+			close: boolean;
+			repeat: string[];
+			instruction: string;
+			at: number;
+		}
+	>();
 
 	const log = (error) => pi.logger?.debug("waitingfor", { error: messageOf(error) });
 	const quietly = (task) => {
@@ -911,6 +1176,7 @@ export default function (pi) {
 		shownLine = null; // a switched session may start with omp's widgets reset
 		waits = [];
 		menuSeq = 0;
+		closeAfterTurn = undefined; // chosen for the session switched away from
 		activatedAt = Date.now() - (Date.now() % 1000);
 		setPanel(c, undefined);
 		sessionId = c.sessionManager.getSessionId();
@@ -953,6 +1219,7 @@ export default function (pi) {
 		if (event?.willContinue) return;
 		report("turn_finished", (session) => session.waits?.length > 0, c);
 		dropUnwrittenCheck(c);
+		if (c?.agent?.kind !== "sub" && closeAfterTurn !== undefined && closeAfterTurn === sessionId) closeOnceSettled(c);
 	});
 	pi.on("input", (_event, c) => {
 		if (panel) setPanel(c, undefined);
@@ -1049,7 +1316,7 @@ export default function (pi) {
 		});
 	}
 
-	/** Carries out a request from a /wait line or the menu for `session`, the one open when it was asked. */
+	/** Carries out a request from a /wait line or the menu for `session`, the one open when it was asked; the CLI's answer. */
 	async function perform(c, request, session: string) {
 		if (request.check) {
 			// The instruction goes to whichever session is open now.
@@ -1057,38 +1324,63 @@ export default function (pi) {
 			return requestCheck(c, request.check);
 		}
 		const target = await targetOptions(request, c);
-		await act(c, [request.command, "--session", session, ...target, ...request.args]);
+		return act(c, [request.command, "--session", session, ...target, ...request.args]);
 	}
 
 	/**
-	 * The steps of an `options` flow, then its command and, if chosen, the park or, for a flow that
-	 * offers it, closing the session once the command (and with it the pin) succeeded. Nothing
-	 * happens before the command.
+	 * Closes `session`, the one whose wait the CLI saved (`answer`), and with `pinned` its pin, which
+	 * is what brings a When I have time session back. Without it, with a turn running, or with
+	 * another session open by then, it stays open and says why.
+	 */
+	async function closeSession(c, session: string, answer, pinned = false) {
+		if (pinned && answer?.pinned !== true) {
+			setPanel(c, errorPanel(`Not closed: the session couldn't be pinned (${answer?.pin_error ?? "no pin"}). Try /pin, then close it.`));
+			return;
+		}
+		// The CLI steps under way (an ack, a turn's end) finish first; a prompt they sent starts a turn.
+		await tail;
+		// shutdown ends whichever session is open, and a switch meanwhile made it another one.
+		if (session !== sessionId || c.sessionManager.getSessionId() !== session) return;
+		// A prompt sent while the dialogs were open may have started a turn, and closing would cut it off.
+		if (!c.isIdle()) {
+			const kept = pinned ? "The session stays pinned" : "The wait is saved";
+			setPanel(c, errorPanel(`Not closed: the agent started a turn meanwhile. ${kept}; close it once the turn ends.`));
+			return;
+		}
+		await c.shutdown();
+	}
+
+	/**
+	 * Closes the session whose described check the agent just wrote, once the turn that wrote it has
+	 * settled: omp reports idle a moment after agent_end. Five seconds still busy means a new turn.
+	 */
+	function closeOnceSettled(c, tries = 20) {
+		if (!ctx || closeAfterTurn !== sessionId) return;
+		if (!c.isIdle() && tries > 0) {
+			ctx.setTimeout(() => closeOnceSettled(c, tries - 1), 250);
+			return;
+		}
+		const session = closeAfterTurn;
+		closeAfterTurn = undefined;
+		closeSession(c, session, undefined).catch((error) => setPanel(c, errorPanel(messageOf(error))));
+	}
+
+	/**
+	 * The steps of an `options` flow, then its command and, if chosen, the park or closing the session
+	 * once the command succeeded. Nothing happens before the command.
 	 */
 	async function setAside(c, session: string, flow, pr: string | undefined, record) {
 		const options = await flow.options(c, pr);
 		if (!options) return;
-		const sentence = await ask(c, "Why set it aside, what next?", record?.note ?? "");
+		const sentence = await ask(c, SENTENCE_TITLE, record?.note ?? "");
 		if (sentence === undefined) return;
 		const prompt = flow.prompt === false ? "" : await ask(c, PROMPT_TITLE);
 		if (prompt === undefined) return;
-		// Closing mid-turn would cut the agent off.
-		const choice = await askPark(c, flow.close === true && c.isIdle());
+		const choice = await askPark(c, flow.closeNote ?? (prompt ? CLOSE_NOTES.prompt : CLOSE_NOTES.quiet));
 		if (!choice) return;
 		const kind = flow.kind ? ["--kind", flow.kind] : [];
 		const answer = await act(c, [flow.command ?? "add", "--session", session, ...kind, ...options, ...userArgs(sentence, prompt, choice.park)]);
-		if (!choice.close) return;
-		// The pin is what brings a closed session back: without it, stay open and say why.
-		if (answer?.pinned !== true) {
-			setPanel(c, errorPanel(`Not closed: the session couldn't be pinned (${answer?.pin_error ?? "no pin"}). Try /pin, then close it.`));
-			return;
-		}
-		// A prompt sent while the dialogs were open may have started a turn, and closing would cut it off.
-		if (!c.isIdle()) {
-			setPanel(c, errorPanel("Not closed: the agent started a turn meanwhile. The session stays pinned; close it once the turn ends."));
-			return;
-		}
-		await c.shutdown();
+		if (choice.close) await closeSession(c, session, answer, flow.pin === true);
 	}
 
 	async function openMenu(c) {
@@ -1114,8 +1406,10 @@ export default function (pi) {
 			if (!chosen.flow) await waitMenu(c, session, open);
 			else if (!chosen.flow.request) await setAside(c, session, chosen.flow, pr, record);
 			else {
-				const request = await chosen.flow.request(c, record);
-				if (request) await perform(c, request, session);
+				const request = await chosen.flow.request(c, record, pr);
+				if (!request) return;
+				const answer = await perform(c, request, session);
+				if (request.close) await closeSession(c, session, answer);
 			}
 		} catch (error) {
 			setPanel(c, errorPanel(messageOf(error)));
@@ -1125,7 +1419,7 @@ export default function (pi) {
 	}
 
 	pi.registerCommand("wait", {
-		description: "Set this session aside: /wait opens the menu, or /wait 2d <sentence> [-- prompt] | gh pr|babysit|release | check | for | later | list | done | help",
+		description: "Set this session aside: /wait opens the menu, or /wait 2d <sentence> [-- prompt] | every 2h -- <prompt> | gh pr|babysit|release | check | for | later | list | done | help",
 		getArgumentCompletions: (prefix: string) => waitCompletions(prefix, waits),
 		handler: async (input: string, c) => {
 			const parsed = parseWait(input);
@@ -1156,16 +1450,16 @@ export default function (pi) {
 		description: [
 			"Wait for an event and tell the user when it happens: a PR's review, comments, merge or release, CI, a command's output or a time. Code polls; no tokens until it fires.",
 			"Use this whenever the user says wait for X, notify me when, or tell me if, and right after you create a pull request (kind pr, or babysit_pr for review, ready and merged). The user is notified in Tern and on their phone: don't add your own ntfy call or polling loop.",
-			"The session can be parked or closed meanwhile; a closed one comes back to the user with a Resume button.",
-			"Kinds: pr for a known PR's review_on_head, ready, merged, released, or activity (the next comment, review, merge or close from someone other than the user); release for a repo's next release; command for anything else code can check; time to retry later; something for what code can't watch, such as a person's reply, named by what: it never fires and the user closes it; later for when the user has time.",
-			"Not for re-prompting yourself on a timer with no event to watch: that is the schedule tool.",
+			"The session can be parked or closed meanwhile; a closed one reopens in Tern by itself when a prompt is due, else it comes back to the user with a Resume button.",
+			"Kinds: pr for a known PR's review_on_head, ready, merged, released, or activity (the next comment, review, merge or close from someone other than the user); release for a repo's next release; command for anything else code can check; time to retry later; repeat to send prompt on a timer; something for what code can't watch, such as a person's reply, named by what: it never fires and the user closes it; later for when the user has time.",
+			"every sends prompt again and again instead of once: kind repeat runs until the user's Done; with kind command, pr or release it ends once that holds; for or times end it after a while or a number of runs; with kind repeat, until is a condition in words that you judge at each run, ending the repeat with end_repeat once it holds. A run due while the last run's turn still goes is skipped.",
 			"note is your suggested sentence for the user. The user's own sentence always stands: never try to overwrite it, and don't repeat a note the session already has.",
 			"prompt is sent into this session when the wait fires. list shows the open waits, done closes one by its id.",
 			"This tool never parks the session on its own; setting it aside is the user's call. When the user's /wait check asked you for a command, call add with kind command and argv only: it becomes their check.",
 		].join("\n"),
 		parameters: z.object({
-			action: z.enum(["add", "babysit_pr", "list", "done"]).describe("What to do"),
-			kind: z.enum(["time", "command", "pr", "release", "something", "later"]).optional().describe("add: what to wait for"),
+			action: z.enum(["add", "babysit_pr", "list", "done", "end_repeat"]).describe("What to do"),
+			kind: z.enum(["time", "command", "pr", "release", "repeat", "something", "later"]).optional().describe("add: what to wait for"),
 			label: z.string().optional().describe("add: short label; derived when omitted"),
 			note: z.string().optional().describe("add, babysit_pr: suggested sentence for the user"),
 			in: z.string().optional().describe("time: delay such as 30m, 2h, 1d, 1h30m"),
@@ -1180,17 +1474,24 @@ export default function (pi) {
 			pr: z.string().optional().describe("pr, babysit_pr: URL, O/R#N, or a number in this repo"),
 			repo: z.string().optional().describe("pr, babysit_pr: O/R, with number; release: the O/R whose next release to wait for"),
 			number: z.number().optional().describe("pr, babysit_pr: PR number; the repo defaults to this directory's"),
-			until: z.enum(["review_on_head", "ready", "merged", "released", "activity"]).optional().describe("pr: default ready; activity for any feedback from others"),
+			until: z
+				.string()
+				.optional()
+				.describe("pr: review_on_head, ready (default), merged, released, or activity for any feedback from others; repeat: when to stop, in words you judge"),
+			every: z.string().optional().describe("repeat, command, pr, release: send prompt every this long (30m, 2h, 1d; at least 1m); prompt is then required"),
+			for: z.string().optional().describe("with every: end the repeat after this long"),
+			times: z.number().int().optional().describe("with every: end the repeat after this many runs"),
 			bots: z.string().optional().describe("pr: review bots, comma separated"),
 			size: z.enum(["S", "M", "L"]).optional().describe("later: how big the task is"),
 			deadline: z.string().optional().describe("add: tell the user if nothing happened by this time"),
 			deadline_in: z.string().optional().describe("add: the same as a delay from now"),
-			prompt: z.string().optional().describe("add: text to send into this session when the wait fires"),
+			prompt: z.string().optional().describe("add: text to send into this session when the wait fires; with every, at each run"),
 			verify: z.string().optional().describe("add: JSON condition that must hold after the prompt's turn"),
 			after: z.string().optional().describe("add: start only after this wait id completes"),
 			no_fix: z.boolean().optional().describe("babysit_pr: skip the automatic review-fix prompt"),
 			released: z.boolean().optional().describe("babysit_pr: also wait for a release"),
-			wait: z.string().optional().describe("done: the wait id to close"),
+			wait: z.string().optional().describe("done, end_repeat: the wait id"),
+			reason: z.string().optional().describe("end_repeat: why it ended"),
 		}),
 		approval: "write",
 		loadMode: "essential",
@@ -1207,7 +1508,14 @@ export default function (pi) {
 			switch (params.action) {
 				case "add":
 					args = check
-						? ["add", "--session", session, ...checkOptions(JSON.stringify(params.argv), check.description, check.interval), ...userArgs("", check.prompt, check.park ?? true)]
+						? [
+								"add",
+								"--session",
+								session,
+								...checkOptions(JSON.stringify(params.argv), check.description, check.interval),
+								...check.repeat,
+								...userArgs(check.sentence, check.prompt, check.park),
+							]
 						: await toolAddArgs(params, session, c.cwd);
 					break;
 				case "babysit_pr":
@@ -1227,12 +1535,17 @@ export default function (pi) {
 					if (!params.wait) throw new Error("done needs a wait id; list shows them");
 					args = ["done", "--session", session, `--wait=${params.wait}`];
 					break;
+				case "end_repeat":
+					if (!params.wait) throw new Error("end_repeat needs the repeat's wait id; its prompt names it");
+					args = ["end-repeat", "--session", session, `--wait=${params.wait}`, ...(params.reason ? [`--reason=${params.reason}`] : [])];
+					break;
 				default:
 					args = ["list", "--session", session];
 			}
 			const { view, ...answer } = await act(c, args);
 			if (check) {
 				if (checks.get(session) === check) checks.delete(session);
+				if (check.close && session === sessionId) closeAfterTurn = session;
 				if (ctx && session === sessionId) setPanel(ctx, () => `Check: ${params.argv.join(" ")} every ${check.interval}`);
 			}
 			const result = params.action === "list" ? (answer.sessions?.[0] ?? { waits: [] }) : answer;
