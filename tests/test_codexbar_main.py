@@ -1067,6 +1067,25 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 check(countText.text === "2" && count.opacity === 1, "fresh count is plain")
                 check(row.waitingHoverText.indexOf("⚠") < 0, "fresh row tooltip has no warning")
                 check(app.toolTipSubText.indexOf("⚠") < 0, "fresh panel tooltip has no warning")
+                var partial = JSON.parse(JSON.stringify(fresh))
+                partial.health.error = "session abcd can't be shown:\\n gone"
+                partial.health.error_kind = "partial"
+                app.applyWaitingView(partial)
+                var lastCheck = "⚠ Last check: session abcd can't be shown: gone"
+                check(app.waitingWarning === lastCheck && label.visible && label.text === lastCheck,
+                    "a fresh check's error is the last check's: " + app.waitingWarning)
+                check(count.visible && countText.text === "2" && count.opacity === 1,
+                    "a fresh check's error leaves the count plain: " + countText.text)
+                check(row.waitingHoverText.indexOf(lastCheck) >= 0
+                    && app.toolTipSubText.indexOf("⚠ Last check: session abcd") >= 0,
+                    "both tooltips carry the last check's error")
+                var failed = JSON.parse(JSON.stringify(partial))
+                failed.health.error = "tern: no daemon"
+                failed.health.error_kind = "failed"
+                app.applyWaitingView(failed)
+                check(app.waitingWarning.indexOf("⚠ Waits not checked since ") === 0
+                    && app.waitingWarning.indexOf(": tern: no daemon") > 0 && countText.text === "2?",
+                    "a failed tick with a fresh checked_at keeps the old wording and N?: " + app.waitingWarning)
                 app.applyWaitingView({ health: { checked_at: null, error: "tern: no daemon" } })
                 check(count.visible && countText.text === "0?",
                     "a failed first tick still marks the panel at zero")
@@ -1087,31 +1106,55 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
 
                 function local(d, h, m, s) { return new Date(2026, 10, d, h, m, s || 0) }
                 var now = local(12, 9, 20).getTime()
-                function warn(health, unchecked) { return app.waitingHealthWarning(health, now, unchecked) }
+                function health(h, unchecked) { return app.waitingHealth(h, now, unchecked) }
+                function warn(h, unchecked) { return health(h, unchecked).text }
                 function iso(d) { return d.toISOString() }
-                check(warn(null) === "", "no health (an older CLI): no warning")
+                check(warn(null) === "" && !health(null).uncertain, "no health (an older CLI): no warning")
                 check(warn({ checked_at: iso(local(12, 9, 5, 1)) }) === "", "checked 14:59 ago is current")
                 check(warn({ checked_at: iso(local(12, 9, 4, 59)) }) === "⚠ Waits not checked since 09:04",
                     "checked over 15 min ago: " + warn({ checked_at: iso(local(12, 9, 4, 59)) }))
+                check(health({ checked_at: iso(local(12, 9, 4, 59)) }).uncertain, "a stale check is uncertain")
                 check(warn({ checked_at: iso(local(11, 23, 50)) }) === "⚠ Waits not checked since Nov 11, 23:50",
                     "an older day shows the date")
-                check(warn({ error: "boom" }) === "⚠ Waits not checked since never: boom",
-                    "a failure before any successful tick")
-                check(warn({ checked_at: iso(local(12, 9, 18)), error: "boom",
-                             agents_stale_since: iso(local(12, 9, 0)) })
-                    === "⚠ Waits not checked since 09:18: boom", "an error outranks a stale scan")
-                check(warn({ checked_at: iso(local(12, 9, 18)), agents_stale_since: iso(local(12, 9, 0)) })
-                    === "⚠ Session scan stale since 09:00", "fresh ticks over a stale session scan")
+                check(warn({ error: "boom" }) === "⚠ Waits not checked since never: boom"
+                    && health({ error: "boom" }).uncertain, "a failure before any successful tick")
+                var partialAt = function(at, extra) {
+                    return health(Object.assign({ checked_at: iso(at), error: "PR checks: 502", error_kind: "partial" },
+                                                extra || {}))
+                }
+                var recent = partialAt(local(12, 9, 5, 1))
+                check(recent.text === "⚠ Last check: PR checks: 502" && !recent.uncertain,
+                    "a partial error from a check 14:59 ago is the last check's, count certain: " + recent.text)
+                var old = partialAt(local(12, 9, 4, 59))
+                check(old.text === "⚠ Waits not checked since 09:04: PR checks: 502" && old.uncertain,
+                    "a partial error from a check over 15 min ago keeps the old wording: " + old.text)
+                var failedTick = partialAt(local(12, 9, 18), { error_kind: "failed" })
+                check(failedTick.text === "⚠ Waits not checked since 09:18: PR checks: 502" && failedTick.uncertain,
+                    "a failed tick is not a last check: " + failedTick.text)
+                var olderCli = partialAt(local(12, 9, 18), { error_kind: undefined })
+                check(olderCli.text === "⚠ Waits not checked since 09:18: PR checks: 502" && olderCli.uncertain,
+                    "no error_kind (an older CLI) reads as a failed tick: " + olderCli.text)
+                var scanned = partialAt(local(12, 9, 18), { agents_stale_since: iso(local(12, 9, 0)) })
+                check(scanned.text === "⚠ Last check: PR checks: 502 · session scan stale since 09:00"
+                    && scanned.uncertain, "a stale scan rides along a last check and keeps N?: " + scanned.text)
+                var failedScan = partialAt(local(12, 9, 18), { error_kind: "failed",
+                                                               agents_stale_since: iso(local(12, 9, 0)) })
+                check(failedScan.text === "⚠ Waits not checked since 09:18: PR checks: 502" && failedScan.uncertain,
+                    "a failed tick outranks a stale scan")
+                var scanOnly = health({ checked_at: iso(local(12, 9, 18)), agents_stale_since: iso(local(12, 9, 0)) })
+                check(scanOnly.text === "⚠ Session scan stale since 09:00" && scanOnly.uncertain,
+                    "fresh ticks over a stale session scan")
                 check(warn({ checked_at: null }, local(12, 9, 5, 1).getTime()) === "",
                     "unchecked for 14:59 is not yet a warning")
                 check(warn({ error: " \\n " }, local(12, 9, 4, 59).getTime()) === "⚠ Waits not checked since never",
                     "a blank error is no error; unchecked for over 15 min warns")
                 check(warn({ checked_at: null }) === "", "unchecked since unknown: no warning")
-                var long = warn({ checked_at: iso(local(12, 9, 18)), error: new Array(201).join("x") })
-                check(long === "⚠ Waits not checked since 09:18: " + new Array(120).join("x") + "…",
+                var long = warn({ checked_at: iso(local(12, 9, 18)), error: new Array(201).join("x"),
+                                  error_kind: "partial" })
+                check(long === "⚠ Last check: " + new Array(120).join("x") + "…",
                     "a long error is cut to 120 characters: " + long.length)
-                var emoji = warn({ checked_at: iso(local(12, 9, 18)), error: new Array(201).join("🙂") })
-                check(emoji === "⚠ Waits not checked since 09:18: " + new Array(120).join("🙂") + "…",
+                var emoji = warn({ checked_at: iso(local(12, 9, 4)), error: new Array(201).join("🙂") })
+                check(emoji === "⚠ Waits not checked since 09:04: " + new Array(120).join("🙂") + "…",
                     "the cap counts characters, not halves of an emoji: " + emoji.length)
                 console.log("PASS actual main waiting health")
                 Qt.exit(0)

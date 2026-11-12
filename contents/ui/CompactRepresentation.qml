@@ -408,14 +408,14 @@ Item {
 
         // Tern integration: sessions set aside whose ball is back with
         // you (waiting_view.json counts.on_me). A dot row like the stack's,
-        // in the color the Agents rows give their ● marker. While waits are
-        // not being checked (root.waitingWarning) it reads "N?", dimmed, and
+        // in the color the Agents rows give their ● marker. While waits may
+        // be out of date (root.waitingUncertain) it reads "N?", dimmed, and
         // shows at zero too: a silent panel would claim nothing is on you.
         RowLayout {
             id: waitingOnMe
             objectName: "waitingOnMeCount"
             readonly property real _scale: (Plasmoid.configuration.agentStateDotsScale || 100) / 100.0
-            readonly property bool uncertain: !!root.waitingWarning
+            readonly property bool uncertain: root.waitingUncertain === true
             visible: root.waitingOnMeCount > 0 || uncertain
             opacity: uncertain ? 0.55 : 1
             spacing: 4

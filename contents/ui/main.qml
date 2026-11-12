@@ -114,9 +114,10 @@ PlasmoidItem {
     // sessionId → { line, onMe } for every session the view lists.
     property var waitingBySession: ({})
     property int waitingOnMeCount: 0
-    // One "⚠ …" line while the view's `health` says waits are not being
-    // checked (waitingHealthWarning); the panel count then reads as uncertain.
+    // The view's `health` as waitingHealth reads it: one "⚠ …" line, and
+    // whether the panel count reads as uncertain.
     property string waitingWarning: ""
+    property bool waitingUncertain: false
     readonly property int waitingTickStaleMs: 15 * 60 * 1000
     onTernIntegrationChanged: {
         if (root.ternIntegration) return
@@ -948,31 +949,42 @@ PlasmoidItem {
             root._waitingUncheckedSince = 0
         else if (!root._waitingUncheckedSince)
             root._waitingUncheckedSince = nowMs
-        var warning = root.waitingHealthWarning(health, nowMs, root._waitingUncheckedSince)
-        var key = JSON.stringify([sessions, onMe, warning])
+        var state = root.waitingHealth(health, nowMs, root._waitingUncheckedSince)
+        var key = JSON.stringify([sessions, onMe, state])
         if (key === root._waitingViewKey) return
         root._waitingViewKey = key
         root.waitingBySession = sessions
         root.waitingOnMeCount = onMe
-        root.waitingWarning = warning
+        root.waitingWarning = state.text
+        root.waitingUncertain = state.uncertain
     }
 
     // When this applet first saw a view no tick had checked yet, in ms; 0
     // once one has (or with no view).
     property real _waitingUncheckedSince: 0
-    // waiting_view.json `health` → the warning every waitingfor surface
-    // shows, or "" while ticks are current. Before the first tick
+    // waiting_view.json `health` → { text, uncertain }: the warning every
+    // waitingfor surface shows ("" while ticks are current), and whether the
+    // waits may be out of date. A check that ran within 15 minutes and
+    // reported a partial problem (`error_kind` "partial": a session it can't
+    // show, PR checks) is the last check's error, with the count certain
+    // unless the session scan is stale; a failed tick (`error_kind`
+    // "failed", or none from an older CLI) means the waits were not
+    // checked. Before the first tick
     // (`checked_at` null) it warns only once this surface has seen it so
     // for 15 minutes (`uncheckedSinceMs`), so a fresh install doesn't
     // flash a warning. Only an older CLI writes no `health`: no warning.
-    function waitingHealthWarning(health, nowMs, uncheckedSinceMs) {
-        if (!health || typeof health !== "object") return ""
+    function waitingHealth(health, nowMs, uncheckedSinceMs) {
+        if (!health || typeof health !== "object") return { text: "", uncertain: false }
         function at(value) {
             var when = value ? new Date(value) : null
             return when && !isNaN(when.getTime()) ? when : null
         }
         var checked = at(health.checked_at)
         var since = checked ? root._absoluteTime(checked, nowMs) : "never"
+        var last = checked ? checked.getTime() : uncheckedSinceMs
+        var stale = !!last && nowMs - last > root.waitingTickStaleMs
+        var scan = at(health.agents_stale_since)
+        var scanSince = scan ? root._absoluteTime(scan, nowMs) : ""
         // Capped at 120 characters, counted by code point as Tern counts
         // them, so no emoji is cut in half: both tooltips show it in full,
         // on every waiting row. V4's Array.from splits a string into UTF-16
@@ -980,13 +992,16 @@ PlasmoidItem {
         var error = String(health.error || "").replace(/\s+/g, " ").trim()
         var chars = error.match(/[\uD800-\uDBFF][\uDC00-\uDFFF]|[\s\S]/g) || []
         if (chars.length > 120) error = chars.slice(0, 119).join("") + "…"
+        if (error && checked && !stale && health.error_kind === "partial")
+            return { text: "⚠ Last check: " + error + (scan ? " · session scan stale since " + scanSince : ""),
+                     uncertain: !!scan }
         if (error)
-            return "⚠ Waits not checked since " + since + ": " + error
-        var last = checked ? checked.getTime() : uncheckedSinceMs
-        if (last && nowMs - last > root.waitingTickStaleMs)
-            return "⚠ Waits not checked since " + since
-        var scan = at(health.agents_stale_since)
-        return scan ? "⚠ Session scan stale since " + root._absoluteTime(scan, nowMs) : ""
+            return { text: "⚠ Waits not checked since " + since + ": " + error, uncertain: true }
+        if (stale)
+            return { text: "⚠ Waits not checked since " + since, uncertain: true }
+        return scan
+            ? { text: "⚠ Session scan stale since " + scanSince, uncertain: true }
+            : { text: "", uncertain: false }
     }
 
     function refresh(automatic = false) {

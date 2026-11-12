@@ -435,8 +435,9 @@ ColumnLayout {
         text: root.teleportError
     }
 
-    // waitingfor health: waits are not being checked, so the row markers
-    // and the panel count may be out of date. Kept to two lines.
+    // waitingfor health: waits not being checked (the row markers and the
+    // panel count may be out of date) or the last check's error. Kept to
+    // two lines.
     PC3.Label {
         objectName: "waitingWarning"
         visible: text.length > 0
