@@ -23,6 +23,7 @@ const VIEW_FILE = path.join(STATE_DIR, VIEW_NAME);
 
 const WIDGET = "waitingfor";
 const PANEL = "waitingfor-panel";
+const HEALTH = "waitingfor-health";
 const CLI_TIMEOUT_MS = 30_000;
 const GH_TIMEOUT_MS = 15_000;
 /** A guess for a prefill must not hold the next dialog for long. */
@@ -500,6 +501,28 @@ function when(iso: string): string {
 	return iso.slice(5, 16).replace("T", " ");
 }
 
+/** A tick older than this means the waits went unchecked; the CLI ticks every few minutes at most. */
+const TICK_STALE_MS = 15 * 60_000;
+const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+/** "16:00" today, else "Nov 6, 16:00", as Tern and the applet write times. */
+function clockTime(ms: number, now: number): string {
+	const at = new Date(ms);
+	const hhmm = `${String(at.getHours()).padStart(2, "0")}:${String(at.getMinutes()).padStart(2, "0")}`;
+	return at.toDateString() === new Date(now).toDateString() ? hhmm : `${MONTHS[at.getMonth()]} ${at.getDate()}, ${hhmm}`;
+}
+
+/** The warning a view's `health` gives at `now`; undefined while the waits are being checked. */
+export function healthWarning(health, now = Date.now()): string | undefined {
+	if (!health) return undefined;
+	const checked = Date.parse(health.checked_at ?? "");
+	const since = Number.isNaN(checked) ? "never" : clockTime(checked, now);
+	if (health.error) return `⚠ Waits not checked since ${since}: ${health.error}`;
+	if (!(now - checked <= TICK_STALE_MS)) return `⚠ Waits not checked since ${since}`;
+	const stale = Date.parse(health.agents_stale_since ?? "");
+	return Number.isNaN(stale) ? undefined : `⚠ Session scan stale since ${clockTime(stale, now)}`;
+}
+
 function waitFacts(wait): string {
 	return [wait.progress ?? wait.state, wait.overdue ? "overdue" : null, wait.due_at ? `due ${when(wait.due_at)}` : null, wait.reason].filter(Boolean).join(", ");
 }
@@ -531,8 +554,11 @@ function errorPanel(message: string, forms = []) {
 	return (theme, width: number) => [theme.fg("error", message), ...(forms.length > 0 ? [columns(forms, theme, width)] : [])].join("\n");
 }
 
-/** The session details: `card` is the CLI's answer. */
-function detailsPanel(card) {
+/**
+ * The session details: `card` is the CLI's answer, `warning` gives the health warning when drawn,
+ * as the row redraws the panel when it changes.
+ */
+function detailsPanel(card, warning: () => string | undefined) {
 	return (theme) => {
 		const muted = (text: string) => theme.fg("muted", text);
 		const waits = card.waits ?? [];
@@ -546,7 +572,9 @@ function detailsPanel(card) {
 		};
 		const prs = card.prs ?? [];
 		const mentioned = prs.filter((pr) => pr.source === "mentioned");
+		const warned = warning();
 		return [
+			warned && theme.fg("warning", warned),
 			card.headline && theme.fg(TONES[card.outcome] ?? "muted", card.headline),
 			card.outcome && card.still_waiting?.length > 0 && `${muted("Still waiting for")} ${card.still_waiting.join("  ·  ")}`,
 			sentence && bold(sentence),
@@ -934,6 +962,8 @@ export default function (pi) {
 	let debounce;
 	let watcher;
 	let shownLine: string | undefined | null = null; // what drawRow last drew; null: draw next time, whatever it is
+	let ownSession; // this session's record, as the last applied view had it
+	let health; // the last applied view's health
 	let waits = []; // this session's open waits, as the last applied view had them
 	let menuOpen = false;
 	let closeAfterTurn: string | undefined; // the session to close once the turn writing its described check ends
@@ -970,11 +1000,16 @@ export default function (pi) {
 	};
 	const inOrder = (step) => (tail = tail.then(step).catch(log));
 
-	function drawRow(session) {
+	/** Draws the health warning, when there is one, over the session's row, when it has one. */
+	function drawRow() {
+		const session = ownSession;
 		const line = session?.composer_row || undefined;
-		const shown = line && JSON.stringify([session.outcome, session.headline, line]);
+		const warning = healthWarning(health);
+		const shown = JSON.stringify([session?.outcome, session?.headline, line, warning]);
 		if (!ctx || shown === shownLine) return;
 		shownLine = shown;
+		// omp draws widgets in the order they were set: the warning, the row, then the panel.
+		ctx.ui.setWidget(HEALTH, warning && ((_tui, theme) => panelComponent((t) => t.fg("warning", warning), theme)), { placement: "aboveEditor" });
 		// In Tern a click on the row opens the session's card.
 		const href = process.env.TERN_PANE ? `codexbar-agentview://card/${sessionId}` : undefined;
 		const [open, close] = href ? [`\x1b]8;;${href}\x1b\\`, "\x1b]8;;\x1b\\"] : ["", ""];
@@ -1001,7 +1036,6 @@ export default function (pi) {
 			};
 		};
 		ctx.ui.setWidget(WIDGET, line ? widget : undefined, { placement: "aboveEditor" });
-		// omp draws widgets in the order they were set, and the panel belongs under the row.
 		if (panel) drawPanel(ctx);
 	}
 
@@ -1036,13 +1070,18 @@ export default function (pi) {
 	async function showDetails(c) {
 		const loading = (theme) => theme.fg("muted", "Loading…");
 		setPanel(c, loading);
+		const warning = () => healthWarning(health);
 		let details;
 		try {
-			details = detailsPanel((await cli(["card", "--session", c.sessionManager.getSessionId()])).card);
+			details = detailsPanel((await cli(["card", "--session", c.sessionManager.getSessionId()])).card, warning);
 		} catch (error) {
 			const message = messageOf(error);
-			// A session with no message yet has nothing for the card to read.
-			details = message.startsWith("unknown session") ? detailsPanel({}) : errorPanel(message);
+			const failed = errorPanel(message);
+			// A session with no message yet has nothing for the card to read; an unreadable state
+			// fails the card, and the warning says since when.
+			details = message.startsWith("unknown session")
+				? detailsPanel({}, warning)
+				: (theme, width: number) => [warning() && theme.fg("warning", warning()), failed(theme, width)].filter(Boolean).join("\n");
 		}
 		if (panel === loading) setPanel(c, details);
 	}
@@ -1056,20 +1095,33 @@ export default function (pi) {
 		if (at >= activatedAt && Date.now() - at < MENU_REQUEST_MS) void openMenu(ctx);
 	}
 
+	/** Applies a view; one without `sessions` is a failed tick's health alone, and the row stays as it was. */
 	function applyView(view) {
 		if (!view || !ctx) return;
 		viewsApplied += 1;
-		const session = view.sessions?.find((record) => record.session_id === sessionId);
-		waits = session?.waits ?? [];
-		drawRow(session);
-		if (session?.prompts_queued > 0) void claimPrompts();
+		if ("health" in view) health = view.health;
+		if (!view.sessions) {
+			drawRow();
+			return;
+		}
+		ownSession = view.sessions.find((session) => session.session_id === sessionId);
+		waits = ownSession?.waits ?? [];
+		drawRow();
+		if (ownSession?.prompts_queued > 0) void claimPrompts();
 		answerMenuRequest(view);
 	}
 
+	/** Applies this session's list; when the CLI fails, the view file, which holds a failed tick's error. */
 	async function refresh() {
 		const session = sessionId;
 		const applied = viewsApplied;
-		const view = await cli(["list", "--session", session]);
+		let view;
+		try {
+			view = await cli(["list", "--session", session]);
+		} catch (error) {
+			log(error);
+			view = await readViewFile();
+		}
 		// A view applied meanwhile came from a later command than this answer.
 		if (session === sessionId && applied === viewsApplied) applyView(view);
 	}
@@ -1174,6 +1226,7 @@ export default function (pi) {
 		clearTimers();
 		ctx = c;
 		shownLine = null; // a switched session may start with omp's widgets reset
+		ownSession = undefined;
 		waits = [];
 		menuSeq = 0;
 		closeAfterTurn = undefined; // chosen for the session switched away from
