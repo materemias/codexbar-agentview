@@ -18,6 +18,7 @@ import contextlib
 import copy
 import errno
 import fcntl
+import functools
 import json
 import math
 import os
@@ -72,6 +73,9 @@ ACTION_KEPT_S = 7 * 24 * 3600
 MAX_DURATION_S = 10 * 366 * 24 * 3600
 TICK_MIN_S = 15
 TICK_MAX_S = 300
+# A daemon that ticked within this still ticks: another one's tick stands aside.
+TICKER_LEASE_S = 2 * TICK_MAX_S
+TICK_SKIPPED = "another Tern daemon ticks this state"
 # Soon enough for a window that just opened, late enough for acks to land. Only
 # fresh actions get this: without a window nobody will ack them.
 TICK_OUTBOX_S = 30
@@ -172,6 +176,8 @@ DELIVERY_REASONS = (REASON_CLOSED, REASON_NO_EXTENSION, REASON_RESUMING)
 # Anything else on me (an error, a PR's news) says more than either.
 RESUMING_REPLACES = (None, REASON_QUESTION, *DELIVERY_REASONS)
 CLOSED_REPLACES = (*RESUMING_REPLACES, REASON_OVERDUE)
+# Actions that name a pane, which only the daemon that ran then knows.
+PANE_ACTIONS = ("park", "close_pane")
 
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -1152,6 +1158,7 @@ def _ensure(state: dict, session: str | None, pane: int | None) -> dict:
         if session:
             state["sessions"][session] = record
         else:
+            record["daemon"] = _creator_daemon(state)
             state["panes"][str(pane)] = record
     return record
 
@@ -1192,8 +1199,42 @@ def _log(
     del record["history"][:-HISTORY_KEPT]
 
 
+def _ticking_daemon(state: dict) -> str | None:
+    return (state.get("ticker") or {}).get("daemon")
+
+
+@functools.lru_cache(maxsize=None)
+def _ancestor_daemon() -> str | None:
+    """The Tern daemon this process runs under (a pane's command, or the host's
+    own), named as the host names it for `tick --daemon`: its pid and start time.
+    None outside Tern or without /proc."""
+    pid = os.getpid()
+    while pid > 1:
+        try:
+            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+        name_end = stat.rfind(")")
+        fields = stat[name_end + 2:].split()
+        if stat[stat.find("(") + 1:name_end] == "tern" and len(fields) > 19:
+            return f"{pid}-{fields[19]}"
+        try:
+            pid = int(fields[1])
+        except (IndexError, ValueError):
+            return None
+    return None
+
+
+def _creator_daemon(state: dict) -> str | None:
+    """Whose pane ids a new pane-scoped item names (`_panes_gone`): the daemon
+    the command runs under, else the one that ticks."""
+    return _ancestor_daemon() or _ticking_daemon(state)
+
+
 def _enqueue(state: dict, now: datetime, action: dict) -> None:
     state["action_seq"] += 1
+    if action["type"] in PANE_ACTIONS:
+        action = {**action, "daemon": _creator_daemon(state)}
     state["actions"].append({
         "id": f"a{state['action_seq']}", **action, "created_at": _iso(now),
     })
@@ -1229,6 +1270,8 @@ def _new_wait(state: dict, now: datetime, **fields: object) -> dict:
         "retry_as": None,
     }
     wait.update(fields)
+    if wait.get("kind") == "job":
+        wait["daemon"] = _creator_daemon(state)
     return wait
 
 
@@ -2289,12 +2332,42 @@ def _merge(state: dict, finished: list[dict], now: datetime) -> None:
                 _apply_result(state, record, wait, job, now)
 
 
-def _pane_closed(state: dict, pane: int, now: datetime) -> None:
-    state["panes"].pop(str(pane), None)
+def _pane_closed(state: dict, pane: int, now: datetime, keep=None) -> None:
+    """`keep(item)` spares a pane record or job wait of another pane of that id."""
+    record = state["panes"].get(str(pane))
+    if record is not None and not (keep and keep(record)):
+        del state["panes"][str(pane)]
     for record in list(state["sessions"].values()):
         for wait in list(record["waits"]):
-            if _watches_job(wait, pane):
+            if _watches_job(wait, pane) and not (keep and keep(wait)):
                 _attention(state, record, wait, now, "Pane closed before the job finished")
+
+
+def _other_daemons(item: dict) -> bool:
+    """A pane-scoped item another daemon made: a pane event of this command's
+    daemon is about another pane of that number."""
+    daemon = _ancestor_daemon()
+    return daemon is not None and item.get("daemon") not in (None, daemon)
+
+
+def _panes_gone(state: dict, now: datetime, daemon: str | None = None) -> None:
+    """A pane id names a pane of the Tern daemon that ran then: after a reboot,
+    or under another daemon, it may name another pane. What watched one ends as
+    pane gone; what `daemon` made stays."""
+    def mine(item: dict) -> bool:
+        return daemon is not None and item.get("daemon") == daemon
+
+    panes = {int(pane) for pane, record in state["panes"].items() if not mine(record)} | {
+        wait["condition"]["pane"]
+        for record in state["sessions"].values() for wait in record["waits"]
+        if wait["kind"] == "job" and wait["state"] == "waiting" and not mine(wait)
+    }
+    for pane in panes:
+        _pane_closed(state, pane, now, keep=mine)
+    state["actions"] = [
+        action for action in state["actions"]
+        if action["type"] not in PANE_ACTIONS or mine(action)
+    ]
 
 
 def _watches_job(wait: dict, pane: int) -> bool:
@@ -2347,24 +2420,30 @@ def _after_reboot(state: dict, agents: Agents, now: datetime) -> None:
                 _log(record, now, wait, f"Sending again after a reboot: {wait['label']}")
 
 
-def _housekeeping(state: dict, agents: Agents, omp: Omp, now: datetime) -> None:
+def _housekeeping(
+    state: dict, agents: Agents, omp: Omp, now: datetime, daemon: str | None = None,
+) -> None:
+    """`daemon` is the ticking Tern daemon's id: under a new one, pane ids name
+    other panes."""
     stamp = now.timestamp()
     boot = _boot_id(agents)
+    rebooted = bool(boot and state["boot_id"] and state["boot_id"] != boot)
     if boot:
-        if state["boot_id"] and state["boot_id"] != boot:
+        if rebooted:
             _after_reboot(state, agents, now)
             # Pane ids don't survive a reboot, and may belong to another pane now.
-            panes = {int(pane) for pane in state["panes"]} | {
-                wait["condition"]["pane"]
-                for record in state["sessions"].values() for wait in record["waits"]
-                if wait["kind"] == "job" and wait["state"] == "waiting"
-            }
-            for pane in panes:
-                _pane_closed(state, pane, now)
+            _panes_gone(state, now)
             state["actions"] = [
                 action for action in state["actions"] if action["type"] == "toast"
             ]
         state["boot_id"] = boot
+    if daemon:
+        last = _ticking_daemon(state)
+        if last and last != daemon and not rebooted:
+            # A new daemon: its panes are new too, and so may be the ones extensions report.
+            _panes_gone(state, now, daemon)
+            state["extension_panes"] = {}
+        state["ticker"] = {"daemon": daemon, "at": _iso(now)}
     state["extensions"] = {
         session: seen for session, seen in state["extensions"].items()
         if stamp - _parse_time(seen).timestamp() <= EXTENSION_KEPT_S
@@ -2543,7 +2622,7 @@ def _record_times(state: dict, record: dict, now: datetime) -> list[float | None
 def _public_action(action: dict) -> dict:
     return {
         key: value for key, value in action.items()
-        if key not in ("wait", "created_at", "window_since")
+        if key not in ("wait", "created_at", "window_since", "daemon")
     }
 
 
@@ -3836,12 +3915,12 @@ def cmd_event(args: argparse.Namespace) -> dict:
         elif kind == "job_finished":
             finished_jobs = [
                 (held, wait) for held in _records(state) for wait in held["waits"]
-                if _watches_job(wait, args.pane)
+                if _watches_job(wait, args.pane) and not _other_daemons(wait)
             ]
             for held, wait in finished_jobs:
                 _finish_job(state, held, wait, args.status, now)
         elif kind == "pane_closed":
-            _pane_closed(state, args.pane, now)
+            _pane_closed(state, args.pane, now, keep=_other_daemons)
         return {}
 
     return _mutate(apply, agents=agents)
@@ -3975,6 +4054,29 @@ def cmd_tick(args: argparse.Namespace) -> dict:
         raise
 
 
+def _ticked_elsewhere(state: dict, daemon: str, now: datetime) -> bool:
+    """Another Tern daemon holds the ticker: it ticked lately."""
+    ticker = state.get("ticker") or {}
+    if not ticker.get("daemon") or ticker["daemon"] == daemon or not _daemon_alive(ticker["daemon"]):
+        return False
+    at = _stamp(ticker.get("at"))
+    return at is not None and 0 <= now.timestamp() - at < TICKER_LEASE_S
+
+
+def _daemon_alive(daemon: str) -> bool:
+    """False for a `<pid>-<start time>` id whose process is gone or is another
+    one now (a restart, a reboot); an id /proc can't check counts as alive."""
+    pid, _, start = daemon.partition("-")
+    if not (pid.isdigit() and start.isdigit()) or not Path("/proc/self/stat").exists():
+        return True
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    fields = stat[stat.rfind(")") + 2:].split()
+    return len(fields) > 19 and fields[19] == start
+
+
 def _note_tick(state: dict, now: datetime, stale: bool) -> None:
     """A tick long after the last one follows a sleep (or a stopped daemon):
     extensions get a heartbeat's time from then (`_extension_lost`)."""
@@ -4003,8 +4105,13 @@ def _tick(args: argparse.Namespace) -> dict:
         }
 
     with _transaction() as state:
+        if args.daemon and _ticked_elsewhere(state, args.daemon, now):
+            return {
+                "ok": True, "skipped": TICK_SKIPPED, "actions": [], "next_tick_s": TICK_MAX_S,
+                "view": _build_view(state, now, agents, omp=omp),
+            }
         _note_tick(state, now, stale)
-        _housekeeping(state, agents, omp, now)
+        _housekeeping(state, agents, omp, now, args.daemon)
         _pin_pass(state, omp, now)
         _evaluate(state, now)
         _delivery_pass(state, agents, now, args.window, stale)
@@ -4355,6 +4462,8 @@ def _parser() -> argparse.ArgumentParser:
     tick.add_argument("--now")
     # Tern says a window is up to carry out a resume; until one is, none expires.
     tick.add_argument("--window", action="store_true")
+    # The Tern daemon that ticks: one ticks at a time, and pane ids are its own.
+    tick.add_argument("--daemon")
 
     command("list", cmd_list).add_argument("--session", type=_session_arg)
     command("inventory", cmd_inventory)

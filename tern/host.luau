@@ -384,6 +384,9 @@ local store = {
 	-- to come runs it, so neither a sleep nor a wall clock set back holds it up.
 	waitingAt = 0,
 	waitingAtMono = 0,
+	waitingSkipped = nil :: string?, -- another Tern daemon ticks this state: why, as the CLI said
+	daemonId = nil :: string?, -- `tick --daemon`: which daemon process this is (set at load, at the end)
+	daemonKnown = false, -- whether that answer came, with an id or without one
 	jobEventAt = {} :: { [number]: number }, -- pane -> os.clock() when its last job event went to the CLI
 	waitingMemo = nil :: any, -- waitingGroups' last answer, for one view and filter
 	lastPoke = nil :: any,
@@ -1376,7 +1379,8 @@ local function publishSummary()
 		usage = if store.usage then usageWidgets(store.usage, os.time()) else {},
 		counts = counts,
 		restore = restore,
-		waiting = { on_me = tonumber(val(waitingCounts().on_me)) or 0, panes = waitingPanes() },
+		-- While another daemon ticks, the view's pane ids are its panes: none of ours.
+		waiting = { on_me = tonumber(val(waitingCounts().on_me)) or 0, panes = if store.waitingSkipped then {} else waitingPanes() },
 	}
 	local sig = tern.json.encode(summary)
 	if sig ~= store.summarySig then
@@ -1484,6 +1488,9 @@ end
 
 -- One `tick` at a time; a request during one runs right after it.
 local function waitingTick()
+	if not store.daemonKnown then
+		return -- the timed tick runs once the daemon's id is known (end of file)
+	end
 	if store.waitingTicking then
 		store.waitingAgain = true
 		return
@@ -1500,18 +1507,33 @@ local function waitingTick()
 	if left > 0 and left <= 30 then
 		table.insert(args, "--window")
 	end
+	if store.daemonId then
+		table.insert(args, "--daemon")
+		table.insert(args, store.daemonId)
+	end
 	python(WAITING_CLI, args, WAITING_TIMEOUT_MS, function(res)
 		store.waitingTicking = false
 		local okj, data = pcall(tern.json.decode, res.stdout)
 		local nextIn = WAITING_RETRY_S
 		local ticked = res.status == 0 and okj and type(data) == "table" and type(val(data.view)) == "table"
+		local skipped = if ticked then str(data.skipped) else ""
 		if ticked then
-			local hadError = store.waitingError ~= nil
+			-- Before the view goes out: while skipped, the summary leaves out the
+			-- other daemon's panes (publishSummary).
+			local wasSkipped, hadError = store.waitingSkipped, store.waitingError ~= nil
+			store.waitingSkipped = if skipped ~= "" then skipped else nil
 			store.waitingError = nil
 			applyWaiting(val(data.view))
-			publishActions(if type(val(data.actions)) == "table" then val(data.actions) else tern.json.array())
+			-- Another daemon's windows carry the outbox out; ours would do it twice.
+			publishActions(if skipped == "" and type(val(data.actions)) == "table" then val(data.actions) else tern.json.array())
 			nextIn = tonumber(val(data.next_tick_s)) or nextIn
-			if hadError then
+			if skipped ~= "" and wasSkipped == nil then
+				tern.log.warn("codexbar: waiting tick skipped", skipped)
+			end
+			if (wasSkipped == nil) ~= (store.waitingSkipped == nil) then
+				publishSummary()
+				renderAll() -- the Waiting tab's line about the other daemon
+			elseif hadError then
 				renderAll() -- the warning line goes, though the view may be the same
 			end
 		else
@@ -1526,8 +1548,9 @@ local function waitingTick()
 		-- tick's last transaction: the poll would take that change as seen, and a
 		-- window action it queued would wait for the next timed tick. Its view or
 		-- an action the tick didn't return tells; one recheck, so no tick loop.
+		-- A skipped tick publishes no action, so it doesn't look.
 		local recheck = false
-		if ticked and not store.waitingAgain and not store.waitingRecheck then
+		if ticked and skipped == "" and not store.waitingAgain and not store.waitingRecheck then
 			local okv, file = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
 			if okv and type(file) == "table" then
 				file.now = nil
@@ -1590,12 +1613,14 @@ end
 -- an ack that landed stays marked until a tick drops its action, and a failed
 -- one waits before the next try. An empty listing is no evidence, as while the
 -- daemon starts: those actions wait for a listing, or for the CLI to expire them.
+-- While another daemon ticks the state (`waitingSkipped`), its panes aren't in
+-- this listing: nothing is acked.
 local function ackGonePanes()
 	local live: { [number]: boolean } = {}
 	for _, p in tern.pane.list() do
 		live[p.pane] = true
 	end
-	if next(live) == nil then
+	if next(live) == nil or store.waitingSkipped then
 		return
 	end
 	for _, a in (if type(store.waitingActions) == "table" then store.waitingActions else {}) do
@@ -1646,8 +1671,9 @@ local function jobFinished(pane: number, status: number, exited: boolean)
 	if exited and now - (store.jobEventAt[pane] or -math.huge) <= 2 then
 		return
 	end
-	local watched = type(store.waiting) == "table" and jobPanes(store.waiting)[pane] == true
-	if not watched and (store.waitingTicking or readWaiting(WAITING_FILE) ~= store.waitingRaw) then
+	-- While another daemon ticks, its waits' pane ids name its panes, not ours.
+	local watched = not store.waitingSkipped and type(store.waiting) == "table" and jobPanes(store.waiting)[pane] == true
+	if not watched and not store.waitingSkipped and (store.waitingTicking or readWaiting(WAITING_FILE) ~= store.waitingRaw) then
 		local okj, view = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
 		watched = okj and type(view) == "table" and jobPanes(view)[pane] == true
 	end
@@ -1913,8 +1939,9 @@ local function tick()
 				scanAgents(false)
 			end
 			ackGonePanes()
-			-- Another writer (the omp extension, tern-awui) may have queued a window action.
-			if not store.waitingTicking and readWaiting(WAITING_FILE) ~= store.waitingRaw then
+			-- Another writer (the omp extension, tern-awui) may have queued a window
+			-- action; while another daemon ticks, its writes are its own business.
+			if not store.waitingTicking and not store.waitingSkipped and readWaiting(WAITING_FILE) ~= store.waitingRaw then
 				waitingTick()
 			end
 			if store.menuRetryAt and os.clock() >= store.menuRetryAt and store.loadMenu then
@@ -3088,8 +3115,9 @@ end
 
 -- A line above the groups while the waits may be out of date: the last tick
 -- failed (this half saw it, or the CLI noted it in `health`), no tick finished
--- for 15 minutes, or the session scan the ticks read is stale. Without a view
--- the empty state tells the failure instead.
+-- for 15 minutes, or the session scan the ticks read is stale. Without one,
+-- while another daemon ticks, a muted line says so. Without a view the empty
+-- state tells the failure instead.
 local function waitingView(b: Block, now: number, into: { Node })
 	if not store.waiting and not store.waitingError then
 		table.insert(into, ui.node("skeleton", { key = "list", shape = "rows", rows = 8, aria = "Reading waits" }))
@@ -3109,6 +3137,8 @@ local function waitingView(b: Block, now: number, into: { Node })
 			text = "⚠️ Waits not checked since " .. since
 		elseif scan then
 			text = "⚠️ Session scan stale since " .. absoluteTime(scan, now)
+		elseif store.waitingSkipped then
+			text, tone = "Another Tern daemon checks these waits", "muted"
 		end
 		if text then
 			table.insert(into, withp(ui.text({ ui.span(clip(text, 200), tone) }), { key = "health", role = "codexbar.health" }))
@@ -4131,6 +4161,35 @@ tern.block.define("settings", {
 local initialGoto = tern.kv.get("goto")
 store.lastGoto = if type(initialGoto) == "table" then initialGoto.seq else nil
 store.lastPoke = tern.kv.get("waitingPoke")
+
+-- Which daemon process this is, for `tick --daemon`: Tern's API names none, so it
+-- is the process's pid and start time. A plugin reload keeps them, and so does an
+-- update (the daemon becomes the new build in place, its programs running on); a
+-- daemon restart changes them. Linux reads them in /proc, as the CLI does for the
+-- daemon that runs a command; elsewhere `ps` reads them for a shell's parent, this
+-- process. Without either, ticks go without `--daemon`.
+-- The timed tick waits for the answer (`daemonKnown`). In a callback of its own:
+-- the main chunk is at Luau's 200-local limit.
+tern.timer(0, function()
+	local ok, stat = pcall(tern.fs.read, "/proc/self/stat", 4096)
+	local pid, rest
+	if ok then
+		pid, rest = string.match(stat, "^(%d+) %(.*%) (.*)$")
+	end
+	local fields = if rest then string.split(rest, " ") else {}
+	if pid and fields[20] then -- the fields after the name start at the third; the start time is the 22nd
+		store.daemonId, store.daemonKnown = pid .. "-" .. fields[20], true
+	elseif tern.runtime.os ~= "linux" then -- on Linux, only /proc's form: a second one would read as another daemon
+		local started = pcall(tern.process.run, { "/bin/sh", "-c", 'echo "$PPID" $(ps -o lstart= -p "$PPID")' }, { timeout_ms = 10000 }, function(res: ProcessResult)
+			local id = (string.gsub(string.match(res.stdout, "^%s*(.-)%s*$") or "", "%s+", "-"))
+			store.daemonId = if res.status == 0 and string.match(id, "^%d+%-%S") then id else nil
+			store.daemonKnown = true
+		end)
+		store.daemonKnown = not started
+	else
+		store.daemonKnown = true
+	end
+end)
 tern.timer(0, tick)
 
 -- The set-aside items (waiting_menu.json, validated by the CLI), once per load

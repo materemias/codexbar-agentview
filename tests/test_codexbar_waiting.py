@@ -99,6 +99,11 @@ class Case(unittest.TestCase):
         boot = mock.patch.object(waiting, "_system_boot_id", lambda: self.system_boot)
         boot.start()
         self.addCleanup(boot.stop)
+        # The Tern daemon a command runs under; tests run outside Tern unless set.
+        self.creator = None
+        creator = mock.patch.object(waiting, "_ancestor_daemon", lambda: self.creator)
+        creator.start()
+        self.addCleanup(creator.stop)
 
     def agents(self, *live: str, closed: list[dict] | None = None, boot: str = "") -> None:
         for sid in live:
@@ -1472,6 +1477,7 @@ class MenuRequestTests(Case):
         self.assertEqual(self.run_cli("list")["extension_panes"], {})
         answer = self.run_cli("menu-request", "--pane", "52")
         self.assertEqual((answer["menu"], answer["reason"]), (False, waiting.REASON_MENU_NO_PANE))
+
 
     def test_a_resumed_session_keeps_its_pane_before_the_sweep_sees_it(self) -> None:
         self.agents(closed=[{"sessionId": SID, "cwd": "/w", "windowTitle": "x"}])
@@ -4874,6 +4880,63 @@ class RetryTests(Case):
         seen = self.wait_of(self.wait)
         self.assertEqual((seen["state"], seen["ball"]), ("waiting", "on_machine"))
         self.assertEqual(self.session()["history"][-1]["text"], "Checks work again: PR")
+
+
+class DaemonTests(Case):
+    def test_another_daemon_stands_aside_while_one_ticks(self) -> None:
+        self.add("--kind", "later")
+        self.tick("--daemon", "a")
+        saved = (self.state_dir / "waiting.json").read_text()
+        self.advance(minutes=5)
+        answer = self.tick("--daemon", "b")
+        self.assertEqual((answer["skipped"], answer["actions"]), (waiting.TICK_SKIPPED, []))
+        self.assertEqual(len(answer["view"]["sessions"]), 1)
+        self.assertEqual((self.state_dir / "waiting.json").read_text(), saved)
+        self.advance(seconds=waiting.TICKER_LEASE_S - 5 * 60)
+        self.assertNotIn("skipped", self.tick("--daemon", "b"))
+        self.assertEqual(self.state()["ticker"]["daemon"], "b")
+
+    def test_a_daemon_that_is_gone_holds_no_lease(self) -> None:
+        self.tick("--daemon", "999999999-1")  # no such process
+        self.advance(minutes=1)
+        self.assertNotIn("skipped", self.tick("--daemon", "b"))
+
+    def test_a_pane_event_reaches_only_its_daemons_waits(self) -> None:
+        self.creator = "b"
+        job = self.add("--kind", "job", "--pane", "51")["id"]
+        self.creator = "a"  # daemon a's pane 51 is another pane
+        self.run_cli("event", "--type", "job_finished", "--pane", "51", "--status", "1")
+        self.run_cli("event", "--type", "pane_closed", "--pane", "51")
+        self.assertEqual(self.wait_of(job)["state"], "waiting")
+        self.creator = "b"
+        self.run_cli("event", "--type", "pane_closed", "--pane", "51")
+        self.assertEqual(self.wait_of(job)["state"], "needs_attention")
+
+    def test_a_new_daemon_ends_what_watched_the_old_ones_panes(self) -> None:
+        self.tick("--daemon", "a")
+        job = self.add("--kind", "job", "--pane", "51")["id"]
+        self.run_cli("add", "--pane", "52", "--kind", "later", "--park")
+        self.assertEqual(self.state()["sessions"][SID]["waits"][0]["daemon"], "a")
+        self.advance(seconds=waiting.TICKER_LEASE_S)
+        actions = self.tick("--daemon", "b")["actions"]
+        self.assertEqual([action["type"] for action in actions if action["type"] != "toast"], [])
+        seen = self.wait_of(job)
+        self.assertEqual((seen["state"], seen["reason"]), ("needs_attention", "Pane closed before the job finished"))
+        self.assertEqual(self.run_cli("list")["panes"], [])
+        later = self.add("--kind", "job", "--pane", "51")["id"]
+        self.advance(minutes=1)
+        self.tick("--daemon", "b")
+        self.assertEqual(self.wait_of(later)["state"], "waiting")
+
+    def test_a_pane_of_the_new_daemon_made_before_it_ticked_stays(self) -> None:
+        self.tick("--daemon", "a")
+        self.creator = "b"  # added from a pane of daemon b, which hasn't ticked yet
+        job = self.add("--kind", "job", "--pane", "51")["id"]
+        self.run_cli("add", "--pane", "52", "--kind", "later")
+        self.advance(seconds=waiting.TICKER_LEASE_S)
+        self.tick("--daemon", "b")
+        self.assertEqual(self.wait_of(job)["state"], "waiting")
+        self.assertEqual([pane["pane"] for pane in self.run_cli("list")["panes"]], [52])
 
 
 if __name__ == "__main__":
