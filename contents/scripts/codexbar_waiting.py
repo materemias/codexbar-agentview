@@ -366,10 +366,10 @@ def _transaction():
 
 def _publish(
     state: dict, now: datetime, agents: "Agents | None" = None, omp: "Omp | None" = None,
-    ticked: bool = False,
+    ticked: bool = False, problems: list[str] = (),
 ) -> dict:
     """Build the view and write waiting_view.json; callers hold the lock."""
-    view = _build_view(state, now, agents or _read_agents(), omp=omp, ticked=ticked)
+    view = _build_view(state, now, agents or _read_agents(), omp=omp, ticked=ticked, problems=problems)
     _write_file(_view_path(), json.dumps(view), durable=False)
     return view
 
@@ -2717,7 +2717,7 @@ def _evaluate_record(state: dict, record: dict, now: datetime) -> None:
                 _toast(state, record, wait, now, "error", f"{wait['label']}: {REASON_OVERDUE}")
 
 
-def _check_bound_s(wait: dict) -> int:
+def _check_bound_s(wait: dict, pr_bound: int) -> int:
     """How far ahead a wait's next check can lie: its interval or claim, an
     hour for a retry, or what its snooze asked for."""
     if wait["state"] == "needs_attention":
@@ -2725,8 +2725,7 @@ def _check_bound_s(wait: dict) -> int:
     elif wait["kind"] == "command":
         bound = max(wait["condition"]["interval_s"], CHECK_CLAIM_S)
     else:
-        # waiting_github's longest `next_poll_s`.
-        bound = max(_github().ENDED_POLL_S, CHECK_CLAIM_S)
+        bound = pr_bound
     return max(bound, wait.get("snooze_s") or 0)
 
 
@@ -2743,10 +2742,21 @@ def _backfill_snooze(record: dict, wait: dict, stamp: float) -> None:
     wait["snooze_s"] = math.ceil(ahead) if ahead > 0 else None
 
 
-def _clamp(state: dict, now: datetime) -> None:
+def _clamp(state: dict, now: datetime, problems: list[str]) -> None:
     """A clock that jumped forward and back leaves times far ahead: none lies
-    further out than its own interval. Deadlines and time waits are mine."""
+    further out than its own interval. Deadlines and time waits are mine.
+    What no one record causes goes to `problems`, the tick's error."""
     stamp = now.timestamp()
+    pr_bound = None
+    if any(
+        isinstance(wait, dict) and wait.get("kind") == "pr"
+        for record in _records(state) for wait in record.get("waits") or []
+    ):
+        try:
+            # waiting_github's longest `next_poll_s`.
+            pr_bound = max(_github().ENDED_POLL_S, CHECK_CLAIM_S)
+        except Exception as error:  # the PR checks fail the same way; their times stay
+            problems.append(f"PR checks: {_error_line(error)}")
 
     def bound(wait: dict, holder: dict, key: str, seconds: int) -> None:
         if (_stamp(holder.get(key)) or 0) > stamp + seconds:
@@ -2758,8 +2768,8 @@ def _clamp(state: dict, now: datetime) -> None:
             for wait in _open_waits(record):
                 if "snooze_s" not in wait:
                     _backfill_snooze(record, wait, stamp)
-                if wait["kind"] in ("command", "pr"):
-                    bound(wait, wait, "next_check_at", _check_bound_s(wait))
+                if wait["kind"] == "command" or wait["kind"] == "pr" and pr_bound is not None:
+                    bound(wait, wait, "next_check_at", _check_bound_s(wait, pr_bound))
                 bound(wait, wait, "verify_claim_until", RETRY_DEAD_S)
                 repeat = wait.get("repeat")
                 if repeat:
@@ -3287,8 +3297,10 @@ def _sort_key(view: dict) -> tuple:
 def _build_view(
     state: dict, now: datetime, agents: Agents,
     only: str | None = None, omp: Omp | None = None, ticked: bool = False,
+    problems: list[str] = (),
 ) -> dict:
-    """`ticked`: a tick's view, which clears the error a failed tick left."""
+    """`ticked`: a tick's view, which clears the error a failed tick left.
+    `problems`: what went wrong in the tick beyond any one record."""
     facts = Facts(agents, omp)
     pins = set(facts.omp.pins())
     chosen = []
@@ -3300,7 +3312,7 @@ def _build_view(
             chosen.append((session, record))
     facts.prefetch([session for session, _ in chosen])
     prs = PrCache()
-    errors: list[str] = []
+    errors = list(problems)
 
     def shown(name: str, build) -> list[dict]:
         """`build()`'s rows; one that can't be built is left out, and the view's
@@ -4312,6 +4324,8 @@ def _tick(args: argparse.Namespace) -> dict:
     agents = _read_agents()
     stale = _agents_stale(agents, now)
     omp = Omp()
+    # What went wrong beyond any one record: the view's `health.error`.
+    problems: list[str] = []
 
     def finish(state: dict, agents: Agents) -> dict:
         if args.daemon:
@@ -4324,7 +4338,7 @@ def _tick(args: argparse.Namespace) -> dict:
                 if not _for_other_panes(action, args.daemon)
             ],
             "next_tick_s": _next_tick_s(state, now),
-            "view": _publish(state, now, agents, omp, ticked=True),
+            "view": _publish(state, now, agents, omp, ticked=True, problems=problems),
         }
 
     with _transaction() as state:
@@ -4335,7 +4349,7 @@ def _tick(args: argparse.Namespace) -> dict:
             }
         _note_tick(state, now, stale)
         _housekeeping(state, agents, omp, now, args.daemon)
-        _clamp(state, now)
+        _clamp(state, now, problems)
         _pin_pass(state, omp, now)
         _evaluate(state, now)
         _delivery_pass(state, agents, now, args.window, stale)

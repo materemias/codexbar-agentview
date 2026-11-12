@@ -5085,6 +5085,20 @@ class ToastFoldTests(Case):
         self.assertEqual(self.toasts(), ["4 waits changed while no Tern window was open"])
 
 
+class SharedFailureTests(Case):
+    def test_a_failure_no_record_causes_is_the_ticks_error_not_a_quarantine(self) -> None:
+        wait = self.add("--kind", "pr", "--repo", "o/r", "--number", "7")["id"]
+
+        def broken():
+            raise ImportError("no waiting_github")
+
+        with mock.patch.object(waiting, "_github", broken):
+            health = self.tick()["view"]["health"]
+        self.assertEqual(health["error"], "PR checks: ImportError: no waiting_github")
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["reason"]), ("waiting", None))
+
+
 class ClampTests(Case):
     def edit_waits(self, change) -> None:
         state = self.state()
