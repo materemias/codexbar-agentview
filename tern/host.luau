@@ -403,7 +403,7 @@ type Block = {
 	sel: string?,
 	peek: boolean,
 	filter: string,
-	launched: { [string]: number },
+	launched: { [string]: number }, -- row key -> os.clock() of its launch: the wall clock may be set back
 	busy: string?,
 	closed: boolean?,
 }
@@ -2776,7 +2776,7 @@ local function peekNode(b: Block, r: any, history: boolean): Node
 	local buttons: { Node } = {}
 	if history then
 		if LAUNCH_HOSTS[str(r.host)] and str(r.resumeCommand) ~= "" then
-			local busy = b.launched[key] ~= nil and os.time() - b.launched[key] < 60
+			local busy = b.launched[key] ~= nil and os.clock() - b.launched[key] < 60
 			table.insert(buttons, button("Launch", "launch", { variant = "primary", keys = { "enter" }, busy = busy }))
 		end
 		if str(r.resumeCommand) ~= "" then
@@ -3117,7 +3117,7 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	if live then
 		table.insert(buttons, button("Open", "wait_open", { variant = "primary", keys = { "enter" } }))
 	else
-		local busy = b.busy == rowKey or (b.launched[rowKey] ~= nil and os.time() - b.launched[rowKey] < 60)
+		local busy = b.busy == rowKey or (b.launched[rowKey] ~= nil and os.clock() - b.launched[rowKey] < 60)
 		table.insert(buttons, button("Resume", "wait_open", { variant = "primary", keys = { "enter" }, busy = busy }))
 	end
 	local due, retry = firstDue(r)
@@ -3447,10 +3447,10 @@ local function launchRecord(b: Block, r: any)
 		b.cx:toast("info", "CodexBar AgentView: " .. str(r.host) .. " sessions can't be relaunched", "Copy the resume command instead")
 		return
 	end
-	if b.launched[key] and os.time() - b.launched[key] < 60 then
+	if b.launched[key] and os.clock() - b.launched[key] < 60 then
 		return
 	end
-	b.launched[key] = os.time()
+	b.launched[key] = os.clock()
 	python("codexbar_focus.py", { "--tern", "--launch", str(r.provider), str(r.sessionId) }, 60000, function(res)
 		report(b.cx, "launch", res)
 		if res.status ~= 0 then
@@ -3482,7 +3482,7 @@ end
 -- Relaunches the shown restart rows, skipping those launched within the last minute.
 local function restoreAll(b: Block)
 	local reboot = historyRows(string.lower(b.filter))
-	local now = os.time()
+	local now = os.clock()
 	local targets = {}
 	for _, r in reboot do
 		local key = recordKey(r)
@@ -3548,7 +3548,7 @@ local function waitingOpen(b: Block, r: any)
 		focusRecord(b, { sessionId = r.session_id })
 	else
 		local key = waitKey(r)
-		if b.busy == key or (b.launched[key] and os.time() - b.launched[key] < 60) then
+		if b.busy == key or (b.launched[key] and os.clock() - b.launched[key] < 60) then
 			return
 		end
 		b.busy = key
@@ -3556,7 +3556,7 @@ local function waitingOpen(b: Block, r: any)
 		waitingRun(b.cx, "resume", waitArgs("resume", r), function(data)
 			b.busy = nil
 			if data then
-				b.launched[key] = os.time()
+				b.launched[key] = os.clock()
 				waitingRequest(b, { op = "launch", command = str(data.command), cwd = str(data.cwd), session = str(r.session_id) })
 			end
 			b.cx:render()
