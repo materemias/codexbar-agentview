@@ -1467,7 +1467,9 @@ local function runActions(cx: WindowCx, leader: boolean)
 			heldSince[id] = nil
 		end
 	end
-	for id in (if type(actions) == "table" then resumes else {}) do
+	-- Only the leader rewrites them: another window's copy, read before the
+	-- leader settled a resume, would drop that outcome.
+	for id in (if leader and type(actions) == "table" then resumes else {}) do
 		if not listed[id] then
 			resumes[id] = nil
 			resumesChanged = true
