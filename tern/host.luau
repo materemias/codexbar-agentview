@@ -3325,7 +3325,7 @@ local function dockView(b: Block, now: number): Node
 			table.insert(hints, key("del"))
 			table.insert(hints, ui.span("\u{a0}done   ", "dim"))
 			table.insert(hints, key("f2"))
-			table.insert(hints, ui.span("\u{a0}waiting\u{a0}for   ", "dim"))
+			table.insert(hints, ui.span("\u{a0}manual\u{a0}wait   ", "dim"))
 			if row and row.waiting and select(2, firstDue(row.record)) then
 				table.insert(hints, key("f5"))
 				table.insert(hints, ui.span("\u{a0}retry   ", "dim"))
