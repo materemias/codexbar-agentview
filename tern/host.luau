@@ -1350,13 +1350,18 @@ end
 -- else the record's own. Pane ids name the panes of the daemon a wait carries
 -- (`daemon`): while another daemon ticks, only ours count; while this one ticks,
 -- waits without the field count too, as the CLI takes them for the ticker's.
+-- With no id to be had (`daemonKnown` without `daemonId`) every wait counts
+-- unless another daemon ticks: the event goes without `--daemon`, and the CLI
+-- scopes it by the daemon it runs under if it can tell, else not at all. Until
+-- the id is known, a stamped one doesn't: such an unscoped event could end
+-- another daemon's wait on a pane of the same number.
 local function jobPanes(view: any): { [number]: boolean }
 	local out: { [number]: boolean } = {}
 	for _, field in { "sessions", "panes" } do
 		for _, r in val(view[field]) or {} do
 			for _, w in val(r.waits) or {} do
 				local stamp = val(w.daemon) or val(r.daemon)
-				local ours = if stamp ~= nil then stamp == store.daemonId else not store.waitingSkipped
+				local ours = if stamp ~= nil and (store.daemonId or not store.daemonKnown) then stamp == store.daemonId else not store.waitingSkipped
 				if ours and w.kind == "job" and w.state == "waiting" then
 					local cond = val(w.condition)
 					local pane = (if type(cond) == "table" then tonumber(val(cond.pane)) else nil) or tonumber(val(r.pane))
