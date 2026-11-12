@@ -297,14 +297,12 @@ function releaseParts(text: string) {
 }
 
 /**
- * What follows `every`: `<dur> [for <dur>] [<N> times] [until <end> | <sentence>]`, or `{error}`.
- * `repeat` holds the CLI options; a `for` or `times` not followed by its value, or given twice,
- * starts the sentence.
+ * `for <dur>` and `<N> times`, each once and in either order, taken off the front of `text`; a
+ * `for` or `times` not followed by its value, or given twice, stays in `rest`. Parsing and
+ * completion both read the repeat's end through it.
  */
-function everyParts(text: string) {
-	const [every, tail] = cut(text);
-	if (!DURATION.test(every)) return { error: `every takes a duration such as 2h${every ? `, not ${every}` : ""}.` };
-	let rest = tail;
+function repeatEnds(text: string) {
+	let rest = text;
 	let span: string | undefined;
 	let times: string | undefined;
 	for (;;) {
@@ -314,6 +312,17 @@ function everyParts(text: string) {
 		else if (count) [, times, rest = ""] = count;
 		else break;
 	}
+	return { span, times, rest };
+}
+
+/**
+ * What follows `every`: `<dur> [for <dur>] [<N> times] [until <end> | <sentence>]`, or `{error}`.
+ * `repeat` holds the CLI options.
+ */
+function everyParts(text: string) {
+	const [every, tail] = cut(text);
+	if (!DURATION.test(every)) return { error: `every takes a duration such as 2h${every ? `, not ${every}` : ""}.` };
+	const { span, times, rest } = repeatEnds(tail);
 	if (times !== undefined && Number(times) < 1) return { error: "times takes 1 run or more." };
 	const invalid = repeatError(every, span);
 	if (invalid) return { error: invalid };
@@ -434,18 +443,11 @@ function atValue(at): string {
 function everyChoices(words: string[]) {
 	if (words.length === 0) return EVERY_CHOICES;
 	if (!DURATION.test(words[0])) return [];
-	let rest = words.slice(1);
-	// Each of `for <dur>` and `<N> times` counts once, as the parser takes them.
-	const used = new Set<string>();
-	for (;;) {
-		if (!used.has("for") && rest[0] === "for" && DURATION.test(rest[1] ?? "")) used.add("for");
-		else if (!used.has("times") && /^\d+$/.test(rest[0] ?? "") && rest[1] === "times") used.add("times");
-		else break;
-		rest = rest.slice(2);
-	}
-	if (rest.length === 0) return EVERY_ENDS.filter((item) => !used.has(item.label));
-	if (rest.length === 1 && rest[0] === "for" && !used.has("for")) return FOR_CHOICES;
-	if (rest.length === 1 && /^\d+$/.test(rest[0]) && !used.has("times")) return [TIMES];
+	const { span, times, rest: text } = repeatEnds(words.slice(1).join(" "));
+	const rest = text ? text.split(" ") : [];
+	if (rest.length === 0) return EVERY_ENDS.filter((item) => !(item.label === "for" && span !== undefined));
+	if (rest.length === 1 && rest[0] === "for" && span === undefined) return FOR_CHOICES;
+	if (rest.length === 1 && /^\d+$/.test(rest[0]) && times === undefined) return [TIMES];
 	if (rest[0] !== "until") return [];
 	if (rest.length === 1) return UNTIL_CHOICES;
 	if (rest[1] !== "gh") return [];
