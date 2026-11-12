@@ -1346,13 +1346,18 @@ local function waitingPanes(): { [string]: any }
 	return panes
 end
 
--- Panes whose next command ends a job wait: the condition's, else the record's own.
+-- Panes whose next command ends a job wait of this daemon's: the condition's,
+-- else the record's own. Pane ids name the panes of the daemon a wait carries
+-- (`daemon`): while another daemon ticks, only ours count; while this one ticks,
+-- waits without the field count too, as the CLI takes them for the ticker's.
 local function jobPanes(view: any): { [number]: boolean }
 	local out: { [number]: boolean } = {}
 	for _, field in { "sessions", "panes" } do
 		for _, r in val(view[field]) or {} do
 			for _, w in val(r.waits) or {} do
-				if w.kind == "job" and w.state == "waiting" then
+				local stamp = val(w.daemon) or val(r.daemon)
+				local ours = if stamp ~= nil then stamp == store.daemonId else not store.waitingSkipped
+				if ours and w.kind == "job" and w.state == "waiting" then
 					local cond = val(w.condition)
 					local pane = (if type(cond) == "table" then tonumber(val(cond.pane)) else nil) or tonumber(val(r.pane))
 					if pane then
@@ -1613,20 +1618,20 @@ end
 -- A window sees only its own panes; this half alone can tell that a pane is
 -- gone from every window. A pane action's target gone: the outbox is the last
 -- tick's, so an ack that landed stays marked until a tick drops its action, and
--- a failed one waits before the next try. A watched job's pane gone without the
--- event that ends its wait (`tern close`, no window, a plugin reload): after
--- 10 s, time for a `pane_exited` in flight to land, the CLI hears `pane_closed`.
--- An empty listing is no evidence until this daemon has listed a pane, as
--- while it starts; after that, every pane is gone, the last one closed too.
--- While another daemon ticks the state (`waitingSkipped`), its panes aren't in
--- this listing: nothing is told.
+-- a failed one waits before the next try (while another daemon ticks, the outbox
+-- here is empty). A watched job's pane gone without the event that ends its wait
+-- (`tern close`, no window, a plugin reload): after 10 s, time for a
+-- `pane_exited` in flight to land, the CLI hears `pane_closed`. Only this
+-- daemon's job waits count (jobPanes). An empty listing is no evidence until
+-- this daemon has listed a pane, as while it starts; after that, every pane is
+-- gone, the last one closed too.
 local function reconcilePanes()
 	local live: { [number]: boolean } = {}
 	for _, p in tern.pane.list() do
 		live[p.pane] = true
 		store.panesListed = true
 	end
-	if not store.panesListed or store.waitingSkipped then
+	if not store.panesListed then
 		return
 	end
 	local now = os.clock()
@@ -1659,7 +1664,12 @@ local function reconcilePanes()
 				store.paneGoneAt[pane] = now
 			elseif now - since >= 10 then
 				store.paneGoneAt[pane] = math.huge
-				waitingRun(nil, "pane event", { "event", "--type", "pane_closed", "--pane", tostring(pane) }, function(data)
+				local args = { "event", "--type", "pane_closed", "--pane", tostring(pane) }
+				if store.daemonId then -- the CLI then ends only what this daemon's pane held
+					table.insert(args, "--daemon")
+					table.insert(args, store.daemonId)
+				end
+				waitingRun(nil, "pane event", args, function(data)
 					if not data and store.paneGoneAt[pane] then
 						store.paneGoneAt[pane] = os.clock() -- tries again in 10 s
 					end
@@ -1703,15 +1713,19 @@ local function jobFinished(pane: number, status: number, exited: boolean)
 	if exited and now - (store.jobEventAt[pane] or -math.huge) <= 2 then
 		return
 	end
-	-- While another daemon ticks, its waits' pane ids name its panes, not ours.
-	local watched = not store.waitingSkipped and type(store.waiting) == "table" and jobPanes(store.waiting)[pane] == true
-	if not watched and not store.waitingSkipped and (store.waitingTicking or readWaiting(WAITING_FILE) ~= store.waitingRaw) then
+	local watched = type(store.waiting) == "table" and jobPanes(store.waiting)[pane] == true
+	if not watched and (store.waitingTicking or readWaiting(WAITING_FILE) ~= store.waitingRaw) then
 		local okj, view = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
 		watched = okj and type(view) == "table" and jobPanes(view)[pane] == true
 	end
 	if watched then
 		store.jobEventAt[pane] = now
-		waitingRun(nil, "job event", { "event", "--type", "job_finished", "--pane", tostring(pane), "--status", tostring(status) })
+		local args = { "event", "--type", "job_finished", "--pane", tostring(pane), "--status", tostring(status) }
+		if store.daemonId then
+			table.insert(args, "--daemon")
+			table.insert(args, store.daemonId)
+		end
+		waitingRun(nil, "job event", args)
 	end
 end
 
@@ -1972,9 +1986,19 @@ local function tick()
 			end
 			reconcilePanes()
 			-- Another writer (the omp extension, tern-awui) may have queued a window
-			-- action; while another daemon ticks, its writes are its own business.
-			if not store.waitingTicking and not store.waitingSkipped and readWaiting(WAITING_FILE) ~= store.waitingRaw then
-				waitingTick()
+			-- action. While another daemon ticks, the outbox is its business, but
+			-- the view it writes still names this daemon's job waits: reconcilePanes
+			-- and jobFinished read it, without a Python process.
+			if not store.waitingTicking and readWaiting(WAITING_FILE) ~= store.waitingRaw then
+				if store.waitingSkipped then
+					store.waitingRaw = readWaiting(WAITING_FILE)
+					local okv, view = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
+					if okv and type(view) == "table" and type(val(view.panes)) == "table" then
+						applyWaiting(view)
+					end
+				else
+					waitingTick()
+				end
 			end
 			if store.menuRetryAt and os.clock() >= store.menuRetryAt and store.loadMenu then
 				store.menuRetryAt = nil
