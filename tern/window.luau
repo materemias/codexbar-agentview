@@ -1348,9 +1348,26 @@ local function reserveSession(session: string, cwd: any, done: (number, string, 
 	end)
 end
 
+-- Whether the outbox still holds action `id`. Without a published outbox
+-- nothing says it was taken back.
+local function stillQueued(id: string): boolean
+	local actions = tern.kv.get("waitingActions")
+	if type(actions) ~= "table" then
+		return true
+	end
+	for _, q in actions do
+		if tostring(q.id) == id then
+			return true
+		end
+	end
+	return false
+end
+
 -- A 5 means someone else has the session, so the resume is done; the CLI puts
 -- the wait on me if it still doesn't run within its grace. Any other refusal,
 -- 11 included, fails the resume with its reason, which puts the wait on me now.
+-- Done or Snooze may take the resume back while the helper runs: then nothing
+-- opens, and with the action gone nothing acks it either.
 local function reserveThenResume(a: any, state: any)
 	local id = tostring(a.id)
 	local function settle(result: string, err: string?)
@@ -1361,6 +1378,10 @@ local function reserveThenResume(a: any, state: any)
 		tern.kv.set("waitingResumes", resumes)
 	end
 	reserveSession(tostring(val(a.session)), val(a.cwd), function(status, why, cx2)
+		if not stillQueued(id) then
+			state.sending = false
+			return
+		end
 		if status == 5 then
 			settle("done")
 		elseif status ~= 0 then
