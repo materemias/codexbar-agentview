@@ -4268,8 +4268,9 @@ def _move_session(state: dict, old: str, new: str, omp: Omp, now: datetime) -> N
     # This process ran `old`, and runs `new` now.
     for heard in ("extensions", "extension_features", "extension_panes"):
         state[heard].pop(old, None)
-    if old in omp.fresh_pins():
-        _move_pin(state, new, True, omp, now)
+    # The old pin goes only once the new one holds: a pin no wait asks for
+    # (one the user set) has no retry, and would be lost.
+    if old in omp.fresh_pins() and "pin_error" not in _move_pin(state, new, True, omp, now):
         # A failed unpin would leave a record under `old` to retry it; the pin
         # only lists the old session, which `new` continues.
         with contextlib.suppress(OSError, PinError):

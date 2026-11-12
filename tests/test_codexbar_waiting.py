@@ -5359,6 +5359,22 @@ class SessionMoveTests(Case):
         self.assertEqual(json.loads(pins.read_text()), [OTHER])
         self.assertEqual([row["session_id"] for row in self.run_cli("list")["sessions"]], [OTHER])
 
+    def test_a_pin_the_new_id_could_not_take_stays_on_the_old_one(self) -> None:
+        self.add("--kind", "something", "--what", "x")
+        pins = self.omp / "session-pins.json"
+        pins.write_text(json.dumps([SID]))  # the user's own pin: no wait asks for it
+        real = waiting._write_pin
+
+        def locked(path: Path, session: str, pinned: bool) -> None:
+            if pinned:
+                raise waiting.PinError("session-pins.json is locked by another process")
+            real(path, session, pinned)
+
+        with mock.patch.object(waiting, "_write_pin", locked):
+            self.moved("replaced")
+        self.assertEqual(json.loads(pins.read_text()), [SID])
+        self.assertEqual({row["session_id"] for row in self.run_cli("list")["sessions"]}, {SID, OTHER})
+
     def test_a_move_needs_both_flags(self) -> None:
         self.run_cli("heartbeat", "--session", OTHER, "--moved-from", SID, expect=2)
         self.run_cli("heartbeat", "--session", OTHER, "--move-reason", "replaced", expect=2)
