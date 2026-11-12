@@ -3184,11 +3184,12 @@ local function waitingView(b: Block, now: number, into: { Node })
 		health = if type(health) == "table" then health else {}
 		local checked = epoch(val(health.checked_at))
 		local since = if checked then absoluteTime(checked, now) else "never"
-		local err = store.waitingError or oneLine(health.error)
+		-- One line, capped as the applet and omp cap it.
+		local err = string.match(oneLine(store.waitingError or val(health.error)), "^%s*(.-)%s*$")
 		local scan = epoch(val(health.agents_stale_since))
 		local text, tone = nil, "warning"
 		if err ~= "" then
-			text, tone = "⚠️ Waits not checked since " .. since .. ": " .. oneLine(err), "error"
+			text, tone = "⚠️ Waits not checked since " .. since .. ": " .. clip(err, 120), "error"
 		elseif checked and now - checked > 15 * 60 then
 			text = "⚠️ Waits not checked since " .. since
 		elseif scan then
@@ -3197,7 +3198,7 @@ local function waitingView(b: Block, now: number, into: { Node })
 			text, tone = "Another Tern daemon checks these waits", "muted"
 		end
 		if text then
-			table.insert(into, withp(ui.text({ ui.span(clip(text, 200), tone) }), { key = "health", role = "codexbar.health" }))
+			table.insert(into, withp(ui.text({ ui.span(text, tone) }), { key = "health", role = "codexbar.health" }))
 		end
 	end
 	local q = string.lower(b.filter)
