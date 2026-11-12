@@ -185,7 +185,9 @@ session, parked or not, after the running turn. A prompt can carry a check (a
 command or a PR state) that decides whether the turn did its job. When the
 turn ends, verification is queued for a background tick, not run inside the
 extension's turn-finished event. Without a check, the wait comes back to you
-as "ran, take a look".
+as "ran, take a look", unless the agent set a new wait during that turn: then
+the new wait is the next step, and the one that ran closes ("ran; superseded by
+…" in its history).
 
 A closed session comes back by itself when one of its waits has a prompt to
 send: Tern reopens it with `omp --resume` in a new tab of the Tern session it

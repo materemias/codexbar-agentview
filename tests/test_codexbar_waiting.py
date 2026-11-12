@@ -551,6 +551,36 @@ class ConditionTests(Case):
         self.run_cli("event", "--type", "turn_finished", "--pane", "40")
         self.assertEqual(self.wait_of(wait)["state"], "review")
 
+    def test_a_wait_the_agent_sets_during_the_prompts_turn_supersedes_the_one_that_ran(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        wait, _ = self.queued_prompt("--label", "4h check")
+        self.advance(minutes=1)
+        after = self.add("--kind", "time", "--in", "1d", "--label", "24h check", "--by", "agent")["id"]
+        self.run_cli("event", "--type", "turn_finished", "--pane", "40")
+        self.assertEqual(self.state()["sessions"][SID]["waits"][0]["state"], "done")
+        session = self.session()
+        self.assertEqual([w["id"] for w in session["waits"]], [after])
+        self.assertEqual(session["ball"], "on_timer")
+        self.assertIn("4h check: ran; superseded by 24h check", [h["text"] for h in session["history"]])
+
+    def test_a_wait_set_before_the_prompt_ran_doesnt_supersede_it(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        self.add("--kind", "time", "--in", "1d", "--label", "later one")
+        wait, _ = self.queued_prompt()
+        self.run_cli("event", "--type", "turn_finished", "--pane", "40")
+        self.assertEqual(self.wait_of(wait)["state"], "review")
+
+    def test_a_wait_i_add_during_the_prompts_turn_doesnt_supersede_it(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        wait, _ = self.queued_prompt()
+        self.advance(minutes=1)
+        self.add("--kind", "time", "--in", "1d", "--label", "mine")
+        self.run_cli("event", "--type", "turn_finished", "--pane", "40")
+        self.assertEqual(self.wait_of(wait)["state"], "review")
+
     def test_job_on_a_pane_record(self) -> None:
         answer = self.run_cli("add", "--pane", "51", "--kind", "job", "--note", "build")
         self.assertIsNone(answer["session"])

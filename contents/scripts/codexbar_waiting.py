@@ -3353,6 +3353,20 @@ def _settle_turn(state: dict, record: dict, now: datetime) -> None:
     wait.update(on_me=False, reason=None)
     verify = wait["verify"]
     if verify is None or (verify["type"] == "pr_fix" and not wait["snapshot"]):
+        # A wait the agent set during the turn is the next step the run decided
+        # on: the one that ran is behind it, not on me. One I added meanwhile
+        # is my own business, and chain steps waiting behind it, set up with
+        # it, are not that either.
+        start = _stamp(entry.get("claimed_at"))
+        after = next((
+            other for other in _open_waits(record)
+            if other is not wait and other["state"] != "pending" and other["by"] == "agent"
+            and start is not None and _stamp(other["created_at"]) > start
+        ), None)
+        if after is not None:
+            _log(record, now, wait, f"{wait['label']}: ran; superseded by {after['label']}")
+            _complete(state, record, wait, now)
+            return
         wait.update(state="review", reason=REASON_REVIEW)
         _touch(wait)
         _log(record, now, wait, f"{wait['label']}: {REASON_REVIEW}")
