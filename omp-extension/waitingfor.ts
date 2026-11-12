@@ -529,9 +529,10 @@ export function healthWarning(health, now = Date.now(), uncheckedSince?: number)
 	if (!health) return undefined;
 	const checked = Date.parse(health.checked_at ?? "");
 	const since = Number.isNaN(checked) ? "never" : clockTime(checked, now);
-	// One line, capped as the applet caps it: an error with a traceback must not flood the row above the composer.
-	let error = String(health.error ?? "").replace(/\s+/g, " ").trim();
-	if (error.length > 120) error = `${error.slice(0, 119)}…`;
+	// One line, capped as the applet caps it: an error with a traceback must not flood the row above
+	// the composer. Capped by code points, as a cut through a surrogate pair would draw garbage.
+	const chars = Array.from(String(health.error ?? "").replace(/\s+/g, " ").trim());
+	const error = chars.length > 120 ? `${chars.slice(0, 119).join("")}…` : chars.join("");
 	if (error) return `⚠ Waits not checked since ${since}: ${error}`;
 	const last = Number.isNaN(checked) ? uncheckedSince : checked;
 	if (last !== undefined && now - last > TICK_STALE_MS) return `⚠ Waits not checked since ${since}`;
