@@ -2560,11 +2560,15 @@ def _fold_toasts(state: dict, now: datetime) -> None:
         return
     gone = {action["id"] for action in old}
     state["actions"] = [action for action in state["actions"] if action["id"] not in gone]
-    count = sum(action.get("folded", 1) for action in old)
+    # A wait that toasted several times, or was folded before, counts once.
+    waits = sorted({
+        wait for action in old for wait in action.get("waits") or [action.get("wait")] if wait
+    })
+    changed = f"{len(waits)} wait changed" if len(waits) == 1 else f"{len(waits)} waits changed"
     _enqueue(state, now, {
         "type": "toast", "level": "error" if any(action["level"] == "error" for action in old) else "info",
-        "text": f"{count} waits changed while no Tern window was open", "sub": None,
-        "session": None, "pane": None, "folded": count,
+        "text": f"{changed} while no Tern window was open", "sub": None,
+        "session": None, "pane": None, "waits": waits,
     })
 
 
@@ -2877,7 +2881,7 @@ def _record_times(state: dict, record: dict, now: datetime) -> list[float | None
 def _public_action(action: dict) -> dict:
     return {
         key: value for key, value in action.items()
-        if key not in ("wait", "created_at", "window_since", "windowless_since", "daemon", "folded")
+        if key not in ("wait", "waits", "created_at", "window_since", "windowless_since", "daemon")
     }
 
 

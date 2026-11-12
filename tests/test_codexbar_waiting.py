@@ -5282,6 +5282,15 @@ class ToastFoldTests(Case):
         self.advance(minutes=61)
         self.assertEqual(self.toasts(), ["4 waits changed while no Tern window was open"])
 
+    def test_a_wait_that_toasted_again_counts_once(self) -> None:
+        self.fire(1)
+        state = self.state()
+        toast = next(action for action in state["actions"] if action["type"] == "toast")
+        state["actions"] += [{**toast, "id": f"again{index}"} for index in range(3)]
+        (self.state_dir / "waiting.json").write_text(json.dumps(state))
+        self.advance(minutes=61)
+        self.assertEqual(self.toasts(), ["1 wait changed while no Tern window was open"])
+
 
 class SharedFailureTests(Case):
     def test_a_failure_no_record_causes_is_the_ticks_error_not_a_quarantine(self) -> None:
