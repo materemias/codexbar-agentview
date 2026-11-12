@@ -191,8 +191,9 @@ A closed session comes back by itself when one of its waits has a prompt to
 send: Tern reopens it with `omp --resume` in a new tab of the Tern session it
 was last in (or Default), without switching to it, and the prompt goes in once
 omp is up. With the dashboard open, Tern waits up to 30 seconds for it to
-close. If Tern doesn't reopen the session within 3 minutes, or it doesn't
-start, the wait comes back to you with Resume; meanwhile Resume says the
+close. If a Tern window is up for 3 minutes without reopening the session, or
+it doesn't start, the wait comes back to you with Resume; while no window is
+up, as right after login, the reopen waits for one. Meanwhile Resume says the
 session is reopening. Before opening the tab, Tern takes the session's startup
 ownership, the same one History's Launch and Teleport take: it doesn't reopen a
 session that runs, is starting, or that a running omp may be writing, and
@@ -201,6 +202,15 @@ whose extension was heard from in the last 6 minutes may still be running and
 isn't reopened. A wait without a prompt only comes back to you. A live session
 without the extension can't take prompts; its wait comes back to you saying
 so.
+
+After a reboot, waits pick up where they were once Tern starts at login: a time
+that came due while the machine was off fires on the first tick, and
+PR, release and command checks poll again. Each closed session with a prompt to
+send gets a fresh reopen, even one whose reopen didn't work before the reboot,
+and an extension heard from just before it doesn't hold the reopen back. A
+prompt whose turn the reboot cut off is sent again once, led by a note asking
+the agent to check what was already done; cut off a second time, it comes to
+you. A job wait on a shell pane comes back to you, since the pane is gone.
 
 ## When a wait is fulfilled
 

@@ -120,8 +120,8 @@ class Case(unittest.TestCase):
     def advance(self, **delta) -> None:
         self.clock += timedelta(**delta)
 
-    def tick(self) -> dict:
-        return self.run_cli("tick", "--now", self.clock.isoformat())
+    def tick(self, *extra: str) -> dict:
+        return self.run_cli("tick", "--now", self.clock.isoformat(), *extra)
 
     def session(self, sid: str = SID) -> dict:
         view = self.run_cli("list")
@@ -4202,8 +4202,10 @@ class RepeatTests(Case):
 class ResumeTests(Case):
     """A closed session whose wait sends a prompt comes back in Tern by itself."""
 
+    boot = "one"
+
     def live(self, tern_session: str | None = "work") -> None:
-        self.agents(SID)
+        self.agents(SID, boot=self.boot)
         payload = json.loads((self.state_dir / "agents.json").read_text())
         if tern_session is None:
             del payload["agents"][0]["ternSession"]
@@ -4215,10 +4217,73 @@ class ResumeTests(Case):
         row = {"sessionId": SID, "cwd": "/w", "windowTitle": "x"}
         if command:
             row["resumeCommand"] = command
-        self.agents(closed=[row])
+        self.agents(closed=[row], boot=self.boot)
 
-    def resumes(self) -> list[dict]:
-        return [action for action in self.tick()["actions"] if action["type"] == "resume"]
+    def resumes(self, window: bool = True) -> list[dict]:
+        answer = self.tick("--window") if window else self.tick()
+        return [action for action in answer["actions"] if action["type"] == "resume"]
+
+    def resumed_and_delivered(self) -> None:
+        """The resume brought the session up and its extension took the prompt."""
+        self.run_cli("ack", "--action", self.resumes()[0]["id"], "--result", "done")
+        self.live()
+        self.heartbeat(SID)
+        prompt = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]
+        self.run_cli("ack", "--action", prompt["action"], "--result", "delivered")
+
+    def rebooted(self) -> None:
+        self.boot = "two" if self.boot == "one" else "three"
+        self.advance(minutes=1)
+        self.closed()
+
+    def test_a_resume_waits_for_a_window_before_it_can_expire(self) -> None:
+        wait = self.fired_prompt()
+        self.assertEqual(len(self.resumes(window=False)), 1)
+        self.advance(seconds=3 * waiting.RESUME_GRACE_S)
+        self.assertEqual(len(self.resumes(window=False)), 1)
+        self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_RESUMING)
+        self.assertEqual(len(self.resumes()), 1)  # a window is up from here
+        self.advance(seconds=waiting.RESUME_GRACE_S)
+        self.assertEqual(self.resumes(), [])
+        self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_CLOSED)
+
+    def test_a_reboot_resumes_again_and_sends_the_cut_prompt_once_more(self) -> None:
+        wait = self.fired_prompt()
+        self.resumed_and_delivered()
+        self.rebooted()
+        resumes = self.resumes()
+        self.assertEqual([action["session"] for action in resumes], [SID])
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["reason"]), ("acting", waiting.REASON_RESUMING))
+        self.assertIn("Sending again after a reboot: Retry", [h["text"] for h in self.session()["history"]])
+        self.run_cli("ack", "--action", resumes[0]["id"], "--result", "done")
+        self.live()
+        self.heartbeat(SID)
+        prompt = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]
+        self.assertEqual(prompt["text"], f"{waiting.REBOOT_NOTE}\n\ngo")
+        self.assertFalse(prompt["resend_check"])
+        # Cut off a second time, it comes to me instead.
+        self.run_cli("ack", "--action", prompt["action"], "--result", "delivered")
+        self.rebooted()
+        self.tick("--window")
+        self.assertEqual(self.wait_of(wait)["state"], "needs_attention")
+
+    def test_a_reboot_gives_a_session_that_never_came_up_a_fresh_resume(self) -> None:
+        wait = self.fired_prompt()
+        self.run_cli("ack", "--action", self.resumes()[0]["id"], "--result", "done")
+        self.advance(seconds=waiting.RESUME_GRACE_S)
+        self.assertEqual(self.resumes(), [])
+        self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_CLOSED)
+        self.rebooted()
+        self.assertEqual(len(self.resumes()), 1)
+        self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_RESUMING)
+
+    def test_an_extension_heard_before_a_reboot_doesnt_hold_the_resume(self) -> None:
+        self.fired_prompt()
+        self.heartbeat(SID)
+        self.assertEqual(self.resumes(), [])  # heard lately: it may still run
+        self.rebooted()
+        self.assertEqual(len(self.resumes()), 1)
 
     def fired_prompt(self) -> str:
         """A time wait whose prompt is due while its session, last seen in Tern

@@ -147,6 +147,8 @@ MENU_TARGETS = ("session", "pane")
 
 REASON_CLOSED = "session closed: resume it to deliver the prompt"
 REASON_RESUMING = "resuming the session in Tern"
+# Leads a prompt sent again because a reboot cut its turn off.
+REBOOT_NOTE = "(A reboot cut this prompt's earlier turn off. Check what was already done before you go on.)"
 REASON_NO_EXTENSION = "omp extension not loaded"
 REASON_QUESTION = "agent asks a question"
 REASON_REVIEW = "ran, take a look"
@@ -1417,16 +1419,20 @@ def _heard_lately(state: dict, session: str, now: datetime) -> bool:
     return seen is not None and now.timestamp() - seen < RESUME_QUIET_S
 
 
-def _resume(state: dict, record: dict, facts: Facts, now: datetime) -> bool:
+def _resume(state: dict, record: dict, facts: Facts, now: datetime, window: bool) -> bool:
     """Have the Tern window resume a closed session whose prompts wait in its
     queue. True while that is under way; False when the prompts wait for me:
     the resume opened and the session didn't come up, failed, found no window,
     or there is no command. Each prompt gets one automatic resume."""
     session = record["session"]
     pending = _pending_resume(state, session)
-    if pending is not None and now.timestamp() - _stamp(pending["created_at"]) >= RESUME_GRACE_S:
-        # No window carried it out. One that comes up much later would open a
-        # session nobody expects by then.
+    if pending is not None and window and pending.get("window_since") is None:
+        pending["window_since"] = _iso(now)
+    since = _stamp(pending.get("window_since")) if pending is not None else None
+    if pending is not None and since is not None and now.timestamp() - since >= RESUME_GRACE_S:
+        # A window was up all that time and didn't carry it out. One that comes
+        # up much later would open a session nobody expects by then; a window
+        # that wasn't up yet, as at login, doesn't count.
         state["actions"].remove(pending)
         return False
     queued = [entry["action"] for entry in record["prompt_queue"]]
@@ -1451,6 +1457,7 @@ def _resume(state: dict, record: dict, facts: Facts, now: datetime) -> bool:
     _enqueue(state, now, {
         "type": "resume", "session": session, "command": info["resume_command"],
         "cwd": info["cwd"], "tern_session": record.get("tern_session"), "wait": head,
+        "window_since": _iso(now) if window else None,
     })
     record.update(resume_prompts=queued, resume_opened_at=None)
     wait = _wait_in(record, head)
@@ -1459,7 +1466,7 @@ def _resume(state: dict, record: dict, facts: Facts, now: datetime) -> bool:
     return True
 
 
-def _delivery_pass(state: dict, agents: Agents, now: datetime) -> None:
+def _delivery_pass(state: dict, agents: Agents, now: datetime, window: bool = False) -> None:
     """Who can take the queued prompts: a closed session is resumed in Tern, and
     comes to me when that doesn't bring it up; one without the extension comes
     to me at once. The prompts stay queued for later."""
@@ -1495,7 +1502,7 @@ def _delivery_pass(state: dict, agents: Agents, now: datetime) -> None:
             # Up again, its extension about to say so.
             _mark_resuming(record)
             continue
-        if not live and _resume(state, record, facts, now):
+        if not live and _resume(state, record, facts, now, window):
             continue
         reason = REASON_NO_EXTENSION if live else REASON_CLOSED
         for entry in list(queue):
@@ -1966,10 +1973,34 @@ def _finish_job(state: dict, record: dict, wait: dict, status: int | None, now: 
     )
 
 
+def _after_reboot(state: dict, agents: Agents, now: datetime) -> None:
+    """Nothing that ran before the reboot runs now. Each closed session gets one
+    fresh automatic resume, an extension heard from before the reboot doesn't
+    hold it back, and a prompt the reboot cut off is sent again, once, saying
+    so; cut off a second time it comes to me."""
+    state["extensions"] = {
+        session: seen for session, seen in state["extensions"].items()
+        if _running(state, agents, session)
+    }
+    for record in state["sessions"].values():
+        record.update(resume_prompts=[], resume_opened_at=None)
+        for entry in record["prompt_queue"]:
+            if entry["state"] == "queued" or entry.get("rebooted"):
+                continue
+            entry.update(
+                state="queued", claimed_at=None, rebooted=True,
+                text=f"{REBOOT_NOTE}\n\n{entry['text']}",
+            )
+            wait = _wait_in(record, entry["wait"])
+            if wait is not None:
+                _log(record, now, wait, f"Sending again after a reboot: {wait['label']}")
+
+
 def _housekeeping(state: dict, agents: Agents, omp: Omp, now: datetime) -> None:
     stamp = now.timestamp()
     if agents.boot_id:
         if state["boot_id"] and state["boot_id"] != agents.boot_id:
+            _after_reboot(state, agents, now)
             # Pane ids don't survive a reboot, and may belong to another pane now.
             panes = {int(pane) for pane in state["panes"]} | {
                 wait["condition"]["pane"]
@@ -2144,7 +2175,10 @@ def _next_tick_s(state: dict, now: datetime) -> int:
 
 
 def _public_action(action: dict) -> dict:
-    return {key: value for key, value in action.items() if key not in ("wait", "created_at")}
+    return {
+        key: value for key, value in action.items()
+        if key not in ("wait", "created_at", "window_since")
+    }
 
 
 # View ------------------------------------------------------------------------
@@ -3504,7 +3538,7 @@ def cmd_tick(args: argparse.Namespace) -> dict:
         _housekeeping(state, agents, omp, now)
         _pin_pass(state, omp, now)
         _evaluate(state, now)
-        _delivery_pass(state, agents, now)
+        _delivery_pass(state, agents, now, args.window)
         jobs = _claim_checks(state, now)
         answer = None if jobs else finish(state, agents)
     if jobs:
@@ -3515,7 +3549,7 @@ def cmd_tick(args: argparse.Namespace) -> dict:
         now = moment()
         with _transaction() as state:
             _merge(state, finished, now)
-            _delivery_pass(state, agents, now)
+            _delivery_pass(state, agents, now, args.window)
             answer = finish(state, agents)
     cache = PrCache()
     stale = cache.stale(
@@ -3838,6 +3872,8 @@ def _parser() -> argparse.ArgumentParser:
 
     tick = command("tick", cmd_tick)
     tick.add_argument("--now")
+    # Tern says a window is up to carry out a resume; until one is, none expires.
+    tick.add_argument("--window", action="store_true")
 
     command("list", cmd_list).add_argument("--session", type=_session_arg)
     command("inventory", cmd_inventory)

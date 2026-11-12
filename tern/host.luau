@@ -1468,7 +1468,11 @@ local function waitingTick()
 	end
 	store.waitingTicking = true
 	store.waitingAgain = false
-	python(WAITING_CLI, { "tick" }, WAITING_TIMEOUT_MS, function(res)
+	-- A leader window holds a lease (window.luau `lead`): only then can a resume
+	-- be carried out, so only then does the CLI count down to giving one up.
+	local lease = tern.kv.get("waitingLeader")
+	local window = type(lease) == "table" and type(lease.expires) == "number" and lease.expires > os.time()
+	python(WAITING_CLI, if window then { "tick", "--window" } else { "tick" }, WAITING_TIMEOUT_MS, function(res)
 		store.waitingTicking = false
 		local okj, data = pcall(tern.json.decode, res.stdout)
 		local nextIn = WAITING_RETRY_S
