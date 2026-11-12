@@ -315,6 +315,8 @@ class SessionOperationOwnershipTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(focus, "_user_shell", return_value="/bin/sh"))
             stack.enter_context(mock.patch.object(focus.agents, "_pgrep", return_value=[]))
             stack.enter_context(mock.patch.object(focus.agents, "tern_bin", return_value="/unused/tern"))
+            # A listed writer runs unless the test says it exited after the scan.
+            stack.enter_context(mock.patch.object(focus, "_exited", return_value=mode == "writer-exited"))
             if mode in ("unresolved-empty-cwd", "unresolved-same-cwd"):
                 stack.enter_context(mock.patch.object(
                     focus.agents, "_pgrep",
@@ -475,6 +477,13 @@ class SessionOperationOwnershipTests(unittest.TestCase):
         self.snapshot(live=True)
         reserved, _ = self.start_helper(action="--reserve")
         self.assertEqual(self.finish_helper(reserved)[0], 5)
+
+    def test_a_reserve_ignores_a_listed_writer_that_exited(self) -> None:
+        # A stale scan still lists the session after its writer exited.
+        self.snapshot(live=True)
+        reserved, _ = self.start_helper(action="--reserve", mode="writer-exited")
+        result = self.finish_helper(reserved)
+        self.assertEqual(result[0], 0, result[1])
 
     def test_first_teleport_after_successful_launch_reconciles_discovered_writer(self) -> None:
         launched, _ = self.start_helper()

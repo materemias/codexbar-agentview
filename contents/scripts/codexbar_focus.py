@@ -598,9 +598,21 @@ def reserve(provider: str, session_id: str, cwd: str = "") -> int:
     return _session_operation(provider, session_id, "launch", _writer_refusal, cwd)
 
 
+def _listed_writer_runs(record: dict) -> bool:
+    """Whether an agents.json row's process still runs. A stale scan lists
+    writers that exited since; a row without a pid can't be checked."""
+    pid = record.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 1:
+        return True
+    return not _exited(pid)
+
+
 def _writer_refusal(provider: str, session_id: str, payload: dict, cwd: str) -> int:
     """5, saying why, when the session runs or a running process may write it."""
-    if any(agents._record_key(r) == (provider, session_id) for r in payload["agents"]):
+    if any(
+        agents._record_key(r) == (provider, session_id) and _listed_writer_runs(r)
+        for r in payload["agents"]
+    ):
         status = "running"
     else:
         status = _session_writer_status(provider, session_id, cwd)
