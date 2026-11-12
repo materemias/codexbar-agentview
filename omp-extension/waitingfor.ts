@@ -165,8 +165,10 @@ const EVERY_CHOICES = [
 	{ label: "2h", description: "every two hours" },
 	{ label: "1d", description: "once a day" },
 ];
+// `end`: what repeatEnds gives once the line has that end, which takes the item off.
 const EVERY_ENDS = [
-	{ label: "for", description: "stop after a while: for 1d (or say 5 times)" },
+	{ label: "for", description: "stop after a while: for 1d", end: "span" },
+	{ label: "5 times", description: "stop after this many runs, any number of them", end: "times" },
 	{ label: "until", description: "stop when it holds: ! command, check <what>, gh pr …, gh release …, or words the agent judges" },
 ];
 const FOR_CHOICES = [
@@ -445,7 +447,8 @@ function everyChoices(words: string[]) {
 	if (!DURATION.test(words[0])) return [];
 	const { span, times, rest: text } = repeatEnds(words.slice(1).join(" "));
 	const rest = text ? text.split(" ") : [];
-	if (rest.length === 0) return EVERY_ENDS.filter((item) => !(item.label === "for" && span !== undefined));
+	const given = { span, times };
+	if (rest.length === 0) return EVERY_ENDS.filter((item) => item.end === undefined || given[item.end] === undefined);
 	if (rest.length === 1 && rest[0] === "for" && span === undefined) return FOR_CHOICES;
 	if (rest.length === 1 && /^\d+$/.test(rest[0]) && times === undefined) return [TIMES];
 	if (rest[0] !== "until") return [];
