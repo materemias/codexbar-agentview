@@ -1073,7 +1073,7 @@ do
 			if type(runs) ~= "table" or #runs == 0 then
 				return nil
 			end
-			table.insert(tracked, { runs = runs, weight = a.weight })
+			table.insert(tracked, { runs = runs, weight = a.weight, next = 1, run = nil :: any })
 			spanSecs = math.max(spanSecs, (tonumber(val(a.w.windowMinutes)) or 0) * 60)
 		end
 		if #tracked == 0 or spanSecs <= 0 then
@@ -1084,19 +1084,17 @@ do
 			local t = now - spanSecs + spanSecs * i / (SAMPLES - 1)
 			local sum, total, known = 0, 0, true
 			for _, a in tracked do
-				local used: number? = nil
-				for _, run in a.runs do
-					if (tonumber(run[1]) or math.huge) > t then
-						break
-					end
-					local reset = tonumber(val(run[4]))
-					used = if reset and reset <= t then 0 else tonumber(run[3]) or 0
+				-- Samples only move forward: each account's run carries over.
+				while a.next <= #a.runs and (tonumber(a.runs[a.next][1]) or math.huge) <= t do
+					a.run = a.runs[a.next]
+					a.next += 1
 				end
-				if used == nil then
+				if a.run == nil then
 					known = false
 					break
 				end
-				sum += a.weight * used
+				local reset = tonumber(val(a.run[4]))
+				sum += a.weight * (if reset and reset <= t then 0 else tonumber(a.run[3]) or 0)
 				total += a.weight
 			end
 			if known and total > 0 then
@@ -1213,7 +1211,8 @@ do
 				text = "7d " .. roundPct(weekly.pct),
 				tone = if stale then "muted" elseif weekly.lvl then STATUS_TONE[weekly.lvl] else nil,
 				value = weekly.pct / 100,
-				series = graph(weekly),
+				-- With only the weekly window reported, it is windows[1] too.
+				series = if weekly == windows[1] then out[id].series else graph(weekly),
 				title = title,
 			}
 		end
