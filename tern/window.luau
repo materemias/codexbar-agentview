@@ -1763,7 +1763,7 @@ local function paneItems(): ({ PickItem }?, string?)
 		return nil, if type(menu) == "table" and type(menu.error) == "string" then menu.error else nil
 	end
 	local items: { PickItem } = {}
-	for _, it in menu.items do -- kv tables are read-only proxies: plain loops, no table library
+	for _, it in menu.items do
 		local forPane = false
 		for _, target in (if type(it) == "table" and type(it.targets) == "table" then it.targets else {}) do
 			forPane = forPane or target == "pane"
@@ -1927,7 +1927,7 @@ local function waitingRequest(cx: WindowCx)
 		tern.kv.set("waitingRequestTaken", seq)
 	end
 	if request.op == "what" then
-		local args: { string } = {} -- kv tables are read-only proxies
+		local args: { string } = {} -- strings only, as the CLI takes them
 		for _, a in (if type(request.args) == "table" then request.args else {}) do
 			table.insert(args, tostring(a))
 		end
