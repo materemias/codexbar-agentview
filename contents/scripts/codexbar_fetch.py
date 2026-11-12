@@ -1578,23 +1578,30 @@ def _usage_history_observe(history: dict[str, list[list]], record: dict) -> None
         runs.append(current)
 
 
+def _window_runs(runs: list[list], seconds: int, now: _dt.datetime) -> list[list]:
+    """The runs covering the last `seconds`: the one in effect at their start, then the later ones."""
+    start = int(now.timestamp()) - seconds
+    if not runs or runs[-1][1] < start:
+        return []
+    base = 0
+    while base + 1 < len(runs) and runs[base + 1][0] <= start:
+        base += 1
+    return runs[base:]
+
+
 def _usage_history_prune(history: dict[str, list[list]], now: _dt.datetime) -> None:
     """Keep a week of runs plus the run in effect at its start; runs that ended
     before the last day (and a thin interval of margin) merge into one per
     thin interval, carrying the interval's last reading."""
     now_ts = int(now.timestamp())
-    start = now_ts - HISTORY_KEEP_SECONDS
     detailed = now_ts - max(RECENT_LOOKBACK_HOURS.values()) * 3600 - HISTORY_THIN_SECONDS
     for key in list(history):
-        runs = history[key]
-        if runs[-1][1] < start:
+        runs = _window_runs(history[key], HISTORY_KEEP_SECONDS, now)
+        if not runs:
             del history[key]
             continue
-        first = 0
-        while first + 1 < len(runs) and runs[first + 1][0] <= start:
-            first += 1
         kept: list[list] = []
-        for run in runs[first:]:
+        for run in runs:
             last = kept[-1] if kept else None
             if (last is not None and run[1] < detailed
                     and last[0] // HISTORY_THIN_SECONDS == run[0] // HISTORY_THIN_SECONDS):
@@ -1612,14 +1619,10 @@ def _recent_consumption(runs: list[list], hours: int, now: _dt.datetime) -> dict
     start cannot be placed on either side, so it is left out; a change across
     an ordinary poll interval spanning it counts in full.
     """
-    now_ts = int(now.timestamp())
-    start = now_ts - hours * 3600
-    if not runs or runs[-1][1] < start:
+    start = int(now.timestamp()) - hours * 3600
+    window = _window_runs(runs, hours * 3600, now)
+    if not window:
         return None
-    base = 0
-    while base + 1 < len(runs) and runs[base + 1][0] <= start:
-        base += 1
-    window = runs[base:]
     straddles = (window[0][1] < start and len(window) > 1
                  and window[1][0] - window[0][1] > HISTORY_GAP_SECONDS)
     consumed = 0.0
@@ -1631,17 +1634,6 @@ def _recent_consumption(runs: list[list], hours: int, now: _dt.datetime) -> dict
         else:
             consumed += max(0.0, current[2] - previous[2])
     return {"hours": hours, "consumedPercent": round(consumed, 2)}
-
-
-def _window_runs(runs: list[list], seconds: int, now: _dt.datetime) -> list[list]:
-    """The runs covering the last `seconds`: the one in effect at their start, then the later ones."""
-    start = int(now.timestamp()) - seconds
-    if not runs or runs[-1][1] < start:
-        return []
-    base = 0
-    while base + 1 < len(runs) and runs[base + 1][0] <= start:
-        base += 1
-    return runs[base:]
 
 
 def _attach_recent_usage(records: list[dict], history: dict[str, list[list]], now: _dt.datetime) -> None:
