@@ -4949,5 +4949,25 @@ class DaemonTests(Case):
         self.assertEqual([pane["pane"] for pane in self.run_cli("list")["panes"]], [52])
 
 
+class ToastFoldTests(Case):
+    def fire(self, count: int) -> None:
+        for index in range(count):
+            self.add("--kind", "time", "--in", "1s", "--label", f"T{index}", session=f"{OTHER[:-1]}{index}")
+        self.advance(seconds=2)
+        self.tick()
+
+    def toasts(self) -> list[str]:
+        return [action["text"] for action in self.tick()["actions"] if action["type"] == "toast"]
+
+    def test_toasts_no_window_showed_for_an_hour_fold_into_one(self) -> None:
+        self.fire(3)
+        self.advance(minutes=61)
+        self.assertEqual(len(self.toasts()), 3)
+        self.fire(1)
+        self.assertEqual(len(self.toasts()), 4)
+        self.advance(minutes=61)
+        self.assertEqual(self.toasts(), ["4 waits changed while no Tern window was open"])
+
+
 if __name__ == "__main__":
     unittest.main()

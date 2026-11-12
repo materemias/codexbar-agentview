@@ -70,6 +70,9 @@ BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 MENU_REQUEST_FRESH_S = 15
 CLOSED_RECORD_KEPT_S = 7 * 24 * 3600
 ACTION_KEPT_S = 7 * 24 * 3600
+# Toasts no window showed: past this many, the ones older than TOAST_FOLD_S fold into one.
+TOAST_FOLD_COUNT = 3
+TOAST_FOLD_S = 60 * 60
 MAX_DURATION_S = 10 * 366 * 24 * 3600
 TICK_MIN_S = 15
 TICK_MAX_S = 300
@@ -2442,6 +2445,26 @@ def _after_reboot(state: dict, agents: Agents, now: datetime) -> None:
                 _log(record, now, wait, f"Sending again after a reboot: {wait['label']}")
 
 
+def _fold_toasts(state: dict, now: datetime) -> None:
+    """Toasts no window has shown for an hour fold into one, so the first window
+    doesn't play a burst of them."""
+    stamp = now.timestamp()
+    old = [
+        action for action in state["actions"]
+        if action["type"] == "toast" and stamp - _stamp(action["created_at"]) > TOAST_FOLD_S
+    ]
+    if len(old) <= TOAST_FOLD_COUNT:
+        return
+    gone = {action["id"] for action in old}
+    state["actions"] = [action for action in state["actions"] if action["id"] not in gone]
+    count = sum(action.get("folded", 1) for action in old)
+    _enqueue(state, now, {
+        "type": "toast", "level": "error" if any(action["level"] == "error" for action in old) else "info",
+        "text": f"{count} waits changed while no Tern window was open", "sub": None,
+        "session": None, "pane": None, "folded": count,
+    })
+
+
 def _housekeeping(
     state: dict, agents: Agents, omp: Omp, now: datetime, daemon: str | None = None,
 ) -> None:
@@ -2494,6 +2517,7 @@ def _housekeeping(
         action for action in state["actions"]
         if stamp - _parse_time(action["created_at"]).timestamp() <= ACTION_KEPT_S
     ]
+    _fold_toasts(state, now)
 
 
 def _timer_text(wait: dict) -> str:
@@ -2644,7 +2668,7 @@ def _record_times(state: dict, record: dict, now: datetime) -> list[float | None
 def _public_action(action: dict) -> dict:
     return {
         key: value for key, value in action.items()
-        if key not in ("wait", "created_at", "window_since", "windowless_since", "daemon")
+        if key not in ("wait", "created_at", "window_since", "windowless_since", "daemon", "folded")
     }
 
 
