@@ -9,11 +9,12 @@
 -- For sessions set aside it adds the set-aside command, which on an omp pane asks
 -- the omp extension to open its menu and elsewhere shows Tern's own picker, and
 -- the session card, also opened from `codexbar-agentview://card/<id>` links. It
--- carries out `waitingActions`: one leader window shows the toasts, and each
--- pane's action falls to the window holding that pane, as windows don't share
--- panes. So do its agent and pane events and tab colors. `waitingPoke` makes the
--- host tick after a CLI call from here; `codexbar-agentview://request`, from the
--- host, makes this half take `waitingRequest` up without waiting for the poll.
+-- carries out `waitingActions`: one leader window shows the toasts and reopens
+-- closed sessions a prompt waits for, and each pane's action falls to the window
+-- holding that pane, as windows don't share panes. So do its agent and pane
+-- events and tab colors. `waitingPoke` makes the host tick after a CLI call
+-- from here; `codexbar-agentview://request`, from the host, makes this half
+-- take `waitingRequest` up without waiting for the poll.
 --
 -- `tern.kv` and `tern.process` belong to the machine each half runs on: a window
 -- attached to a remote host runs this half on its own machine, beside another
@@ -471,6 +472,36 @@ local function shellQuote(text: string): string
 	return "'" .. string.gsub(text, "'", "'\\''") .. "'"
 end
 
+-- Resume commands this machine started lately, by when (`waitingLaunches` in
+-- `tern.kv`, which every window here shares). One started again before
+-- agents.json lists it would be a second writer of its session file: Resume
+-- pressed while the automatic resume opens it, or the other way round.
+local LAUNCH_HOLD_S = 60
+
+-- Opens a tab that runs `command` as History's Launch does: an interactive
+-- shell loads the user's PATH and stays when the agent exits. Nil and true when
+-- `command` started within LAUNCH_HOLD_S.
+local function launchTab(cx: WindowCx, command: string, cwd: string?, reveal: Reveal?): (number?, boolean)
+	local now = os.time()
+	local stored = tern.kv.get("waitingLaunches")
+	local launches: { [string]: number } = {}
+	for c, at in (if type(stored) == "table" then stored else {}) do
+		if type(at) == "number" and now - at < LAUNCH_HOLD_S then
+			launches[c] = at
+		end
+	end
+	if launches[command] then
+		return nil, true
+	end
+	local shell = shellQuote(tern.getenv("SHELL") or "/bin/sh")
+	local pane = cx.layout:new_tab({ cwd = cwd, command = shell .. " -ic " .. shellQuote(command .. "; exec " .. shell .. " -i") }, reveal)
+	if pane then
+		launches[command] = now
+		tern.kv.set("waitingLaunches", launches)
+	end
+	return pane, false
+end
+
 local function trim(text: string): string
 	return string.match(text, "^%s*(.-)%s*$") or text
 end
@@ -809,28 +840,6 @@ local function waitRow(w: any, now: number): Node
 	return ui.text(spans)
 end
 
--- Exact, unlike `age`: "90m", "2h", "45s".
-local function period(secs: number): string
-	if secs % 86400 == 0 then
-		return (secs // 86400) .. "d"
-	elseif secs % 3600 == 0 then
-		return (secs // 3600) .. "h"
-	elseif secs % 60 == 0 then
-		return (secs // 60) .. "m"
-	end
-	return secs .. "s"
-end
-
-local function scheduleRow(j: any, now: number): Node
-	local every = tonumber(j.every_s)
-	local due = epoch(j.due_at)
-	local text = if every then "every " .. period(every) else "once"
-	if due then
-		text ..= if due > now then " · next in " .. age(due - now) else " · next now"
-	end
-	return ui.text({ ui.span(text .. "  ", "muted"), clipped(tostring(j.prompt), 80) })
-end
-
 -- The recap with its time, else the last exchange, which is left for the full card. A recap
 -- written before the session's later turns is shown dimmed, as an earlier one.
 local function cardRecap(cx: WindowCx, pane: number, r: any, reading: boolean): Node?
@@ -897,11 +906,6 @@ local function cardView(cx: WindowCx, pane: number, r: any, reading: boolean): N
 		table.insert(waits, waitRow(w, now))
 	end
 	section("Waiting for", waits)
-	local schedules: { Node } = {}
-	for _, j in list("schedules") do
-		table.insert(schedules, scheduleRow(j, now))
-	end
-	section("Schedules", schedules)
 	local since: { Node } = {}
 	local history = list("history")
 	for i = math.max(1, #history - 4), #history do
@@ -1226,11 +1230,57 @@ end
 type Acted = { result: string, error: string?, sending: boolean, acked: boolean, retryAt: number, tries: number }
 local acted: { [string]: Acted } = {} -- by action id: the outbox repeats an action until its ack lands
 
+-- A closed session that a wait has a prompt for comes back in a new tab of the
+-- Tern session it was last seen in, else `Default`, else this window's, behind
+-- whatever the user looks at. Its omp takes the prompt once it runs.
+local function resumeSession(cx: WindowCx, a: any): (string, string?)
+	local command = val(a.command)
+	if type(command) ~= "string" or command == "" then
+		return "failed", "no resume command"
+	end
+	local want = val(a.tern_session)
+	local named, default, current = nil, nil, nil
+	for _, s in cx.session:sessions() do
+		if s.name == want then
+			named = s.id
+		elseif s.name == "Default" then
+			default = s.id
+		end
+		if s.current then
+			current = s.id
+		end
+	end
+	if want and not named then
+		tern.log.info("codexbar: no Tern session named " .. tostring(want) .. " to resume in")
+	end
+	local cwd = val(a.cwd)
+	local pane, held = launchTab(cx, command, if type(cwd) == "string" and cwd ~= "" then cwd else nil, { focus = false })
+	if held then
+		return "done" -- it started a moment ago
+	elseif not pane then
+		return "failed", "Tern opened no tab"
+	end
+	local session = named or default
+	if session and session ~= current then
+		-- The session runs from here on, whatever the move does.
+		local ok, moved, err = pcall(function()
+			return cx.layout:move_to_new_tab(pane :: number, session, { focus = false })
+		end)
+		if not (ok and moved) then
+			tern.log.warn("codexbar: the resumed session stays in this Tern session", if ok then err else moved)
+		end
+	end
+	return "done"
+end
+
 local function carryOut(cx: WindowCx, a: any, info: PaneInfo?): (string, string?)
 	if a.type == "toast" then
 		local level = if a.level == "success" or a.level == "error" then a.level else "info"
 		cx:toast(level, tostring(a.text), if type(a.sub) == "string" then a.sub else nil)
 		return "done"
+	end
+	if a.type == "resume" then
+		return resumeSession(cx, a)
 	end
 	if not info then
 		return "done" -- the session has no Tern pane
@@ -1248,6 +1298,12 @@ local function carryOut(cx: WindowCx, a: any, info: PaneInfo?): (string, string?
 	return "failed", "unknown action " .. tostring(a.type)
 end
 
+-- How long a dashboard open in the leader window holds a resume back: its
+-- layout restore refuses once a tab opened, and the CLI gives a resume up when
+-- no window carried it out within RESUME_GRACE_S (3 minutes).
+local RESUME_HOLD_S = 30
+local heldSince: { [string]: number } = {} -- resume action id -> when a dashboard here first held it back
+
 -- Whether this window should take `a` up now. A pane action no window holds
 -- stays queued for the window that will; the host acks it once the pane is gone.
 local function ownsAction(a: any, info: PaneInfo?, leader: boolean): boolean
@@ -1255,11 +1311,28 @@ local function ownsAction(a: any, info: PaneInfo?, leader: boolean): boolean
 		-- A dashboard's layout restore would bring a pane parked now back.
 		return not (a.type == "park" and opened)
 	end
-	return leader and (a.type == "toast" or tonumber(a.pane) == nil)
+	if not leader or (a.type ~= "toast" and tonumber(a.pane) ~= nil) then
+		return false
+	end
+	if a.type == "resume" and opened then
+		local id = tostring(a.id)
+		heldSince[id] = heldSince[id] or os.time()
+		return os.time() - heldSince[id] >= RESUME_HOLD_S
+	end
+	return true
 end
 
 local function runActions(cx: WindowCx, leader: boolean)
 	local actions = tern.kv.get("waitingActions")
+	-- A resume isn't idempotent as the other actions are, and `acted` dies with
+	-- a plugin reload or a leader's lease: how each resume went stays in
+	-- `tern.kv` until its action leaves the outbox, however long its ack fails.
+	local stored = tern.kv.get("waitingResumes")
+	local resumes: { [string]: { result: string, error: string? } } = {}
+	for id, r in (if type(stored) == "table" then stored else {}) do
+		resumes[id] = { result = tostring(r.result), error = if type(r.error) == "string" then r.error else nil }
+	end
+	local resumesChanged = false
 	local listed: { [string]: boolean } = {}
 	for _, a in (if type(actions) == "table" then actions else {}) do
 		local id = tostring(a.id)
@@ -1268,7 +1341,13 @@ local function runActions(cx: WindowCx, leader: boolean)
 		local pane = if a.type ~= "toast" then tonumber(a.pane) else nil
 		local info = if pane then paneInfo(cx, pane) else nil
 		if not state and ownsAction(a, info, leader) then
-			local ok, result, err = pcall(carryOut, cx, a, info)
+			local before = if a.type == "resume" then resumes[id] else nil
+			local ok, result, err = true, nil, nil
+			if before then
+				result, err = before.result, before.error
+			else
+				ok, result, err = pcall(carryOut, cx, a, info)
+			end
 			state = {
 				result = if ok then result else "failed",
 				error = if ok then err else tostring(result),
@@ -1278,6 +1357,10 @@ local function runActions(cx: WindowCx, leader: boolean)
 				tries = 0,
 			}
 			acted[id] = state
+			if a.type == "resume" and not before then
+				resumes[id] = { result = state.result, error = state.error }
+				resumesChanged = true
+			end
 		end
 		if state and not state.sending and not state.acked and os.time() >= state.retryAt then
 			local sent = state
@@ -1302,6 +1385,20 @@ local function runActions(cx: WindowCx, leader: boolean)
 		if not listed[id] and not state.sending then
 			acted[id] = nil
 		end
+	end
+	for id in (if type(actions) == "table" then heldSince else {}) do
+		if not listed[id] then
+			heldSince[id] = nil
+		end
+	end
+	for id in (if type(actions) == "table" then resumes else {}) do
+		if not listed[id] then
+			resumes[id] = nil
+			resumesChanged = true
+		end
+	end
+	if resumesChanged then
+		tern.kv.set("waitingResumes", if next(resumes) then resumes else nil)
 	end
 end
 
@@ -1773,12 +1870,10 @@ local function waitingRequest(cx: WindowCx)
 	end
 	afterRestore(cx, function(cx2)
 		if request.op == "launch" then
-			-- As History's Launch: an interactive shell loads the user's PATH and stays when the agent exits.
-			local shell = shellQuote(tern.getenv("SHELL") or "/bin/sh")
-			cx2.layout:new_tab({
-				cwd = request.cwd,
-				command = shell .. " -ic " .. shellQuote(request.command .. "; exec " .. shell .. " -i"),
-			})
+			local _, held = launchTab(cx2, tostring(request.command), request.cwd)
+			if held then
+				cx2:toast("info", "CodexBar AgentView: that session is opening already")
+			end
 			return
 		end
 		local target = tonumber(request.target)

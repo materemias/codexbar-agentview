@@ -1274,15 +1274,16 @@ local function waitingCounts(): any
 	return if type(counts) == "table" then counts else {}
 end
 
--- The wait +1 day pushes: one on me first, then the earliest due. `snooze` moves
--- only these kinds; the CLI changes nothing for the others. (Inline: the main
--- chunk is at Luau's 200-local limit.)
+-- The wait +1 day pushes: one on me first, then the earliest due. It skips the
+-- ones `snooze` refuses for their kind or state (not started, done, my-time
+-- ones, a job still running in time), so a new kind needs no change here; the
+-- CLI also refuses one whose prompt the agent runs now. (Inline: the main chunk
+-- is at Luau's 200-local limit.)
 local function firstDue(r: any): any
 	local first, at, onMe = nil, math.huge, false
 	for _, w in val(r.waits) or {} do
-		local kind = w.kind
-		local snoozable = w.state ~= "pending" and (val(w.overdue) == true or kind == "time" or kind == "command"
-			or kind == "pr" or kind == "something" or (kind == "job" and w.state ~= "waiting"))
+		local snoozable = w.state ~= "pending" and w.state ~= "done" and w.kind ~= "later"
+			and not (w.kind == "job" and w.state == "waiting" and val(w.overdue) ~= true)
 		if snoozable then
 			local due = epoch(w.due_at) or math.huge
 			local mine = w.ball == "on_me"
@@ -3037,19 +3038,6 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 			local at = epoch(r.recap_at)
 			local head = (if val(r.recap_stale) == true then "Earlier recap" else "Recap") .. (if at then " · " .. absoluteTime(at, now) else "")
 			table.insert(kids, detailLines("recap", head, { ui.text({ ui.span(recap, "muted") }) }))
-		end
-		local schedules = {}
-		for i, j in val(r.schedules) or {} do
-			local every = tonumber(val(j.every_s))
-			local due = epoch(j.due_at)
-			local text = if every then "every " .. string.gsub(span(every), " 0[hm]$", "") else "once"
-			if due then
-				text ..= " · next " .. absoluteTime(due, now)
-			end
-			table.insert(schedules, withp(ui.text({ ui.span(text .. "  ", "dim"), clip(oneLine(j.prompt), 80) }), { key = "j" .. i }))
-		end
-		if #schedules > 0 then
-			table.insert(kids, detailLines("schedules", "Schedules", schedules))
 		end
 	end
 	return withp(ui.col(kids), { key = "peek-" .. rowKey, role = "codexbar.peek", gap = "sm" })
