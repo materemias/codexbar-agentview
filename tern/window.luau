@@ -356,6 +356,28 @@ local function summary(): any
 	return if type(s) == "table" then s else nil
 end
 
+-- The line the host publishes while the waits may be out of date (a failed or
+-- partial check, no check for 15 minutes, a stale session scan): { text, tone }.
+local function waitingHealth(): any
+	local s = summary()
+	local w = if s then s.waiting else nil
+	local h = if type(w) == "table" then w.health else nil
+	return if type(h) == "table" and type(h.text) == "string" and h.text ~= "" then h else nil
+end
+
+-- Appends `--daemon <id>` to a CLI call about this daemon's panes: pane ids
+-- name panes of one daemon, and a window's commands run under the app, where
+-- the CLI can't tell which. The host publishes its id in `summary.daemon`.
+local function withDaemon(args: { string }): { string }
+	local s = summary()
+	local id = if s then s.daemon else nil
+	if type(id) == "string" and id ~= "" then
+		table.insert(args, "--daemon")
+		table.insert(args, id)
+	end
+	return args
+end
+
 -- The session text for the focused pane; the rest is in the widgets below.
 tern.chrome.status(function(pane)
 	local s = summary()
@@ -378,9 +400,9 @@ end)
 local POOLED = "plan-weighted across all your accounts"
 local USAGE_WIDGETS = {
 	{ "claude", "Claude usage", "provider-anthropic", "5h and weekly use, " .. POOLED .. "; the ring, bar and graph show the 5h window" },
-	{ "claude-7d", "Claude weekly usage", "provider-anthropic", "Weekly use, " .. POOLED .. "; the graph spans the week" },
+	{ "claude-7d", "Claude weekly usage", "provider-anthropic", "Weekly use, " .. POOLED .. "; the graph spans the week, or, while the history is shorter, from where the tooltip says" },
 	{ "codex", "Codex usage", "provider-openai", "5h and weekly use, " .. POOLED .. "; the ring, bar and graph show the 5h window" },
-	{ "codex-7d", "Codex weekly usage", "provider-openai", "Weekly use, " .. POOLED .. "; the graph spans the week" },
+	{ "codex-7d", "Codex weekly usage", "provider-openai", "Weekly use, " .. POOLED .. "; the graph spans the week, or, while the history is shorter, from where the tooltip says" },
 	{ "zai", "z.ai usage", "provider-zai" },
 	{ "opencodego", "OpenCode Go usage", "provider-opencode" },
 	{ "openrouter", "OpenRouter usage", "gauge", nil, "OpenRouter" },
@@ -439,7 +461,9 @@ tern.chrome.widget("on-me", {
 		if n == 0 then
 			return nil
 		end
-		return { text = n .. " on me", tone = "warn", command = "plugin.codexbar-agentview.waiting" }
+		local health = waitingHealth()
+		-- The count stays as is; the tooltip says when the waits may be out of date.
+		return { text = n .. " on me", tone = "warn", title = if health then health.text else nil, command = "plugin.codexbar-agentview.waiting" }
 	end,
 })
 
@@ -668,7 +692,9 @@ local function cardSig(session: string?, owner: number): string
 	for _, field in { "sessions", "panes" } do
 		for _, r in (if type(view[field]) == "table" then view[field] else {}) do
 			if (session and r.session_id == session) or (not session and field == "panes" and r.pane == owner) then
-				return tern.json.encode(r)
+				-- The out-of-date line above the card changes it too.
+				local health = waitingHealth()
+				return tern.json.encode(r) .. (if health then health.text else "")
 			end
 		end
 	end
@@ -875,6 +901,10 @@ end
 local function cardView(cx: WindowCx, pane: number, r: any, reading: boolean): Node
 	local now = os.time()
 	local kids: { Node } = {}
+	local health = waitingHealth()
+	if health then
+		table.insert(kids, ui.text({ ui.span(health.text, health.tone) }))
+	end
 	local banner = cardBanner(r, now)
 	if banner then
 		table.insert(kids, banner)
@@ -1248,11 +1278,13 @@ local acted: { [string]: Acted } = {} -- by action id: the outbox repeats an act
 
 -- A closed session that a wait has a prompt for comes back in a new tab of the
 -- Tern session it was last seen in, else `Default`, else this window's, behind
--- whatever the user looks at. Its omp takes the prompt once it runs.
-local function resumeSession(cx: WindowCx, a: any): (string, string?)
+-- whatever the user looks at. Its omp takes the prompt once it runs. Third:
+-- whether omp may run now, from this tab or a launch a moment ago; false only
+-- when nothing started it.
+local function resumeSession(cx: WindowCx, a: any): (string, string?, boolean)
 	local command = val(a.command)
 	if type(command) ~= "string" or command == "" then
-		return "failed", "no resume command"
+		return "failed", "no resume command", false
 	end
 	local want = val(a.tern_session)
 	local named, default, current = nil, nil, nil
@@ -1272,9 +1304,9 @@ local function resumeSession(cx: WindowCx, a: any): (string, string?)
 	local cwd = val(a.cwd)
 	local pane, held = launchTab(cx, command, if type(cwd) == "string" and cwd ~= "" then cwd else nil, { focus = false })
 	if held then
-		return "done" -- it started a moment ago
+		return "done", nil, true -- it started a moment ago
 	elseif not pane then
-		return "failed", "Tern opened no tab"
+		return "failed", "Tern opened no tab", false
 	end
 	local session = named or default
 	if session and session ~= current then
@@ -1286,7 +1318,7 @@ local function resumeSession(cx: WindowCx, a: any): (string, string?)
 			tern.log.warn("codexbar: the resumed session stays in this Tern session", if ok then err else moved)
 		end
 	end
-	return "done"
+	return "done", nil, true
 end
 
 local function carryOut(cx: WindowCx, a: any, info: PaneInfo?): (string, string?)
@@ -1340,16 +1372,30 @@ end
 -- Teleport use, and holds off every other launcher for a minute after. It
 -- refuses with 5 while omp runs the session or another launcher starts it, and
 -- with 11 when an omp that names none of its sessions runs in its folder and
--- may be writing it. `done` gets that status and the helper's reason. Only omp
--- sessions have session-keyed waits: the omp extension and `paneSession` name
--- them, and pins are omp's. So the provider is omp.
-local function reserveSession(session: string, cwd: any, done: (number, string, WindowCx?) -> ())
+-- may be writing it. `done` gets that status, the helper's reason and `release`,
+-- which gives a reservation taken back when no tab started omp after all: one
+-- left would refuse every other launcher for its minute. Never call it once omp
+-- may run. Only omp sessions have session-keyed waits: the omp extension and
+-- `paneSession` name them, and pins are omp's. So the provider is omp.
+local function reserveSession(session: string, cwd: any, done: (number, string, WindowCx?, () -> ()) -> ())
 	local args = { "--tern", "--reserve", "omp", session }
 	if type(cwd) == "string" and cwd ~= "" then
 		table.insert(args, cwd)
 	end
 	python("codexbar_focus.py", args, function(res, cx)
-		done(res.status, (string.gsub(firstLine(res.stderr), "^codexbar_focus: ", "")), cx)
+		-- The reservation's token, its last line; an older helper prints none.
+		local token = if res.status == 0 then string.match(res.stdout, "([^\n]*%S)%s*$") else nil
+		local function release()
+			if token then
+				python("codexbar_focus.py", { "--tern", "--release", "omp", session, trim(token) }, function(r)
+					if r.status ~= 0 then
+						tern.log.warn("codexbar: session reservation not released", firstLine(r.stderr))
+					end
+				end)
+				token = nil
+			end
+		end
+		done(res.status, (string.gsub(firstLine(res.stderr), "^codexbar_focus: ", "")), cx, release)
 	end)
 end
 
@@ -1390,9 +1436,10 @@ local function reserveThenResume(a: any, state: any)
 		resumes[id] = { result = result, error = err }
 		tern.kv.set("waitingResumes", resumes)
 	end
-	reserveSession(tostring(val(a.session)), val(a.cwd), function(status, why, cx2)
+	reserveSession(tostring(val(a.session)), val(a.cwd), function(status, why, cx2, release)
 		if not stillQueued(id) then
 			state.sending = false
+			release()
 			return
 		end
 		if status == 5 then
@@ -1400,9 +1447,13 @@ local function reserveThenResume(a: any, state: any)
 		elseif status ~= 0 then
 			settle("failed", if why ~= "" then why else "couldn't reserve the session")
 		elseif not cx2 then
+			release()
 			settle("failed", "the Tern window closed before it could open the session")
 		else
-			local ok, result, err = pcall(resumeSession, cx2 :: WindowCx, a)
+			local ok, result, err, started = pcall(resumeSession, cx2 :: WindowCx, a)
+			if ok and not started then
+				release()
+			end
 			settle(if ok then result else "failed", if ok then err else tostring(result))
 		end
 	end)
@@ -1655,7 +1706,7 @@ local function finishSetAside(cx: WindowCx, t: SetAside, kind: string, args: { s
 	end
 	ask(cx, { value = t.note, placeholder = "Why set it aside, what next?", action = "next" }, function(note, cx2)
 		-- Free text as `--flag=value`: argparse takes a separate "-zsh" for an option.
-		local full = { "add", "--pane", tostring(t.pane), "--kind", kind, "--by", "user", "--label=" .. t.label }
+		local full = withDaemon({ "add", "--pane", tostring(t.pane), "--kind", kind, "--by", "user", "--label=" .. t.label })
 		for _, a in args do
 			table.insert(full, a)
 		end
@@ -1915,7 +1966,7 @@ tern.on("pane_closed", function(ev, _cx)
 	end
 	local entry = waitingEntry(ev.pane)
 	if entry and entry.record then
-		waitingSend("pane event", { "event", "--type", "pane_closed", "--pane", tostring(ev.pane) })
+		waitingSend("pane event", withDaemon({ "event", "--type", "pane_closed", "--pane", tostring(ev.pane) }))
 	end
 end)
 
@@ -1976,22 +2027,28 @@ local function waitingRequest(cx: WindowCx)
 	end
 	afterRestore(cx, function(cx2)
 		if request.op == "launch" then
-			local function open(cx3: WindowCx)
-				local _, held = launchTab(cx3, tostring(request.command), request.cwd)
+			-- Whether omp may run now: this tab's, or a launch a moment ago.
+			local function open(cx3: WindowCx): boolean
+				local pane, held = launchTab(cx3, tostring(request.command), request.cwd)
 				if held then
 					cx3:toast("info", "CodexBar AgentView: that session is opening already")
+				elseif not pane then
+					waitingFailed("resume", "Tern opened no tab", cx3)
 				end
+				return pane ~= nil or held
 			end
 			if type(request.session) ~= "string" or request.session == "" then
 				open(cx2)
 				return
 			end
 			-- The same startup ownership as an automatic resume and History's Launch.
-			reserveSession(request.session, request.cwd, function(status, why, cx3)
+			reserveSession(request.session, request.cwd, function(status, why, cx3, release)
 				if not cx3 then
-					return
+					release()
 				elseif status == 0 then
-					open(cx3 :: WindowCx)
+					if not open(cx3 :: WindowCx) then
+						release()
+					end
 				elseif status == 5 then
 					cx3:toast("info", "CodexBar AgentView: that session is running or opening already")
 				else

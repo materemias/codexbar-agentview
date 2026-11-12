@@ -367,6 +367,7 @@ local store = {
 	waiting = nil :: any, -- the CLI's last view
 	waitingUncheckedSince = nil :: number?, -- os.time() a view no tick had checked yet first came, while none has
 	waitingError = nil :: string?, -- the last tick's failure, cleared by a tick that succeeds
+	waitingHealth = nil :: any, -- { text, tone } of the out-of-date line, as publishSummary last made it
 	waitingActions = nil :: any, -- the outbox as last published
 	-- os.clock() below is Luau's: seconds on the system's monotonic clock
 	-- (CLOCK_MONOTONIC on Linux, mach_absolute_time on macOS), not CPU time. The
@@ -374,7 +375,7 @@ local store = {
 	-- VM, every VM on the machine reads the same one, so the window half's leader
 	-- lease uses it too. It stands still in sleep and starts over at a reboot.
 	waitingAcking = {} :: { [string]: number }, -- action id -> no ack of it before then, os.clock() (math.huge: sent)
-	waitingRaw = "", -- waiting.json as our last tick left it
+	waitingRaw = "", -- waiting.stamp (an older CLI's: waiting.json) as our last tick left it
 	waitingSig = "",
 	waitingActionsSig = "",
 	waitingAgents = "",
@@ -1063,23 +1064,24 @@ do
 	-- The window's used percent over its last span, 0–1 and oldest first, weighted
 	-- across `accounts` ({ w, weight }) from the history runs the fetch attaches
 	-- ([firstSeen, lastSeen, usedPercent, resetsAt]). Starts once every account
-	-- has a reading; nil when any account has no runs, so the graph never pools
-	-- fewer accounts than the ring.
-	local function seriesOf(accounts: { any }, now: number): { number }?
+	-- has a reading, the time of its first sample second when that is later than
+	-- the span's start; nil when any account has no runs, so the graph never
+	-- pools fewer accounts than the ring.
+	local function seriesOf(accounts: { any }, now: number): ({ number }?, number?)
 		local tracked = {}
 		local spanSecs = 0
 		for _, a in accounts do
 			local runs = val(a.w.runs)
 			if type(runs) ~= "table" or #runs == 0 then
-				return nil
+				return nil, nil
 			end
 			table.insert(tracked, { runs = runs, weight = a.weight, next = 1, run = nil :: any })
 			spanSecs = math.max(spanSecs, (tonumber(val(a.w.windowMinutes)) or 0) * 60)
 		end
 		if #tracked == 0 or spanSecs <= 0 then
-			return nil
+			return nil, nil
 		end
-		local out = {}
+		local out, since = {}, nil
 		for i = 0, SAMPLES - 1 do
 			local t = now - spanSecs + spanSecs * i / (SAMPLES - 1)
 			local sum, total, known = 0, 0, true
@@ -1098,10 +1100,16 @@ do
 				total += a.weight
 			end
 			if known and total > 0 then
+				if #out == 0 and i > 0 then
+					since = t
+				end
 				table.insert(out, math.floor(math.clamp(sum / total, 0, 100) * 10 + 0.5) / 1000)
 			end
 		end
-		return if #out >= 2 then out else nil
+		if #out < 2 then
+			return nil, nil
+		end
+		return out, since
 	end
 
 	-- One provider's widget bar views: Claude's and Codex's windows plan-weighted
@@ -1195,25 +1203,35 @@ do
 			end
 		end
 		local title = table.concat(lines, "\n")
-		local function graph(w: any): { number }?
-			return if w and not stale then seriesOf(w.accounts, now) else nil
+		-- A window's graph, and the hover text saying where it starts when the
+		-- accounts' history covers less than the window.
+		local function graph(w: any): ({ number }?, string)
+			local series, since = nil, nil
+			if w and not stale then
+				series, since = seriesOf(w.accounts, now)
+			end
+			return series, if since then title .. "\nGraph since " .. absoluteTime(since, now) else title
 		end
+		local series, graphTitle = graph(windows[1])
 		out[id] = {
 			text = if #parts > 0 then table.concat(parts, " · ") else balance,
 			tone = if stale then "muted" elseif worst then STATUS_TONE[worst] else nil,
 			value = if windows[1] then windows[1].pct / 100 else nil,
-			series = graph(windows[1]),
-			title = title,
+			series = series,
+			title = graphTitle,
 		}
 		local weekly = if pooled then windows[#windows] else nil
 		if weekly and weekly.label == "7d" then
+			-- With only the weekly window reported, it is windows[1] too.
+			if weekly ~= windows[1] then
+				series, graphTitle = graph(weekly)
+			end
 			out[id .. "-7d"] = {
 				text = "7d " .. roundPct(weekly.pct),
 				tone = if stale then "muted" elseif weekly.lvl then STATUS_TONE[weekly.lvl] else nil,
 				value = weekly.pct / 100,
-				-- With only the weekly window reported, it is windows[1] too.
-				series = if weekly == windows[1] then out[id].series else graph(weekly),
-				title = title,
+				series = series,
+				title = graphTitle,
 			}
 		end
 	end
@@ -1287,18 +1305,21 @@ local function waitingCounts(): any
 	return if type(counts) == "table" then counts else {}
 end
 
--- The wait Snooze 1d pushes: one on me first, then the earliest due. It skips the
--- ones `snooze` refuses for their kind or state (not started, done, my-time
--- ones, a job still running in time), so a new kind needs no change here; the
--- CLI also refuses one whose prompt the agent runs now. Second, the wait Retry
--- checks again: one the CLI put on me after its checks kept failing
+-- The wait Snooze 1d pushes: one on me first, then the earliest due, of those the
+-- view marks `snoozable` (the ones `snooze --wait` accepts). An older CLI marks
+-- none: then this skips the ones `snooze` refuses for their kind or state (not
+-- started, done, my-time ones, a job still running in time). Second, the wait
+-- Retry checks again: one the CLI put on me after its checks kept failing
 -- (`retryable`), which nothing polls until then. (Inline, and one function for
 -- both: the main chunk is at Luau's 200-local limit.)
 local function firstDue(r: any): (any, any)
 	local first, at, onMe, retry = nil, math.huge, false, nil
 	for _, w in val(r.waits) or {} do
-		local snoozable = w.state ~= "pending" and w.state ~= "done" and w.kind ~= "later"
-			and not (w.kind == "job" and w.state == "waiting" and val(w.overdue) ~= true)
+		local snoozable = val(w.snoozable)
+		if type(snoozable) ~= "boolean" then
+			snoozable = w.state ~= "pending" and w.state ~= "done" and w.kind ~= "later"
+				and not (w.kind == "job" and w.state == "waiting" and val(w.overdue) ~= true)
+		end
 		if snoozable then
 			local due = epoch(w.due_at) or math.huge
 			local mine = w.ball == "on_me"
@@ -1375,6 +1396,15 @@ local function jobPanes(view: any): { [number]: boolean }
 	return out
 end
 
+-- Also the line every waits surface shows while the waits may be out of date
+-- (`store.waitingHealth`, `summary.waiting.health`), as of now: the last tick
+-- failed (this half saw it, or the CLI noted it in `health`), no tick finished
+-- for 15 minutes (before the first tick: for 15 minutes since this half saw the
+-- view so), or the session scan the ticks read is stale. A check within those
+-- 15 minutes that ran but reported a problem in part (`error_kind` "partial":
+-- a session it can't show, PR checks) is the last check's error instead; a
+-- failed tick (`error_kind` "failed", or none from an older CLI) means the waits
+-- were not checked. Republished every minute, so the line ages with the clock.
 local function publishSummary()
 	local counts = { working = 0, blocked = 0, idle = 0, untracked = 0 }
 	for _, a in liveAgents() do
@@ -1387,6 +1417,29 @@ local function publishSummary()
 			restore += 1
 		end
 	end
+	local line = nil
+	if store.waiting then
+		local now = os.time()
+		local health = val(store.waiting.health)
+		health = if type(health) == "table" then health else {}
+		local checked = epoch(val(health.checked_at))
+		local since = if checked then absoluteTime(checked, now) else "never"
+		-- One line, capped as the applet and omp cap it.
+		local err = clip(string.match(oneLine(store.waitingError or val(health.error)), "^%s*(.-)%s*$") or "", 120)
+		local scan = epoch(val(health.agents_stale_since))
+		local last = checked or store.waitingUncheckedSince
+		local stale = last ~= nil and now - last > 15 * 60
+		if err ~= "" and checked and not stale and not store.waitingError and val(health.error_kind) == "partial" then
+			line = { text = "⚠️ Last check: " .. err .. (if scan then " · session scan stale since " .. absoluteTime(scan, now) else ""), tone = "warning" }
+		elseif err ~= "" then
+			line = { text = "⚠️ Waits not checked since " .. since .. ": " .. err, tone = "error" }
+		elseif stale then
+			line = { text = "⚠️ Waits not checked since " .. since, tone = "warning" }
+		elseif scan then
+			line = { text = "⚠️ Session scan stale since " .. absoluteTime(scan, now), tone = "warning" }
+		end
+	end
+	store.waitingHealth = line
 	local summary = {
 		-- On the minute: the graphs and "resets in" lines move with the clock,
 		-- and a summary rebuilt within the minute stays the one published.
@@ -1394,7 +1447,13 @@ local function publishSummary()
 		counts = counts,
 		restore = restore,
 		-- While another daemon ticks, the view's pane ids are its panes: none of ours.
-		waiting = { on_me = tonumber(val(waitingCounts().on_me)) or 0, panes = if store.waitingSkipped then {} else waitingPanes() },
+		waiting = {
+			on_me = tonumber(val(waitingCounts().on_me)) or 0,
+			panes = if store.waitingSkipped then {} else waitingPanes(),
+			health = line,
+		},
+		-- Which daemon this is, for the window half's pane events and adds (`--daemon`).
+		daemon = store.daemonId,
 	}
 	local sig = tern.json.encode(summary)
 	if sig ~= store.summarySig then
@@ -1452,14 +1511,25 @@ local function readAgents(): boolean
 	return true
 end
 
-local function readWaiting(path: string): string
-	local ok, raw = pcall(tern.fs.read, path, 16 * 1024 * 1024)
+-- A state file's text, "" when unreadable. Without `path`, what tells that
+-- waiting.json changed: the `waiting.stamp` the CLI rewrites after every save,
+-- a few bytes; an older CLI writes none, and then it is waiting.json itself.
+local function readWaiting(path: string?): string
+	if not path then
+		local ok, stamp = pcall(tern.fs.read, STATE_DIR .. "/waiting.stamp", 4096)
+		if ok then
+			return stamp
+		end
+		path = WAITING_FILE
+	end
+	local ok, raw = pcall(tern.fs.read, path :: string, 16 * 1024 * 1024)
 	return if ok then raw else ""
 end
 
 -- Republishes only what changed: kv.json is one file every VM rereads. `now`
--- and `health.checked_at` move on every tick; the warning line reads the
--- latter from `store.waiting`, rendered once a minute.
+-- and `health.checked_at` move on every tick; the out-of-date line reads the
+-- latter, so while it shows, every view makes it again (a tick that came
+-- after 15 minutes without one clears it).
 local function applyWaiting(view: any)
 	store.waiting = view
 	local at = view.now
@@ -1482,6 +1552,12 @@ local function applyWaiting(view: any)
 		tern.kv.set("waitingView", view)
 		publishSummary()
 		renderAll()
+	elseif store.waitingHealth then
+		local was = store.waitingHealth.text
+		publishSummary()
+		if (store.waitingHealth and store.waitingHealth.text) ~= was then
+			renderAll()
+		end
 	end
 end
 
@@ -1548,20 +1624,21 @@ local function waitingTick()
 			if skipped ~= "" and wasSkipped == nil then
 				tern.log.warn("codexbar: waiting tick skipped", skipped)
 			end
-			if (wasSkipped == nil) ~= (store.waitingSkipped == nil) then
+			if (wasSkipped == nil) ~= (store.waitingSkipped == nil) or hadError then
+				-- The Waiting tab's line about the other daemon, or the warning
+				-- line going, though the view may be the same.
 				publishSummary()
-				renderAll() -- the Waiting tab's line about the other daemon
-			elseif hadError then
-				renderAll() -- the warning line goes, though the view may be the same
+				renderAll()
 			end
 		else
 			local detail = if okj and type(data) == "table" then str(data.error) else ""
 			detail = if detail ~= "" then detail else firstLine(res.stderr)
 			store.waitingError = if detail ~= "" then detail else "exit " .. res.status
 			tern.log.warn("codexbar: waiting tick failed", store.waitingError)
-			renderAll() -- the Waiting tab's warning line, or its empty state without a view
+			publishSummary()
+			renderAll() -- the warning line, or the Waiting tab's empty state without a view
 		end
-		store.waitingRaw = readWaiting(WAITING_FILE)
+		store.waitingRaw = readWaiting()
 		-- Another writer (the omp extension, tern-awui) may have written after the
 		-- tick's last transaction: the poll would take that change as seen, and a
 		-- window action it queued would wait for the next timed tick. Its view or
@@ -1581,7 +1658,7 @@ local function waitingTick()
 			for _, a in (if type(store.waitingActions) == "table" then store.waitingActions else {}) do
 				listed[str(a.id)] = true
 			end
-			local okr, state = pcall(tern.json.decode, store.waitingRaw)
+			local okr, state = pcall(tern.json.decode, readWaiting(WAITING_FILE))
 			for _, a in (if okr and type(state) == "table" then val(state.actions) else nil) or {} do
 				recheck = recheck or not listed[str(a.id)]
 			end
@@ -1725,7 +1802,7 @@ local function jobFinished(pane: number, status: number, exited: boolean)
 		return
 	end
 	local watched = type(store.waiting) == "table" and jobPanes(store.waiting)[pane] == true
-	if not watched and (store.waitingTicking or readWaiting(WAITING_FILE) ~= store.waitingRaw) then
+	if not watched and (store.waitingTicking or readWaiting() ~= store.waitingRaw) then
 		local okj, view = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
 		watched = okj and type(view) == "table" and jobPanes(view)[pane] == true
 	end
@@ -1766,8 +1843,9 @@ end
 -- process measured usage for two intervals, so it never adds requests while
 -- the applet runs; every fetch is a Claude OAuth call, and when that one is
 -- rate-limited the fetcher falls back to starting a Claude Code session.
--- `--min-interval` makes the fetcher's lock allow one fetch per interval
--- across every daemon and the applet; a refused one answers from the cache.
+-- `--min-interval` makes the fetcher's claim allow one fetch per provider per
+-- interval across every daemon and the applet; a provider claimed within it is
+-- answered from the cache.
 local function staleAfter(): number
 	return 2 * refreshSeconds()
 end
@@ -2000,7 +2078,7 @@ local function tick()
 			-- action. While another daemon ticks, the outbox is its business, but
 			-- the view it writes still names this daemon's job waits: reconcilePanes
 			-- and jobFinished read it, without a Python process.
-			local raw = if store.waitingTicking then nil else readWaiting(WAITING_FILE)
+			local raw = if store.waitingTicking then nil else readWaiting()
 			if raw ~= nil and raw ~= store.waitingRaw then
 				if store.waitingSkipped then
 					store.waitingRaw = raw
@@ -3182,38 +3260,21 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	return withp(ui.col(kids), { key = "peek-" .. rowKey, role = "codexbar.peek", gap = "sm" })
 end
 
--- A line above the groups while the waits may be out of date: the last tick
--- failed (this half saw it, or the CLI noted it in `health`), no tick finished
--- for 15 minutes (before the first tick: for 15 minutes since this half saw
--- the view so), or the session scan the ticks read is stale. Without one,
--- while another daemon ticks, a muted line says so. Without a view the empty
--- state tells the failure instead.
+-- A line above the groups while the waits may be out of date, the one every
+-- waits surface shows (publishSummary). Without one, while another daemon
+-- ticks, a muted line says so. Without a view the empty state tells the failure.
 local function waitingView(b: Block, now: number, into: { Node })
 	if not store.waiting and not store.waitingError then
 		table.insert(into, ui.node("skeleton", { key = "list", shape = "rows", rows = 8, aria = "Reading waits" }))
 		return
 	end
 	if store.waiting then
-		local health = val(store.waiting.health)
-		health = if type(health) == "table" then health else {}
-		local checked = epoch(val(health.checked_at))
-		local since = if checked then absoluteTime(checked, now) else "never"
-		-- One line, capped as the applet and omp cap it.
-		local err = string.match(oneLine(store.waitingError or val(health.error)), "^%s*(.-)%s*$")
-		local scan = epoch(val(health.agents_stale_since))
-		local last = checked or store.waitingUncheckedSince
-		local text, tone = nil, "warning"
-		if err ~= "" then
-			text, tone = "⚠️ Waits not checked since " .. since .. ": " .. clip(err, 120), "error"
-		elseif last and now - last > 15 * 60 then
-			text = "⚠️ Waits not checked since " .. since
-		elseif scan then
-			text = "⚠️ Session scan stale since " .. absoluteTime(scan, now)
-		elseif store.waitingSkipped then
-			text, tone = "Another Tern daemon checks these waits", "muted"
+		local line = store.waitingHealth
+		if not line and store.waitingSkipped then
+			line = { text = "Another Tern daemon checks these waits", tone = "muted" }
 		end
-		if text then
-			table.insert(into, withp(ui.text({ ui.span(text, tone) }), { key = "health", role = "codexbar.health" }))
+		if line then
+			table.insert(into, withp(ui.text({ ui.span(line.text, line.tone) }), { key = "health", role = "codexbar.health" }))
 		end
 	end
 	local q = string.lower(b.filter)
@@ -3852,7 +3913,7 @@ local SETTINGS_LEADS = {
 	usage = "Choose the details shown in the Usage tab. Changes save immediately.",
 	providers = "Choose which providers appear in usage and the widget bar. Credentials stay in ~/.codexbar/config.json.",
 	agents = "Choose which live agents and recently closed sessions appear.",
-	general = "The plugin reads the applet's usage cache. It fetches only after two refresh intervals without a measurement, at most once per interval across Tern daemons and the applet. A live Claude fetch may start a probe session when rate-limited.",
+	general = "The plugin reads the applet's usage cache. It fetches only after two refresh intervals without a measurement, each provider at most once per interval across Tern daemons and the applet. A live Claude fetch may start a probe session when rate-limited.",
 	about = "CodexBar AgentView brings provider usage and coding-agent sessions to KDE Plasma and Tern. It uses the upstream CodexBar CLI for usage data.",
 }
 local SETTINGS_ROWS: { any } = {
@@ -4256,6 +4317,7 @@ tern.timer(0, function()
 			local id = (string.gsub(string.match(res.stdout, "^%s*(.-)%s*$") or "", "%s+", "-"))
 			store.daemonId = if res.status == 0 and string.match(id, "^%d+%-%S") then id else nil
 			store.daemonKnown = true
+			publishSummary() -- one published meanwhile named no daemon
 		end)
 		if not started then -- else the callback says, whenever it runs
 			store.daemonKnown = true
