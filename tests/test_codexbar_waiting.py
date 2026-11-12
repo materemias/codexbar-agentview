@@ -4921,6 +4921,33 @@ class RetryTests(Case):
         self.assertEqual(self.session()["history"][-1]["text"], "Checks work again: PR")
 
 
+class AncestorDaemonTests(unittest.TestCase):
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.proc = Path(temporary.name)
+
+    def process(self, pid: int, parent: int, name: str, *argv: str) -> None:
+        folder = self.proc / str(pid)
+        folder.mkdir()
+        # Field 22, the start time, is the 20th after the name.
+        fields = ["S", str(parent), *["0"] * 17, f"{pid}00"]
+        (folder / "stat").write_text(f"{pid} ({name}) {' '.join(fields)} 0 0\n")
+        (folder / "cmdline").write_bytes(b"\0".join(part.encode() for part in argv) + b"\0")
+
+    def test_only_the_tern_daemon_counts_not_the_window_app(self) -> None:
+        self.process(80, 1, "tern", "/opt/tern/tern", "daemon", "--socket", "/run/t.sock")
+        self.process(90, 80, "tern", "/opt/tern/tern")  # the window app
+        self.process(100, 90, "python3", "python3", "codexbar_waiting.py")
+        self.assertEqual(waiting._daemon_above(100, self.proc), "80-8000")
+
+    def test_a_window_outside_the_daemon_names_none(self) -> None:
+        self.process(90, 1, "tern", "/opt/tern/tern")
+        self.process(95, 90, "tern", "/opt/tern/tern", "tray")
+        self.process(100, 95, "python3", "python3")
+        self.assertIsNone(waiting._daemon_above(100, self.proc))
+
+
 class DaemonTests(Case):
     def test_another_daemon_stands_aside_while_one_ticks(self) -> None:
         self.add("--kind", "later")

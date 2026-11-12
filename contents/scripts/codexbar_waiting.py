@@ -66,6 +66,7 @@ SETTLE_IDLE_S = 2 * 60
 # The sweep writes agents.json every few seconds: older than this, nobody sweeps.
 AGENTS_STALE_S = 2 * 60
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
+PROC = Path("/proc")
 # How long a menu request stands: a key press, not a wait. Later nobody is there.
 MENU_REQUEST_FRESH_S = 15
 CLOSED_RECORD_KEPT_S = 7 * 24 * 3600
@@ -1236,26 +1237,46 @@ def _ticking_daemon(state: dict) -> str | None:
     return (state.get("ticker") or {}).get("daemon")
 
 
+def _proc_stat(pid: int | str, proc: Path = PROC) -> tuple[str, int, str] | None:
+    """(name, parent pid, start time) of a process from /proc, or None."""
+    try:
+        stat = (proc / str(pid) / "stat").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    name_end = stat.rfind(")")
+    fields = stat[name_end + 2:].split()
+    try:
+        return stat[stat.find("(") + 1:name_end], int(fields[1]), fields[19]
+    except (IndexError, ValueError):
+        return None
+
+
+def _daemon_above(pid: int, proc: Path = PROC) -> str | None:
+    """The `tern daemon` process above `pid`, as `<pid>-<start time>`. Tern's
+    window app, tray, remote server and event listener are named `tern` too, and
+    a window's commands run under the app: only argv[1] `daemon` counts."""
+    while pid > 1:
+        stat = _proc_stat(pid, proc)
+        if stat is None:
+            return None
+        name, parent, start = stat
+        if name == "tern":
+            try:
+                argv = (proc / str(pid) / "cmdline").read_bytes().split(b"\0")
+            except OSError:
+                argv = []
+            if argv[1:2] == [b"daemon"]:
+                return f"{pid}-{start}"
+        pid = parent
+    return None
+
+
 @functools.lru_cache(maxsize=None)
 def _ancestor_daemon() -> str | None:
     """The Tern daemon this process runs under (a pane's command, or the host's
-    own), named as the host names it for `tick --daemon`: its pid and start time.
-    None outside Tern or without /proc."""
-    pid = os.getpid()
-    while pid > 1:
-        try:
-            stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return None
-        name_end = stat.rfind(")")
-        fields = stat[name_end + 2:].split()
-        if stat[stat.find("(") + 1:name_end] == "tern" and len(fields) > 19:
-            return f"{pid}-{fields[19]}"
-        try:
-            pid = int(fields[1])
-        except (IndexError, ValueError):
-            return None
-    return None
+    own), named as the host names it for `tick --daemon`. None outside Tern's
+    daemon or without /proc."""
+    return _daemon_above(os.getpid())
 
 
 def _creator_daemon(state: dict) -> str | None:
