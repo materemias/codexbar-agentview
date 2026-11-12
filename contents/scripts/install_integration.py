@@ -240,12 +240,16 @@ def remove_focus_url_handler() -> str:
 
 
 def _write_mimeapps(text: str) -> None:
-    """Replace the config atomically, following any user-owned symlink."""
+    """Replace the config atomically, following any user-owned symlink. A
+    new file gets the mode any program creating it would: 0666 less the
+    umask, so 0644 usually."""
     target = MIMEAPPS_FILE.resolve()
     try:
         mode = target.stat().st_mode & 0o7777
     except FileNotFoundError:
-        mode = 0o600
+        umask = os.umask(0)
+        os.umask(umask)
+        mode = 0o666 & ~umask
     temporary: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(

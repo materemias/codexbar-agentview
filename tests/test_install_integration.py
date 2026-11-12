@@ -265,6 +265,14 @@ class MimeappsReplacementTests(unittest.TestCase):
         self.assertEqual(os.readlink(config), original_link)
         self.assertEqual(list(target.parent.glob(".associations.list.*.tmp")), [])
 
+    def test_a_new_config_gets_the_umask_mode(self) -> None:
+        previous = os.umask(0o022)
+        self.addCleanup(os.umask, previous)
+        self.installer._set_mimeapps_default(self.installer.SCHEME_KEY, "new.desktop")
+        config = self.installer.MIMEAPPS_FILE
+        self.assertIn(f"{self.installer.SCHEME_KEY}=new.desktop;", config.read_text())
+        self.assertEqual(config.stat().st_mode & 0o7777, 0o644)
+
     def test_failed_replace_preserves_bytes_and_removes_temporary(self) -> None:
         config = self.installer.MIMEAPPS_FILE
         config.parent.mkdir(exist_ok=True)
