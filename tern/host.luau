@@ -1514,14 +1514,15 @@ local function waitingTick()
 	end
 	store.waitingTicking = true
 	store.waitingAgain = false
-	-- A leader window holds a lease (window.luau `lead`): only then can a resume
-	-- be carried out, so only then does the CLI count down to giving one up. A
-	-- lease runs LEASE_S = 30 s on os.clock(); one further out is from before a
+	-- A leader window holds a lease (window.luau `leading`): only then can a
+	-- resume be carried out, so only then does the CLI count down to giving one
+	-- up. A lease runs LEASE_S on os.clock(); one further out is from before a
 	-- reboot (or a wall-clock lease of an older build) and counts as none.
+	local LEASE_S = 30 -- window.luau's LEASE_S: change both together
 	local lease = tern.kv.get("waitingLeader")
 	local left = if type(lease) == "table" and type(lease.expires) == "number" then lease.expires - os.clock() else 0
 	local args = { "tick" }
-	if left > 0 and left <= 30 then
+	if left > 0 and left <= LEASE_S then
 		table.insert(args, "--window")
 	end
 	if store.daemonId then

@@ -27,7 +27,8 @@ local SCRIPTS = tern.plugin.dir .. "/../contents/scripts"
 -- The leader lease runs on os.clock(), Luau's seconds on the system's monotonic
 -- clock (not CPU time), as do the waits here: every VM on the machine, the host
 -- half's included, reads the same one, and the wall clock can't move it. Both
--- halves read a lease further out than LEASE_S as none.
+-- halves read a lease further out than LEASE_S as none; host.luau's
+-- waitingTick has its own LEASE_S: change both together.
 local LEASE_S = 30
 local CARD_ABOUT = "Session card of pane "
 
