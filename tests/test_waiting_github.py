@@ -1357,6 +1357,30 @@ class RateLimitTest(PollTestCase):
         self.assertTrue(result["fired"])
         self.assertEqual(result["fire_text"], "review from alice (changes requested): no")
 
+    def test_rest_ignores_reviews_older_than_graphqls_window(self) -> None:
+        reviews = [
+            {
+                "node_id": f"R{index}",
+                "state": "COMMENTED",
+                "body": "looks fine",
+                "commit_id": HEAD,
+                "user": {"login": "alice", "type": "User"},
+            }
+            for index in range(101)
+        ]
+        # A whole GraphQL poll saw R1..R100 and has since forgotten R0.
+        self.memo = {
+            "seen": [f"head:{HEAD}", *(f"c:R{index}" for index in range(1, 101))],
+            "baselined": True,
+            "rest_baselined": True,
+            "viewer": "me",
+        }
+        gh = FakeGh(remaining=100)
+        gh.rest_pr = self.rest()
+        gh.rest_reviews = reviews
+        result = self.poll(gh, until="activity")
+        self.assertEqual((result["fired"], result["events"]), (False, []))
+
 
 class VerifyFixTest(unittest.TestCase):
     def test_snapshot_shape(self) -> None:

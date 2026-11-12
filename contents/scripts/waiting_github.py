@@ -421,7 +421,10 @@ def _fetch_rest(repo: str, number: int, run: Run, viewer: str) -> Json:
     lines = _gh(
         run, ["api", "--paginate", f"repos/{repo}/pulls/{number}/reviews?per_page=100", "--jq", ".[]"]
     ).splitlines()
-    reviews = [_json(line, dict) for line in lines if line.strip()]
+    # GitHub lists reviews oldest first. Keep the last 100, the window the GraphQL
+    # query reads: a whole poll lets memo.seen forget reviews outside it, and REST
+    # must not bring those back as news.
+    reviews = [_json(line, dict) for line in lines if line.strip()][-100:]
     return {
         "full": False,
         "state": "MERGED" if merged else str(pr.get("state") or "").upper(),
