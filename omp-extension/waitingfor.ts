@@ -405,7 +405,8 @@ export function parseWait(input: string) {
 				const pr = prParts(ghText);
 				return { ...add("pr", [...pr.options, ...repeat], pr.sentence), needs: "pr", pr: pr.ref };
 			}
-			if (sub !== "release") return bad("until gh takes pr or release.");
+			// gh is taken, as check is: words for the agent to judge start with another word.
+			if (sub !== "release") return bad("until gh takes pr or release; words for the agent to judge can't start with gh.");
 			const release = releaseParts(ghText);
 			return { ...add("release", [...release.options, ...repeat], release.sentence), needs: release.needs };
 		}
