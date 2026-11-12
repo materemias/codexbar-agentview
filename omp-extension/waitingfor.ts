@@ -754,11 +754,12 @@ const CLOSE_NOTES = {
 
 /**
  * The menu's last step: the chosen `{park, close?}`, undefined on Esc. With `closeNote`, what brings the
- * session back, closing is offered first, but only while the agent is idle: closing mid-turn would cut it off.
+ * session back, closing is offered first, but only while `idle(c)` holds: closing mid-turn, or while omp
+ * retries, compacts or holds a queued message, would cut the turn off.
  * A check the agent is to write (`what`) closes once its turn wrote it.
  */
-async function askPark(c, closeNote?: string, what?: string) {
-	if (!closeNote || !c.isIdle()) return pick(c, "Park the session?", PARK_CHOICES);
+async function askPark(c, idle: (c) => boolean, closeNote?: string, what?: string) {
+	if (!closeNote || !idle(c)) return pick(c, "Park the session?", PARK_CHOICES);
 	const described = what !== undefined && !LITERAL_CHECK.test(what);
 	const description = described ? `${closeNote}; it closes once the agent wrote the command` : closeNote;
 	return pick(c, "Close or park the session?", [{ label: "Close the session", description, park: false, close: true }, ...PARK_CHOICES]);
@@ -831,8 +832,9 @@ const ENDS = [
  * The steps of the menu's items, keyed by the item ids of MENU_FILE, which holds their text.
  * `options` asks what the form needs and gives its CLI options; undefined ends the flow (Esc, or a
  * required line left empty). The sentence and the prompt come after it, unless the flow turns
- * them off; `closeNote` replaces the park step's own. `request` instead asks everything, the park
- * step included, and gives a request as parseWait does, with `close` when the user chose to close.
+ * them off; `closeNote` replaces the park step's own. `request(c, record, pr, idle)` instead asks
+ * everything, the park step included, and gives a request as parseWait does, with `close` when the
+ * user chose to close; `idle` is the guard askPark offers Close under.
  * Shell panes get Tern's own picker from the same file.
  */
 const FLOWS = {
@@ -844,7 +846,7 @@ const FLOWS = {
 		},
 	},
 	every: {
-		async request(c, record, pr) {
+		async request(c, record, pr, idle) {
 			const typed = await ask(c, "Repeat every? 30m, 2h, 1d", "1h");
 			if (!typed) return undefined;
 			const every = durationOf(typed);
@@ -859,7 +861,7 @@ const FLOWS = {
 			if (!prompt) throw new Error("Repeat a prompt needs the prompt to repeat.");
 			const sentence = await ask(c, SENTENCE_TITLE, record?.note ?? "");
 			if (sentence === undefined) return undefined;
-			const choice = await askPark(c, CLOSE_NOTES.repeat, ends.check);
+			const choice = await askPark(c, idle, CLOSE_NOTES.repeat, ends.check);
 			if (!choice) return undefined;
 			const repeat = [`--every=${every}`];
 			if (ends.check === undefined) {
@@ -895,14 +897,14 @@ const FLOWS = {
 		},
 	},
 	check: {
-		async request(c) {
+		async request(c, _record, _pr, idle) {
 			const what = await ask(c, CHECK_TITLE);
 			if (!what) return undefined;
 			const every = await ask(c, "Check every", CHECK_EVERY);
 			if (every === undefined) return undefined;
 			const prompt = await ask(c, PROMPT_TITLE);
 			if (prompt === undefined) return undefined;
-			const choice = await askPark(c, prompt ? CLOSE_NOTES.prompt : CLOSE_NOTES.quiet, what);
+			const choice = await askPark(c, idle, prompt ? CLOSE_NOTES.prompt : CLOSE_NOTES.quiet, what);
 			if (!choice) return undefined;
 			const request = checkRequest(what, { interval: durationOf(every) || CHECK_EVERY, prompt, park: choice.park, close: choice.close });
 			if (request.error) throw new Error(request.error);
@@ -910,10 +912,10 @@ const FLOWS = {
 		},
 	},
 	for: {
-		async request(c, record) {
+		async request(c, record, _pr, idle) {
 			const what = await ask(c, "What do you wait for? (empty: nothing any more)", record?.waiting_for ?? "");
 			if (what === undefined) return undefined;
-			const choice = what ? await askPark(c, CLOSE_NOTES.something) : PARK_CHOICES[1];
+			const choice = what ? await askPark(c, idle, CLOSE_NOTES.something) : PARK_CHOICES[1];
 			return choice ? { ...whatRequest(what, choice.park), close: choice.close } : undefined;
 		},
 	},
@@ -1470,7 +1472,7 @@ export default function (pi) {
 		if (sentence === undefined) return;
 		const prompt = flow.prompt === false ? "" : await ask(c, PROMPT_TITLE);
 		if (prompt === undefined) return;
-		const choice = await askPark(c, flow.closeNote ?? (prompt ? CLOSE_NOTES.prompt : CLOSE_NOTES.quiet));
+		const choice = await askPark(c, idle, flow.closeNote ?? (prompt ? CLOSE_NOTES.prompt : CLOSE_NOTES.quiet));
 		if (!choice) return;
 		const kind = flow.kind ? ["--kind", flow.kind] : [];
 		const answer = await act(c, [flow.command ?? "add", "--session", session, ...kind, ...options, ...userArgs(sentence, prompt, choice.park)]);
@@ -1502,7 +1504,7 @@ export default function (pi) {
 			if (!chosen.flow) await waitMenu(c, session, open);
 			else if (!chosen.flow.request) await setAside(c, session, chosen.flow, pr, record);
 			else {
-				const request = await chosen.flow.request(c, record, pr);
+				const request = await chosen.flow.request(c, record, pr, idle);
 				if (!request) return;
 				const answer = await perform(c, request, session);
 				if (request.close) await closeSession(c, session, answer);
