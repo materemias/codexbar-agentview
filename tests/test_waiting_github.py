@@ -210,8 +210,10 @@ class FakeGh:
         raise AssertionError(f"unexpected gh call: {args}")
 
 
-def release(tag: str, published: str, body: str = "", draft: bool = False) -> dict:
-    return {"tag_name": tag, "published_at": published, "body": body, "draft": draft}
+def release(tag: str, published: str, body: str = "", draft: bool = False,
+            prerelease: bool = False) -> dict:
+    return {"tag_name": tag, "published_at": published, "body": body, "draft": draft,
+            "prerelease": prerelease}
 
 
 class PollTestCase(unittest.TestCase):
@@ -1078,6 +1080,38 @@ class ReleasedTest(PollTestCase):
         gh.releases = [release("v1+build/x", "2026-11-02T00:00:00Z")]
         gh.compare = {"v1%2Bbuild/x": "ahead"}
         self.assertTrue(self.poll(gh, until="released")["fired"])
+
+    def test_a_prerelease_with_the_merge_is_news_not_the_release(self) -> None:
+        gh = FakeGh(pr_answer(state="MERGED"))
+        gh.releases = [
+            release("v2-rc2", "2026-11-03T00:00:00Z", prerelease=True),
+            release("v2-rc1", "2026-11-02T00:00:00Z", "#7", prerelease=True),
+        ]
+        gh.compare = {"v2-rc1": "ahead", "v2-rc2": "ahead"}
+        first = self.poll(gh, until="released")
+        self.assertFalse(first["fired"])
+        self.assertFalse(first["confirm"])
+        self.assertEqual(
+            [(event["key"], event["text"], event["on_me"]) for event in first["events"]],
+            [("prerelease:v2-rc1", "PR#7 is in prerelease v2-rc1; waiting for a release", False)],
+        )
+        second = self.poll(gh, until="released")
+        self.assertFalse(second["fired"])
+        self.assertEqual(second["events"], [])
+
+        gh.releases.insert(0, release("v2", "2026-11-04T00:00:00Z"))
+        gh.compare["v2"] = "ahead"
+        third = self.poll(gh, until="released")
+        self.assertTrue(third["fired"])
+        self.assertEqual(third["fire_text"], "PR#7 released in v2")
+
+    def test_a_prerelease_without_the_merge_says_nothing(self) -> None:
+        gh = FakeGh(pr_answer(state="MERGED"))
+        gh.releases = [release("v2-rc1", "2026-11-02T00:00:00Z", prerelease=True)]
+        gh.compare = {"v2-rc1": "behind"}
+        result = self.poll(gh, until="released")
+        self.assertFalse(result["fired"])
+        self.assertEqual(result["events"], [])
 
 
 class ErrorsTest(PollTestCase):

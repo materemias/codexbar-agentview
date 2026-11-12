@@ -794,6 +794,8 @@ def _check_release(
     compared = memo.setdefault("compared", {})
     reference = _reference(repo, number)
     to_confirm: tuple[str, str] | None = None
+    # A prerelease isn't the release: one with the merge is only news.
+    prerelease: str | None = None
     for release in candidates:
         tag = release["tag_name"]
         if tag not in compared:
@@ -805,12 +807,22 @@ def _check_release(
                     raise
                 compared[tag] = "unrelated"
         status = compared[tag]
+        if release.get("prerelease"):
+            if prerelease is None and status in ("ahead", "identical"):
+                prerelease = tag
+            continue
         if status in ("ahead", "identical"):
             result["fired"] = True
             result["fire_text"] = f"PR#{number} released in {tag}"
             return
         if to_confirm is None and reference.search(release.get("body") or ""):
             to_confirm = (tag, status)
+    if prerelease:
+        events.emit(
+            f"prerelease:{prerelease}",
+            f"PR#{number} is in prerelease {prerelease}; waiting for a release",
+            always=True,
+        )
     if to_confirm:
         tag, status = to_confirm
         result["confirm"] = True
