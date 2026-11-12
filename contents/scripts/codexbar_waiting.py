@@ -46,6 +46,8 @@ COMMAND_TIMEOUT_S = 60
 DEFAULT_INTERVAL_S = 15 * 60
 RELEASE_INTERVAL_S = 60 * 60
 PR_POLL_S = 3 * 60
+# A wait that check errors put on me is tried again this often, silently.
+RETRY_DEAD_S = 60 * 60
 # How long GitHub or a release check may stay unreachable before the wait says so.
 TRANSIENT_REPORT_S = 60 * 60
 # How long a claimed check stays with the process that claimed it. A tick takes
@@ -1223,6 +1225,8 @@ def _new_wait(state: dict, now: datetime, **fields: object) -> dict:
         "snoozed_from": None, "repeat": None,
         # Since when checks fail for a reason that passes (`_note_transient`).
         "transient_since": None, "transient_logged": False,
+        # What `retry` restores of a wait check errors put on me (`_attention`).
+        "retry_as": None,
     }
     wait.update(fields)
     return wait
@@ -1447,9 +1451,18 @@ def _run_over(state: dict, record: dict, entry: dict, now: datetime) -> None:
         repeat["next_at"] = _iso(now + timedelta(seconds=repeat["every_s"]))
 
 
-def _attention(state: dict, record: dict, wait: dict, now: datetime, reason: str) -> None:
+def _attention(
+    state: dict, record: dict, wait: dict, now: datetime, reason: str, retry_as: str | None = None,
+) -> None:
+    """`retry_as` is "check" or "verify" when check errors brought it here: then
+    `retry` can put it back, and `_claim_checks` tries it again now and then.
+    "internal" (`_quarantine`) only `retry` puts back."""
     wait["state"] = "needs_attention"
-    wait.update(reason=reason, on_me=False, verify_pending=False)
+    wait.update(reason=reason, on_me=False, verify_pending=False, retry_as=retry_as)
+    if retry_as == "check":
+        wait["next_check_at"] = _iso(now + timedelta(seconds=RETRY_DEAD_S))
+    elif retry_as == "verify":
+        wait["verify_claim_until"] = _iso(now + timedelta(seconds=RETRY_DEAD_S))
     _touch(wait)
     _cancel_prompts(record, wait)
     _log(record, now, wait, reason, "attention")
@@ -1470,6 +1483,8 @@ def _flag_on_me(
 
 
 INTERNAL_ERROR = "internal error: "
+# The `retry_as` kinds `_claim_checks` tries again hourly; "internal" waits for `retry`.
+CHECK_RETRIES = ("check", "verify")
 # The time fields `_quarantine` clears when they don't parse, so the record can
 # still be shown.
 _WAIT_TIMES = ("deadline", "refire_at", "next_check_at", "verify_claim_until", "armed_at", "fired_at")
@@ -1498,10 +1513,14 @@ def _quarantine(state: dict, record: dict, now: datetime, error: Exception) -> N
                 _stamp(wait.get(key))
             except Exception:
                 wait[key] = None
+        # What `retry` puts it back to (`_rearm`).
+        wait["quarantined"] = {
+            key: wait.get(key) for key in ("state", "reason", "on_me", "verify_pending", "retry_as")
+        }
         try:
-            _attention(state, record, wait, now, reason)
+            _attention(state, record, wait, now, reason, retry_as="internal")
         except Exception:  # the record is too broken for its prompts to be cancelled
-            wait.update(state="needs_attention", reason=reason, on_me=False)
+            wait.update(state="needs_attention", reason=reason, on_me=False, retry_as="internal")
             with contextlib.suppress(Exception):
                 _log(record, now, wait, reason, "attention")
 
@@ -1830,7 +1849,11 @@ def _run_verify(job: dict) -> dict:
         reason = "verify command holds" if result["holds"] else (
             result["error"] or "verify command does not hold"
         )
-        return {"ok": result["holds"], "reason": reason, "transient": False}
+        # An error is a command that couldn't run or be judged, not a "no".
+        return {
+            "ok": result["holds"], "reason": reason, "error": bool(result["error"]),
+            "transient": False,
+        }
     github = _github()
     if verify["type"] == "pr_fix":
         try:
@@ -1838,7 +1861,7 @@ def _run_verify(job: dict) -> dict:
         except Exception as error:  # a check that couldn't run, not a failed fix
             # Only GitHub's own failures pass; anything else is a bug that stays.
             return {
-                "ok": False, "reason": str(error) or type(error).__name__,
+                "ok": False, "reason": str(error) or type(error).__name__, "error": True,
                 "transient": isinstance(error, github.GhError) and bool(error.transient),
             }
         return {"ok": ok, "reason": reason, "transient": False}
@@ -1846,7 +1869,7 @@ def _run_verify(job: dict) -> dict:
     memo = polled.get("memo", job["memo"])
     if polled.get("error"):
         return {
-            "ok": False, "reason": polled["error"], "memo": memo,
+            "ok": False, "reason": polled["error"], "memo": memo, "error": True,
             "transient": bool(polled.get("transient")),
         }
     held = bool(polled.get("fired"))
@@ -1876,7 +1899,7 @@ def _run_job(job: dict, now: datetime) -> dict:
         return {**job, "result": result}
     except Exception as error:
         if job["type"] == "verify":
-            result = {"ok": False, "reason": _error_line(error), "transient": False}
+            result = {"ok": False, "reason": _error_line(error), "transient": False, "error": True}
         else:
             result = {"error": _error_line(error), "transient": False, "holds": False}
         return {**job, "result": result}
@@ -1898,6 +1921,32 @@ def _verify_job(wait: dict, now: datetime) -> dict:
     }
 
 
+def _check_job(wait: dict, now: datetime, recheck: bool = False) -> dict:
+    _touch(wait)
+    job = {"wait": wait["id"], "rev": wait["rev"], "condition": wait["condition"]}
+    if wait["kind"] == "command":
+        job["type"] = "command"
+        interval = wait["condition"]["interval_s"]
+    else:
+        job.update(type="recheck" if recheck else "pr", memo=wait["memo"], fix=wait["fix"])
+        interval = PR_POLL_S
+    # The result sets the real next check; this only holds the claim.
+    claim = max(interval, CHECK_CLAIM_S)
+    wait["next_check_at"] = _iso(now + timedelta(seconds=claim))
+    return job
+
+
+def _retry_job(wait: dict, now: datetime) -> dict:
+    """The hourly try of a wait check errors put on me (`_apply_retry`)."""
+    if wait["retry_as"] == "verify":
+        job = _verify_job(wait, now)
+        wait["verify_claim_until"] = _iso(now + timedelta(seconds=RETRY_DEAD_S))
+    else:
+        job = _check_job(wait, now)
+        wait["next_check_at"] = _iso(now + timedelta(seconds=RETRY_DEAD_S))
+    return {**job, "retry": True}
+
+
 def _claim_checks(state: dict, now: datetime) -> list[dict]:
     """Take the due checks out of the next tick's way before running them."""
     jobs = []
@@ -1907,6 +1956,11 @@ def _claim_checks(state: dict, now: datetime) -> list[dict]:
             for wait in record["waits"]:
                 if len(jobs) >= MAX_CHECKS_PER_TICK:
                     return jobs
+                if wait["state"] == "needs_attention" and wait.get("retry_as"):
+                    due = wait["verify_claim_until" if wait["retry_as"] == "verify" else "next_check_at"]
+                    if wait["retry_as"] in CHECK_RETRIES and (_stamp(due) or 0) <= stamp:
+                        jobs.append(_retry_job(wait, now))
+                    continue
                 if wait["state"] == "acting" and wait["verify_pending"]:
                     if (_stamp(wait["verify_claim_until"]) or 0) <= stamp:
                         jobs.append(_verify_job(wait, now))
@@ -1916,18 +1970,7 @@ def _claim_checks(state: dict, now: datetime) -> list[dict]:
                     continue
                 if (_stamp(wait["next_check_at"]) or 0) > stamp:
                     continue
-                _touch(wait)
-                job = {"wait": wait["id"], "rev": wait["rev"], "condition": wait["condition"]}
-                if wait["kind"] == "command":
-                    job["type"] = "command"
-                    interval = wait["condition"]["interval_s"]
-                else:
-                    job.update(type="recheck" if recheck else "pr", memo=wait["memo"], fix=wait["fix"])
-                    interval = PR_POLL_S
-                # The result sets the real next check; this only holds the claim.
-                claim = max(interval, CHECK_CLAIM_S)
-                wait["next_check_at"] = _iso(now + timedelta(seconds=claim))
-                jobs.append(job)
+                jobs.append(_check_job(wait, now, recheck))
     return jobs
 
 
@@ -1957,6 +2000,41 @@ def _checks_work(wait: dict) -> None:
     wait.update(transient_since=None, transient_logged=False)
 
 
+def _rearm(wait: dict, now: datetime) -> None:
+    """Back from check errors to what failed: its checks, or its verification.
+    A quarantined wait goes back to what it was; if its record still raises, it
+    is quarantined again."""
+    if wait["retry_as"] == "internal":
+        _unquarantine(wait, now)
+        _touch(wait)
+        return
+    if wait["retry_as"] == "verify":
+        wait.update(state="acting", verify_pending=True, verify_claim_until=None)
+    else:
+        wait.update(state="waiting", errors=0, next_check_at=_iso(now))
+    wait.update(on_me=False, reason=None, retry_as=None)
+    _checks_work(wait)
+    _touch(wait)
+
+
+def _unquarantine(wait: dict, now: datetime) -> None:
+    before = wait.pop("quarantined", None) or {"state": "waiting"}
+    wait.update(
+        state=before["state"], reason=before.get("reason"), on_me=bool(before.get("on_me")),
+        verify_pending=bool(before.get("verify_pending")), retry_as=before.get("retry_as"),
+        errors=0,
+    )
+    if wait["state"] == "acting" and not wait["verify_pending"]:
+        # The quarantine cancelled its prompt: whatever ran is mine to look at.
+        wait.update(state="review", reason=REASON_REVIEW)
+    elif wait["state"] == "acting":
+        wait["verify_claim_until"] = None
+    elif wait["state"] == "snoozed" and wait.get("refire_at") is None:
+        wait["refire_at"] = _iso(now)  # cleared as unreadable: it comes back now
+    elif wait["state"] == "waiting" and wait["kind"] in ("command", "pr"):
+        wait["next_check_at"] = _iso(now)
+
+
 def _apply_command(state: dict, record: dict, wait: dict, result: dict, now: datetime) -> None:
     wait["next_check_at"] = _iso(now + timedelta(seconds=wait["condition"]["interval_s"]))
     if result.get("transient"):
@@ -1965,7 +2043,10 @@ def _apply_command(state: dict, record: dict, wait: dict, result: dict, now: dat
     if result["error"]:
         wait["errors"] += 1
         if wait["errors"] >= MAX_ERRORS:
-            _attention(state, record, wait, now, f"Command failed {MAX_ERRORS} times: {result['error']}")
+            _attention(
+                state, record, wait, now, f"Command failed {MAX_ERRORS} times: {result['error']}",
+                retry_as="check",
+            )
         return
     _checks_work(wait)
     wait["errors"] = 0
@@ -2121,7 +2202,10 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
             return
         wait["errors"] += 1
         if wait["errors"] >= MAX_ERRORS:
-            _attention(state, record, wait, now, f"GitHub failed {MAX_ERRORS} times: {error}")
+            _attention(
+                state, record, wait, now, f"GitHub failed {MAX_ERRORS} times: {error}",
+                retry_as="check",
+            )
         return
     _checks_work(wait)
     wait["errors"] = 0
@@ -2149,7 +2233,43 @@ def _apply_verify(state: dict, record: dict, wait: dict, result: dict, now: date
         _toast(state, record, wait, now, "success", wait["label"])
         _complete(state, record, wait, now)
     else:
-        _attention(state, record, wait, now, result["reason"])
+        # A check that couldn't run can run again; a fix that didn't hold can't.
+        retry_as = "verify" if result.get("error") else None
+        _attention(state, record, wait, now, result["reason"], retry_as=retry_as)
+
+
+def _apply_retry(state: dict, record: dict, wait: dict, job: dict, now: datetime) -> None:
+    """The hourly try of a wait check errors put on me: a failure changes nothing
+    (its next try is claimed already); a success takes it back from me and
+    counts like any other result."""
+    result = job["result"]
+    if job["type"] == "verify":
+        if result["transient"] or result.get("error"):
+            wait["verify_memo"] = result.get("memo", wait["verify_memo"])
+            return
+    elif result.get("error"):
+        if job["type"] == "pr":
+            wait["memo"] = result.get("memo", wait["memo"])
+        return
+    _rearm(wait, now)
+    _log(record, now, wait, f"Checks work again: {wait['label']}")
+    _apply_result(state, record, wait, job, now)
+
+
+def _apply_result(state: dict, record: dict, wait: dict, job: dict, now: datetime) -> None:
+    apply = {
+        "verify": _apply_verify, "recheck": _apply_recheck, "command": _apply_command,
+    }.get(job["type"], _apply_poll)
+    apply(state, record, wait, job["result"], now)
+
+
+def _awaits(wait: dict, job: dict) -> bool:
+    """Whether the wait is still where this kind of result applies."""
+    if job["type"] == "verify":
+        return wait["state"] == "acting" and wait["verify_pending"]
+    if job["type"] == "recheck":
+        return _revocable(wait)
+    return wait["state"] == "waiting"
 
 
 def _merge(state: dict, finished: list[dict], now: datetime) -> None:
@@ -2160,15 +2280,13 @@ def _merge(state: dict, finished: list[dict], now: datetime) -> None:
             continue
         record, wait = found
         with _isolated(state, record, now):
-            if job["type"] == "verify":
-                if wait["rev"] == job["rev"] and wait["state"] == "acting" and wait["verify_pending"]:
-                    _apply_verify(state, record, wait, job["result"], now)
-            elif job["type"] == "recheck":
-                if wait["rev"] == job["rev"] and _revocable(wait):
-                    _apply_recheck(state, record, wait, job["result"], now)
-            elif wait["rev"] == job["rev"] and wait["state"] == "waiting":
-                apply = _apply_command if job["type"] == "command" else _apply_poll
-                apply(state, record, wait, job["result"], now)
+            if wait["rev"] != job["rev"]:
+                continue
+            if job.get("retry"):
+                if wait["state"] == "needs_attention" and wait.get("retry_as") in CHECK_RETRIES:
+                    _apply_retry(state, record, wait, job, now)
+            elif _awaits(wait, job):
+                _apply_result(state, record, wait, job, now)
 
 
 def _pane_closed(state: dict, pane: int, now: datetime) -> None:
@@ -2291,7 +2409,7 @@ def _unsnooze(state: dict, record: dict, wait: dict, now: datetime) -> None:
     back = wait["snoozed_from"]
     wait.update(state=back, snoozed_from=None, refire_at=None)
     if back == "needs_attention":
-        _attention(state, record, wait, now, wait["reason"])
+        _attention(state, record, wait, now, wait["reason"], retry_as=wait.get("retry_as"))
     elif back == "review":
         wait["reason"] = REASON_REVIEW
         _touch(wait)
@@ -2560,6 +2678,8 @@ def _wait_view(wait: dict, now: datetime) -> dict:
         if fulfilled else None,
         "fired_at": (wait.get("fired_at") or wait["created_at"]) if fulfilled else None,
         "progress": _progress(wait, outcome, now),
+        # Check errors put it on me, and `retry` can put it back.
+        "retryable": wait["state"] == "needs_attention" and bool(wait.get("retry_as")),
         "reason": wait["reason"], "created_at": wait["created_at"],
         "due_at": None if due is None else _iso(datetime.fromtimestamp(due).astimezone()),
         "deadline": wait["deadline"], "condition": wait["condition"],
@@ -3567,6 +3687,24 @@ def cmd_snooze(args: argparse.Namespace) -> dict:
     return _mutate(apply)
 
 
+def cmd_retry(args: argparse.Namespace) -> dict:
+    """Retry now: a wait check errors put on me goes back to its checks, or its
+    verification, and the next tick runs them; a quarantined one goes back to
+    what it was."""
+    session, pane = _target(args)
+
+    def apply(state: dict, now: datetime) -> dict:
+        record = _lookup(state, session, pane)
+        wait = _target_wait(record, args.wait)
+        if wait["state"] != "needs_attention" or not wait.get("retry_as"):
+            raise BadInput(f"{args.wait} did not stop on failed checks or an internal error")
+        _rearm(wait, now)
+        _log(record, now, wait, f"Retry: {wait['label']}")
+        return {}
+
+    return _mutate(apply)
+
+
 def cmd_end_repeat(args: argparse.Namespace) -> dict:
     """The agent saw the repeat's `until` hold: the wait fires, with no prompt."""
     reason = _text(args.reason)
@@ -4139,6 +4277,10 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--every")
     add.add_argument("--for", dest="for_")
     add.add_argument("--times", type=int)
+
+    retry = command("retry", cmd_retry)
+    _add_target(retry)
+    retry.add_argument("--wait", required=True)
 
     end_repeat = command("end-repeat", cmd_end_repeat)
     end_repeat.add_argument("--session", type=_session_arg, required=True)

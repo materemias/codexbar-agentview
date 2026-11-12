@@ -1277,10 +1277,12 @@ end
 -- The wait Snooze 1d pushes: one on me first, then the earliest due. It skips the
 -- ones `snooze` refuses for their kind or state (not started, done, my-time
 -- ones, a job still running in time), so a new kind needs no change here; the
--- CLI also refuses one whose prompt the agent runs now. (Inline: the main chunk
--- is at Luau's 200-local limit.)
-local function firstDue(r: any): any
-	local first, at, onMe = nil, math.huge, false
+-- CLI also refuses one whose prompt the agent runs now. Second, the wait Retry
+-- checks again: one the CLI put on me after its checks kept failing
+-- (`retryable`), which nothing polls until then. (Inline, and one function for
+-- both: the main chunk is at Luau's 200-local limit.)
+local function firstDue(r: any): (any, any)
+	local first, at, onMe, retry = nil, math.huge, false, nil
 	for _, w in val(r.waits) or {} do
 		local snoozable = w.state ~= "pending" and w.state ~= "done" and w.kind ~= "later"
 			and not (w.kind == "job" and w.state == "waiting" and val(w.overdue) ~= true)
@@ -1291,8 +1293,11 @@ local function firstDue(r: any): any
 				first, at, onMe = w, due, mine
 			end
 		end
+		if not retry and val(w.retryable) == true then
+			retry = w
+		end
 	end
-	return first
+	return first, retry
 end
 
 -- Per Tern pane, what the window half needs: the status segment, the session
@@ -1301,7 +1306,7 @@ local function waitingPanes(): { [string]: any }
 	local panes: { [string]: any } = {}
 	local function add(pane: number?, r: any, session: string?, record: boolean)
 		if pane then
-			local wait = firstDue(r)
+			local wait, retry = firstDue(r)
 			panes[tostring(pane)] = {
 				text = str(r.status),
 				on_me = r.ball == "on_me",
@@ -1310,6 +1315,7 @@ local function waitingPanes(): { [string]: any }
 				session = session,
 				record = record,
 				wait = if wait then str(wait.id) else nil,
+				retry = if retry then str(retry.id) else nil,
 			}
 		end
 	end
@@ -3012,9 +3018,13 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 		local busy = b.busy == rowKey or (b.launched[rowKey] ~= nil and os.time() - b.launched[rowKey] < 60)
 		table.insert(buttons, button("Resume", "wait_open", { variant = "primary", keys = { "enter" }, busy = busy }))
 	end
+	local due, retry = firstDue(r)
+	if retry then -- any of the row's waits, not only the one its headline tells: each is a dead end without it
+		table.insert(buttons, button("Retry", "wait_retry", { icon = "repeat", keys = { "f5" }, title = "Check “" .. oneLine(retry.label) .. "” again now" }))
+	end
 	table.insert(buttons, button("Snooze 1d", "wait_snooze", {
 		keys = if b.filter == "" then { "+" } else nil,
-		disabled = if firstDue(r) then false else "Nothing to snooze",
+		disabled = if due then false else "Nothing to snooze",
 	}))
 	table.insert(buttons, button("Done", "wait_done", { keys = { "del" } }))
 	if cardPane(r, true) then
@@ -3199,6 +3209,10 @@ local function dockView(b: Block, now: number): Node
 			table.insert(hints, ui.span("\u{a0}done   ", "dim"))
 			table.insert(hints, key("f2"))
 			table.insert(hints, ui.span("\u{a0}waiting\u{a0}for   ", "dim"))
+			if row and row.waiting and select(2, firstDue(row.record)) then
+				table.insert(hints, key("f5"))
+				table.insert(hints, ui.span("\u{a0}retry   ", "dim"))
+			end
 		elseif b.tab == "history" then
 			table.insert(hints, key("del"))
 			table.insert(hints, ui.span("\u{a0}dismiss   ", "dim"))
@@ -3452,6 +3466,11 @@ local function waitingAct(b: Block, name: string, r: any)
 		if wait then
 			waitingRun(b.cx, "snooze", waitArgs("snooze", r, { "--wait", str(wait.id), "--for", "1d" }))
 		end
+	elseif name == "wait_retry" then
+		local _, wait = firstDue(r)
+		if wait then
+			waitingRun(b.cx, "retry", waitArgs("retry", r, { "--wait", str(wait.id) }))
+		end
 	elseif name == "wait_accept" then
 		waitingRun(b.cx, "accept note", waitArgs("note", r, { "--accept-suggested" }))
 	elseif name == "wait_card" then
@@ -3661,6 +3680,8 @@ tern.block.define("dashboard", {
 			act(b, "wait_snooze")
 		elseif name == "f2" and b.tab == "waiting" then
 			act(b, "wait_what")
+		elseif name == "f5" and b.tab == "waiting" then
+			act(b, "wait_retry")
 		elseif name == "backspace" then
 			if b.filter == "" then
 				return false

@@ -1970,7 +1970,7 @@ class ViewTests(Case):
             {
                 "id", "kind", "label", "summary", "state", "ball", "overdue", "outcome",
                 "fired_text", "fired_at", "progress", "mark", "reason", "created_at", "due_at", "deadline",
-                "condition", "has_prompt", "next", "by", "repeat",
+                "condition", "has_prompt", "next", "by", "repeat", "retryable",
             },
         )
         seen = self.session()
@@ -4610,6 +4610,29 @@ class IsolationTests(Case):
         self.assertEqual(len(self.session()["history"]), lines)
         self.assertEqual(self.wait_of(wait)["reason"], "internal error: RuntimeError: try 0")
 
+    def test_retry_puts_a_quarantined_wait_back_and_a_new_failure_comes_back_once(self) -> None:
+        argv = json.dumps([sys.executable, "-c", "raise SystemExit(1)"])
+        wait = self.add("--kind", "command", "--argv", argv)["id"]
+        failing = mock.patch.object(waiting, "_evaluate_record", side_effect=RuntimeError("boom"))
+        with failing:
+            self.tick()
+        self.assertTrue(self.wait_of(wait)["retryable"])
+        with failing:
+            self.tick_through(hours=2)  # no hourly retry: only `retry` puts it back
+        self.assertEqual(self.wait_of(wait)["state"], "needs_attention")
+        self.run_cli("retry", "--session", SID, "--wait", wait)
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["reason"], seen["retryable"]), ("waiting", None, False))
+        with failing:
+            self.tick()
+            lines = len(self.session()["history"])
+            self.tick_through(minutes=10)
+        self.assertEqual(self.wait_of(wait)["reason"], "internal error: RuntimeError: boom")
+        self.assertEqual(len(self.session()["history"]), lines)
+        self.run_cli("retry", "--session", SID, "--wait", wait)
+        self.tick()
+        self.assertEqual(self.wait_of(wait)["state"], "waiting")
+
     def test_a_record_that_keeps_failing_says_so_once(self) -> None:
         self.agents(OTHER)
         wait = self.add("--kind", "later", session=OTHER)["id"]
@@ -4776,6 +4799,81 @@ class TransientTests(Case):
             (seen["state"], seen["progress"]),
             ("waiting", f"{Path(sys.executable).name} failing since 12:05"),
         )
+
+    def test_a_verify_command_that_cant_run_can_be_retried(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        verify = json.dumps({"type": "command", "argv": [str(self.root / "missing")]})
+        wait, _ = self.queued_prompt("--verify", verify)
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.tick()
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["retryable"]), ("needs_attention", True))
+
+    def test_a_bug_in_a_fix_check_is_no_outage(self) -> None:
+        reads = iter(["bug", "ok"])
+
+        def verify_fix(repo, number, before):
+            if next(reads) == "bug":
+                raise KeyError("head")
+            return True, "new head"
+
+        first = PrTests.fix_chain(self, verify_fix)
+        action = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]["action"]
+        self.run_cli("ack", "--action", action, "--result", "delivered")
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.tick()
+        seen = self.wait_of(first)
+        self.assertEqual((seen["state"], seen["retryable"]), ("needs_attention", True))
+        self.run_cli("retry", "--session", SID, "--wait", first)
+        self.assertEqual(self.wait_of(first)["state"], "acting")
+        self.tick()
+        self.assertEqual(self.session()["waits"][0]["label"], "Ready")
+
+
+class RetryTests(Case):
+    def setUp(self) -> None:
+        super().setUp()
+        self.down = True
+        self.polls = 0
+
+        def poll(cond, memo, **kwargs):
+            self.polls += 1
+            return poll_result(memo, error="HTTP 401: Bad credentials") if self.down else poll_result(memo)
+
+        self.github(poll=poll)
+        self.wait = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--label", "PR")["id"]
+        for _ in range(waiting.MAX_ERRORS):
+            self.tick()
+            self.advance(minutes=4)
+        self.assertEqual(self.wait_of(self.wait)["state"], "needs_attention")
+
+    def test_retry_puts_it_back_to_its_checks(self) -> None:
+        self.assertTrue(self.wait_of(self.wait)["retryable"])
+        other = self.add("--kind", "later")["id"]
+        self.run_cli("retry", "--session", SID, "--wait", other, expect=2)
+        self.down = False
+        self.run_cli("retry", "--session", SID, "--wait", self.wait)
+        seen = self.wait_of(self.wait)
+        self.assertEqual((seen["state"], seen["ball"], seen["retryable"]), ("waiting", "on_machine", False))
+        self.assertEqual(self.session()["history"][-1]["text"], "Retry: PR")
+        polls = self.polls
+        self.tick()
+        self.assertEqual((self.polls, self.wait_of(self.wait)["state"]), (polls + 1, "waiting"))
+
+    def test_it_is_tried_again_hourly_and_comes_back_when_that_works(self) -> None:
+        polls, lines = self.polls, len(self.session()["history"])
+        self.tick_through(minutes=50)
+        self.assertEqual(self.polls, polls)
+        self.tick_through(minutes=10)
+        self.assertEqual(self.polls, polls + 1)
+        self.assertEqual(len(self.session()["history"]), lines)  # still down: nothing to say
+        self.assertEqual(self.wait_of(self.wait)["state"], "needs_attention")
+        self.down = False
+        self.tick_through(minutes=60)
+        seen = self.wait_of(self.wait)
+        self.assertEqual((seen["state"], seen["ball"]), ("waiting", "on_machine"))
+        self.assertEqual(self.session()["history"][-1]["text"], "Checks work again: PR")
 
 
 if __name__ == "__main__":

@@ -936,9 +936,10 @@ local function cardTitle(cx: WindowCx, pane: number, r: any): string
 	return clipped(if type(title) == "string" and title ~= "" then title else "Session", 70)
 end
 
--- Done and Snooze 1d need waits of a record, and Snooze 1d one that snoozing moves.
--- Both act on the pane's entry, so it has to be the card's session: a link can
--- name one the agents scan has not mapped to the pane yet.
+-- Done, Retry and Snooze 1d need waits of a record; Retry one whose checks kept
+-- failing, Snooze 1d one that snoozing moves. They act on the pane's entry, so it
+-- has to be the card's session: a link can name one the agents scan has not
+-- mapped to the pane yet.
 local function cardDock(pane: number, r: any): Node
 	local function act(text: string, name: string, variant: string?): Node
 		return ui.button(text, { key = name, size = "sm", variant = variant, actions = { click = name } })
@@ -947,6 +948,9 @@ local function cardDock(pane: number, r: any): Node
 	local entry = waitingEntry(pane)
 	if entry and entry.session == r.session_id and r.has_record ~= false and type(r.waits) == "table" and #r.waits > 0 then
 		table.insert(kids, act("Done", "card_done", "primary"))
+		if entry.retry then
+			table.insert(kids, act("Retry", "card_retry"))
+		end
 		if entry.wait then
 			table.insert(kids, act("Snooze 1d", "card_snooze"))
 		end
@@ -990,7 +994,8 @@ local function openCard(cx: WindowCx, pane: number, known: string?)
 		view = cardView(cx, pane, shown, session ~= nil),
 		dock = cardDock(pane, shown),
 		about = CARD_ABOUT .. pane .. (if session then " for session " .. session else "")
-			.. ". Done, when shown, ends what's on you, Snooze 1d, when shown, pushes the first due one by a day, Close only closes this card.",
+			.. ". Done, when shown, ends what's on you, Retry, when shown, checks a failed wait again,"
+			.. " Snooze 1d, when shown, pushes the first due one by a day, Close only closes this card.",
 		how = "beside",
 		target = pane,
 		focus = false,
@@ -1190,6 +1195,8 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 	end
 	if entry and ev.act == "card_done" then
 		waitingSend("done", targetArgs("done", pane, entry.session))
+	elseif entry and ev.act == "card_retry" and entry.retry then
+		waitingSend("retry", targetArgs("retry", pane, entry.session, { "--wait", entry.retry }))
 	elseif entry and ev.act == "card_snooze" and entry.wait then
 		waitingSend("snooze", targetArgs("snooze", pane, entry.session, { "--wait", entry.wait, "--for", "1d" }))
 	end

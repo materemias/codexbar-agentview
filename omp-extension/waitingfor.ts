@@ -1326,9 +1326,12 @@ export default function (pi) {
 		const items = open.map((wait) => ({ label: `${wait.id}  ${wait.label}`, description: waitFacts(wait), wait }));
 		const chosen = await pick(c, "This session's waits", items);
 		if (!chosen) return;
-		const { id, state, kind } = chosen.wait;
-		const action = await c.ui.select(chosen.label, ["Done", ...(state === "pending" || kind === "later" ? [] : ["Snooze 1d"]), "Back"]);
-		if (action === "Done") await act(c, ["done", "--session", session, `--wait=${id}`]);
+		const { id, state, kind, retryable } = chosen.wait;
+		// Retry comes first for a wait that check errors stopped: after fixing the cause it is the step to take.
+		const actions = [...(retryable ? ["Retry"] : []), "Done", ...(state === "pending" || kind === "later" ? [] : ["Snooze 1d"]), "Back"];
+		const action = await c.ui.select(chosen.label, actions);
+		if (action === "Retry") await act(c, ["retry", "--session", session, `--wait=${id}`]);
+		else if (action === "Done") await act(c, ["done", "--session", session, `--wait=${id}`]);
 		else if (action === "Snooze 1d") await act(c, ["snooze", "--session", session, `--wait=${id}`, "--for", "1d"]);
 	}
 
@@ -1483,7 +1486,9 @@ export default function (pi) {
 			const first = pr && prItem ? [{ ...prItem, description: prItem.description.replace("gh pr", `gh pr ${short}`) }] : [];
 			const items = [
 				...first,
-				...(open.length > 0 ? [{ label: `This session's waits (${open.length})`, description: "done or one more day" }] : []),
+				...(open.length > 0
+					? [{ label: `This session's waits (${open.length})`, description: open.some((wait) => wait.retryable) ? "retry, done or one more day" : "done or one more day" }]
+					: []),
 				...MENU.items.filter((item) => first.length === 0 || item !== prItem),
 			];
 			const chosen = await pick(c, "What does this wait for?", items);

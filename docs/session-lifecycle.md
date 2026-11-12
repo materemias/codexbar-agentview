@@ -260,6 +260,7 @@ closed and the merged step fires at once.
 | `Shift+Enter` | the session card |
 | `+` | Snooze 1d (below) |
 | `F2` | Manual wait…: edit the free-text wait |
+| `F5` | Retry a wait its failing checks stopped (when shown) |
 | `Delete` | Done |
 
 A row shows what the session waits for in your words when it has a manual wait

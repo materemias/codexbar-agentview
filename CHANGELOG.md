@@ -20,6 +20,7 @@
 - A session card floats over any omp session in Tern (`Ctrl+Alt+I`, a click on the row above the composer or on the status segment, or the Card buttons, `Shift+Enter`) with your sentence, folder, branch, model, the pull requests it waits on or created and, apart, the ones only mentioned, waits, what happened since you set it aside with times, and omp's recap with its time ("Earlier recap" when the session moved on since); it opens by itself the first time you focus a session whose wait fired. The row above the composer underlines under the pointer. Outside Tern, `Ctrl+Alt+I` shows the same details above the composer. A status line segment and a colored tab show sessions back on you.
 - The Plasma widget's new Settings → Agents → Tern integration switch marks set-aside sessions in Agents and counts the ones back on you beside the panel dots.
 - `Ctrl+Alt+H` toggles the Tern dashboard on History.
+- Retry (`F5` on the Waiting tab, on the card, in the omp menu, `retry --wait`) watches a wait its failing checks or an internal error stopped; such waits are also retried every hour.
 
 ### Fixes
 
