@@ -906,26 +906,20 @@ PlasmoidItem {
             root.waitingRequest = null
             if (!root.ternIntegration) return
             // Qt answers a file:// read with status 0 whether or not the
-            // file exists, so this guard only catches a non-file URL.
-            if (xhr.status !== 0 && xhr.status !== 200) {
-                root.applyWaitingView(root._waitingView)
-                return
-            }
-            // No file yet (or one Qt can't read, which looks the same):
-            // nothing is waiting. The CLI replaces it atomically, so a parse
-            // error is a broken file; keep the last view, judged again by
-            // the clock so its health can still turn stale, rather than
-            // blinking the markers off.
-            var text = (xhr.responseText || "").trim()
-            if (text === "") {
-                root.applyWaitingView(null)
-                return
-            }
-            try {
-                var view = JSON.parse(text)
-            } catch (err) {
-                console.warn("waiting_view.json: " + err.message)
-                view = root._waitingView
+            // file exists, and a missing or unreadable file reads empty. The
+            // CLI replaces the file atomically and never deletes it, so an
+            // empty, unparsable or failed read keeps the last view (none
+            // before the first), judged again by the clock so its health
+            // turns stale instead of the markers blinking off or the count
+            // reading as nothing waiting.
+            var text = xhr.status === 0 || xhr.status === 200 ? (xhr.responseText || "").trim() : ""
+            var view = root._waitingView
+            if (text !== "") {
+                try {
+                    view = JSON.parse(text)
+                } catch (err) {
+                    console.warn("waiting_view.json: " + err.message)
+                }
             }
             root.applyWaitingView(view)
         }

@@ -1114,6 +1114,34 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 Qt.exit(0)
 ''', {"waitingView": view}, views=True)
 
+    def test_waiting_view_that_reads_empty_keeps_the_last_view(self):
+        # No waiting_view.json here. The CLI never deletes it, so once a view
+        # was read, an empty read is a broken state dir, not "nothing waiting".
+        self.applet('''
+                if (app.cacheRestoring || app.loading) return
+                if (fixture.stage === 0) {
+                    Plasmoid.configuration.ternIntegration = true
+                    app.refreshWaitingView()
+                    fixture.stage = 1
+                    return
+                }
+                if (app.waitingRequest) return
+                if (fixture.stage === 1) {
+                    check(app._waitingView === null && app.waitingOnMeCount === 0,
+                        "no file before the first read: nothing waiting")
+                    app.applyWaitingView({ counts: { on_me: 2 }, sessions: [],
+                        health: { checked_at: new Date(Date.now() - 20 * 60 * 1000).toISOString() } })
+                    app.refreshWaitingView()
+                    fixture.stage = 2
+                    return
+                }
+                check(app.waitingOnMeCount === 2, "an empty read keeps the last count")
+                check(app.waitingWarning.indexOf("⚠ Waits not checked since ") === 0,
+                    "the kept view turns stale by the clock: " + app.waitingWarning)
+                console.log("PASS actual main waiting empty read")
+                Qt.exit(0)
+''')
+
 
 if __name__ == "__main__":
     unittest.main()
