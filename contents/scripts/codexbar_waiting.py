@@ -2589,7 +2589,7 @@ def _housekeeping(
             # A new daemon: its panes are new too, and so may be the ones extensions report.
             _panes_gone(state, now, daemon)
             state["extension_panes"] = {}
-        state["ticker"] = {"daemon": daemon, "at": _iso(now)}
+        _hold_ticker(state, daemon, now)
     state["extensions"] = {
         session: seen for session, seen in state["extensions"].items()
         if stamp - _parse_time(seen).timestamp() <= EXTENSION_KEPT_S
@@ -4286,17 +4286,31 @@ def _for_other_panes(action: dict, daemon: str | None) -> bool:
 
 
 def _ticked_elsewhere(state: dict, daemon: str, now: datetime) -> bool:
-    """Another Tern daemon holds the ticker. One that still runs keeps it however
-    long it slept; one whose life can't be checked keeps it while its last tick
-    is recent. A tick dated more than a minute ahead (a clock set back) is old."""
+    """Another Tern daemon holds the ticker while its last tick is recent. One
+    that still runs counts that in time the machine was awake, so a suspend
+    doesn't cost it the ticker but its plugin going quiet does; one that is gone
+    holds nothing. One whose life can't be checked counts the wall clock, and a
+    tick dated more than a minute ahead (a clock set back) is old."""
     ticker = state.get("ticker") or {}
     if not ticker.get("daemon") or ticker["daemon"] == daemon:
         return False
     alive = _daemon_alive(ticker["daemon"])
-    if alive is not None:
-        return alive
+    if alive is False:
+        return False
+    awake = ticker.get("awake")
+    if alive and type(awake) in (int, float):
+        return 0 <= _awake_s() - awake < TICKER_LEASE_S
     at = _stamp(ticker.get("at"))
     return at is not None and -TICKER_AHEAD_S <= now.timestamp() - at < TICKER_LEASE_S
+
+
+def _hold_ticker(state: dict, daemon: str, now: datetime) -> None:
+    state["ticker"] = {"daemon": daemon, "at": _iso(now), "awake": _awake_s()}
+
+
+def _awake_s() -> float:
+    """Seconds the machine was awake, on a clock every process of this boot shares."""
+    return time.monotonic()
 
 
 def _daemon_alive(daemon: str) -> bool | None:
@@ -4335,7 +4349,7 @@ def _tick(args: argparse.Namespace) -> dict:
         state["agents_stale_since"] = (state.get("agents_stale_since") or _iso(now)) if stale else None
         if args.daemon:
             # The lease runs from the end of the tick: slow checks don't shorten it.
-            state["ticker"] = {"daemon": args.daemon, "at": _iso(now)}
+            _hold_ticker(state, args.daemon, now)
         return {
             "ok": True,
             "actions": [

@@ -5040,12 +5040,25 @@ class DaemonTests(Case):
         self.assertNotIn("skipped", self.tick("--daemon", "b"))
         self.assertEqual(self.state()["ticker"]["daemon"], "b")
 
-    def test_a_running_daemon_keeps_the_ticker_however_long_it_slept(self) -> None:
+    def own_daemon(self) -> str:
+        """This process, named as a running Tern daemon."""
         stat = Path("/proc/self/stat").read_text()
-        me = f"{os.getpid()}-{stat[stat.rfind(')') + 2:].split()[19]}"
-        self.tick("--daemon", me)
+        return f"{os.getpid()}-{stat[stat.rfind(')') + 2:].split()[19]}"
+
+    def test_a_running_daemon_keeps_the_ticker_however_long_it_slept(self) -> None:
+        self.tick("--daemon", self.own_daemon())
         self.advance(hours=2)
         self.assertEqual(self.tick("--daemon", "b")["skipped"], waiting.TICK_SKIPPED)
+
+    def test_a_running_daemon_that_stopped_ticking_loses_the_ticker(self) -> None:
+        awake = [1000.0]
+        with mock.patch.object(waiting, "_awake_s", lambda: awake[0]):
+            self.tick("--daemon", self.own_daemon())
+            awake[0] += waiting.TICKER_LEASE_S - 1
+            self.assertEqual(self.tick("--daemon", "b")["skipped"], waiting.TICK_SKIPPED)
+            awake[0] += 1
+            self.assertNotIn("skipped", self.tick("--daemon", "b"))
+        self.assertEqual(self.state()["ticker"]["daemon"], "b")
 
     def test_a_tick_dated_ahead_by_a_clock_set_back_is_old(self) -> None:
         self.tick("--daemon", "a")
