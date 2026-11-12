@@ -772,6 +772,70 @@ class SessionOperationOwnershipTests(unittest.TestCase):
             self.assertEqual(focus.main(["--tern", "--reserve", "omp", "sid-1", "/work/project"]), 11)
         self.assertIn("a running omp in /work/project may be writing this session", stderr.getvalue())
 
+    def reserve(self) -> str:
+        with (
+            mock.patch.object(focus.sys, "stdout", io.StringIO()) as stdout,
+            mock.patch.object(focus.state_paths, "migrate"),
+        ):
+            self.assertEqual(focus.main(["--tern", "--reserve", "codex", "same-session"]), 0)
+        return stdout.getvalue().strip()
+
+    def release(self, token: str) -> int:
+        with mock.patch.object(focus.state_paths, "migrate"):
+            return focus.main(["--tern", "--release", "codex", "same-session", token])
+
+    def test_release_by_its_owner_lets_the_session_launch(self) -> None:
+        with (
+            mock.patch.object(focus, "AGGREGATE_PATH", self.path),
+            mock.patch.object(focus, "_launch_tern", return_value=0) as dispatch,
+            mock.patch.object(focus.sys, "stderr", io.StringIO()),
+        ):
+            token = self.reserve()
+            self.assertEqual(focus.launch("codex", "same-session"), 5)
+            self.assertEqual(self.release(token), 0)
+            self.assertFalse(focus._reservation_path("codex", "same-session").exists())
+            self.assertEqual(focus.launch("codex", "same-session"), 0)
+            dispatch.assert_called_once()
+            # Nothing of the caller's is left: a second release changes nothing.
+            self.assertEqual(self.release(token), 0)
+            self.assertTrue(focus._reservation_path("codex", "same-session").exists())
+
+    def test_release_leaves_a_reservation_it_does_not_own(self) -> None:
+        with (
+            mock.patch.object(focus, "AGGREGATE_PATH", self.path),
+            mock.patch.object(focus.sys, "stderr", io.StringIO()),
+        ):
+            token = self.reserve()
+            reservation = focus._reservation_path("codex", "same-session")
+            owner = json.loads(reservation.read_text())
+            later = focus.time.monotonic() + focus.SESSION_START_RESERVATION_SECONDS + 1
+            cases = {
+                "another launcher's": ({**owner, "expiresAt": owner["expiresAt"] + 1}, None),
+                "another boot's": ({**owner, "bootId": "another-boot"}, None),
+                "expired": (owner, later),
+                "not a reservation": ([owner], None),
+            }
+            for name, (written, now) in cases.items():
+                with self.subTest(name):
+                    reservation.write_text(json.dumps(written))
+                    with ExitStack() as stack:
+                        if now is not None:
+                            stack.enter_context(
+                                mock.patch.object(focus.time, "monotonic", return_value=now))
+                        self.assertEqual(self.release(token), 0)
+                    self.assertEqual(json.loads(reservation.read_text()), written)
+
+    def test_release_rejects_a_malformed_token(self) -> None:
+        with (
+            mock.patch.object(focus, "AGGREGATE_PATH", self.path),
+            mock.patch.object(focus.sys, "stderr", io.StringIO()) as stderr,
+        ):
+            token = self.reserve()
+            self.assertEqual(self.release("not-a-token"), 1)
+            self.assertIn("not a reservation token", stderr.getvalue())
+            self.assertTrue(focus._reservation_path("codex", "same-session").exists())
+            self.assertEqual(self.release(token), 0)
+
 
 class TeleportTests(unittest.TestCase):
     AGENT, SHELL, KITTY = 500, 400, 300

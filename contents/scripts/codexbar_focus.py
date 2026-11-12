@@ -32,6 +32,13 @@ session in Tern.
 
 takes the session's startup ownership for a caller that starts the writer
 itself in <cwd>, as the Tern plugin does when it reopens a session for a wait.
+On success it prints the reservation's token on stdout.
+
+  codexbar_focus.py --release <provider> <sessionId> <token>
+
+gives that ownership back when the caller never started the writer. Only the
+reservation the token names goes, while it holds: one that expired, or that
+another launcher took since, stays.
 
 A leading --tern (e.g. `--tern --launch <provider> <sessionId>`) is passed by
 the Tern plugin, which may run outside KDE: the helper then never calls KWin.
@@ -566,12 +573,13 @@ def _reservation_path(provider: str, session_id: str) -> Path:
 def _session_operation(
     provider: str, session_id: str, kind: Literal["launch", "teleport"],
     operation: Callable[[str, str, dict, str], int], cwd: str = "",
+    print_token: bool = False,
 ) -> int:
     """Own validation through dispatch, then reserve the writer's startup.
     `operation` gets the session's folder: its agents.json record's, else
-    `cwd`, else the last reservation's, else ""."""
-    digest = hashlib.sha256(json.dumps([provider, session_id]).encode()).hexdigest()
-    reservation = AGGREGATE_PATH.with_name(f"{AGGREGATE_PATH.name}.{digest}.startup.json")
+    `cwd`, else the last reservation's, else "". With `print_token`, a
+    reservation that stays is named on stdout for `release`."""
+    reservation = _reservation_path(provider, session_id)
     lock = reservation.with_suffix(".lock")
     with _startup_lock(lock):
         _prune_startup_locks(lock.parent, keep=lock)
@@ -629,6 +637,8 @@ def _session_operation(
                 return result
         owner["expiresAt"] = time.monotonic() + SESSION_START_RESERVATION_SECONDS
         agents._write_file(reservation, json.dumps(owner), durable=True)
+        if print_token and result == 0:
+            print(json.dumps(owner["expiresAt"]))
         return result
 
 
@@ -643,8 +653,43 @@ def reserve(provider: str, session_id: str, cwd: str = "") -> int:
     tab of its choosing. Refused as `_refusal` says, or with 5 while another
     launcher starts it, and Launch, Teleport or another reserve are refused
     for the reservation's lifetime after it. A session agents.json has no row
-    for is checked against the processes in `cwd`."""
-    return _session_operation(provider, session_id, "launch", _writer_refusal, cwd)
+    for is checked against the processes in `cwd`. Prints the token
+    `release` takes."""
+    return _session_operation(
+        provider, session_id, "launch", _writer_refusal, cwd, print_token=True
+    )
+
+
+def release(provider: str, session_id: str, token: str) -> int:
+    """Give back the startup ownership `reserve` took, for a caller that never
+    started the writer. The reservation goes only while it is the one the
+    token names: this boot's, with that deadline, not yet past. One that
+    expired may have let another launcher start the session, and theirs
+    carries another deadline. 0 when it went or nothing of the caller's is
+    left."""
+    try:
+        deadline = float(token)
+    except ValueError:
+        sys.stderr.write(f"codexbar_focus: not a reservation token: {token}\n")
+        return 1
+    reservation = _reservation_path(provider, session_id)
+    if not reservation.exists():
+        return 0
+    with _startup_lock(reservation.with_suffix(".lock")):
+        try:
+            owner = json.loads(reservation.read_text())
+        except FileNotFoundError:
+            return 0
+        except ValueError:
+            return 0  # not a reservation `reserve` wrote
+        held = owner.get("expiresAt") if isinstance(owner, dict) else None
+        if (
+            isinstance(held, float) and held == deadline
+            and owner.get("bootId") == agents._read_boot_id()
+            and time.monotonic() < deadline
+        ):
+            reservation.unlink()
+    return 0
 
 
 def _listed_writer_runs(record: dict) -> bool:
@@ -1058,6 +1103,8 @@ def main(argv: list[str]) -> int:
     state_paths.migrate()
     if argv[0] == "--reserve":
         return reserve(*argv[1:]) if len(argv) in (3, 4) else 1
+    if argv[0] == "--release":
+        return release(*argv[1:]) if len(argv) == 4 else 1
     if argv[0] in ("--launch", "--teleport"):
         if len(argv) != 3:
             return 1
