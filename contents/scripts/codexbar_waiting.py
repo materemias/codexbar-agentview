@@ -3220,7 +3220,7 @@ def _prompt_handed_over(record: dict, wait: dict) -> bool:
 
 
 def _snooze_hides(wait: dict) -> bool:
-    """Whether +1 day only hides the wait until then. Its event already
+    """Whether Snooze 1d only hides the wait until then. Its event already
     happened: watching for it again would wait for it twice, run a prompt that
     ran again, or arm the chain's next step a second time. A Time wait is the
     exception: it waits for the new time and its prompt runs then, unless it
@@ -3235,7 +3235,7 @@ def _snooze_hides(wait: dict) -> bool:
 
 
 def cmd_snooze(args: argparse.Namespace) -> dict:
-    """+1 day: the wait comes off me until `--for` from now. A waiting one is
+    """Snooze 1d: the wait comes off me until `--for` from now. A waiting one is
     watched again from then; one whose event happened is hidden until then and
     comes back as it was (`_unsnooze`)."""
     session, pane = _target(args)

@@ -1274,7 +1274,7 @@ local function waitingCounts(): any
 	return if type(counts) == "table" then counts else {}
 end
 
--- The wait +1 day pushes: one on me first, then the earliest due. It skips the
+-- The wait Snooze 1d pushes: one on me first, then the earliest due. It skips the
 -- ones `snooze` refuses for their kind or state (not started, done, my-time
 -- ones, a job still running in time), so a new kind needs no change here; the
 -- CLI also refuses one whose prompt the agent runs now. (Inline: the main chunk
@@ -2998,7 +2998,7 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 		local busy = b.busy == rowKey or (b.launched[rowKey] ~= nil and os.time() - b.launched[rowKey] < 60)
 		table.insert(buttons, button("Resume", "wait_open", { variant = "primary", keys = { "enter" }, busy = busy }))
 	end
-	table.insert(buttons, button("+1 day", "wait_snooze", {
+	table.insert(buttons, button("Snooze 1d", "wait_snooze", {
 		keys = if b.filter == "" then { "+" } else nil,
 		disabled = if firstDue(r) then false else "Nothing to snooze",
 	}))

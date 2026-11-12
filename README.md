@@ -291,7 +291,7 @@ Checks saved by older versions without a working directory must be recreated.
 After a follow-up turn ends, the next background tick runs its verification.
 
 [Session lifecycle](docs/session-lifecycle.md) covers the commands, what each
-wait watches, the groups, +1 day and Done, follow-up prompts, and how it works.
+wait watches, the groups, Snooze 1d and Done, follow-up prompts, and how it works.
 
 ### Panel (Plasma)
 

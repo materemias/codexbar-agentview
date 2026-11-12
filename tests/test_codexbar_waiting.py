@@ -1088,7 +1088,7 @@ class DeadlineTests(Case):
 
 
 class SnoozeTests(Case):
-    """+1 day: a wait still waiting is watched again from the new time; one whose
+    """Snooze 1d: a wait still waiting is watched again from the new time; one whose
     event happened is hidden until then and comes back as it was."""
 
     def snooze(self, wait: str, expect: int = 0) -> dict:

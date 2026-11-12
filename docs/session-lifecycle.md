@@ -19,7 +19,7 @@ list.
 
 Press `Ctrl+Alt+B` or type `/wait` in omp. Both open the same menu:
 
-1. **This session's waits**, when it has some: Done or +1 day for each.
+1. **This session's waits**, when it has some: Done or Snooze 1d for each.
 2. What the session waits for. Every item shows the `/wait` command that does
    the same in one line.
 3. Your sentence: why you left it, what comes next. It starts with the
@@ -256,7 +256,7 @@ closed and the merged step fires at once.
 | `Space` | details: your sentence, what it waits for, what happened since, the next step, the recap and the session's pull requests |
 | `Enter` | open the session in its own tab, or resume a closed one |
 | `Shift+Enter` | the session card |
-| `+` | +1 day (below) |
+| `+` | Snooze 1d (below) |
 | `F2` | Waiting for…: edit the free-text status |
 | `Delete` | Done |
 
@@ -265,11 +265,11 @@ status (`/wait for`), and `F2` or the row's **Waiting for…** button edits it. 
 session has one free-text status; setting it again replaces it, and an empty
 one removes it.
 
-**+1 day** pushes the row's most pressing wait: the one that's on you, else
+**Snooze 1d** pushes the row's most pressing wait: the one that's on you, else
 the one due first. It always takes the wait off you, and a prompt that wait
 had queued is cancelled until it fires again.
 
-| Wait | +1 day |
+| Wait | Snooze 1d |
 |---|---|
 | Time | moves the time to 24 hours from now; the prompt runs then |
 | Repeat | moves the next run to 24 hours from now; a run already going finishes |
@@ -327,7 +327,7 @@ session's own wait saw merged reads merged at once.
 - **Plasma** shows the waits only with Settings → Agents → **Tern
   integration** on: an hourglass on waiting rows, `●` when one is back on you,
   and an amber count beside the panel dots.
-- **tern-awui** shows the same groups on the phone, with +1 day, Done and a
+- **tern-awui** shows the same groups on the phone, with Snooze 1d, Done and a
   push notification when a session comes back to you.
 
 ## How it works

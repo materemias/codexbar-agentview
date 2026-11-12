@@ -1242,9 +1242,9 @@ export default function (pi) {
 		const chosen = await pick(c, "This session's waits", items);
 		if (!chosen) return;
 		const { id, state, kind } = chosen.wait;
-		const action = await c.ui.select(chosen.label, ["Done", ...(state === "pending" || kind === "later" ? [] : ["+1 day"]), "Back"]);
+		const action = await c.ui.select(chosen.label, ["Done", ...(state === "pending" || kind === "later" ? [] : ["Snooze 1d"]), "Back"]);
 		if (action === "Done") await act(c, ["done", "--session", session, `--wait=${id}`]);
-		else if (action === "+1 day") await act(c, ["snooze", "--session", session, `--wait=${id}`, "--for", "1d"]);
+		else if (action === "Snooze 1d") await act(c, ["snooze", "--session", session, `--wait=${id}`, "--for", "1d"]);
 	}
 
 	/** A described check whose turn ended without the tool call is dropped, and the user told. */

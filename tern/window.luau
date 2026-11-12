@@ -936,7 +936,7 @@ local function cardTitle(cx: WindowCx, pane: number, r: any): string
 	return clipped(if type(title) == "string" and title ~= "" then title else "Session", 70)
 end
 
--- Done and +1 day need waits of a record, and +1 day one that snoozing moves.
+-- Done and Snooze 1d need waits of a record, and Snooze 1d one that snoozing moves.
 -- Both act on the pane's entry, so it has to be the card's session: a link can
 -- name one the agents scan has not mapped to the pane yet.
 local function cardDock(pane: number, r: any): Node
@@ -948,7 +948,7 @@ local function cardDock(pane: number, r: any): Node
 	if entry and entry.session == r.session_id and r.has_record ~= false and type(r.waits) == "table" and #r.waits > 0 then
 		table.insert(kids, act("Done", "card_done", "primary"))
 		if entry.wait then
-			table.insert(kids, act("+1 day", "card_snooze"))
+			table.insert(kids, act("Snooze 1d", "card_snooze"))
 		end
 	end
 	table.insert(kids, act("Close", "card_close", "quiet"))
@@ -990,7 +990,7 @@ local function openCard(cx: WindowCx, pane: number, known: string?)
 		view = cardView(cx, pane, shown, session ~= nil),
 		dock = cardDock(pane, shown),
 		about = CARD_ABOUT .. pane .. (if session then " for session " .. session else "")
-			.. ". Done, when shown, ends its waits, +1 day, when shown, snoozes the first due one, Close only closes this card.",
+			.. ". Done, when shown, ends its waits, Snooze 1d, when shown, pushes the first due one by a day, Close only closes this card.",
 		how = "beside",
 		target = pane,
 		focus = false,
