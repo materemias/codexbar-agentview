@@ -4905,15 +4905,30 @@ class RetryTests(Case):
         self.down = True
         self.polls = 0
 
+        self.events = []
+
         def poll(cond, memo, **kwargs):
             self.polls += 1
-            return poll_result(memo, error="HTTP 401: Bad credentials") if self.down else poll_result(memo)
+            if self.down:
+                return poll_result(memo, error="HTTP 401: Bad credentials", events=self.events)
+            return poll_result(memo)
 
         self.github(poll=poll)
         self.wait = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--label", "PR")["id"]
         for _ in range(waiting.MAX_ERRORS):
             self.tick()
             self.advance(minutes=4)
+        self.assertEqual(self.wait_of(self.wait)["state"], "needs_attention")
+
+    def test_a_failed_hourly_try_keeps_the_events_it_saw(self) -> None:
+        self.events = [
+            {"key": "c:1", "text": "comment from a reviewer", "on_me": False},
+            {"key": "r:1", "text": "changes requested", "on_me": True},
+        ]
+        self.tick_through(minutes=65)
+        lines = [(line["text"], line["kind"]) for line in self.session()["history"]]
+        self.assertIn(("comment from a reviewer", None), lines)
+        self.assertIn(("changes requested", "attention"), lines)
         self.assertEqual(self.wait_of(self.wait)["state"], "needs_attention")
 
     def test_retry_puts_it_back_to_its_checks(self) -> None:

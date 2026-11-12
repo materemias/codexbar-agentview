@@ -2372,7 +2372,15 @@ def _apply_retry(state: dict, record: dict, wait: dict, job: dict, now: datetime
             return
     elif result.get("error"):
         if job["type"] == "pr":
+            # The memo now counts these events as seen: say them, or they're lost.
             wait["memo"] = result.get("memo", wait["memo"])
+            for event in result.get("events") or []:
+                if event.get("on_me"):
+                    _log(record, now, wait, event["text"], "attention")
+                    record["unseen"] = True
+                    _toast(state, record, wait, now, "error", f"{wait['label']}: {event['text']}")
+                else:
+                    _log(record, now, wait, event["text"])
         return
     _rearm(wait, now)
     _log(record, now, wait, f"Checks work again: {wait['label']}")
