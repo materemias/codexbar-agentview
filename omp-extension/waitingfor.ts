@@ -570,11 +570,8 @@ function errorPanel(message: string, forms = []) {
 	return (theme, width: number) => [theme.fg("error", message), ...(forms.length > 0 ? [columns(forms, theme, width)] : [])].join("\n");
 }
 
-/**
- * The session details: `card` is the CLI's answer, `warning` gives the health warning when drawn,
- * as the row redraws the panel when it changes.
- */
-function detailsPanel(card, warning: () => string | undefined) {
+/** The session details from `card`, the CLI's answer; the health warning has its own line above the row. */
+function detailsPanel(card) {
 	return (theme) => {
 		const muted = (text: string) => theme.fg("muted", text);
 		const waits = card.waits ?? [];
@@ -588,9 +585,7 @@ function detailsPanel(card, warning: () => string | undefined) {
 		};
 		const prs = card.prs ?? [];
 		const mentioned = prs.filter((pr) => pr.source === "mentioned");
-		const warned = warning();
 		return [
-			warned && theme.fg("warning", warned),
 			card.headline && theme.fg(TONES[card.outcome] ?? "muted", card.headline),
 			card.outcome && card.still_waiting?.length > 0 && `${muted("Still waiting for")} ${card.still_waiting.join("  ·  ")}`,
 			sentence && bold(sentence),
@@ -1093,18 +1088,14 @@ export default function (pi) {
 	async function showDetails(c) {
 		const loading = (theme) => theme.fg("muted", "Loading…");
 		setPanel(c, loading);
-		const warning = () => healthWarning(health, Date.now(), uncheckedSince);
 		let details;
 		try {
-			details = detailsPanel((await cli(["card", "--session", c.sessionManager.getSessionId()])).card, warning);
+			details = detailsPanel((await cli(["card", "--session", c.sessionManager.getSessionId()])).card);
 		} catch (error) {
 			const message = messageOf(error);
-			const failed = errorPanel(message);
 			// A session with no message yet has nothing for the card to read; an unreadable state
-			// fails the card, and the warning says since when.
-			details = message.startsWith("unknown session")
-				? detailsPanel({}, warning)
-				: (theme, width: number) => [warning() && theme.fg("warning", warning()), failed(theme, width)].filter(Boolean).join("\n");
+			// fails the card, and the health warning above the row says since when.
+			details = message.startsWith("unknown session") ? detailsPanel({}) : errorPanel(message);
 		}
 		if (panel === loading) setPanel(c, details);
 	}
