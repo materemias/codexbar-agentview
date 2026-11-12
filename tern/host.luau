@@ -387,6 +387,8 @@ local store = {
 	waitingSkipped = nil :: string?, -- another Tern daemon ticks this state: why, as the CLI said
 	daemonId = nil :: string?, -- `tick --daemon`: which daemon process this is (set at load, at the end)
 	daemonKnown = false, -- whether that answer came, with an id or without one
+	paneGoneAt = {} :: { [number]: number }, -- watched job pane -> os.clock() when the pane list lost it (math.huge: told)
+	panesListed = false, -- whether this daemon's pane list has named a pane: only then is an empty one evidence
 	jobEventAt = {} :: { [number]: number }, -- pane -> os.clock() when its last job event went to the CLI
 	waitingMemo = nil :: any, -- waitingGroups' last answer, for one view and filter
 	lastPoke = nil :: any,
@@ -1608,31 +1610,61 @@ local function waitingRun(cx: BlockCx?, what: string, args: { string }, done: ((
 	end)
 end
 
--- A window sees only its own panes; this half alone can tell that a pane
--- action's target is gone from every window. The outbox is the last tick's, so
--- an ack that landed stays marked until a tick drops its action, and a failed
--- one waits before the next try. An empty listing is no evidence, as while the
--- daemon starts: those actions wait for a listing, or for the CLI to expire them.
+-- A window sees only its own panes; this half alone can tell that a pane is
+-- gone from every window. A pane action's target gone: the outbox is the last
+-- tick's, so an ack that landed stays marked until a tick drops its action, and
+-- a failed one waits before the next try. A watched job's pane gone without the
+-- event that ends its wait (`tern close`, no window, a plugin reload): after
+-- 10 s, time for a `pane_exited` in flight to land, the CLI hears `pane_closed`.
+-- An empty listing is no evidence until this daemon has listed a pane, as
+-- while it starts; after that, every pane is gone, the last one closed too.
 -- While another daemon ticks the state (`waitingSkipped`), its panes aren't in
--- this listing: nothing is acked.
-local function ackGonePanes()
+-- this listing: nothing is told.
+local function reconcilePanes()
 	local live: { [number]: boolean } = {}
 	for _, p in tern.pane.list() do
 		live[p.pane] = true
+		store.panesListed = true
 	end
-	if next(live) == nil or store.waitingSkipped then
+	if not store.panesListed or store.waitingSkipped then
 		return
 	end
+	local now = os.clock()
 	for _, a in (if type(store.waitingActions) == "table" then store.waitingActions else {}) do
 		local pane = tonumber(val(a.pane))
 		local id = str(a.id)
-		if a.type ~= "toast" and pane and not live[pane] and os.clock() >= (store.waitingAcking[id] or 0) then
+		if a.type ~= "toast" and pane and not live[pane] and now >= (store.waitingAcking[id] or 0) then
 			store.waitingAcking[id] = math.huge
 			waitingRun(nil, "ack", { "ack", "--action", id, "--result", "done" }, function(data)
 				if not data and store.waitingAcking[id] then
 					store.waitingAcking[id] = os.clock() + 30
 				end
 			end)
+		end
+	end
+	-- A tick under way may be ending these waits already; its view decides after.
+	if store.waitingTicking or type(store.waiting) ~= "table" then
+		return
+	end
+	local watched = jobPanes(store.waiting)
+	for pane in store.paneGoneAt do
+		if live[pane] or not watched[pane] then
+			store.paneGoneAt[pane] = nil
+		end
+	end
+	for pane in watched do
+		if not live[pane] then
+			local since = store.paneGoneAt[pane]
+			if not since then
+				store.paneGoneAt[pane] = now
+			elseif now - since >= 10 then
+				store.paneGoneAt[pane] = math.huge
+				waitingRun(nil, "pane event", { "event", "--type", "pane_closed", "--pane", tostring(pane) }, function(data)
+					if not data and store.paneGoneAt[pane] then
+						store.paneGoneAt[pane] = os.clock() -- tries again in 10 s
+					end
+				end)
+			end
 		end
 	end
 end
@@ -1938,7 +1970,7 @@ local function tick()
 			if not updated or nowMs() - updated > AGENTS_STALE_MS then
 				scanAgents(false)
 			end
-			ackGonePanes()
+			reconcilePanes()
 			-- Another writer (the omp extension, tern-awui) may have queued a window
 			-- action; while another daemon ticks, its writes are its own business.
 			if not store.waitingTicking and not store.waitingSkipped and readWaiting(WAITING_FILE) ~= store.waitingRaw then
