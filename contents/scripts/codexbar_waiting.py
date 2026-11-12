@@ -314,29 +314,84 @@ def _load_state() -> dict:
 
 
 @contextlib.contextmanager
-def _transaction():
-    """The state under the writer lock, saved on a clean exit if it changed."""
+def _writer_lock():
     state_paths.migrate()
     lock = os.open(state_paths.state_dir() / "waiting.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(lock)
+
+
+@contextlib.contextmanager
+def _transaction():
+    """The state under the writer lock, saved on a clean exit if it changed."""
+    with _writer_lock():
         state = _load_state()
         before = json.dumps(state)
         yield state
         after = json.dumps(state)
         if after != before:
             _write_file(_state_path(), json.dumps(state, indent=1), durable=True)
-    finally:
-        os.close(lock)
 
 
 def _publish(
     state: dict, now: datetime, agents: "Agents | None" = None, omp: "Omp | None" = None,
+    ticked: bool = False,
 ) -> dict:
     """Build the view and write waiting_view.json; callers hold the lock."""
-    view = _build_view(state, now, agents or _read_agents(), omp=omp)
+    view = _build_view(state, now, agents or _read_agents(), omp=omp, ticked=ticked)
     _write_file(_view_path(), json.dumps(view), durable=False)
     return view
+
+
+def _error_line(error: BaseException) -> str:
+    text = " ".join(str(error).split())
+    return _clip(f"{type(error).__name__}: {text}" if text else type(error).__name__, 300)
+
+
+def _last_health() -> dict:
+    """The `health` waiting_view.json holds: a failed tick leaves its error only there."""
+    try:
+        health = json.loads(_view_path().read_text(encoding="utf-8")).get("health")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return health if isinstance(health, dict) else {}
+
+
+def _health(state: dict, now: datetime, ticked: bool) -> dict:
+    """The view's `health`. Only a tick clears the error a failed tick left;
+    any other view carries it over."""
+    last = _last_health()
+    last_error = last.get("error") if isinstance(last.get("error"), str) else None
+    error = None if ticked else last_error
+    since = last.get("error_since") if last_error and isinstance(last.get("error_since"), str) else None
+    return {
+        "checked_at": state.get("last_tick_at"),
+        "error": error,
+        "error_since": (since or _iso(now)) if error else None,
+    }
+
+
+def _report_tick_failure(error: BaseException) -> None:
+    """A tick that failed says so in the view it leaves; waiting.json stays as it is."""
+    with contextlib.suppress(Exception):
+        with _writer_lock():
+            path = _view_path()
+            try:
+                view = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                view = None
+            view = view if isinstance(view, dict) else {}
+            last = view.get("health") if isinstance(view.get("health"), dict) else {}
+            health = {"checked_at": None, **last}
+            health.update(
+                error=_error_line(error),
+                error_since=(last.get("error") and last.get("error_since")) or _iso(_now()),
+            )
+            view["health"] = health
+            _write_file(path, json.dumps(view), durable=False)
 
 
 def _mutate(
@@ -2638,8 +2693,9 @@ def _sort_key(view: dict) -> tuple:
 
 def _build_view(
     state: dict, now: datetime, agents: Agents,
-    only: str | None = None, omp: Omp | None = None,
+    only: str | None = None, omp: Omp | None = None, ticked: bool = False,
 ) -> dict:
+    """`ticked`: a tick's view, which clears the error a failed tick left."""
     facts = Facts(agents, omp)
     pins = set(facts.omp.pins())
     chosen = []
@@ -2671,6 +2727,7 @@ def _build_view(
         "ok": True, "now": _iso(now), "counts": counts, "sessions": sessions, "panes": panes,
         "menu_requests": _fresh_menu_requests(state, now),
         "extension_panes": _extension_panes(state, agents, now),
+        "health": _health(state, now, ticked),
     }
 
 
@@ -3543,6 +3600,14 @@ def cmd_ack(args: argparse.Namespace) -> dict:
 
 
 def cmd_tick(args: argparse.Namespace) -> dict:
+    try:
+        return _tick(args)
+    except Exception as error:
+        _report_tick_failure(error)
+        raise
+
+
+def _tick(args: argparse.Namespace) -> dict:
     def moment() -> datetime:
         return _parse_time(args.now) if args.now else _now()
 
@@ -3555,10 +3620,11 @@ def cmd_tick(args: argparse.Namespace) -> dict:
             "ok": True,
             "actions": [_public_action(action) for action in state["actions"]],
             "next_tick_s": _next_tick_s(state, now),
-            "view": _publish(state, now, agents, omp),
+            "view": _publish(state, now, agents, omp, ticked=True),
         }
 
     with _transaction() as state:
+        state["last_tick_at"] = _iso(now)
         _housekeeping(state, agents, omp, now)
         _pin_pass(state, omp, now)
         _evaluate(state, now)

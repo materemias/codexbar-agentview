@@ -4506,5 +4506,51 @@ class ResumeTests(Case):
         self.assertEqual([action["tern_session"] for action in self.resumes()], [None])
 
 
+class HealthTests(Case):
+    def view_file(self) -> dict:
+        return json.loads((self.state_dir / "waiting_view.json").read_text())
+
+    def failing_tick(self) -> None:
+        self.run_cli("tick", "--now", self.clock.isoformat(), expect=1)
+
+    def test_a_tick_says_when_it_checked(self) -> None:
+        self.assertEqual(self.tick()["view"]["health"], {
+            "checked_at": self.clock.isoformat(), "error": None, "error_since": None,
+        })
+
+    def test_a_failed_tick_leaves_its_error_in_the_view_and_only_a_tick_clears_it(self) -> None:
+        self.add("--kind", "later")
+        self.tick()
+        checked = self.clock.isoformat()
+        saved = (self.state_dir / "waiting.json").read_text()
+        with mock.patch.object(waiting, "_evaluate", side_effect=RuntimeError("boom")):
+            self.advance(minutes=5)
+            self.failing_tick()
+            first = self.clock.isoformat()
+            self.advance(minutes=5)
+            self.failing_tick()
+        self.assertEqual((self.state_dir / "waiting.json").read_text(), saved)
+        view = self.view_file()
+        self.assertEqual(len(view["sessions"]), 1)
+        self.assertEqual(view["health"], {
+            "checked_at": checked, "error": "RuntimeError: boom", "error_since": first,
+        })
+        # Any other command's view keeps saying so.
+        self.assertEqual(self.run_cli("list")["health"]["error"], "RuntimeError: boom")
+        self.add("--kind", "later")
+        self.assertEqual(self.view_file()["health"]["error_since"], first)
+        health = self.tick()["view"]["health"]
+        self.assertEqual((health["error"], health["error_since"]), (None, None))
+
+    def test_an_unreadable_state_without_a_view_writes_health_alone(self) -> None:
+        (self.state_dir / "waiting.json").write_text("{broken")
+        self.failing_tick()
+        view = self.view_file()
+        self.assertEqual(list(view), ["health"])
+        self.assertIsNone(view["health"]["checked_at"])
+        self.assertIn("unreadable", view["health"]["error"])
+        self.assertEqual((self.state_dir / "waiting.json").read_text(), "{broken")
+
+
 if __name__ == "__main__":
     unittest.main()
