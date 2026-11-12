@@ -66,7 +66,7 @@ CodexBar module.
 <details>
 <summary>Screenshots</summary>
 
-![Tern widget bar: combined Claude and Codex usage rings, agent counts and the Claude widget's details](docs/tern/widget-bar.png)
+![Tern widget bar: the combined Claude usage ring, the combined Codex 5h graph, agent counts and the Claude widget's details](docs/tern/widget-bar.png)
 
 | Usage | Agents | History | Settings |
 | :---: | :---: | :---: | :---: |
@@ -311,14 +311,15 @@ while it has nothing to show, and a click opens the matching dashboard tab.
 
 | Widget | Shows |
 | --- | --- |
-| Claude usage, Codex usage | 5h and 7d percent, plan-weighted across all your accounts as the combined bars are. The ring or bar shows the window furthest ahead of its pace; hover for each window's pace and reset and every account's own figures |
-| z.ai, OpenCode Go, OpenRouter, Kilo, TypeSafe usage | Each window's percent, or the balance |
+| Claude usage, Codex usage | 5h and 7d percent, plan-weighted across all your accounts as the combined bars are. The ring and bar show the combined 5h window, the graph its last five hours; hover for each window's pace and reset and every account's own figures |
+| z.ai, OpenCode Go, OpenRouter, Kilo, TypeSafe usage | Each window's percent, or the balance; the ring, bar and graph show the shortest window |
 | Coding agents | Blocked, working and idle agents, in Tern and outside it |
 | Back on me | Set-aside sessions whose next step is yours |
 | Sessions to restore | Sessions a reboot closed |
 
-Usage widgets take the pace colours of the Usage tab and offer ring, bar and
-text styles. The focused pane's set-aside status stays in the **Plugin
+Usage widgets take the pace colours of the Usage tab, from their worst window,
+and offer ring, graph, bar and text styles. The graph needs the readings of
+the past five hours, so it fills in as usage is polled. The focused pane's set-aside status stays in the **Plugin
 segments** widget.
 
 ### Tern specifics

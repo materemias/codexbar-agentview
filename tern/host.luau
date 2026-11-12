@@ -614,6 +614,7 @@ local function composite(records: { any }, minutes: number, now: number): any
 		remaining = (total * 100 - used) / 100,
 		nextReset = if soonest < math.huge then now + soonest else nil,
 		recent = if hours > 0 then { hours = hours, consumedPercent = consumed / total } else nil,
+		accounts = windows,
 	}
 end
 
@@ -1042,9 +1043,55 @@ do
 		return math.floor(math.clamp(pct, 0, 100) + 0.5) .. "%"
 	end
 
+	local SAMPLES = 60
+
+	-- The window's used percent over its last span, 0–1 and oldest first, weighted
+	-- across `accounts` ({ w, weight }) from the history runs the fetch attaches
+	-- ([firstSeen, lastSeen, usedPercent, resetsAt]). Starts once every account
+	-- with runs has a reading; nil when none has runs.
+	local function seriesOf(accounts: { any }, now: number): { number }?
+		local tracked = {}
+		local spanSecs = 0
+		for _, a in accounts do
+			local runs = val(a.w.runs)
+			if type(runs) == "table" and #runs > 0 then
+				table.insert(tracked, { runs = runs, weight = a.weight })
+				spanSecs = math.max(spanSecs, (tonumber(val(a.w.windowMinutes)) or 0) * 60)
+			end
+		end
+		if #tracked == 0 or spanSecs <= 0 then
+			return nil
+		end
+		local out = {}
+		for i = 0, SAMPLES - 1 do
+			local t = now - spanSecs + spanSecs * i / (SAMPLES - 1)
+			local sum, total, known = 0, 0, true
+			for _, a in tracked do
+				local used: number? = nil
+				for _, run in a.runs do
+					if (tonumber(run[1]) or math.huge) > t then
+						break
+					end
+					local reset = tonumber(val(run[4]))
+					used = if reset and reset <= t then 0 else tonumber(run[3]) or 0
+				end
+				if used == nil then
+					known = false
+					break
+				end
+				sum += a.weight * used
+				total += a.weight
+			end
+			if known and total > 0 then
+				table.insert(out, math.clamp(sum / total, 0, 100) / 100)
+			end
+		end
+		return if #out >= 2 then out else nil
+	end
+
 	-- One provider's widget bar view: Claude's and Codex's windows plan-weighted
-	-- across every current account, the others' per window. The bar and ring show
-	-- the binding window: the furthest ahead of its pace, then the fullest.
+	-- across every current account, the others' per window. The ring, bar and
+	-- graph show the shortest window; the tone is the worst window's.
 	local function usageWidget(id: string, recs: { any }, now: number): any
 		local ok, stale = {}, false
 		for _, r in recs do
@@ -1062,13 +1109,19 @@ do
 			for _, spec in POOLED_WINDOWS do
 				local pool = if #ok > 1 then composite(ok, spec[1], now) else nil
 				if pool then
-					table.insert(windows, { label = spec[2], pct = pool.usedPercent, pace = pool.pacePct, reset = pool.nextReset })
+					table.insert(windows, { label = spec[2], pct = pool.usedPercent, pace = pool.pacePct, reset = pool.nextReset, accounts = pool.accounts })
 				else
 					-- One account, or only one reporting this window.
 					for _, r in ok do
 						local w = windowOf(r, spec[1])
 						if w then
-							table.insert(windows, { label = spec[2], pct = tonumber(val(w.usedPercent)) or 0, pace = pacePercent(w, now), reset = epoch(w.resetsAt) })
+							table.insert(windows, {
+								label = spec[2],
+								pct = tonumber(val(w.usedPercent)) or 0,
+								pace = pacePercent(w, now),
+								reset = epoch(w.resetsAt),
+								accounts = { { w = w, weight = 1 } },
+							})
 							break
 						end
 					end
@@ -1083,6 +1136,7 @@ do
 						pct = tonumber(val(w.usedPercent)) or 0,
 						pace = pacePercent(w, now),
 						reset = epoch(w.resetsAt),
+						accounts = { { w = w, weight = 1 } },
 					})
 				end
 			end
@@ -1091,17 +1145,14 @@ do
 		if #windows == 0 and balance == "" then
 			return nil
 		end
+		local series = if windows[1] and not stale then seriesOf(windows[1].accounts, now) else nil
 		local name = PROVIDER_NAMES[id] or id
 		local lines = { name .. (if pooled and #ok > 1 then " · " .. #ok .. " accounts, plan-weighted" else "") .. (if stale then " · last known" else "") }
 		local parts = {}
-		local worst: string?, bind: any = nil, nil
+		local worst: string? = nil
 		for _, w in windows do
 			local pct = math.clamp(w.pct, 0, 100)
 			local lvl = if stale then nil else level(pct, if w.pace >= 3 then w.pace else -1)
-			local rank = LEVEL_RANK[lvl or "ok"]
-			if not bind or rank > bind.rank or (rank == bind.rank and pct > bind.pct) then
-				bind = { rank = rank, pct = pct }
-			end
 			worst = worse(worst, lvl)
 			table.insert(parts, roundPct(pct))
 			local line = w.label .. "  " .. roundPct(pct)
@@ -1136,7 +1187,8 @@ do
 		return {
 			text = (if PROVIDER_ICONS[id] then "" else name .. " ") .. (if #parts > 0 then table.concat(parts, " · ") else balance),
 			tone = if stale then "muted" elseif worst then STATUS_TONE[worst] else nil,
-			value = if bind then bind.pct / 100 else nil,
+			value = if windows[1] then math.clamp(windows[1].pct, 0, 100) / 100 else nil,
+			series = series,
 			title = table.concat(lines, "\n"),
 		}
 	end

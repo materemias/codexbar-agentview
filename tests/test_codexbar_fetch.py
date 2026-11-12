@@ -1937,6 +1937,22 @@ class RecentUsageTests(unittest.TestCase):
         fetch._attach_recent_usage([record], history, self.NOW)
         self.assertEqual(record["primary"]["recent"], {"hours": 1, "consumedPercent": 7})
 
+    def test_five_hour_window_gets_runs_covering_its_span_and_weekly_none(self) -> None:
+        reset = self.NOW + dt.timedelta(hours=2)
+        history: dict = {}
+        for minutes, used in ((7 * 60, 5), (6 * 60, 8), (4 * 60, 20), (0, 37)):
+            fetch._usage_history_observe(history, {
+                "id": "claude", "ok": True, "updatedAt": (self.NOW - dt.timedelta(minutes=minutes)).isoformat(),
+                "primary": {"usedPercent": used, "windowMinutes": 300, "resetsAt": reset.isoformat()},
+                "secondary": {"usedPercent": used, "windowMinutes": 10080, "resetsAt": reset.isoformat()},
+            })
+        record = {"id": "claude", "ok": True, "primary": {"usedPercent": 37, "windowMinutes": 300},
+                  "secondary": {"usedPercent": 37, "windowMinutes": 10080}}
+        fetch._attach_recent_usage([record], history, self.NOW)
+        # The run in effect five hours ago (8%, seen 6h ago) starts it; the 7h-old one is dropped.
+        self.assertEqual([run[2] for run in record["primary"]["runs"]], [8, 20, 37])
+        self.assertNotIn("runs", record["secondary"])
+
     def test_gap_across_lookback_start_is_not_counted(self) -> None:
         reset = self.NOW + dt.timedelta(hours=2)
         history: dict = {}

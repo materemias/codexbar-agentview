@@ -1617,16 +1617,34 @@ def _recent_consumption(runs: list[list], hours: int, now: _dt.datetime) -> dict
     return {"hours": hours, "consumedPercent": round(consumed, 2)}
 
 
+def _window_runs(runs: list[list], seconds: int, now: _dt.datetime) -> list[list]:
+    """The runs covering the last `seconds`: the one in effect at their start, then the later ones."""
+    start = int(now.timestamp()) - seconds
+    if not runs or runs[-1][1] < start:
+        return []
+    base = 0
+    while base + 1 < len(runs) and runs[base + 1][0] <= start:
+        base += 1
+    return [list(run) for run in runs[base:]]
+
+
 def _attach_recent_usage(records: list[dict], history: dict[str, list[list]], now: _dt.datetime) -> None:
+    """Adds each window's recent consumption and, for windows the kept history
+    spans whole (5h), its runs over the window's length, for usage graphs."""
+    kept = max(RECENT_LOOKBACK_HOURS.values()) * 3600
     for record in records:
         if record.get("ok") is not True:
             continue
         for key, window in _usage_history_windows(record):
-            recent = _recent_consumption(
-                history.get(key, []), RECENT_LOOKBACK_HOURS[window["windowMinutes"]], now,
-            )
+            runs = history.get(key, [])
+            recent = _recent_consumption(runs, RECENT_LOOKBACK_HOURS[window["windowMinutes"]], now)
             if recent is not None:
                 window["recent"] = recent
+            span = window["windowMinutes"] * 60
+            if span <= kept:
+                covering = _window_runs(runs, span, now)
+                if covering:
+                    window["runs"] = covering
 
 
 def _last_known(record: dict, error: str = "") -> dict:

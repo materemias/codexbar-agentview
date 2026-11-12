@@ -43,7 +43,7 @@ PROVIDERS = ["claude", "codex", "zai", "opencodego", "openrouter", "kilo"]
 NAMES = {"claude": "Claude Code", "codex": "Codex", "omp": "omp"}
 # The widget bar: the plugin's widgets, then its status segment at the far end. No directory widget:
 # the working folder is the take's scratch folder, not a project's.
-WIDGETS = [{"id": "codexbar-agentview/claude", "style": "ring"}, {"id": "codexbar-agentview/codex", "style": "ring"},
+WIDGETS = [{"id": "codexbar-agentview/claude", "style": "ring"}, {"id": "codexbar-agentview/codex", "style": "graph"},
            {"id": "codexbar-agentview/agents"}, {"id": "codexbar-agentview/on-me"},
            {"id": "codexbar-agentview/restore"}, {"id": "spacer"}, {"id": "status"}]
 
@@ -333,10 +333,25 @@ class Take:
 
         def window(provider, email, slot, used, minutes, hours_left, recent=None):
             reset = int(now + hours_left * 3600)
-            if recent is not None:
-                start = int(now) - (1 if minutes == 300 else 24) * 3600
-                history[f"{provider}:{(email or '').casefold()}:{slot}"] = [
-                    [start - 1200, start + 600, used - recent, reset], [start + 900, int(now) - 60, used, reset]]
+            key = f"{provider}:{(email or '').casefold()}:{slot}"
+            if recent is not None and minutes == 300:
+                # Ten-minute readings over the last five hours: the previous window's tail, then this
+                # window from its start, reaching used - recent an hour ago and `used` now.
+                begin, hour_ago = reset - 5 * 3600, int(now) - 3600
+                runs = []
+                for t in range(int(now) - 5 * 3600, int(now) - 60, 600):
+                    if t < begin:
+                        v, rst = 30 + 40 * (t - (int(now) - 5 * 3600)) / max(1, begin - (int(now) - 5 * 3600)), begin
+                    elif t < hour_ago:
+                        v, rst = (used - recent) * (t - begin) / max(1, hour_ago - begin), reset
+                    else:
+                        v, rst = used - recent + recent * (t - hour_ago) / 3600, reset
+                    runs.append([t, t + 300, round(v), rst])
+                runs.append([int(now) - 60, int(now) - 60, used, reset])
+                history[key] = runs
+            elif recent is not None:
+                start = int(now) - 24 * 3600
+                history[key] = [[start - 1200, start + 600, used - recent, reset], [start + 900, int(now) - 60, used, reset]]
             return {"usedPercent": used, "windowMinutes": minutes,
                     "resetsAt": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(reset))}
 

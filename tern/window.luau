@@ -384,17 +384,17 @@ for _, spec in USAGE_WIDGETS do
 	tern.chrome.widget(id, {
 		name = spec[2],
 		description = if pooled
-			then "5h and weekly use, plan-weighted across all your accounts; the ring shows the window closest to running out"
-			else "Use per window, or the balance",
+			then "5h and weekly use, plan-weighted across all your accounts; the ring, bar and graph show the 5h window"
+			else "Use per window, or the balance; the ring, bar and graph show the shortest window",
 		icon = spec[3],
-		styles = { "ring", "bar", "text" },
+		styles = { "ring", "graph", "bar", "text" },
 		render = function()
 			local s = summary()
 			local u = if s and type(s.usage) == "table" then s.usage[id] else nil
 			if type(u) ~= "table" then
 				return nil
 			end
-			return { text = u.text, tone = u.tone, title = u.title, value = u.value, command = "plugin.codexbar-agentview.usage" }
+			return { text = u.text, tone = u.tone, title = u.title, value = u.value, series = u.series, command = "plugin.codexbar-agentview.usage" }
 		end,
 	})
 end
