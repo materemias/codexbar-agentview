@@ -23,9 +23,11 @@ stale, cachedAt, and refreshError fields. The same file keeps a run-length
 usage history per 7d and 5h window, reported as `recent` consumption over the
 last 24 hours and 1 hour respectively.
 
-Every refresh stamps a shared claim. With --min-interval N a
-fetch that finds a claim younger than N seconds returns the --cache-only result
-instead, so pollers in several processes do not refresh the same usage twice.
+Every refresh stamps a shared claim per provider. With --min-interval N, a
+provider claimed under N seconds ago is answered from the cache instead, so
+pollers in several processes do not refresh the same usage twice; when every
+requested provider is, the answer is the --cache-only result. A poller asking
+for fewer providers leaves the rest to the next one asking for them.
 Our files live in the state directory from state_paths; the CLI's own
 ~/.codexbar/config.json is only read.
 """
@@ -1172,7 +1174,7 @@ def _parse_iso(value) -> _dt.datetime | None:
 
 
 USAGE_CACHE_NAME = "usage_cache.json"
-# Stamped with the start time of every fetch that runs the CLI.
+# Each provider's last fetch start, which every fetch that runs it stamps.
 FETCH_CLAIM_NAME = "fetch_claim"
 USAGE_CACHE_TTL = 24 * 60 * 60
 # Recent-consumption lookback per window length: minutes → hours.
@@ -2043,29 +2045,55 @@ def _positive_seconds(value: str) -> float:
     return seconds
 
 
-def _claim_fetch(min_interval: float | None) -> bool:
-    """Stamp the shared fetch claim unless a fetch started under
-    `min_interval` seconds ago. The flock makes check and stamp atomic across
-    processes. An unusable claim file never blocks a fetch."""
+def _claim_fetch(min_interval: float | None, providers: list[str]) -> list[str]:
+    """Stamp the shared fetch claim of every provider no fetch started on
+    under `min_interval` seconds ago, and return those. The flock makes check
+    and stamp atomic across processes. An unusable claim file never blocks a
+    fetch; a bare time, from before claims were per provider, covers all."""
     path = _state_file(FETCH_CLAIM_NAME)
     try:
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
         fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
     except OSError:
-        return True
+        return providers
+    due = providers
     with os.fdopen(fd, "r+", encoding="utf-8") as fh:
         try:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             now = time.time()
-            last = _as_float(fh.read().strip())
-            if min_interval is not None and last is not None and 0 <= now - last < min_interval:
-                return False
-            fh.seek(0)
-            fh.truncate()
-            fh.write(f"{now}\n")
-        except (OSError, ValueError):
+            try:
+                stamps = json.loads(fh.read() or "{}")
+            except ValueError:
+                stamps = {}
+            if not isinstance(stamps, dict):
+                stamps = dict.fromkeys(providers, stamps)
+
+            def claimed(provider: str) -> bool:
+                last = _as_float(stamps.get(provider))
+                return min_interval is not None and last is not None and 0 <= now - last < min_interval
+
+            due = [provider for provider in providers if not claimed(provider)]
+            if due:
+                stamps.update(dict.fromkeys(due, now))
+                fh.seek(0)
+                fh.truncate()
+                json.dump(stamps, fh)
+                fh.write("\n")
+        except (OSError, ValueError, TypeError):
             pass
-    return True
+    return due
+
+
+def _adopt_shared(records: list[dict], now: _dt.datetime, min_interval: float) -> None:
+    """Show as current the cached records another poller measured recently,
+    within Tern's adoption grace: two requesting intervals plus 30 s. Answering
+    from the cache is not a refresh and never renews the measurement."""
+    max_age = 2 * min_interval + 30
+    for record in records:
+        measured = _parse_iso(record.get("cachedAt"))
+        if measured is not None and 0 <= (now - measured).total_seconds() <= max_age \
+                and not record.get("refreshError") and not record.get("sourceStale"):
+            record["stale"] = False
 
 
 def main(argv: list[str]) -> int:
@@ -2112,18 +2140,14 @@ def main(argv: list[str]) -> int:
         "cliVersion": None,
     }
     cli_missing = not (os.path.isfile(cli) and os.access(cli, os.X_OK)) and not shutil.which(cli)
-    shared_cache = not args.cache_only and not _claim_fetch(args.min_interval)
-    if args.cache_only or shared_cache:
-        if shared_cache:
-            # Match Tern's adoption grace: two requesting intervals plus 30 s.
-            # A refused claim is not a refresh and never renews the measurement.
-            max_age = 2 * args.min_interval + 30
-            for record in restored:
-                measured = _parse_iso(record.get("cachedAt"))
-                if measured is not None and 0 <= (now - measured).total_seconds() <= max_age \
-                        and not record.get("refreshError") and not record.get("sourceStale"):
-                    record["stale"] = False
+    due = [] if args.cache_only else _claim_fetch(args.min_interval, providers)
+    if args.cache_only or (providers and not due):
+        if not args.cache_only:
+            _adopt_shared(restored, now, args.min_interval)
             out["sharedCache"] = True
+            # The forecast has its own cache; it isn't part of the claim.
+            if args.forecast_url:
+                out["forecast"] = _fetch_forecast(args.forecast_url, FORECAST_TIMEOUT)
         _attach_recent_usage(restored, _usage_history_entries(_usage_cache_payload(), now), now)
         out["cacheOnly"] = True
         out["inputs"] = _cache_inputs(providers)
@@ -2142,7 +2166,7 @@ def main(argv: list[str]) -> int:
         max_workers=max(1, len(providers) + int(bool(args.forecast_url)))
     ) as pool:
         futures = {
-            pool.submit(_fetch_provider, cli, p, args.timeout, meridian): p for p in providers
+            pool.submit(_fetch_provider, cli, p, args.timeout, meridian): p for p in due
         }
         if args.forecast_url:
             forecast_future = pool.submit(
@@ -2170,7 +2194,14 @@ def main(argv: list[str]) -> int:
     cached = _usage_cache_read(current_scopes, now)
     merged = []
     for provider in providers:
-        if scopes.get(provider) != current_scopes.get(provider):
+        if provider not in due:
+            # Claimed by another poller: its cached reading, as last known.
+            records = [
+                _last_known(record, record.get("refreshError", ""))
+                for record in _by_account(cached.get(provider, []))
+            ]
+            _adopt_shared(records, now, args.min_interval)
+        elif scopes.get(provider) != current_scopes.get(provider):
             records = [_result_error(
                 provider, "credential_scope_changed",
                 "Provider credentials or configuration changed during refresh; refresh again.",
@@ -2186,7 +2217,11 @@ def main(argv: list[str]) -> int:
                 record["sourceScope"] = current_scopes[provider]
         merged.extend(records)
     results = merged
-    _attach_recent_usage(results, _usage_cache_write(current_scopes, results, now), now)
+    history = _usage_cache_write(
+        {provider: scope for provider, scope in current_scopes.items() if provider in due},
+        [record for record in results if record["id"] in due], now,
+    )
+    _attach_recent_usage(results, history, now)
 
     out = {
         "updatedAt": max((r["updatedAt"] for r in results if r.get("updatedAt")), default=None),

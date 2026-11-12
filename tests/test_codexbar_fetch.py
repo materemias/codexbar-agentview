@@ -554,15 +554,18 @@ class UsageCacheTests(IsolatedUsageTestCase):
         })
 
     def snapshot(self, records=None, providers="codex", cache_only=False, cli=TRUE_EXECUTABLE,
-                 min_interval=None) -> dict:
+                 min_interval=None, forecast_url=None) -> dict:
         output = io.StringIO()
         arguments = ["--cli-path", cli, "--providers", providers]
         if cache_only:
             arguments += ["--cache-only", "--forecast-url", "https://example.invalid/forecast"]
         if min_interval is not None:
             arguments += ["--min-interval", str(min_interval)]
+        if forecast_url is not None:
+            arguments += ["--forecast-url", forecast_url]
+        self.fetched: list[str] = []
         with (
-            mock.patch.object(fetch, "_fetch_provider", side_effect=lambda _, p, *__: [
+            mock.patch.object(fetch, "_fetch_provider", side_effect=lambda _, p, *__: self.fetched.append(p) or [
                 record for record in (records or []) if record["id"] == p
             ]),
             mock.patch.object(fetch, "_cli_version", return_value=None),
@@ -590,7 +593,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
                 before = self.cache_path.read_bytes()
                 with (
                     mock.patch.object(fetch._dt, "datetime", wraps=dt.datetime) as clock,
-                    mock.patch.object(fetch, "_claim_fetch", return_value=False),
+                    mock.patch.object(fetch, "_claim_fetch", return_value=[]),
                 ):
                     clock.now.return_value = self.now
                     shared = self.snapshot(min_interval=60)
@@ -608,6 +611,43 @@ class UsageCacheTests(IsolatedUsageTestCase):
         self.assertTrue(restored["cacheOnly"])
         self.assertNotIn("sharedCache", restored)
         self.assertTrue(restored["providers"][0]["stale"])
+
+    def test_a_claim_covers_only_the_providers_fetched(self) -> None:
+        # Another poller refreshed Claude alone just now; this one shows Codex too.
+        self.measured = self.now
+        self.snapshot([self.record("claude", used=10)], providers="claude", min_interval=60)
+        both = self.snapshot([self.record("codex", used=70), self.record("claude", used=99)],
+                             providers="codex,claude", min_interval=60)
+        self.assertEqual(self.fetched, ["codex"])
+        self.assertNotIn("cacheOnly", both)
+        readings = {r["id"]: (r["primary"]["usedPercent"], r.get("stale", False))
+                    for r in both["providers"]}
+        self.assertEqual(readings, {"codex": (70, False), "claude": (10, False)})
+        cached = json.loads(self.cache_path.read_text())["providers"]
+        self.assertEqual(cached["claude"]["records"][0]["primary"]["usedPercent"], 10)
+        again = self.snapshot([self.record("codex", used=99)], providers="codex,claude", min_interval=60)
+        self.assertTrue(again["sharedCache"])
+        self.assertEqual(self.fetched, [])
+
+    def test_a_claim_from_before_per_provider_claims_covers_every_provider(self) -> None:
+        claim = self.cache_path.with_name("fetch_claim")
+        claim.parent.mkdir(parents=True, exist_ok=True)
+        for stamp, shared in ((time.time(), True), (0, False)):
+            with self.subTest(shared=shared):
+                claim.write_text(f"{stamp}\n")
+                answer = self.snapshot([self.record(used=42)], providers="codex", min_interval=60)
+                self.assertEqual(answer.get("sharedCache", False), shared)
+
+    def test_a_refused_claim_still_refreshes_the_forecast(self) -> None:
+        forecast = {"ok": True, "expectedAt": "2026-11-20T00:00:00Z"}
+        with (
+            mock.patch.object(fetch, "_claim_fetch", return_value=[]),
+            mock.patch.object(fetch, "_fetch_forecast", return_value=forecast) as fetch_forecast,
+        ):
+            shared = self.snapshot(min_interval=60, forecast_url="https://example.invalid/f")
+        self.assertTrue(shared["sharedCache"])
+        self.assertEqual(shared["forecast"], forecast)
+        fetch_forecast.assert_called_once()
 
     def test_cached_claude_accounts_keep_their_plan_weight(self) -> None:
         # Tern renders the combined Claude bar from the cache alone.
