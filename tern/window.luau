@@ -990,7 +990,7 @@ local function openCard(cx: WindowCx, pane: number, known: string?)
 		view = cardView(cx, pane, shown, session ~= nil),
 		dock = cardDock(pane, shown),
 		about = CARD_ABOUT .. pane .. (if session then " for session " .. session else "")
-			.. ". Done, when shown, ends its waits, Snooze 1d, when shown, pushes the first due one by a day, Close only closes this card.",
+			.. ". Done, when shown, ends what's on you, Snooze 1d, when shown, pushes the first due one by a day, Close only closes this card.",
 		how = "beside",
 		target = pane,
 		focus = false,

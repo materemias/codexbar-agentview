@@ -281,7 +281,9 @@ had queued is cancelled until it fires again.
 | Anything overdue | moves the deadline to 24 hours from now |
 | When I have time, a chain step not started yet, a job still running, a wait whose prompt the agent has | not offered |
 
-**Done** closes the wait. On a session set aside for later it also unpins it.
+**Done** on a row or card closes what's on you and leaves the waits still
+watched; with nothing on you, it closes every wait. On a session set aside for
+later, closing the last wait also unpins it.
 
 **The session card** floats over the pane. It opens by itself the first time
 you focus a session whose wait fired, and on demand with `Ctrl+Alt+I`, a click

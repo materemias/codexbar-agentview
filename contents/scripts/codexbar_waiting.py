@@ -3202,10 +3202,15 @@ def cmd_done(args: argparse.Namespace) -> dict:
             # Another `later` wait still belongs in the inventory.
             unpin = wait["kind"] == "later" and not _later_open(record)
         elif record:
-            for wait in _open_waits(record):
-                wait["next"] = None
+            # What is on me, when something is: a wait still watched for me
+            # stays. With nothing on me, Done ends them all.
+            mine = [wait for wait in _open_waits(record) if _wait_ball(wait) == "on_me"]
+            for wait in mine or _open_waits(record):
+                if not mine:
+                    wait["next"] = None
                 _complete(state, record, wait, now)
             _settle(state, record, now)
+            unpin = not _open_waits(record)
         return _move_pin(state, session, False if unpin else None, omp, now)
 
     return _mutate(apply, omp=omp)

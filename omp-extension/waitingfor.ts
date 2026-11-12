@@ -137,7 +137,7 @@ const FORMS = [
 		featured: true,
 	},
 	{ word: "list", alone: true, usage: "/wait list", what: "this session's details" },
-	{ word: "done", usage: "/wait done [wait-id]", what: "close one wait, or all of them", example: "done w1" },
+	{ word: "done", usage: "/wait done [wait-id]", what: "close one wait, or what's on you (every wait when nothing is)", example: "done w1" },
 	{ word: "note", usage: "/wait note <text>", what: "set this session's sentence", example: "note on hold until Monday" },
 	{ word: "help", alone: true, usage: "/wait help", what: "this help" },
 ];

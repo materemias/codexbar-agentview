@@ -581,6 +581,17 @@ class ConditionTests(Case):
         self.run_cli("event", "--type", "turn_finished", "--pane", "40")
         self.assertEqual(self.wait_of(wait)["state"], "review")
 
+    def test_done_ends_what_is_on_me_and_keeps_what_still_waits(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        ran, _ = self.queued_prompt()
+        self.run_cli("event", "--type", "turn_finished", "--pane", "40")
+        later = self.add("--kind", "time", "--in", "1d")["id"]
+        self.run_cli("done", "--session", SID)
+        self.assertEqual([w["id"] for w in self.session()["waits"]], [later])
+        self.run_cli("done", "--session", SID)
+        self.assertEqual({w["id"]: w["state"] for w in self.state()["sessions"][SID]["waits"]}, {ran: "done", later: "done"})
+
     def test_job_on_a_pane_record(self) -> None:
         answer = self.run_cli("add", "--pane", "51", "--kind", "job", "--note", "build")
         self.assertIsNone(answer["session"])
