@@ -56,9 +56,9 @@ Type `/wait ` for completions. `/wait help` lists them above the composer.
 | `/wait 2d <sentence> [-- prompt]` | a while: `3h`, `1h30m`, `1w` |
 | `/wait every 2h [for 1d\|3 times] [until …] [sentence] -- <prompt>` | sends the prompt every 2 hours (below) |
 | `/wait 2026-11-07 09:00 <sentence> [-- prompt]` | a date and time, or just `18:00` (the next one) |
-| `/wait gh pr [N\|URL] [until] <sentence> [-- prompt]` | a pull request (see below) |
-| `/wait gh babysit [N\|URL] [sentence]` | a bot review; then the agent fixes what's real, and the wait follows the PR to ready and merged |
-| `/wait gh release [owner/repo] <sentence> [-- prompt]` | a repo's next GitHub release |
+| `/wait gh pr [N\|URL] [until] [--] <sentence> [-- prompt]` | a pull request (see below) |
+| `/wait gh babysit [N\|URL] [--] [sentence]` | a bot review; then the agent fixes what's real, and the wait follows the PR to ready and merged |
+| `/wait gh release [owner/repo] [--] <sentence> [-- prompt]` | a repo's next GitHub release |
 | `/wait check [every 10m] <what to check> [-- prompt]` | a condition you describe; the agent writes the command once, code runs it |
 | `/wait check [every 10m] ! <command> [-- prompt]` | a command you give, until it exits 0 |
 | `/wait for <what>` | anything else, in your words; you mark it done. One per session: it replaces the previous text, and `/wait for` alone removes it |
@@ -73,7 +73,10 @@ session's row, and the answer goes away with your next input.
 
 Without a number, `gh pr` and `gh babysit` take the PR the agent named last,
 else the current branch's PR. `gh release` without a repo takes the current
-one.
+one. A lone `--` right after the PR, state or repo starts the sentence
+(`gh pr -- review the patch`). A first word that could be a repo is checked
+with gh and stays in the sentence if GitHub has no such repo. After saving,
+the area above the composer shows what the line was read as.
 
 **Repeating a prompt.** `/wait every 2h -- <prompt>` sends the prompt every
 2 hours, the first time 2 hours from now, until you press Done. It can stop by
@@ -113,7 +116,8 @@ and no review thread is open. CI that hasn't run doesn't count as green: on a
 PR from a fork, GitHub holds the CI until a maintainer approves it, and the
 wait says so and keeps waiting. `review` waits only for the bot review on the
 latest push. `merged` and `released` do what they say; `released` compares
-the merge commit with the release tags. `activity` fires on the next comment,
+the merge commit with the release tags, and a prerelease that holds it is
+only reported once: the wait keeps waiting for a release. `activity` fires on the next comment,
 review, merge or close from someone other than you, and on a push when the PR
 isn't yours. Failed checks, conflicts and a PR closed without merging bring
 the wait back to you at once.
@@ -351,8 +355,11 @@ and the Plasma Agents section show one line:
 | ⚠ Waits not checked since 14:20 | nothing has checked the waits for 15 minutes (Tern isn't running, say) |
 | ⚠ Waits not checked since never | no check has run yet, 15 minutes after this surface first showed the waits |
 | ⚠ Session scan stale since 14:20 | the session list is older than 2 minutes or from before a reboot |
+| ⚠ Last check: … | the last check ran, recently, but couldn't do part of its work (a session it can't show, a PR whose checks it can't read) |
 
-Meanwhile the panel's back-on-you count reads `2?`, dimmed, or `0?`. A Tern
+Except for "Last check", the panel's back-on-you count meanwhile reads `2?`,
+dimmed, or `0?`; a "Last check" line with a stale session scan says so at its
+end and marks the count too. A Tern
 daemon that isn't the one checking (a second daemon on the same state) says
 "Another Tern daemon checks these waits" and leaves checks, actions and pane
 events to the other one.
