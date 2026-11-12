@@ -1537,20 +1537,14 @@ def _tern_panes(socket: str) -> tuple[dict[int, str], dict[int, str]]:
         name = session["name"][:256]
         tabs = session.get("tabs")
         tabs = [t for t in tabs if isinstance(t, dict)] if isinstance(tabs, list) else []
+        shown = next((t for t in tabs if t.get("shown") is True), tabs[0] if len(tabs) == 1 else None)
         for tab in tabs:
             blocks = tab.get("blocks")
             for block in blocks if isinstance(blocks, list) else []:
                 if isinstance(block, dict) and isinstance(block.get("id"), int):
                     home[block["id"]] = name
-        shown = [t for t in tabs if t.get("shown") is True] or (tabs if len(tabs) == 1 else [])
-        blocks = shown[0].get("blocks") if shown else None
-        for block in blocks if isinstance(blocks, list) else []:
-            if (
-                isinstance(block, dict)
-                and block.get("focused") is True
-                and isinstance(block.get("id"), int)
-            ):
-                visible[block["id"]] = name
+                    if tab is shown and block.get("focused") is True:
+                        visible[block["id"]] = name
     return visible, home
 
 
