@@ -47,6 +47,7 @@ class FakeGhError(Exception):
 def fake_github(**overrides) -> types.SimpleNamespace:
     """waiting_github's contract, answering "nothing happened yet"."""
     defaults = dict(
+        ENDED_POLL_S=3600,
         GhError=FakeGhError,
         is_transient=lambda text: "connect" in text or "HTTP 502" in text,
         FIX_PROMPT="fix {repo}#{number} at {head}",
@@ -4967,6 +4968,77 @@ class ToastFoldTests(Case):
         self.assertEqual(len(self.toasts()), 4)
         self.advance(minutes=61)
         self.assertEqual(self.toasts(), ["4 waits changed while no Tern window was open"])
+
+
+class ClampTests(Case):
+    def edit_waits(self, change) -> None:
+        state = self.state()
+        for wait in state["sessions"][SID]["waits"]:
+            change(wait)
+        (self.state_dir / "waiting.json").write_text(json.dumps(state))
+
+    def far(self) -> str:
+        return (self.clock + timedelta(days=365)).isoformat()
+
+    def test_times_a_clock_jump_left_far_ahead_come_back_within_their_interval(self) -> None:
+        argv = json.dumps([sys.executable, "-c", "raise SystemExit(1)"])
+        check = self.add("--kind", "command", "--argv", argv)["id"]
+        runs = self.add("--kind", "repeat", "--every", "1h", "--prompt", "go")["id"]
+        deadline = self.add("--kind", "later", "--deadline", self.far())["id"]
+        self.tick()
+
+        def jump(wait: dict) -> None:
+            if wait["id"] == check:
+                wait["next_check_at"] = self.far()
+            if wait["id"] == runs:
+                wait["repeat"]["next_at"] = self.far()
+
+        self.edit_waits(jump)
+        self.tick()
+        waits = {wait["id"]: wait for wait in self.state()["sessions"][SID]["waits"]}
+        bound = (self.clock + timedelta(seconds=waiting.DEFAULT_INTERVAL_S)).isoformat()
+        self.assertEqual(waits[check]["next_check_at"], bound)
+        self.assertEqual(waits[runs]["repeat"]["next_at"], (self.clock + timedelta(hours=1)).isoformat())
+        self.assertEqual(waits[deadline]["deadline"], self.far())
+
+    def test_a_snooze_from_before_snooze_s_keeps_its_length(self) -> None:
+        argv = json.dumps([sys.executable, "-c", "raise SystemExit(1)"])
+        check = self.add("--kind", "command", "--argv", argv)["id"]
+        self.run_cli("snooze", "--session", SID, "--wait", check, "--for", "3d")
+        self.edit_waits(lambda wait: wait.pop("snooze_s"))
+        self.advance(minutes=1)
+        self.tick()
+        waits = {wait["id"]: wait for wait in self.state()["sessions"][SID]["waits"]}
+        self.assertEqual(waits[check]["next_check_at"], (self.clock + timedelta(days=3, minutes=-1)).isoformat())
+
+    def test_an_unsnoozed_wait_from_before_snooze_s_gets_its_interval(self) -> None:
+        argv = json.dumps([sys.executable, "-c", "raise SystemExit(1)"])
+        check = self.add("--kind", "command", "--argv", argv)["id"]
+        self.tick()
+
+        def jumped(wait: dict) -> None:
+            wait.pop("snooze_s")
+            wait["next_check_at"] = self.far()
+
+        self.edit_waits(jumped)
+        self.tick()
+        waits = {wait["id"]: wait for wait in self.state()["sessions"][SID]["waits"]}
+        bound = (self.clock + timedelta(seconds=waiting.DEFAULT_INTERVAL_S)).isoformat()
+        self.assertEqual(waits[check]["next_check_at"], bound)
+
+    def test_a_snooze_keeps_its_length(self) -> None:
+        argv = json.dumps([sys.executable, "-c", "raise SystemExit(1)"])
+        check = self.add("--kind", "command", "--argv", argv)["id"]
+        fired = self.add("--kind", "command", "--argv", json.dumps([sys.executable, "-c", "pass"]))["id"]
+        self.advance(seconds=2)
+        self.tick()
+        self.run_cli("snooze", "--session", SID, "--wait", check, "--for", "1d")
+        self.run_cli("snooze", "--session", SID, "--wait", fired, "--for", "2d")
+        self.edit_waits(lambda wait: wait.update(refire_at=self.far()) if wait["id"] == fired else None)
+        self.tick()
+        waits = {wait["id"]: wait for wait in self.state()["sessions"][SID]["waits"]}
+        self.assertEqual(waits[check]["next_check_at"], (self.clock + timedelta(days=1)).isoformat())
+        self.assertEqual(waits[fired]["refire_at"], (self.clock + timedelta(days=2)).isoformat())
 
 
 if __name__ == "__main__":

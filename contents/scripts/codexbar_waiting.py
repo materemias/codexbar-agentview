@@ -73,6 +73,8 @@ ACTION_KEPT_S = 7 * 24 * 3600
 # Toasts no window showed: past this many, the ones older than TOAST_FOLD_S fold into one.
 TOAST_FOLD_COUNT = 3
 TOAST_FOLD_S = 60 * 60
+# How far a snooze from before `snooze_s` may lie ahead.
+SNOOZE_BOUND_S = 24 * 3600
 MAX_DURATION_S = 10 * 366 * 24 * 3600
 TICK_MIN_S = 15
 TICK_MAX_S = 300
@@ -1273,6 +1275,7 @@ def _new_wait(state: dict, now: datetime, **fields: object) -> dict:
         "transient_since": None, "transient_logged": False,
         # What `retry` restores of a wait check errors put on me (`_attention`).
         "retry_as": None,
+        "snooze_s": None,
     }
     wait.update(fields)
     if wait.get("kind") == "job":
@@ -1991,6 +1994,8 @@ def _verify_job(wait: dict, now: datetime) -> dict:
 
 def _check_job(wait: dict, now: datetime, recheck: bool = False) -> dict:
     _touch(wait)
+    # A wait whose snooze ran out is checked again: the bound `_clamp` keeps falls back.
+    wait["snooze_s"] = None
     job = {"wait": wait["id"], "rev": wait["rev"], "condition": wait["condition"]}
     if wait["kind"] == "command":
         job["type"] = "command"
@@ -2586,6 +2591,7 @@ def _repeat_step(state: dict, record: dict, wait: dict, now: datetime) -> None:
         return
     action = _queue_prompt(state, record, wait, _run_text(wait), now, repeat=True)
     repeat.update(runs=repeat["runs"] + 1, running=action, last_run_at=_iso(now))
+    wait["snooze_s"] = None
     # The last run has no next one.
     spent = _repeat_spent(repeat)
     repeat["next_at"] = None if spent else _iso(now + timedelta(seconds=repeat["every_s"]))
@@ -2619,6 +2625,57 @@ def _evaluate_record(state: dict, record: dict, now: datetime) -> None:
                 _log(record, now, wait, f"{wait['label']}: {REASON_OVERDUE}", "attention")
                 record["unseen"] = True
                 _toast(state, record, wait, now, "error", f"{wait['label']}: {REASON_OVERDUE}")
+
+
+def _check_bound_s(wait: dict) -> int:
+    """How far ahead a wait's next check can lie: its interval or claim, an
+    hour for a retry, or what its snooze asked for."""
+    if wait["state"] == "needs_attention":
+        bound = RETRY_DEAD_S
+    elif wait["kind"] == "command":
+        bound = max(wait["condition"]["interval_s"], CHECK_CLAIM_S)
+    else:
+        # waiting_github's longest `next_poll_s`.
+        bound = max(_github().ENDED_POLL_S, CHECK_CLAIM_S)
+    return max(bound, wait.get("snooze_s") or 0)
+
+
+def _backfill_snooze(record: dict, wait: dict, stamp: float) -> None:
+    """A wait from before `snooze_s` whose last history line is its snooze may
+    have been snoozed for days: what lies ahead of it counts as asked for, once.
+    Any other gets its own interval's bound (a hidden snooze: 24 h)."""
+    last = next((line for line in reversed(record["history"]) if line.get("wait") == wait["id"]), None)
+    if last is None or not str(last.get("text")).startswith("Snoozed until "):
+        wait["snooze_s"] = None
+        return
+    times = [wait.get("next_check_at"), wait.get("refire_at"), (wait.get("repeat") or {}).get("next_at")]
+    ahead = max((_stamp(text) - stamp for text in times if text), default=0)
+    wait["snooze_s"] = math.ceil(ahead) if ahead > 0 else None
+
+
+def _clamp(state: dict, now: datetime) -> None:
+    """A clock that jumped forward and back leaves times far ahead: none lies
+    further out than its own interval. Deadlines and time waits are mine."""
+    stamp = now.timestamp()
+
+    def bound(wait: dict, holder: dict, key: str, seconds: int) -> None:
+        if (_stamp(holder.get(key)) or 0) > stamp + seconds:
+            holder[key] = _iso(now + timedelta(seconds=seconds))
+            _touch(wait)
+
+    for record in _records(state):
+        with _isolated(state, record, now):
+            for wait in _open_waits(record):
+                if "snooze_s" not in wait:
+                    _backfill_snooze(record, wait, stamp)
+                if wait["kind"] in ("command", "pr"):
+                    bound(wait, wait, "next_check_at", _check_bound_s(wait))
+                bound(wait, wait, "verify_claim_until", RETRY_DEAD_S)
+                repeat = wait.get("repeat")
+                if repeat:
+                    bound(wait, repeat, "next_at", max(repeat["every_s"], wait.get("snooze_s") or 0))
+                if wait["state"] == "snoozed":
+                    bound(wait, wait, "refire_at", wait.get("snooze_s") or SNOOZE_BOUND_S)
 
 
 def _next_tick_s(state: dict, now: datetime) -> int:
@@ -3774,6 +3831,8 @@ def cmd_snooze(args: argparse.Namespace) -> dict:
             raise BadInput(f"{args.wait}: the agent runs its prompt now")
         until = _iso(now + delay)
         condition = wait["condition"]
+        # How far ahead `_clamp` lets the times this sets lie.
+        wait["snooze_s"] = int(delay.total_seconds())
         if wait["state"] == "snoozed":
             wait["refire_at"] = until
         elif wait["overdue"] and wait["state"] == "waiting":
@@ -4158,6 +4217,7 @@ def _tick(args: argparse.Namespace) -> dict:
             }
         _note_tick(state, now, stale)
         _housekeeping(state, agents, omp, now, args.daemon)
+        _clamp(state, now)
         _pin_pass(state, omp, now)
         _evaluate(state, now)
         _delivery_pass(state, agents, now, args.window, stale)
