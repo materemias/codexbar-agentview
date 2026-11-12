@@ -178,6 +178,40 @@ The Waiting tab, Plasma and tern-awui group sessions the same way:
 A session's group is its most urgent wait's. A repeating prompt shows as
 `↻ every 2h · next 16:00` in the session's status, row and card.
 
+## When a wait is fulfilled
+
+A wait that happened stays in On me until you mark it Done, and everything
+shows it the same way:
+
+| Mark | Means | Color |
+|---|---|---|
+| ✅ | fulfilled: what you waited for happened (`✅ PR#20 merged`) | green |
+| ⚠️ | needs you: a check failed, a PR conflicts or was closed, a prompt couldn't be sent | yellow |
+| ⏰ | overdue: its deadline passed, still watched | yellow |
+| 🔧 | at work: the agent runs the wait's prompt, such as a babysit's review fixes | |
+| ⏲ | waiting for a time | |
+| ⏳ | waiting for anything else | |
+
+A session can wait for several things at once, say two babysat PRs and a
+release. Each chain of steps, and each wait of its own, is a thread. The row
+above the composer, the status segment (`+2`) and the Waiting tab row show
+every thread by its current step, the most urgent first:
+`⏳ PR#18849 · Ready · 27m · + ⏳ PR#26 review on head`. Next step lists each
+thread's next step.
+
+The row above the composer, the Waiting tab row and the status segment start
+with the mark. The session card opens with a banner such as
+`✅ Fulfilled · PR#20 merged · 2h ago`. While another thread still waits, the
+banner drops "Fulfilled" and names it underneath:
+`✅ PR#18849 merged · 1h ago`, then `Still waiting for ⏳ PR#18849 released`.
+Each wait under "Waiting for" carries its mark, and the fulfilling line in
+"Since set aside" is green. In On me, the ⚠️ sessions come first, then ⏰,
+then ✅. A tab holding a session that's on you turns green when all of them
+are fulfilled and yellow when one needs you.
+
+When a babysat PR is merged early, the steps it skipped (review, ready) are
+closed and the merged step fires at once.
+
 ## Follow-up prompts
 
 When a wait with a prompt fires, the omp extension sends the prompt into the
@@ -214,40 +248,6 @@ and an extension heard from just before it doesn't hold the reopen back. A
 prompt whose turn the reboot cut off is sent again once, led by a note asking
 the agent to check what was already done; cut off a second time, it comes to
 you. A job wait on a shell pane comes back to you, since the pane is gone.
-
-## When a wait is fulfilled
-
-A wait that happened stays in On me until you mark it Done, and everything
-shows it the same way:
-
-| Mark | Means | Color |
-|---|---|---|
-| ✅ | fulfilled: what you waited for happened (`✅ PR#20 merged`) | green |
-| ⚠️ | needs you: a check failed, a PR conflicts or was closed, a prompt couldn't be sent | yellow |
-| ⏰ | overdue: its deadline passed, still watched | yellow |
-| 🔧 | at work: the agent runs the wait's prompt, such as a babysit's review fixes | |
-| ⏲ | waiting for a time | |
-| ⏳ | waiting for anything else | |
-
-A session can wait for several things at once, say two babysat PRs and a
-release. Each chain of steps, and each wait of its own, is a thread. The row
-above the composer, the status segment (`+2`) and the Waiting tab row show
-every thread by its current step, the most urgent first:
-`⏳ PR#18849 · Ready · 27m · + ⏳ PR#26 review on head`. Next step lists each
-thread's next step.
-
-The row above the composer, the Waiting tab row and the status segment start
-with the mark. The session card opens with a banner such as
-`✅ Fulfilled · PR#20 merged · 2h ago`. While another thread still waits, the
-banner drops "Fulfilled" and names it underneath:
-`✅ PR#18849 merged · 1h ago`, then `Still waiting for ⏳ PR#18849 released`.
-Each wait under "Waiting for" carries its mark, and the fulfilling line in
-"Since set aside" is green. In On me, the ⚠️ sessions come first, then ⏰,
-then ✅. A tab holding a session that's on you turns green when all of them
-are fulfilled and yellow when one needs you.
-
-When a babysat PR is merged early, the steps it skipped (review, ready) are
-closed and the merged step fires at once.
 
 ## Coming back
 
