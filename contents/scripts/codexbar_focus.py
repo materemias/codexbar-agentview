@@ -429,10 +429,11 @@ def _startup_lock(path: Path):
 
 
 def _prune_startup_locks(directory: Path, keep: Path) -> None:
-    """Remove the startup lock files of other sessions unused for a day. One
-    goes only while nobody holds it and its path still names the inode locked,
-    so a waiter on it notices (`_startup_lock`). At most once an hour: a
-    marker file's age says when the last look was."""
+    """Remove the startup lock and reservation files of other sessions unused
+    for a day. A pair goes only while nobody holds its lock and the lock's
+    path still names the inode locked, so a waiter on it notices
+    (`_startup_lock`); a reservation whose lock is gone is locked anew first.
+    At most once an hour: a marker file's age says when the last look was."""
     now = time.time()
     marker = directory / f"{AGGREGATE_PATH.name}.startup-pruned"
     try:
@@ -443,23 +444,38 @@ def _prune_startup_locks(directory: Path, keep: Path) -> None:
     with contextlib.suppress(OSError):
         marker.touch()
     cutoff = now - STARTUP_LOCK_KEPT_SECONDS
-    for path in directory.glob(f"{AGGREGATE_PATH.name}.*.startup.lock"):
-        if path == keep:
+    locks = {
+        path.with_suffix(".lock")
+        for path in directory.glob(f"{AGGREGATE_PATH.name}.*.startup.*")
+        if path.suffix in (".lock", ".json")
+    }
+    for path in locks - {keep}:
+        reservation = path.with_suffix(".json")
+        if _mtime(path) > cutoff or _mtime(reservation) > cutoff:
             continue
         try:
-            if path.stat().st_mtime > cutoff:
-                continue
-            fd = os.open(path, os.O_RDWR)
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         except OSError:
             continue
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            if _names_inode(fd, path):
+            # A startup may have reserved the session since the look above;
+            # one that only used the lock leaves nothing a removal loses.
+            if _names_inode(fd, path) and _mtime(reservation) <= cutoff:
+                reservation.unlink(missing_ok=True)
                 path.unlink()
         except OSError:
             pass
         finally:
             os.close(fd)
+
+
+def _mtime(path: Path) -> float:
+    """When `path` last changed; a missing file counts as never."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 class _DispatchAckUnknown(Exception):

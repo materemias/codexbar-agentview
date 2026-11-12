@@ -1050,8 +1050,8 @@ class StartupLockTests(unittest.TestCase):
         patch.start()
         self.addCleanup(patch.stop)
 
-    def lock_file(self, name: str, age_s: float) -> Path:
-        path = self.root / f"agents.json.{name}.startup.lock"
+    def lock_file(self, name: str, age_s: float, suffix: str = "lock") -> Path:
+        path = self.root / f"agents.json.{name}.startup.{suffix}"
         path.touch()
         stamp = time.time() - age_s
         os.utime(path, (stamp, stamp))
@@ -1068,6 +1068,21 @@ class StartupLockTests(unittest.TestCase):
         fcntl.flock(holder, fcntl.LOCK_EX)
         focus._prune_startup_locks(self.root, keep=mine)
         self.assertEqual([path.exists() for path in (old, fresh, held, mine)], [False, True, True, True])
+
+    def test_reservations_go_with_their_locks(self) -> None:
+        day = focus.STARTUP_LOCK_KEPT_SECONDS
+        mine = self.lock_file("mine", 0)
+        pair = [self.lock_file("pair", day + 60), self.lock_file("pair", day + 60, "json")]
+        # Its lock went before reservations were pruned too.
+        orphan = self.lock_file("orphan", day + 60, "json")
+        fresh_orphan = self.lock_file("fresh-orphan", day - 60, "json")
+        reserved = [self.lock_file("reserved", day + 60), self.lock_file("reserved", day - 60, "json")]
+        focus._prune_startup_locks(self.root, keep=mine)
+        self.assertEqual([path.exists() for path in pair], [False, False])
+        self.assertFalse(orphan.exists())
+        self.assertFalse(orphan.with_suffix(".lock").exists())
+        self.assertTrue(fresh_orphan.exists())
+        self.assertEqual([path.exists() for path in reserved], [True, True])
 
     def test_it_looks_at_most_once_an_hour(self) -> None:
         day = focus.STARTUP_LOCK_KEPT_SECONDS
