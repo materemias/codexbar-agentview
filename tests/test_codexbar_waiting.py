@@ -5041,5 +5041,54 @@ class ClampTests(Case):
         self.assertEqual(waits[fired]["refire_at"], (self.clock + timedelta(days=2)).isoformat())
 
 
+class PruneTests(Case):
+    def test_waits_that_ended_a_week_ago_leave_an_open_record(self) -> None:
+        self.add("--kind", "later")
+        ended = self.add("--kind", "time", "--in", "1s", "--label", "Old")["id"]
+        self.advance(seconds=2)
+        self.tick()
+        self.run_cli("done", "--session", SID, "--wait", ended)
+        ids = lambda: [wait["id"] for wait in self.state()["sessions"][SID]["waits"]]
+        self.advance(days=7)
+        self.tick()
+        self.assertIn(ended, ids())
+        self.advance(seconds=1)
+        self.tick()
+        self.assertNotIn(ended, ids())
+        self.assertIn("Done: Old", [line["text"] for line in self.state()["sessions"][SID]["history"]])
+
+    def test_pr_cache_rows_unused_for_a_week_go(self) -> None:
+        old = (self.clock - timedelta(days=8)).isoformat()
+        recent = (self.clock - timedelta(days=6)).isoformat()
+        entry = {"path": "/t", "offset": 0, "calls": [], "prs": []}
+        (self.state_dir / "pr_cache.json").write_text(json.dumps({
+            "version": waiting.PR_CACHE_VERSION,
+            "sessions": {"gone": {**entry, "used_at": old}, "kept": {**entry, "used_at": recent}, "unstamped": entry},
+            "statuses": {"o/r#1": {"asked_at": old}, "o/r#2": {"asked_at": recent}},
+        }))
+        cache = waiting.PrCache()
+        self.assertEqual(sorted(cache.sessions), ["kept", "unstamped"])
+        self.assertEqual(list(cache.statuses), ["o/r#2"])
+        cache.save()
+        saved = json.loads((self.state_dir / "pr_cache.json").read_text())
+        self.assertEqual(list(saved["statuses"]), ["o/r#2"])
+        # A row from before `used_at` counts from now, so it goes a week later.
+        self.assertEqual(saved["sessions"]["unstamped"]["used_at"], self.clock.isoformat())
+        self.advance(days=8)
+        self.assertEqual(list(waiting.PrCache().sessions), [])
+
+    def test_a_chain_runs_on_past_a_pruned_step(self) -> None:
+        first = self.add("--kind", "later")["id"]
+        skipped = self.add("--kind", "time", "--in", "1h", "--after", first)["id"]
+        last = self.add("--kind", "later", "--label", "Last", "--after", skipped)["id"]
+        self.run_cli("done", "--session", SID, "--wait", skipped)
+        self.advance(days=8)
+        self.tick()
+        self.assertNotIn(skipped, [wait["id"] for wait in self.state()["sessions"][SID]["waits"]])
+        self.run_cli("done", "--session", SID, "--wait", first)
+        self.assertEqual(self.wait_of(last)["state"], "waiting")
+
+
+
 if __name__ == "__main__":
     unittest.main()

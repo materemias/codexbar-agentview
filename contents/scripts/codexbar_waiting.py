@@ -70,6 +70,8 @@ BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 MENU_REQUEST_FRESH_S = 15
 CLOSED_RECORD_KEPT_S = 7 * 24 * 3600
 ACTION_KEPT_S = 7 * 24 * 3600
+DONE_WAIT_KEPT_S = 7 * 24 * 3600
+PR_CACHE_KEPT_S = 7 * 24 * 3600
 # Toasts no window showed: past this many, the ones older than TOAST_FOLD_S fold into one.
 TOAST_FOLD_COUNT = 3
 TOAST_FOLD_S = 60 * 60
@@ -972,17 +974,27 @@ def _valid_cached_session(entry: object) -> bool:
         and all(isinstance(call, str) for call in entry["calls"])
         and isinstance(entry.get("prs"), list)
         and all(_valid_cached_pr(pr) for pr in entry["prs"])
+        and (entry.get("used_at") is None or _valid_time(entry["used_at"]))
     )
 
 
 def _valid_cached_status(status: object) -> bool:
-    if not isinstance(status, dict) or not isinstance(status.get("asked_at"), str):
+    return isinstance(status, dict) and _valid_time(status.get("asked_at"))
+
+
+def _valid_time(text: object) -> bool:
+    if not isinstance(text, str):
         return False
     try:
-        _parse_time(status["asked_at"])
+        _parse_time(text)
     except BadInput:
         return False
     return True
+
+
+def _recent(text: str | None, now: float) -> bool:
+    """Used within PR_CACHE_KEPT_S; a row from before `used_at` is stamped now."""
+    return text is None or now - _stamp(text) <= PR_CACHE_KEPT_S
 
 
 
@@ -990,7 +1002,8 @@ class PrCache:
     """pr_cache.json: what each session's transcript showed up to `offset`, and
     what GitHub last said about each PR. No lock: it can be rebuilt, so a lost
     race only costs a rescan or a question to GitHub, and a row that can't be
-    read is dropped rather than failing every command."""
+    read is dropped rather than failing every command. A session nobody showed,
+    and a PR nobody asked about, for PR_CACHE_KEPT_S go too."""
 
     def __init__(self, scan: bool = True):
         """Without `scan`, sessions keep what the last scan saved: no transcript is read."""
@@ -999,6 +1012,7 @@ class PrCache:
         self.sessions: dict[str, dict] = {}
         self.statuses: dict[str, dict] = {}
         self.dirty = False
+        self.now = _now()
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -1006,14 +1020,21 @@ class PrCache:
         if isinstance(data, dict) and data.get("version") == PR_CACHE_VERSION:
             sessions, statuses = data.get("sessions"), data.get("statuses")
             if isinstance(sessions, dict) and isinstance(statuses, dict):
+                stamp = self.now.timestamp()
                 self.sessions = {
                     session: entry for session, entry in sessions.items()
-                    if _valid_cached_session(entry)
+                    if _valid_cached_session(entry) and _recent(entry.get("used_at"), stamp)
                 }
                 self.statuses = {
                     key: status for key, status in statuses.items()
-                    if _valid_cached_status(status)
+                    if _valid_cached_status(status) and _recent(status["asked_at"], stamp)
                 }
+                unstamped = [entry for entry in self.sessions.values() if "used_at" not in entry]
+                for entry in unstamped:
+                    entry["used_at"] = _iso(self.now)  # from before `used_at`: counts from now
+                self.dirty = bool(unstamped) or (
+                    len(self.sessions) < len(sessions) or len(self.statuses) < len(statuses)
+                )
 
     def save(self) -> None:
         if self.dirty:
@@ -1064,6 +1085,11 @@ class PrCache:
         A PR the session's own waits saw merged says so before the status cache's next refresh,
         so its badge never contradicts the wait that fired on the merge."""
         scanned = self._scan(session, transcript)
+        entry = self.sessions.get(session)
+        if entry is not None and (_stamp(entry.get("used_at")) or 0) < self.now.timestamp() - 3600:
+            # Kept fresh to the hour: the cache isn't rewritten for every view.
+            entry["used_at"] = _iso(self.now)
+            self.dirty = True
         rows: dict[str, dict] = {}
         for pr in (
             *(pr for pr in scanned if pr["source"] == "created"),
@@ -1275,7 +1301,7 @@ def _new_wait(state: dict, now: datetime, **fields: object) -> dict:
         "transient_since": None, "transient_logged": False,
         # What `retry` restores of a wait check errors put on me (`_attention`).
         "retry_as": None,
-        "snooze_s": None,
+        "done_at": None, "snooze_s": None,
     }
     wait.update(fields)
     if wait.get("kind") == "job":
@@ -1409,7 +1435,7 @@ def _finish(record: dict, wait: dict, now: datetime, activate: bool = True) -> N
     chain on."""
     started = wait["state"] != "pending"
     wait["state"] = "done"
-    wait.update(on_me=False, overdue=False, reason=None, verify_pending=False)
+    wait.update(on_me=False, overdue=False, reason=None, verify_pending=False, done_at=_iso(now))
     _touch(wait)
     _cancel_prompts(record, wait)
     # A pending step that ends early only drops out: the step before it still
@@ -1540,7 +1566,7 @@ INTERNAL_ERROR = "internal error: "
 CHECK_RETRIES = ("check", "verify")
 # The time fields `_quarantine` clears when they don't parse, so the record can
 # still be shown.
-_WAIT_TIMES = ("deadline", "refire_at", "next_check_at", "verify_claim_until", "armed_at", "fired_at")
+_WAIT_TIMES = ("deadline", "refire_at", "next_check_at", "verify_claim_until", "armed_at", "fired_at", "done_at")
 
 
 @contextlib.contextmanager
@@ -2470,6 +2496,36 @@ def _fold_toasts(state: dict, now: datetime) -> None:
     })
 
 
+def _prune_done_waits(state: dict, now: datetime) -> None:
+    """A record kept open by a `later` or a repeat drops the waits that ended a
+    week ago; its history keeps what they did."""
+    for record in _records(state):
+        if _open_waits(record):
+            with _isolated(state, record, now):
+                _prune_record(record, now)
+
+
+def _prune_record(record: dict, now: datetime) -> None:
+    stamp = now.timestamp()
+    for wait in record["waits"]:
+        if wait["state"] == "done" and not wait.get("done_at"):
+            wait["done_at"] = _iso(now)  # ended before `done_at` was kept
+    by_id = {wait["id"]: wait for wait in record["waits"]}
+    gone = {
+        wait["id"] for wait in record["waits"]
+        if wait["state"] == "done" and stamp - _stamp(wait["done_at"]) > DONE_WAIT_KEPT_S
+    }
+    if not gone:
+        return
+    for wait in record["waits"]:
+        # A chain runs on through its ended steps (`_activate_next`): link past them.
+        following = wait["next"]
+        while following in gone:
+            following = by_id[following]["next"]
+        wait["next"] = following
+    record["waits"] = [wait for wait in record["waits"] if wait["id"] not in gone]
+
+
 def _housekeeping(
     state: dict, agents: Agents, omp: Omp, now: datetime, daemon: str | None = None,
 ) -> None:
@@ -2523,6 +2579,7 @@ def _housekeeping(
         if stamp - _parse_time(action["created_at"]).timestamp() <= ACTION_KEPT_S
     ]
     _fold_toasts(state, now)
+    _prune_done_waits(state, now)
 
 
 def _timer_text(wait: dict) -> str:
