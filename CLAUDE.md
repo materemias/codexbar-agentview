@@ -17,7 +17,7 @@ Identities: applet `io.github.materemias.codexbaragentview`, Tern plugin `codexb
 
 - The native plugin can't be replaced while Plasma runs it: `systemctl --user stop plasma-plasmashell.service`, `kpackagetool6 -t Plasma/Applet -u build/package`, then start. `kquitapp6` returns before plasmashell exits, and the restart leaves the panel down.
 - `plasmoidviewer` is unreliable on Wayland; check changes in the real panel.
-- Test `tern/` changes on a scratch daemon: `tern --control <sock> <dir>` with `TERN_DAEMON_SOCKET` set to a scratch socket, driven by `tern ctl --control <sock>`. On the user's daemon, `ctl` input reaches their focused pane.
+- Test `tern/` changes on a scratch daemon: `tern --control <sock> <dir>` with `TERN_DAEMON_SOCKET` set to a scratch socket and `XDG_STATE_HOME` to a scratch dir, driven by `tern ctl --control <sock>`. Without the scratch state, its host ticks the real `waiting.json`. On the user's daemon, `ctl` input reaches their focused pane.
 - After visible UI changes, re-render the films in `film/`.
 - Ship README.md updates in the same change as the feature.
 - Commit with Conventional Commits (`feat(scope): …`, `fix`, `docs`, `ci`, `refactor`, `test`, `chore`), one change per commit. History before October 2026 uses plain sentences; don't copy it.
