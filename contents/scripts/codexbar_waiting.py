@@ -84,6 +84,8 @@ TICK_MAX_S = 300
 # A daemon that ticked within this still ticks: another one's tick stands aside.
 TICKER_LEASE_S = 2 * TICK_MAX_S
 TICK_SKIPPED = "another Tern daemon ticks this state"
+# A ticker's last tick dated further ahead than this was stamped before the clock went back.
+TICKER_AHEAD_S = 60
 # Soon enough for a window that just opened, late enough for acks to land. Only
 # fresh actions get this: without a window nobody will ack them.
 TICK_OUTBOX_S = 30
@@ -4244,20 +4246,26 @@ def cmd_tick(args: argparse.Namespace) -> dict:
 
 
 def _ticked_elsewhere(state: dict, daemon: str, now: datetime) -> bool:
-    """Another Tern daemon holds the ticker: it ticked lately."""
+    """Another Tern daemon holds the ticker. One that still runs keeps it however
+    long it slept; one whose life can't be checked keeps it while its last tick
+    is recent. A tick dated more than a minute ahead (a clock set back) is old."""
     ticker = state.get("ticker") or {}
-    if not ticker.get("daemon") or ticker["daemon"] == daemon or not _daemon_alive(ticker["daemon"]):
+    if not ticker.get("daemon") or ticker["daemon"] == daemon:
         return False
+    alive = _daemon_alive(ticker["daemon"])
+    if alive is not None:
+        return alive
     at = _stamp(ticker.get("at"))
-    return at is not None and 0 <= now.timestamp() - at < TICKER_LEASE_S
+    return at is not None and -TICKER_AHEAD_S <= now.timestamp() - at < TICKER_LEASE_S
 
 
-def _daemon_alive(daemon: str) -> bool:
-    """False for a `<pid>-<start time>` id whose process is gone or is another
-    one now (a restart, a reboot); an id /proc can't check counts as alive."""
+def _daemon_alive(daemon: str) -> bool | None:
+    """Whether the `<pid>-<start time>` daemon still runs: False when its process
+    is gone or is another one now (a restart, a reboot). None when /proc can't
+    tell, or the id is in another form."""
     pid, _, start = daemon.partition("-")
     if not (pid.isdigit() and start.isdigit()) or not Path("/proc/self/stat").exists():
-        return True
+        return None
     try:
         stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
     except OSError:
@@ -4286,6 +4294,9 @@ def _tick(args: argparse.Namespace) -> dict:
     omp = Omp()
 
     def finish(state: dict, agents: Agents) -> dict:
+        if args.daemon:
+            # The lease runs from the end of the tick: slow checks don't shorten it.
+            state["ticker"] = {"daemon": args.daemon, "at": _iso(now)}
         return {
             "ok": True,
             "actions": [_public_action(action) for action in state["actions"]],

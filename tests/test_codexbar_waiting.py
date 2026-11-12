@@ -4962,6 +4962,32 @@ class DaemonTests(Case):
         self.assertNotIn("skipped", self.tick("--daemon", "b"))
         self.assertEqual(self.state()["ticker"]["daemon"], "b")
 
+    def test_a_running_daemon_keeps_the_ticker_however_long_it_slept(self) -> None:
+        stat = Path("/proc/self/stat").read_text()
+        me = f"{os.getpid()}-{stat[stat.rfind(')') + 2:].split()[19]}"
+        self.tick("--daemon", me)
+        self.advance(hours=2)
+        self.assertEqual(self.tick("--daemon", "b")["skipped"], waiting.TICK_SKIPPED)
+
+    def test_a_tick_dated_ahead_by_a_clock_set_back_is_old(self) -> None:
+        self.tick("--daemon", "a")
+        self.advance(seconds=-50)
+        self.assertEqual(self.tick("--daemon", "b")["skipped"], waiting.TICK_SKIPPED)
+        self.advance(seconds=-20)
+        self.assertNotIn("skipped", self.tick("--daemon", "b"))
+
+    def test_the_lease_runs_from_the_end_of_the_tick(self) -> None:
+        self.add("--kind", "command", "--argv", json.dumps([sys.executable, "-c", "raise SystemExit(1)"]))
+        real = waiting._run_jobs
+
+        def slow(jobs, now):
+            self.advance(minutes=4)
+            return real(jobs, now)
+
+        with mock.patch.object(waiting, "_run_jobs", slow):
+            self.run_cli("tick", "--daemon", "a")
+        self.assertEqual(self.state()["ticker"]["at"], self.clock.isoformat())
+
     def test_a_daemon_that_is_gone_holds_no_lease(self) -> None:
         self.tick("--daemon", "999999999-1")  # no such process
         self.advance(minutes=1)
