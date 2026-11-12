@@ -4570,6 +4570,10 @@ class ResumeTests(Case):
 
 
 class HealthTests(Case):
+    def setUp(self) -> None:
+        super().setUp()
+        self.agents()
+
     def view_file(self) -> dict:
         return json.loads((self.state_dir / "waiting_view.json").read_text())
 
@@ -4606,6 +4610,10 @@ class HealthTests(Case):
         self.assertEqual(self.view_file()["health"]["error_since"], first)
         health = self.tick()["view"]["health"]
         self.assertEqual((health["error"], health["error_since"]), (None, None))
+
+    def test_an_unreadable_session_scan_counts_as_stale(self) -> None:
+        (self.state_dir / "agents.json").write_text("{torn")
+        self.assertEqual(self.tick()["view"]["health"]["agents_stale_since"], self.clock.isoformat())
 
     def test_an_unreadable_state_without_a_view_writes_health_alone(self) -> None:
         (self.state_dir / "waiting.json").write_text("{broken")

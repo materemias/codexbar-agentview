@@ -517,15 +517,12 @@ def _boot_id(agents: Agents) -> str:
 
 
 def _agents_stale(agents: Agents, now: datetime) -> bool:
-    """Nobody has swept lately, or not since the reboot: who runs is unknown,
-    whatever the file says. A file that doesn't say when it was written can't
-    be judged."""
-    if agents.foreign:
+    """Nobody has swept lately, or not since the reboot, or the file is missing
+    or unreadable: who runs is unknown, and the view says so. A file that
+    doesn't say when it was written can't be judged."""
+    if agents.foreign or not agents.known:
         return True
-    return (
-        agents.known and agents.updated_at is not None
-        and now.timestamp() - agents.updated_at > AGENTS_STALE_S
-    )
+    return agents.updated_at is not None and now.timestamp() - agents.updated_at > AGENTS_STALE_S
 
 
 class Omp:
