@@ -41,6 +41,11 @@ FONT = 14
 TRANSITION_MS = 1400
 PROVIDERS = ["claude", "codex", "zai", "opencodego", "openrouter", "kilo"]
 NAMES = {"claude": "Claude Code", "codex": "Codex", "omp": "omp"}
+# The widget bar: the plugin's widgets, then its status segment at the far end. No directory widget:
+# the working folder is the take's scratch folder, not a project's.
+WIDGETS = [{"id": "codexbar-agentview/claude", "style": "ring"}, {"id": "codexbar-agentview/codex", "style": "ring"},
+           {"id": "codexbar-agentview/agents"}, {"id": "codexbar-agentview/on-me"},
+           {"id": "codexbar-agentview/restore"}, {"id": "spacer"}, {"id": "status"}]
 
 # The made-up workspace: one tab per project, a pane per live session. `turns` are the session's
 # last messages as the peek shows them; `ago` is minutes since its state changed.
@@ -300,7 +305,7 @@ class Take:
         (self.config / "plugins").mkdir(parents=True)
         (self.config / "plugins/codexbar-agentview.path").write_text(str(REPO / "tern"))
         (self.config / "settings.json").write_text(json.dumps(
-            {"theme": "Dark", "status_bar": True, "plugins_disabled": ["agents"], "new_tabs": "Home"}, indent=1))
+            {"theme": "Dark", "widgets": WIDGETS, "plugins_disabled": ["agents"], "new_tabs": "Home"}, indent=1))
         # Tern finds the stand-in `omp` through $SHELL and would offer, in a dialog on your desktop,
         # to keep it up to date: this is its record of having asked.
         (self.config / "omp").mkdir()
@@ -310,9 +315,7 @@ class Take:
         (self.work / "film.css").write_text(
             "nav#tabbar button.tn-peers { display: none !important; }\n"
             "div#banners.tn-bn-stack, div#banners.tn-bn-stack > div.tn-bn { display: none !important; }\n"
-            ".tn-glow { display: none !important; }\n"
-            # The working folder's path is the take's scratch folder, not a project's.
-            "footer#statusline > span.sl-cwd { visibility: hidden !important; }\n")
+            ".tn-glow { display: none !important; }\n")
 
     def write_usage(self):
         """usage_cache.json as the fetcher writes it, measured a minute ago, under the account
@@ -606,12 +609,12 @@ class Take:
         raise RuntimeError(f"no {kind} block opened")
 
     def film(self):
-        """The story: the status line, the agent list (filter, peek, jump), usage, the native
+        """The story: the widget bar, the agent list (filter, peek, jump), usage, the native
         settings tab, then one closed session brought back from History."""
-        # Framings, in window pixels: the status line under the panes' lower part, the dashboard
+        # Framings, in window pixels: the widget bar under the panes' lower part, the dashboard
         # beside a tab's one pane (it opens as the right half), the tab bar over the question the
         # blocked session asks, and the settings tab's search and results.
-        status = (760, 410, 740, 270)
+        status = (0, 410, 740, 270)
         dash = (700, 40, 800, 430)
         # The dashboard's lower part, where its status bar holds Settings.
         dash_foot = (700, 270, 800, 430)
@@ -631,7 +634,7 @@ class Take:
             self.caption("CodexBar AgentView for Tern", "Usage and agents, always in view.")
             time.sleep(2.6)
 
-            self.caption("Status line", "Who needs you, at a glance.")
+            self.caption("Widget bar", "Who needs you, at a glance.")
             self.cut(status)
             time.sleep(2.0)
 

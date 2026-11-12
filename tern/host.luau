@@ -1020,47 +1020,144 @@ local function providerCards(snap: any, now: number): { Node }
 	return cards
 end
 
--- Status-line summary for the window half ------------------------------------
+-- Widget bar and status summary for the window half ---------------------------
 
-local function usageSummary(snap: any, now: number): { any }
-	local out = {}
-	local seen: { [string]: boolean } = {}
-	local enabled = setting("providers")
-	for _, rec in val(snap.providers) or {} do
-		local id = str(rec.id)
-		if not table.find(enabled, id) or seen[id] or val(rec.ok) ~= true or val(rec.error) ~= nil then
-			continue
-		end
-		local parts, worst = {}, nil
+-- A do block: the main chunk is at Luau's 200-local limit.
+local usageWidgets: (snap: any, now: number) -> { [string]: any }
+do
+	-- The 5h and weekly windows the Claude and Codex widgets pool across accounts.
+	local POOLED_WINDOWS = { { 300, "5h" }, { 10080, "7d" } }
+
+	local function windowOf(rec: any, minutes: number): any
 		for _, slot in { "primary", "secondary" } do
 			local w = val(rec[slot])
-			if type(w) == "table" and val(w.usedPercent) ~= nil then
-				local pct = math.clamp(tonumber(val(w.usedPercent)) or 0, 0, 100)
-				table.insert(parts, math.floor(pct + 0.5) .. "%")
-				if val(rec.stale) ~= true then
-					local pace = pacePercent(w, now)
-					worst = worse(worst, level(pct, if pace >= 3 then pace else -1))
+			if type(w) == "table" and tonumber(val(w.windowMinutes)) == minutes and val(w.usedPercent) ~= nil then
+				return w
+			end
+		end
+		return nil
+	end
+
+	local function roundPct(pct: number): string
+		return math.floor(math.clamp(pct, 0, 100) + 0.5) .. "%"
+	end
+
+	-- One provider's widget bar view: Claude's and Codex's windows plan-weighted
+	-- across every current account, the others' per window. The bar and ring show
+	-- the binding window: the furthest ahead of its pace, then the fullest.
+	local function usageWidget(id: string, recs: { any }, now: number): any
+		local ok, stale = {}, false
+		for _, r in recs do
+			if val(r.ok) == true and val(r.error) == nil then
+				table.insert(ok, r)
+				stale = stale or val(r.stale) == true
+			end
+		end
+		if #ok == 0 then
+			return nil
+		end
+		local pooled = id == "claude" or id == "codex"
+		local windows = {}
+		if pooled then
+			for _, spec in POOLED_WINDOWS do
+				local pool = if #ok > 1 then composite(ok, spec[1], now) else nil
+				if pool then
+					table.insert(windows, { label = spec[2], pct = pool.usedPercent, pace = pool.pacePct, reset = pool.nextReset })
+				else
+					-- One account, or only one reporting this window.
+					for _, r in ok do
+						local w = windowOf(r, spec[1])
+						if w then
+							table.insert(windows, { label = spec[2], pct = tonumber(val(w.usedPercent)) or 0, pace = pacePercent(w, now), reset = epoch(w.resetsAt) })
+							break
+						end
+					end
+				end
+			end
+		else
+			for _, slot in { "primary", "secondary" } do
+				local w = val(ok[1][slot])
+				if type(w) == "table" and val(w.usedPercent) ~= nil then
+					table.insert(windows, {
+						label = windowLabel(id, slot, w, ""),
+						pct = tonumber(val(w.usedPercent)) or 0,
+						pace = pacePercent(w, now),
+						reset = epoch(w.resetsAt),
+					})
 				end
 			end
 		end
-		if #parts == 0 then
-			continue
+		local balance = balanceOf(ok[1])
+		if #windows == 0 and balance == "" then
+			return nil
 		end
-		seen[id] = true
-		-- Claude and Codex always; the rest only when a window runs hot.
-		if id == "claude" or id == "codex" or (worst and LEVEL_RANK[worst] >= 2) then
-			table.insert(out, {
-				id = id,
-				icon = PROVIDER_ICONS[id] or "gauge",
-				text = (if PROVIDER_ICONS[id] then "" else (PROVIDER_NAMES[id] or id) .. " ") .. table.concat(parts, " · "),
-				tone = if val(rec.stale) == true then "muted" elseif worst then STATUS_TONE[worst] else nil,
-			})
+		local name = PROVIDER_NAMES[id] or id
+		local lines = { name .. (if pooled and #ok > 1 then " · " .. #ok .. " accounts, plan-weighted" else "") .. (if stale then " · last known" else "") }
+		local parts = {}
+		local worst: string?, bind: any = nil, nil
+		for _, w in windows do
+			local pct = math.clamp(w.pct, 0, 100)
+			local lvl = if stale then nil else level(pct, if w.pace >= 3 then w.pace else -1)
+			local rank = LEVEL_RANK[lvl or "ok"]
+			if not bind or rank > bind.rank or (rank == bind.rank and pct > bind.pct) then
+				bind = { rank = rank, pct = pct }
+			end
+			worst = worse(worst, lvl)
+			table.insert(parts, roundPct(pct))
+			local line = w.label .. "  " .. roundPct(pct)
+			if not stale and w.pace >= 3 then
+				line ..= " · " .. roundPct(w.pace) .. " elapsed"
+			end
+			if not stale and w.reset and w.reset > now then
+				line ..= " · " .. (if pooled and #ok > 1 then "next reset in " else "resets in ") .. span(w.reset - now)
+			end
+			table.insert(lines, line)
 		end
+		if balance ~= "" then
+			table.insert(lines, balance)
+		end
+		if pooled and #recs > 1 then
+			for i, r in recs do
+				local email = str(r.accountEmail)
+				local each = {}
+				if val(r.ok) == true and val(r.error) == nil then
+					for _, spec in POOLED_WINDOWS do
+						local w = windowOf(r, spec[1])
+						if w then
+							table.insert(each, spec[2] .. " " .. roundPct(tonumber(val(w.usedPercent)) or 0))
+						end
+					end
+				else
+					table.insert(each, "no reading")
+				end
+				table.insert(lines, (if email ~= "" then email else "account " .. i) .. "  " .. table.concat(each, " · "))
+			end
+		end
+		return {
+			text = (if PROVIDER_ICONS[id] then "" else name .. " ") .. (if #parts > 0 then table.concat(parts, " · ") else balance),
+			tone = if stale then "muted" elseif worst then STATUS_TONE[worst] else nil,
+			value = if bind then bind.pct / 100 else nil,
+			title = table.concat(lines, "\n"),
+		}
 	end
-	table.sort(out, function(a, b)
-		return (table.find(PROVIDER_ORDER, a.id) or 99) < (table.find(PROVIDER_ORDER, b.id) or 99)
-	end)
-	return out
+
+	-- Widget views by provider id, for the enabled providers with a reading.
+	usageWidgets = function(snap, now)
+		local byId: { [string]: { any } } = {}
+		local enabled = setting("providers")
+		for _, rec in val(snap.providers) or {} do
+			local id = str(rec.id)
+			if table.find(enabled, id) then
+				byId[id] = byId[id] or {}
+				table.insert(byId[id], rec)
+			end
+		end
+		local out = {}
+		for id, recs in byId do
+			out[id] = usageWidget(id, recs, now)
+		end
+		return out
+	end
 end
 
 local function recordKey(r: any): string
@@ -1197,7 +1294,7 @@ local function publishSummary()
 		end
 	end
 	local summary = {
-		usage = if store.usage then usageSummary(store.usage, os.time()) else tern.json.array(),
+		usage = if store.usage then usageWidgets(store.usage, os.time()) else {},
 		counts = counts,
 		restore = restore,
 		waiting = { on_me = tonumber(val(waitingCounts().on_me)) or 0, panes = waitingPanes() },
@@ -3521,7 +3618,7 @@ local SETTINGS_PAGES = {
 }
 local SETTINGS_LEADS = {
 	usage = "Choose the details shown in the Usage tab. Changes save immediately.",
-	providers = "Choose which providers appear in usage and the status line. Credentials stay in ~/.codexbar/config.json.",
+	providers = "Choose which providers appear in usage and the widget bar. Credentials stay in ~/.codexbar/config.json.",
 	agents = "Choose which live agents and recently closed sessions appear.",
 	general = "The plugin reads the applet's usage cache. It fetches only after two refresh intervals without a measurement, at most once per interval across Tern daemons and the applet. A live Claude fetch may start a probe session when rate-limited.",
 	about = "CodexBar AgentView brings provider usage and coding-agent sessions to KDE Plasma and Tern. It uses the upstream CodexBar CLI for usage data.",

@@ -1,7 +1,7 @@
--- Window half of the CodexBar AgentView plugin: status-line segments, palette commands,
+-- Window half of the CodexBar AgentView plugin: widget bar widgets and status segments, palette commands,
 -- and the pane you came from, which the dashboard marks with a ring.
 --
--- The host half publishes `summary` (status-line data) and `settingsRequest`
+-- The host half publishes `summary` (widget bar and status data) and `settingsRequest`
 -- (dashboard settings button) through `tern.kv`; this half answers with `goto`
 -- (switch a dashboard tab) and `focus` (the last focused pane that is not a
 -- CodexBar AgentView block).
@@ -345,57 +345,111 @@ local OUTCOME_TONES = {
 	overdue = { card = "warning", status = "warn" },
 }
 
-tern.chrome.status(function(pane)
+local function summary(): any
 	local s = tern.kv.get("summary")
-	if type(s) ~= "table" then
+	return if type(s) == "table" then s else nil
+end
+
+-- The session text for the focused pane; the rest is in the widgets below.
+tern.chrome.status(function(pane)
+	local s = summary()
+	local w = if s and type(s.waiting) == "table" then s.waiting else {}
+	local here = if type(w.panes) == "table" then w.panes[tostring(pane.pane)] else nil
+	if type(here) ~= "table" or here.text == "" then
 		return nil
 	end
-	local segments = {}
-	for _, u in (if type(s.usage) == "table" then s.usage else {}) do
-		table.insert(segments, { text = u.text, icon = u.icon, tone = u.tone, command = "plugin.codexbar-agentview.usage" })
-	end
-	local w = if type(s.waiting) == "table" then s.waiting else {}
-	local here = if type(w.panes) == "table" then w.panes[tostring(pane.pane)] else nil
-	if type(here) == "table" and here.text ~= "" then
-		local tones = OUTCOME_TONES[here.outcome]
-		table.insert(segments, {
-			text = here.text,
-			tone = if tones then tones.status elseif here.on_me then "warn" else "muted",
-			command = "plugin.codexbar-agentview.session_card",
-		})
-	end
-	local c = if type(s.counts) == "table" then s.counts else {}
-	local parts = {}
-	if (c.blocked or 0) > 0 then
-		table.insert(parts, c.blocked .. " blocked")
-	end
-	if (c.working or 0) > 0 then
-		table.insert(parts, c.working .. " working")
-	end
-	if (c.idle or 0) > 0 then
-		table.insert(parts, c.idle .. " idle")
-	end
-	if #parts > 0 then
-		table.insert(segments, {
+	local tones = OUTCOME_TONES[here.outcome]
+	return { {
+		text = here.text,
+		tone = if tones then tones.status elseif here.on_me then "warn" else "muted",
+		command = "plugin.codexbar-agentview.session_card",
+	} }
+end)
+
+-- Widget bar ------------------------------------------------------------------
+-- The host half publishes each provider's view under `summary.usage[id]`; same
+-- ids and order as its PROVIDER_ORDER.
+local USAGE_WIDGETS = {
+	{ "claude", "Claude usage", "app-claude" },
+	{ "codex", "Codex usage", "app-codex" },
+	{ "zai", "z.ai usage", "gauge" },
+	{ "opencodego", "OpenCode Go usage", "gauge" },
+	{ "openrouter", "OpenRouter usage", "gauge" },
+	{ "kilo", "Kilo usage", "gauge" },
+	{ "typesafe", "TypeSafe usage", "gauge" },
+}
+for _, spec in USAGE_WIDGETS do
+	local id = spec[1]
+	local pooled = id == "claude" or id == "codex"
+	tern.chrome.widget(id, {
+		name = spec[2],
+		description = if pooled
+			then "5h and weekly use, plan-weighted across all your accounts; the ring shows the window closest to running out"
+			else "Use per window, or the balance",
+		icon = spec[3],
+		styles = { "ring", "bar", "text" },
+		render = function()
+			local s = summary()
+			local u = if s and type(s.usage) == "table" then s.usage[id] else nil
+			if type(u) ~= "table" then
+				return nil
+			end
+			return { text = u.text, tone = u.tone, title = u.title, value = u.value, command = "plugin.codexbar-agentview.usage" }
+		end,
+	})
+end
+
+tern.chrome.widget("agents", {
+	name = "Coding agents",
+	description = "Blocked, working and idle agents, in Tern and outside it",
+	icon = "users",
+	render = function()
+		local s = summary()
+		local c = if s and type(s.counts) == "table" then s.counts else {}
+		local parts = {}
+		for _, state in { "blocked", "working", "idle" } do
+			if (c[state] or 0) > 0 then
+				table.insert(parts, c[state] .. " " .. state)
+			end
+		end
+		if #parts == 0 then
+			return nil
+		end
+		return {
 			text = table.concat(parts, " · "),
-			icon = "users",
 			tone = if (c.blocked or 0) > 0 then "error" elseif (c.working or 0) > 0 then "ok" else "muted",
 			command = "plugin.codexbar-agentview.agents",
-		})
-	end
-	if (w.on_me or 0) > 0 then
-		table.insert(segments, {
-			text = w.on_me .. " on me",
-			icon = "clock",
-			tone = "warn",
-			command = "plugin.codexbar-agentview.waiting",
-		})
-	end
-	if (tonumber(s.restore) or 0) > 0 then
-		table.insert(segments, { text = s.restore .. " to restore", icon = "history", tone = "warn", command = "plugin.codexbar-agentview.history" })
-	end
-	return if #segments > 0 then segments else nil
-end)
+		}
+	end,
+})
+
+tern.chrome.widget("on-me", {
+	name = "Back on me",
+	description = "Set-aside sessions whose next step is yours",
+	icon = "clock",
+	render = function()
+		local s = summary()
+		local n = if s and type(s.waiting) == "table" then tonumber(s.waiting.on_me) or 0 else 0
+		if n == 0 then
+			return nil
+		end
+		return { text = n .. " on me", tone = "warn", command = "plugin.codexbar-agentview.waiting" }
+	end,
+})
+
+tern.chrome.widget("restore", {
+	name = "Sessions to restore",
+	description = "Sessions a reboot closed",
+	icon = "history",
+	render = function()
+		local s = summary()
+		local n = if s then tonumber(s.restore) or 0 else 0
+		if n == 0 then
+			return nil
+		end
+		return { text = n .. " to restore", tone = "warn", command = "plugin.codexbar-agentview.history" }
+	end,
+})
 
 local function remember(cx: WindowCx, pane: number?)
 	if not pane then
@@ -1662,7 +1716,7 @@ tern.on("pane_closed", function(ev, _cx)
 	end
 end)
 
--- Redraws the status line when the host publishes a new summary.
+-- Redraws the widgets and status segment when the host publishes a new summary.
 local summarySig = ""
 local initialSettingsRequest = tern.kv.get("settingsRequest")
 local lastSettingsRequest = if type(initialSettingsRequest) == "table" then initialSettingsRequest.seq else nil

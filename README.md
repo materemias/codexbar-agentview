@@ -6,13 +6,13 @@ interfaces:
 - A **KDE Plasma 6 widget** puts usage rings and agent counts in your panel,
   with a popup for Usage, Agents and History and a global shortcut.
 - A **Tern extension** runs on Linux and macOS. It puts usage and agent counts
-  in Tern's status line and opens the same three tabs as a temporary sidebar.
+  in Tern's widget bar and opens the same three tabs as a temporary sidebar.
 
 What you get:
 
 - **No surprise limits.** Every account's usage in one place, with pace
   ticks and projections that warn you before a limit hits, not after.
-- **Who needs you, at a glance.** Panel dots or Tern's status line count
+- **Who needs you, at a glance.** Panel dots or Tern's widget bar count
   working, blocked and idle agents, so a session waiting for input finds you.
 - **Find any session by typing.** Every Claude Code, Codex, OpenCode, pi
   and omp session in a terminal or T3 Code, filtered as you type, with a peek
@@ -61,12 +61,12 @@ CodexBar module.
 
 ## Tern extension
 
-![The Tern extension: usage and agent counts in the status line, the dashboard opened with Ctrl+Alt+A, filtering by typing, a peek, jumping to the session's pane, the Usage tab, Restore all after a reboot and one closed session brought back](docs/tern.gif)
+![The Tern extension: usage rings and agent counts in the widget bar, the dashboard opened with Ctrl+Alt+A, filtering by typing, a peek, jumping to the session's pane, the Usage tab, Restore all after a reboot and one closed session brought back](docs/tern.gif)
 
 <details>
 <summary>Screenshots</summary>
 
-![Tern status line](docs/tern/status-line.png)
+![Tern widget bar: combined Claude and Codex usage rings, agent counts and the Claude widget's details](docs/tern/widget-bar.png)
 
 | Usage | Agents | History | Settings |
 | :---: | :---: | :---: | :---: |
@@ -85,7 +85,7 @@ for it.
 | Requirement | Plasma | Tern | Enables |
 | --- | :---: | :---: | --- |
 | KDE Plasma 6 with KWin | Required | | The widget |
-| [Tern](https://stencil.so/tern) 0.9.9 or later | | Required | The extension |
+| [Tern](https://stencil.so/tern) 0.9.18 or later | | Required | The extension |
 | Python 3.10+ | Required | Required | The shared helpers |
 | [`codexbar`](https://github.com/steipete/CodexBar) CLI | Required | Required | Usage. Agents and History work without it; with Meridian, so do Claude and Codex seats |
 | [Meridian](https://github.com/rynfar/meridian) | Optional | Optional | Claude accounts and ChatGPT seats read from its usage poll |
@@ -136,6 +136,10 @@ tern plugin link tern
 
 Keep the checkout in place while the extension is linked; it runs its helpers
 from there.
+
+Then place its widgets: palette › **Edit widgets…**, or for example
+`tern ctl widgets set codexbar-agentview/claude@ring codexbar-agentview/codex@ring codexbar-agentview/agents codexbar-agentview/on-me spacer status`
+from a Tern pane, which replaces the whole bar.
 
 On macOS:
 
@@ -299,6 +303,23 @@ with its own windows. A meter picked before the accounts were known (saved as
 `claude:primary`) shows every account's window until you change one account,
 which turns it into one meter per account
 (`claude:<email>:primary`).
+
+### Widget bar (Tern)
+
+Place any of these through palette › **Edit widgets…**; each hides itself
+while it has nothing to show, and a click opens the matching dashboard tab.
+
+| Widget | Shows |
+| --- | --- |
+| Claude usage, Codex usage | 5h and 7d percent, plan-weighted across all your accounts as the combined bars are. The ring or bar shows the window furthest ahead of its pace; hover for each window's pace and reset and every account's own figures |
+| z.ai, OpenCode Go, OpenRouter, Kilo, TypeSafe usage | Each window's percent, or the balance |
+| Coding agents | Blocked, working and idle agents, in Tern and outside it |
+| Back on me | Set-aside sessions whose next step is yours |
+| Sessions to restore | Sessions a reboot closed |
+
+Usage widgets take the pace colours of the Usage tab and offer ring, bar and
+text styles. The focused pane's set-aside status stays in the **Plugin
+segments** widget.
 
 ### Tern specifics
 
