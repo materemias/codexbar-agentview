@@ -1283,6 +1283,23 @@ class SnoozeTests(Case):
             self.snooze(wait, expect=2)
         self.assertNotIn("Snoozed", " ".join(item["text"] for item in self.session()["history"]))
 
+    def test_the_view_offers_snooze_exactly_where_snooze_takes_it(self) -> None:
+        later = self.add("--kind", "later")["id"]
+        job = self.add("--kind", "job", "--pane", "51")["id"]
+        first = self.add("--kind", "time", "--in", "1h")["id"]
+        step = self.add("--kind", "time", "--in", "1h", "--after", first)["id"]
+        acting = self.ran_prompt()
+        offered = {wait["id"]: wait["snoozable"] for wait in self.session()["waits"]}
+        self.assertEqual(offered, {later: False, job: False, first: True, step: False, acting: False})
+        for wait, snoozable in offered.items():
+            self.snooze(wait, expect=0 if snoozable else 2)
+        # A job that ended can be hidden; so can a pane's wait.
+        self.run_cli("event", "--type", "job_finished", "--pane", "51", "--status", "0")
+        self.assertTrue(self.wait_of(job)["snoozable"])
+        self.run_cli("add", "--pane", "52", "--kind", "something", "--what", "deploy")
+        pane = self.run_cli("list")["panes"][0]
+        self.assertEqual([wait["snoozable"] for wait in pane["waits"]], [True])
+
 
 class NoteTests(Case):
     def test_user_sets_note(self) -> None:
@@ -4660,7 +4677,7 @@ class HealthTests(Case):
     def test_a_tick_says_when_it_checked(self) -> None:
         self.assertEqual(self.tick()["view"]["health"], {
             "checked_at": self.clock.isoformat(), "error": None, "error_since": None,
-            "agents_stale_since": None,
+            "error_kind": None, "agents_stale_since": None,
         })
 
     def test_a_failed_tick_leaves_its_error_in_the_view_and_only_a_tick_clears_it(self) -> None:
@@ -4679,14 +4696,24 @@ class HealthTests(Case):
         self.assertEqual(len(view["sessions"]), 1)
         self.assertEqual(view["health"], {
             "checked_at": checked, "error": "RuntimeError: boom", "error_since": first,
-            "agents_stale_since": None,
+            "error_kind": "failed", "agents_stale_since": None,
         })
         # Any other command's view keeps saying so.
         self.assertEqual(self.run_cli("list")["health"]["error"], "RuntimeError: boom")
         self.add("--kind", "later")
-        self.assertEqual(self.view_file()["health"]["error_since"], first)
+        health = self.view_file()["health"]
+        self.assertEqual((health["error_since"], health["error_kind"]), (first, "failed"))
         health = self.tick()["view"]["health"]
-        self.assertEqual((health["error"], health["error_since"]), (None, None))
+        self.assertEqual((health["error"], health["error_since"], health["error_kind"]), (None, None, None))
+
+    def test_an_error_from_a_view_without_its_kind_counts_as_a_failed_tick(self) -> None:
+        self.tick()
+        view = self.view_file()
+        view["health"].update(error="RuntimeError: boom", error_since=self.clock.isoformat())
+        del view["health"]["error_kind"]
+        (self.state_dir / "waiting_view.json").write_text(json.dumps(view))
+        self.add("--kind", "later")
+        self.assertEqual(self.view_file()["health"]["error_kind"], "failed")
 
     def test_a_mistyped_now_is_no_failed_tick(self) -> None:
         self.tick()
@@ -4702,11 +4729,14 @@ class HealthTests(Case):
         self.assertIsNone(self.view_file()["health"]["error"])
         health = self.tick()["view"]["health"]
         self.assertTrue(health["error"].startswith(f"session {OTHER[:8]} can't be shown"))
-        self.assertEqual(health["error_since"], self.clock.isoformat())
+        # The tick ran: only one row is missing.
+        self.assertEqual((health["error_since"], health["error_kind"]), (self.clock.isoformat(), "partial"))
+        self.assertEqual(health["checked_at"], self.clock.isoformat())
         since = self.clock.isoformat()
         self.advance(minutes=5)
         self.add("--kind", "later")
-        self.assertEqual(self.view_file()["health"]["error_since"], since)
+        health = self.view_file()["health"]
+        self.assertEqual((health["error_since"], health["error_kind"]), (since, "partial"))
 
     def test_an_unreadable_session_scan_counts_as_stale(self) -> None:
         (self.state_dir / "agents.json").write_text("{torn")
@@ -5262,6 +5292,137 @@ class DaemonTests(Case):
         self.tick("--daemon", "b")
         self.assertEqual(self.wait_of(job)["state"], "waiting")
         self.assertEqual([pane["pane"] for pane in self.run_cli("list")["panes"]], [52])
+
+    def test_a_window_names_its_daemon_for_what_it_adds(self) -> None:
+        # The window app runs commands outside the daemon's process tree.
+        self.creator = None
+        self.tick("--daemon", "a")
+        self.run_cli("add", "--pane", "52", "--kind", "later", "--park", "--daemon", "b")
+        job = self.add("--kind", "job", "--pane", "51", "--daemon", "b")["id"]
+        self.assertEqual(self.run_cli("list")["panes"][0]["daemon"], "b")
+        self.assertEqual(self.wait_of(job)["daemon"], "b")
+        self.assertEqual([action.get("daemon") for action in self.state()["actions"]], ["b"])
+        # Daemon a's windows don't park daemon b's pane 52.
+        self.assertEqual(self.tick("--daemon", "a")["actions"], [])
+
+
+class SessionMoveTests(Case):
+    """omp moves a session it can't write to a new file under a new id; the
+    extension's heartbeat says from which and why."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.agents(SID, OTHER)
+        self.heartbeat()
+
+    def moved(self, reason: str, sid: str = OTHER, old: str = SID) -> None:
+        self.heartbeat(sid, "--moved-from", old, "--move-reason", reason)
+
+    def test_a_replaced_session_brings_its_waits_prompts_and_history(self) -> None:
+        wait = self.add("--kind", "time", "--in", "1s", "--prompt", "go", "--note", "why")["id"]
+        self.advance(seconds=2)
+        self.tick()
+        self.moved("replaced")
+        view = self.run_cli("list")
+        self.assertEqual([row["session_id"] for row in view["sessions"]], [OTHER])
+        row = self.session(OTHER)
+        self.assertEqual(([w["id"] for w in row["waits"]], row["note"]), ([wait], "why"))
+        self.assertEqual(row["history"][-1]["text"], f"Moved from session {SID[:8]}")
+        self.assertEqual(self.run_cli("claim-prompts", "--session", SID)["prompts"], [])
+        self.assertEqual(self.run_cli("claim-prompts", "--session", OTHER)["prompts"][0]["wait"], wait)
+        # The extension says it again on its next heartbeat: nothing more moves.
+        saved = self.state()["sessions"]
+        self.moved("contested")
+        self.assertEqual(self.state()["sessions"], saved)
+
+    def test_a_session_open_elsewhere_keeps_its_waits(self) -> None:
+        wait = self.add("--kind", "later")["id"]
+        self.moved("open-elsewhere")
+        self.assertEqual([w["id"] for w in self.session(SID)["waits"]], [wait])
+        self.assertNotIn(OTHER, self.state()["sessions"])
+
+    def test_a_new_id_with_waits_of_its_own_keeps_both_and_says_so_once(self) -> None:
+        mine = self.add("--kind", "later")["id"]
+        theirs = self.add("--kind", "something", "--what", "x", session=OTHER)["id"]
+        self.moved("replaced")
+        self.moved("replaced")
+        self.assertEqual([w["id"] for w in self.session(SID)["waits"]], [mine])
+        self.assertEqual([w["id"] for w in self.session(OTHER)["waits"]], [theirs])
+        moved = [line for line in self.session(OTHER)["history"] if SID[:8] in line["text"]]
+        self.assertEqual(len(moved), 1)
+
+    def test_the_pin_moves_with_the_session(self) -> None:
+        self.add("--kind", "later")
+        pins = self.omp / "session-pins.json"
+        self.assertEqual(json.loads(pins.read_text()), [SID])
+        self.moved("replaced")
+        self.assertEqual(json.loads(pins.read_text()), [OTHER])
+        self.assertEqual([row["session_id"] for row in self.run_cli("list")["sessions"]], [OTHER])
+
+    def test_a_move_needs_both_flags(self) -> None:
+        self.run_cli("heartbeat", "--session", OTHER, "--moved-from", SID, expect=2)
+        self.run_cli("heartbeat", "--session", OTHER, "--move-reason", "replaced", expect=2)
+        self.run_cli("heartbeat", "--session", SID, "--moved-from", SID, "--move-reason", "replaced", expect=2)
+
+
+class ClaimPaneTests(Case):
+    """Two processes run one session id: the one that holds it exactly takes its prompts."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.agents(SID)
+        payload = json.loads((self.state_dir / "agents.json").read_text())
+        row = payload["agents"][0]
+        payload["agents"] = [
+            {**row, "ternPane": 40, "identityExact": True},
+            {**row, "ternPane": 41, "identityExact": False},
+        ]
+        (self.state_dir / "agents.json").write_text(json.dumps(payload))
+        self.heartbeat()
+        self.add("--kind", "time", "--in", "1s", "--prompt", "go")
+        self.advance(seconds=2)
+        self.tick()
+
+    def claim(self, *argv: str) -> list[dict]:
+        return self.run_cli("claim-prompts", "--session", SID, *argv)["prompts"]
+
+    def test_a_pane_that_does_not_hold_the_session_exactly_gets_nothing(self) -> None:
+        self.assertEqual(self.claim("--pane", "41"), [])
+        self.assertEqual(self.state()["sessions"][SID]["prompt_queue"][0]["state"], "queued")
+        self.assertEqual(self.claim("--pane", "40")[0]["text"], "go")
+
+    def test_without_a_pane_or_an_exact_holder_the_claim_is_unchanged(self) -> None:
+        payload = json.loads((self.state_dir / "agents.json").read_text())
+        payload["agents"][0]["identityExact"] = False
+        (self.state_dir / "agents.json").write_text(json.dumps(payload))
+        self.assertEqual(self.claim("--pane", "41")[0]["text"], "go")
+
+    def test_a_claim_without_its_pane_is_unchanged(self) -> None:
+        self.assertEqual(self.claim()[0]["text"], "go")
+
+    def test_a_stale_session_scan_refuses_no_claim(self) -> None:
+        payload = json.loads((self.state_dir / "agents.json").read_text())
+        payload["updatedAt"] = (self.clock.timestamp() - waiting.AGENTS_STALE_S - 1) * 1000
+        (self.state_dir / "agents.json").write_text(json.dumps(payload))
+        self.assertEqual(self.claim("--pane", "41")[0]["text"], "go")
+
+
+class StampTests(Case):
+    def stamp(self) -> str:
+        return (self.state_dir / "waiting.stamp").read_text()
+
+    def test_every_save_changes_the_stamp_and_nothing_else_does(self) -> None:
+        self.add("--kind", "later")
+        stamps = [self.stamp()]
+        self.add("--kind", "time", "--in", "1h")
+        stamps.append(self.stamp())
+        self.heartbeat()
+        stamps.append(self.stamp())
+        self.assertEqual(len(set(stamps)), 3)
+        self.assertEqual([int(stamp) for stamp in stamps], sorted(int(stamp) for stamp in stamps))
+        self.run_cli("list")
+        self.assertEqual(self.stamp(), stamps[-1])
+        self.assertEqual(int(self.stamp()), self.state()["save_seq"])
 
 
 class ToastFoldTests(Case):

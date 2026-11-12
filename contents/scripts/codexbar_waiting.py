@@ -287,6 +287,12 @@ def _view_path() -> Path:
     return state_paths.state_dir() / "waiting_view.json"
 
 
+def _stamp_path() -> Path:
+    """Changes with every save of waiting.json, so a reader can tell it changed
+    without reading it all."""
+    return state_paths.state_dir() / "waiting.stamp"
+
+
 def _write_file(path: Path, text: str, durable: bool) -> None:
     """Replace `path` atomically; `durable` also fsyncs it and its folder."""
     with tempfile.NamedTemporaryFile(
@@ -321,6 +327,8 @@ def _empty_state() -> dict:
         "version": STATE_VERSION, "wait_seq": 0, "action_seq": 0, "boot_id": "",
         "sessions": {}, "panes": {}, "actions": [], "extensions": {},
         "extension_features": {}, "extension_panes": {}, "menu_seq": 0, "menu_requests": {},
+        # Counts saves, for waiting.stamp.
+        "save_seq": 0,
     }
 
 
@@ -360,7 +368,9 @@ def _transaction():
         yield state
         after = json.dumps(state)
         if after != before:
+            state["save_seq"] += 1
             _write_file(_state_path(), json.dumps(state, indent=1), durable=True)
+            _write_file(_stamp_path(), f"{state['save_seq']}\n", durable=False)
 
 
 def _publish(
@@ -390,20 +400,26 @@ def _last_health() -> dict:
 def _health(state: dict, now: datetime, error: str | None, ticked: bool) -> dict:
     """The view's `health`. Only a tick sets or clears `error` and `error_since`;
     any other view carries them over as they are, rows it couldn't build
-    included (the next tick reports those)."""
+    included (the next tick reports those). `error_kind` is "partial" for an
+    error of a tick that ran, "failed" for one that didn't (`_report_tick_failure`)."""
     last = _last_health()
     last_error = last.get("error") if isinstance(last.get("error"), str) else None
     last_since = last.get("error_since") if isinstance(last.get("error_since"), str) else None
     if not ticked:
         error, since = last_error, last_since
+        # A view from before `error_kind` can't tell: the error may be a failed tick's.
+        kind = last.get("error_kind") if last.get("error_kind") in ("partial", "failed") else "failed"
+        kind = kind if error else None
     elif error:
         since = (last_error and last_since) or _iso(now)
+        kind = "partial"
     else:
-        since = None
+        since = kind = None
     return {
         "checked_at": state.get("last_tick_at"),
         "error": error,
         "error_since": since,
+        "error_kind": kind,
         "agents_stale_since": state.get("agents_stale_since"),
     }
 
@@ -423,6 +439,7 @@ def _report_tick_failure(error: BaseException) -> None:
             health.update(
                 error=_error_line(error),
                 error_since=(last.get("error") and last.get("error_since")) or _iso(_now()),
+                error_kind="failed",
             )
             view["health"] = health
             _write_file(path, json.dumps(view), durable=False)
@@ -459,13 +476,15 @@ class Agents:
         self.boot_id = _text(data.get("bootId"))
         updated = data.get("updatedAt")
         self.updated_at = updated / 1000 if type(updated) in (int, float) else None
-        self.live = self._by_session(data.get("agents"))
+        # Every live row: one session may run in two processes, which `live` folds into one.
+        self.live_rows = [row for row in self._rows(data.get("agents")) if isinstance(row.get("sessionId"), str)]
+        self.live = self._by_session(self.live_rows)
         self.closed = self._by_session(data.get("history"))
 
     def untrusted(self) -> "Agents":
         """These rows with no session taken for running: for a stale file."""
         agents = copy.copy(self)
-        agents.live, agents.closed = {}, {**self.closed, **self.live}
+        agents.live, agents.live_rows, agents.closed = {}, [], {**self.closed, **self.live}
         return agents
 
     def from_another_boot(self) -> "Agents":
@@ -476,12 +495,12 @@ class Agents:
         return agents
 
     @staticmethod
-    def _by_session(rows: object) -> dict[str, dict]:
-        out: dict[str, dict] = {}
-        for row in rows if isinstance(rows, list) else []:
-            if isinstance(row, dict) and isinstance(row.get("sessionId"), str):
-                out[row["sessionId"]] = row
-        return out
+    def _rows(rows: object) -> list[dict]:
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    @classmethod
+    def _by_session(cls, rows: object) -> dict[str, dict]:
+        return {row["sessionId"]: row for row in cls._rows(rows) if isinstance(row.get("sessionId"), str)}
 
     def pane_of(self, session: str) -> int | None:
         pane = self.live.get(session, {}).get("ternPane")
@@ -492,6 +511,15 @@ class Agents:
             if row.get("ternPane") == pane:
                 return session
         return None
+
+    def held_elsewhere(self, session: str, pane: int) -> bool:
+        """Another Tern pane runs `session` by its exact identity, and `pane` doesn't:
+        that pane's process owns the session's prompts (`claim-prompts --pane`)."""
+        def exact(row: dict) -> bool:
+            return row["sessionId"] == session and row.get("identityExact") is True
+
+        panes = {row.get("ternPane") for row in self.live_rows if exact(row) and type(row.get("ternPane")) is int}
+        return bool(panes - {pane}) and pane not in panes
 
 
 def _read_agents() -> Agents:
@@ -1186,14 +1214,14 @@ def _lookup(state: dict, session: str | None, pane: int | None) -> dict | None:
     return state["sessions"].get(session) if session else state["panes"].get(str(pane))
 
 
-def _ensure(state: dict, session: str | None, pane: int | None) -> dict:
+def _ensure(state: dict, session: str | None, pane: int | None, daemon: str | None = None) -> dict:
     record = _lookup(state, session, pane)
     if record is None:
         record = _new_record(session, pane)
         if session:
             state["sessions"][session] = record
         else:
-            record["daemon"] = _creator_daemon(state)
+            record["daemon"] = _creator_daemon(state, daemon)
             state["panes"][str(pane)] = record
     return record
 
@@ -1280,16 +1308,17 @@ def _ancestor_daemon() -> str | None:
     return _daemon_above(os.getpid())
 
 
-def _creator_daemon(state: dict) -> str | None:
-    """Whose pane ids a new pane-scoped item names (`_panes_gone`): the daemon
-    the command runs under, else the one that ticks."""
-    return _ancestor_daemon() or _ticking_daemon(state)
+def _creator_daemon(state: dict, given: str | None = None) -> str | None:
+    """Whose pane ids a new pane-scoped item names (`_panes_gone`): `given` (a
+    window's `--daemon`), else the daemon the command runs under, else the one
+    that ticks."""
+    return given or _ancestor_daemon() or _ticking_daemon(state)
 
 
-def _enqueue(state: dict, now: datetime, action: dict) -> None:
+def _enqueue(state: dict, now: datetime, action: dict, daemon: str | None = None) -> None:
     state["action_seq"] += 1
     if action["type"] in PANE_ACTIONS:
-        action = {**action, "daemon": _creator_daemon(state)}
+        action = {**action, "daemon": _creator_daemon(state, daemon)}
     state["actions"].append({
         "id": f"a{state['action_seq']}", **action, "created_at": _iso(now),
     })
@@ -1308,7 +1337,7 @@ def _touch(wait: dict) -> None:
     wait["rev"] += 1
 
 
-def _new_wait(state: dict, now: datetime, **fields: object) -> dict:
+def _new_wait(state: dict, now: datetime, daemon: str | None = None, **fields: object) -> dict:
     state["wait_seq"] += 1
     wait = {
         "id": f"w{state['wait_seq']}", "state": "pending", "created_at": _iso(now),
@@ -1327,7 +1356,7 @@ def _new_wait(state: dict, now: datetime, **fields: object) -> dict:
     }
     wait.update(fields)
     if wait.get("kind") == "job":
-        wait["daemon"] = _creator_daemon(state)
+        wait["daemon"] = _creator_daemon(state, daemon)
     return wait
 
 
@@ -3278,7 +3307,10 @@ def _extension_panes(state: dict, agents: Agents, now: datetime) -> dict:
 
 def _target_view(record: dict | None, now: datetime) -> dict:
     """What a session row and a pane row both say about the target's waits."""
-    views = [_wait_view(wait, now) for wait in _open_waits(record)] if record else []
+    views = [
+        {**_wait_view(wait, now), "snoozable": _snooze_refusal(record, wait) is None}
+        for wait in _open_waits(record)
+    ] if record else []
     outcome, headline = _outcome_headline(views)
     dues = [view["due_at"] for view in _active(views) if view["due_at"]]
     return {
@@ -3632,10 +3664,10 @@ def _add_pr(record: dict, repo: str, number: int) -> None:
         record["prs"].append({"repo": repo, "number": number})
 
 
-def _park(state: dict, record: dict, agents: Agents, now: datetime) -> None:
+def _park(state: dict, record: dict, agents: Agents, now: datetime, daemon: str | None = None) -> None:
     session = record["session"]
     pane = agents.pane_of(session) if session else record["pane"]
-    _enqueue(state, now, {"type": "park", "session": session, "pane": pane})
+    _enqueue(state, now, {"type": "park", "session": session, "pane": pane}, daemon)
 
 
 def _attach_after(record: dict, wait: dict, after: str | None, now: datetime) -> None:
@@ -3751,7 +3783,7 @@ def cmd_add(args: argparse.Namespace) -> dict:
             check["cwd"] = cwd
 
     def apply(state: dict, now: datetime) -> dict:
-        record = _ensure(state, session, pane)
+        record = _ensure(state, session, pane, args.daemon)
         _remember_tern_session(record, agents)
         existed = _wait_in(record, args.after) if args.after else None
         if args.after and existed is None:
@@ -3775,7 +3807,7 @@ def cmd_add(args: argparse.Namespace) -> dict:
                 deadline=deadline, deadline_in_s=deadline_in_s,
                 prompt=None if repeat else args.prompt or None, verify=verify,
                 toast=not args.no_toast, repeat=repeat,
-                close_on_success=args.close_on_success,
+                close_on_success=args.close_on_success, daemon=args.daemon,
             )
         _apply_note(record, args.note, args.by)
         if args.size:
@@ -3783,7 +3815,7 @@ def cmd_add(args: argparse.Namespace) -> dict:
         if kind == "pr":
             _add_pr(record, condition["repo"], condition["number"])
         if args.park:
-            _park(state, record, agents, now)
+            _park(state, record, agents, now, args.daemon)
         pin = _move_pin(state, session, True if kind == "later" else None, facts.omp, now)
         return {"session": session, "pane": pane, "wait": _wait_view(wait, now), **pin}
 
@@ -3973,6 +4005,21 @@ def _snooze_hides(wait: dict) -> bool:
     return wait["state"] == "needs_attention" and bool(wait.get("fired_at"))
 
 
+def _snooze_refusal(record: dict, wait: dict) -> str | None:
+    """Why Snooze 1d can't take this open wait (put after its id), or None. The
+    view's `snoozable` says the same, so no surface offers what this refuses."""
+    if wait["state"] == "pending":
+        return " has not started yet"
+    if wait["kind"] == "later":
+        return " waits for my time: nothing brings it back"
+    if wait["kind"] == "job" and wait["state"] == "waiting" and not wait["overdue"]:
+        return " is a job that still runs: it comes back when it ends"
+    # A repeat's run goes on whatever the wait does next.
+    if wait["kind"] != "time" and not wait.get("repeat") and _prompt_handed_over(record, wait):
+        return ": the agent runs its prompt now"
+    return None
+
+
 def cmd_snooze(args: argparse.Namespace) -> dict:
     """Snooze 1d: the wait comes off me until `--for` from now. A waiting one is
     watched again from then; one whose event happened is hidden until then and
@@ -3983,15 +4030,9 @@ def cmd_snooze(args: argparse.Namespace) -> dict:
     def apply(state: dict, now: datetime) -> dict:
         record = _lookup(state, session, pane)
         wait = _target_wait(record, args.wait)
-        if wait["state"] == "pending":
-            raise BadInput(f"{args.wait} has not started yet")
-        if wait["kind"] == "later":
-            raise BadInput(f"{args.wait} waits for my time: nothing brings it back")
-        if wait["kind"] == "job" and wait["state"] == "waiting" and not wait["overdue"]:
-            raise BadInput(f"{args.wait} is a job that still runs: it comes back when it ends")
-        # A repeat's run goes on whatever the wait does next.
-        if wait["kind"] != "time" and not wait.get("repeat") and _prompt_handed_over(record, wait):
-            raise BadInput(f"{args.wait}: the agent runs its prompt now")
+        refusal = _snooze_refusal(record, wait)
+        if refusal:
+            raise BadInput(f"{args.wait}{refusal}")
         until = _iso(now + delay)
         snoozed = f"Snoozed until {_clock(_parse_time(until), now)}"
         if wait["overdue"] and wait["state"] == "waiting":
@@ -4204,10 +4245,50 @@ def cmd_event(args: argparse.Namespace) -> dict:
     return _mutate(apply, agents=agents)
 
 
+def _move_session(state: dict, old: str, new: str, omp: Omp, now: datetime) -> None:
+    """omp moved the conversation from `old` to a new file under `new`: what the
+    CLI keeps under `old` goes with it. A record `new` already has stays, and so
+    does `old`'s, beside it. Running it again changes nothing."""
+    record = state["sessions"].get(old)
+    if record is None:
+        return
+    held = state["sessions"].get(new)
+    if held is not None:
+        text = f"Session {old[:8]} moved here; its waits stay under {old[:8]}, since this session had its own"
+        if all(entry["text"] != text for entry in held["history"]):
+            _log(held, now, None, text)
+        return
+    record["session"] = new
+    state["sessions"][new] = state["sessions"].pop(old)
+    for action in state["actions"]:
+        if action.get("session") == old:
+            action["session"] = new
+    if old in state["menu_requests"]:
+        state["menu_requests"].setdefault(new, state["menu_requests"].pop(old))
+    # This process ran `old`, and runs `new` now.
+    for heard in ("extensions", "extension_features", "extension_panes"):
+        state[heard].pop(old, None)
+    if old in omp.fresh_pins():
+        _move_pin(state, new, True, omp, now)
+        # A failed unpin would leave a record under `old` to retry it; the pin
+        # only lists the old session, which `new` continues.
+        with contextlib.suppress(OSError, PinError):
+            _write_pin(omp.pins_path, old, False)
+    _log(record, now, None, f"Moved from session {old[:8]}")
+
+
 def cmd_heartbeat(args: argparse.Namespace) -> dict:
     features = _comma_list(args.features or "")
+    if (args.moved_from is None) != (args.move_reason is None):
+        raise BadInput("--moved-from and --move-reason go together")
+    if args.moved_from == args.session:
+        raise BadInput("--moved-from names this session")
+    omp = Omp()
 
     def apply(state: dict, now: datetime) -> dict:
+        # On `open-elsewhere` another omp still runs the old session and keeps its waits.
+        if args.move_reason in ("replaced", "contested"):
+            _move_session(state, args.moved_from, args.session, omp, now)
         state["extensions"][args.session] = _iso(now)
         state["extension_features"][args.session] = features
         if args.pane is not None:
@@ -4224,7 +4305,7 @@ def cmd_heartbeat(args: argparse.Namespace) -> dict:
                 _settle_idle(state, record, now)
         return {}
 
-    return _mutate(apply)
+    return _mutate(apply, omp=omp)
 
 
 def cmd_menu_request(args: argparse.Namespace) -> dict:
@@ -4251,7 +4332,17 @@ def cmd_menu_request(args: argparse.Namespace) -> dict:
 
 
 def cmd_claim_prompts(args: argparse.Namespace) -> dict:
+    agents = _read_agents()
+
     def apply(state: dict, now: datetime) -> dict:
+        # Another pane runs the session by its exact identity, and this one isn't
+        # sure it does: a copy omp is about to move to a new id. A scan nobody
+        # keeps up says nothing about who runs now.
+        if (
+            args.pane is not None and not _agents_stale(agents, now)
+            and agents.held_elsewhere(args.session, args.pane)
+        ):
+            return {"prompts": []}
         # Only a loaded extension claims, so this is as good as a heartbeat.
         state["extensions"][args.session] = _iso(now)
         record = state["sessions"].get(args.session)
@@ -4270,7 +4361,7 @@ def cmd_claim_prompts(args: argparse.Namespace) -> dict:
             "resend_check": resend_check, "claimed_at": claimed_at,
         }]}
 
-    return _mutate(apply)
+    return _mutate(apply, agents=agents)
 
 
 def _ack_prompt(
@@ -4716,6 +4807,8 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--every")
     add.add_argument("--for", dest="for_")
     add.add_argument("--times", type=int)
+    # The Tern daemon of the window that adds it: a pane wait or a park names its panes.
+    add.add_argument("--daemon")
 
     retry = command("retry", cmd_retry)
     _add_target(retry)
@@ -4754,11 +4847,13 @@ def _parser() -> argparse.ArgumentParser:
     snooze.add_argument("--wait", required=True)
     snooze.add_argument("--for", dest="for_", required=True)
 
-    for name, run in (
-        ("seen", cmd_seen),
-        ("claim-prompts", cmd_claim_prompts), ("resume", cmd_resume),
-    ):
+    for name, run in (("seen", cmd_seen), ("resume", cmd_resume)):
         command(name, run).add_argument("--session", type=_session_arg, required=True)
+
+    claim = command("claim-prompts", cmd_claim_prompts)
+    claim.add_argument("--session", type=_session_arg, required=True)
+    # The claiming extension's Tern pane: one another pane holds exactly gets nothing.
+    claim.add_argument("--pane", type=_pane_arg)
 
     card = command("card", cmd_card)
     card.add_argument("--session", type=_session_arg, required=True)
@@ -4770,6 +4865,10 @@ def _parser() -> argparse.ArgumentParser:
     heartbeat.add_argument("--features")
     # omp runs no turn and streams nothing (`_settle_idle`).
     heartbeat.add_argument("--idle", action="store_true")
+    # omp moved the conversation to a new file: from which session, and why
+    # (`replaced` and `contested` bring its waits along).
+    heartbeat.add_argument("--moved-from", type=_session_arg)
+    heartbeat.add_argument("--move-reason", choices=("open-elsewhere", "replaced", "contested"))
 
     menu_request = command("menu-request", cmd_menu_request)
     _add_target(menu_request)
