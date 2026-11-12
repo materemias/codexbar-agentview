@@ -276,7 +276,10 @@ function seconds(duration: string): number {
 	return total;
 }
 
-/** Why the CLI would refuse a repeat every `every` for `span`, before anyone typed the rest; undefined when it wouldn't. */
+/**
+ * Why the CLI would refuse a repeat every `every` for `span`, before anyone typed the rest; undefined
+ * when it wouldn't. It mirrors the limits of codexbar_waiting.py's `_repeat_options`: change both.
+ */
 function repeatError(every: string, span?: string): string | undefined {
 	if (seconds(every) < 60 || seconds(every) > 365 * 86_400) return `A repeat runs every 1m to 365d, not every ${every}.`;
 	if (span && seconds(span) <= seconds(every)) return `For ${span} ends by the first run, ${every} from now.`;
