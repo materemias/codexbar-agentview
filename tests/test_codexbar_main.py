@@ -1110,6 +1110,9 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 var long = warn({ checked_at: iso(local(12, 9, 18)), error: new Array(201).join("x") })
                 check(long === "⚠ Waits not checked since 09:18: " + new Array(120).join("x") + "…",
                     "a long error is cut to 120 characters: " + long.length)
+                var emoji = warn({ checked_at: iso(local(12, 9, 18)), error: new Array(201).join("🙂") })
+                check(emoji === "⚠ Waits not checked since 09:18: " + new Array(120).join("🙂") + "…",
+                    "the cap counts characters, not halves of an emoji: " + emoji.length)
                 console.log("PASS actual main waiting health")
                 Qt.exit(0)
 ''', {"waitingView": view}, views=True)

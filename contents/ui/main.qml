@@ -973,9 +973,13 @@ PlasmoidItem {
         }
         var checked = at(health.checked_at)
         var since = checked ? root._absoluteTime(checked, nowMs) : "never"
-        // Capped: both tooltips show it in full, on every waiting row.
+        // Capped at 120 characters, counted by code point as Tern counts
+        // them, so no emoji is cut in half: both tooltips show it in full,
+        // on every waiting row. V4's Array.from splits a string into UTF-16
+        // units, so the pairs are matched by hand.
         var error = String(health.error || "").replace(/\s+/g, " ").trim()
-        if (error.length > 120) error = error.slice(0, 119) + "…"
+        var chars = error.match(/[\uD800-\uDBFF][\uDC00-\uDFFF]|[\s\S]/g) || []
+        if (chars.length > 120) error = chars.slice(0, 119).join("") + "…"
         if (error)
             return "⚠ Waits not checked since " + since + ": " + error
         var last = checked ? checked.getTime() : uncheckedSinceMs
