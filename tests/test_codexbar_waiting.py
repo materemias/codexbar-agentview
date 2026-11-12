@@ -3559,6 +3559,24 @@ class FiredPrTests(Case):
             ("waiting", (self.clock + timedelta(hours=1)).isoformat(), (self.clock + timedelta(hours=2)).isoformat()),
         )
 
+    def test_a_repeat_taken_back_counts_its_runs_anew(self) -> None:
+        self.agents(SID)
+        ready = self.ready()[0]
+        repeat = self.add(
+            "--kind", "repeat", "--every", "1h", "--times", "3", "--prompt", "ping", "--after", ready,
+        )["id"]
+        self.tick()
+        self.advance(hours=1)
+        self.heartbeat()
+        self.tick()
+        action = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]["action"]
+        self.run_cli("ack", "--action", action, "--result", "delivered")
+        self.pr.update(head="b" * 40, holds=False)
+        self.advance(minutes=4)
+        self.tick()
+        waits = {wait["id"]: wait for wait in self.state()["sessions"][SID]["waits"]}
+        self.assertEqual((waits[repeat]["state"], waits[repeat]["repeat"]["runs"]), ("pending", 0))
+
     def test_a_new_babysit_carries_on_to_a_step_chained_after_the_old_one(self) -> None:
         old = self.chain()
         timer = self.add("--kind", "time", "--in", "1h", "--after", old[-1])["id"]

@@ -1356,8 +1356,8 @@ def _arm(wait: dict, now: datetime) -> None:
 
 def _disarm(record: dict, wait: dict) -> None:
     """Back to a chain step not reached yet: the times `_arm` counted from that
-    moment are counted again when the chain reaches it, and a repeat sends no
-    run until then."""
+    moment, and a repeat's runs, are counted again when the chain reaches it,
+    and a repeat sends no run until then."""
     condition = wait["condition"]
     if condition.get("in_s") is not None or condition.get("clock") is not None:
         condition["at"] = None
@@ -1365,7 +1365,7 @@ def _disarm(record: dict, wait: dict) -> None:
         wait["deadline"] = None
     if wait.get("repeat"):
         _stop_repeat(record, wait)
-        wait["repeat"]["ends_at"] = None
+        wait["repeat"].update(ends_at=None, runs=0)
     wait.update(state="pending", next_check_at=None, armed_at=None)
     _touch(wait)
 
