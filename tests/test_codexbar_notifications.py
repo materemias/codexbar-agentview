@@ -39,12 +39,16 @@ Item {
     function delivered(result) {
         var state = result.state
         for (var i = 0; i < result.events.length; i++)
-            state = Notifications.delivery(state, result.events[i], true)
+            state = Notifications.delivery(state, result.events[i], true, Date.parse("2026-09-29T12:00:00Z"))
         return state
+    }
+    function failed(state, event) {
+        return Notifications.delivery(state, event, false, Date.parse("2026-09-29T12:00:00Z"))
     }
     Component.onCompleted: {
         try {
             var now = Date.parse("2026-09-29T12:00:00Z")
+            var retryTime = now + Notifications.RETRY_MS
 ''' + scenario + '''
             console.log("PASS notification policy")
             Qt.exit(0)
@@ -85,11 +89,17 @@ Item {
             result = Notifications.usage(result.state,
                 [record(80, null, "2026-09-29T20:00:00Z")], now, true)
             check(result.events.length === 1, "a new reset period must rearm")
+            var jitter = Notifications.usage(delivered(result),
+                [record(85, null, "2026-09-29T20:00:00.049Z")], now, true)
+            check(jitter.events.length === 0, "a reset reported a few ms apart is the same period")
+            check(Notifications.usage(jitter.state,
+                [record(85, null, "2026-09-29T20:10:00Z")], now, true).events.length === 0,
+                "a reset moved by minutes is the same period")
             check(Notifications.usage(critical, [record(98, null, reset)], now, true)
                 .events.length === 0, "reducer must not mutate earlier state")
         ''')
 
-    def test_projection_uses_shared_pace_with_three_percent_floor(self):
+    def test_projection_waits_for_a_quarter_of_the_window(self):
         self.policy('''
             var item = record(12)
             item.primary.windowMinutes = 300
@@ -98,18 +108,17 @@ Item {
                 "projection must be suppressed before 3% elapsed")
             var result = Notifications.usage({}, [item], now, true)
             check(result.events.length === 0, "early pace noise must stay quiet")
-            item.primary.resetsAt = new Date(now + 300 * 60000 * 0.97).toISOString()
+            item.primary.resetsAt = new Date(now + 300 * 60000 * 0.92).toISOString()
+            check(Usage.projectedPercent(item.primary, now) > 100
+                && Notifications.usage(result.state, [item], now, true).events.length === 0,
+                "a projection before a quarter of the window has passed must stay quiet")
+            item.primary.usedPercent = 30
+            item.primary.resetsAt = new Date(now + 300 * 60000 * 0.74).toISOString()
             result = Notifications.usage(result.state, [item], now, true)
             check(result.events.length === 1 && result.events[0].body.indexOf("Projected") >= 0,
                 "settled over-pace usage must warn")
             result = Notifications.usage(result.state, [item], now, true)
             check(result.events.length === 0, "projected exhaustion must not repeat")
-            var early = record(9)
-            early.primary.windowMinutes = 300
-            early.primary.resetsAt = item.primary.resetsAt
-            check(Usage.projectedPercent(early.primary, now) > 100
-                && Notifications.usage({}, [early], now, true).events.length === 0,
-                "a projection under 10% actual use must stay quiet")
             item.primary.usedPercent = 80
             result = Notifications.usage(result.state, [item], now, true)
             check(result.events.length === 1 && result.events[0].body.indexOf("80%") >= 0,
@@ -183,27 +192,29 @@ Item {
             check(Notifications.usage(result.state, [a, b], now, true).events.length === 0,
                 "in-flight delivery must suppress duplicate polls")
             var state = Notifications.delivery(result.state, result.events[0], true)
-            state = Notifications.delivery(state, result.events[1], false)
-            var retry = Notifications.usage(state, [a, b], now, true)
+            state = Notifications.delivery(state, result.events[1], false, now)
+            check(Notifications.usage(state, [a, b], now, true).events.length === 0,
+                "a failed notification is not tried again on the next poll")
+            var retry = Notifications.usage(state, [a, b], retryTime, true)
             check(retry.events.length === 1 && retry.events[0].usageKey === result.events[1].usageKey,
                 "retry only the failed account, not a successful delivery")
-            check(Notifications.usage(delivered(retry), [a, b], now, true).events.length === 0,
+            check(Notifications.usage(delivered(retry), [a, b], retryTime, true).events.length === 0,
                 "a successful retry must settle the warning")
             var warning = Notifications.usage({}, [record(80)], now, true)
             var critical = Notifications.usage(warning.state, [record(95)], now, true)
-            state = Notifications.delivery(critical.state, warning.events[0], false)
-            state = Notifications.delivery(state, critical.events[0], false)
-            check(Notifications.usage(state, [record(95)], now, true).events.length === 1,
+            state = Notifications.delivery(critical.state, warning.events[0], false, now)
+            state = Notifications.delivery(state, critical.events[0], false, now)
+            check(Notifications.usage(state, [record(95)], retryTime, true).events.length === 1,
                 "failed overlapping escalation must not consume either level")
             state = Notifications.delivery(critical.state, critical.events[0], true)
-            state = Notifications.delivery(state, warning.events[0], false)
+            state = Notifications.delivery(state, warning.events[0], false, now)
             check(Notifications.usage(state, [record(95)], now, true).events.length === 0,
                 "late lower-level failure must not erase a successful escalation")
             var reset = "2026-09-29T15:00:00Z"
             var earlier = Notifications.usage({}, [record(80, null, reset)], now, true)
             var later = Notifications.usage(earlier.state,
                 [record(80, null, "2026-09-29T20:00:00Z")], now, true)
-            state = Notifications.delivery(later.state, earlier.events[0], false)
+            state = Notifications.delivery(later.state, earlier.events[0], false, now)
             check(Notifications.usage(state,
                 [record(80, null, "2026-09-29T20:00:00Z")], now, true).events.length === 0,
                 "an old period completion must not disturb current pending delivery")
@@ -219,15 +230,15 @@ Item {
             check(next.events.length === 1, "new credentials must have an independent allowance alert")
             check(!next.state[first.events[0].usageKey], "retired scope must lose pending deliveries")
             var state = Notifications.delivery(next.state, first.events[0], true)
-            state = Notifications.delivery(state, next.events[0], false)
-            var retry = Notifications.usage(state, [b], now, true)
+            state = Notifications.delivery(state, next.events[0], false, now)
+            var retry = Notifications.usage(state, [b], retryTime, true)
             check(retry.events.length === 1, "late old-scope success must not consume a new-scope retry")
             check(JSON.stringify(next.events.map(function(e) { return [e.title, e.body] }))
                 .indexOf(b.sourceScope) < 0, "credential scope is never notification text")
             var returned = Notifications.usage(next.state, [a], now, true)
             state = Notifications.delivery(returned.state, first.events[0], true)
-            state = Notifications.delivery(state, returned.events[0], false)
-            check(Notifications.usage(state, [a], now, true).events.length === 1,
+            state = Notifications.delivery(state, returned.events[0], false, now)
+            check(Notifications.usage(state, [a], retryTime, true).events.length === 1,
                 "returning to retired credentials cannot revive their old pending callback")
             delete b.sourceScope
             var unknown = Notifications.usage(retry.state, [b], now, true)
@@ -253,8 +264,8 @@ Item {
             var next = Notifications.usage(state, [high], now, true)
             check(next.events.length === 1, "fresh below-80 reading must rearm the next crossing")
             state = Notifications.delivery(next.state, first.events[0], true)
-            state = Notifications.delivery(state, next.events[0], false)
-            check(Notifications.usage(state, [high], now, true).events.length === 1,
+            state = Notifications.delivery(state, next.events[0], false, now)
+            check(Notifications.usage(state, [high], retryTime, true).events.length === 1,
                 "old observed-cycle delivery cannot consume the new crossing")
             var known = record(80, null, "2026-09-29T15:00:00Z")
             state = delivered(Notifications.usage({}, [known], now, true))
@@ -350,7 +361,7 @@ Item {
                 result = Notifications.ompMode(result.state, mode("IDLE"), true)
                 check(result.events.length === 1, "next available transition must alert")
             }
-            result = Notifications.ompMode(valid.state, mode("TARGET"), false)
+            result = Notifications.ompMode(valid.state, mode("TARGET"), false, now)
             check(result.events.length === 0, "disabled mode alerts must stay quiet")
             result = Notifications.ompMode(result.state, mode("IDLE"), true)
             check(result.events.length === 0, "enabling establishes a silent baseline")
@@ -367,7 +378,7 @@ Item {
             var event = changed.events[0]
             var result = Notifications.ompMode(changed.state, mode("TARGET"), true)
             check(result.events.length === 0, "inflight sends must not repeat each poll")
-            var failed = Notifications.ompModeDelivery(result.state, event, false)
+            var failed = Notifications.ompModeDelivery(result.state, event, false, now)
             result = Notifications.ompMode(failed, mode("TARGET"), true)
             check(result.events.length === 1 && result.events[0].body === event.body,
                 "a failed delivery must retry on the next matching fresh reading")
@@ -381,7 +392,7 @@ Item {
             var gap = Notifications.ompMode(failed, null, true)
             var baseline = Notifications.ompMode(gap.state, mode("FILL"), true)
             newer = Notifications.ompMode(baseline.state, mode("TARGET"), true)
-            state = Notifications.ompModeDelivery(newer.state, event, false)
+            state = Notifications.ompModeDelivery(newer.state, event, false, now)
             check(state.pending && state.transition.sequence !== event.sequence,
                 "old acknowledgement must not reopen a post-gap transition")
             check(Notifications.ompMode(gap.state, mode("TARGET"), true).events.length === 0,
@@ -404,7 +415,7 @@ Item {
                 "agent notifications must not expose prompts or paths")
             result = Notifications.agents(result.state, [session("known", "blocked")], true)
             check(result.events.length === 0, "blocked polls must not repeat")
-            result = Notifications.agents(result.state, [session("known", "working")], false)
+            result = Notifications.agents(result.state, [session("known", "working")], false, now)
             result = Notifications.agents(result.state, [session("known", "blocked")], true)
             check(result.events.length === 0, "enabling must establish a silent baseline")
             result = Notifications.agents(result.state, [session("known", "working")], true)

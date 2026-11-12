@@ -232,7 +232,8 @@ System Settings → Shortcuts → KWin, or Tern never sees the key.
   Recent successful shared readings still drive usage warnings in Plasma.
   Refresh now and CLI changes fetch immediately.
 - **Warnings.** A desktop alert at 80% and 95%, or earlier when the pace says
-  the window runs out before it resets. Plasma only.
+  the window runs out before it resets, once a quarter of the window has
+  passed. Alerts from one refresh arrive as one notification. Plasma only.
 
 ### Agents
 

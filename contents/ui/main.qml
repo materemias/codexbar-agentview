@@ -289,9 +289,25 @@ PlasmoidItem {
         return anyData || waitingWarning ? html : ""
     }
 
+    // One notification per poll for usage alerts: Plasma refuses a burst of
+    // similar ones from one app ("ExcessNotificationGeneration").
+    function batchUsage(events) {
+        var usage = events.filter(function(event) { return event.kind === "usage" })
+        if (usage.length < 2) return events
+        var critical = usage.some(function(event) { return event.level === 3 })
+        var batch = { kind: "usageBatch", events: usage,
+            title: "CodexBar AgentView: " + usage.length + " usage "
+                + (critical ? "alerts, critical among them" : "warnings"),
+            body: usage.map(function(event) {
+                return (event.level === 3 ? "Critical: " : "") + event.body
+            }).join("\n") }
+        return [batch].concat(events.filter(function(event) { return event.kind !== "usage" }))
+    }
+
     function dispatchNotifications(events) {
         if (events.length === 0) return
         root.notificationError = ""
+        events = batchUsage(events)
         for (var i = 0; i < events.length; i++) {
             var event = events[i]
             var cmd = "if ! command -v notify-send >/dev/null 2>&1; then "
@@ -319,9 +335,11 @@ PlasmoidItem {
             var event = pending.event
             if (event.kind !== "agent"
                     && pending.backendGeneration !== root.backendGeneration) return
-            if (event.kind === "usage") {
+            var delivered = event.kind === "usageBatch" ? event.events
+                : event.kind === "usage" ? [event] : []
+            for (var d = 0; d < delivered.length; d++) {
                 root.usageNotificationState = Notifications.delivery(
-                    root.usageNotificationState, event, exitCode === 0)
+                    root.usageNotificationState, delivered[d], exitCode === 0, Date.now())
             }
             if (event.kind === "ompMode") {
                 root.ompModeNotificationState = Notifications.ompModeDelivery(

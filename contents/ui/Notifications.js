@@ -13,9 +13,23 @@ function accountIdentity(record) {
         ? record.accountEmail.trim().toLowerCase() : null
 }
 
-// A projection below this much actual use is early-window noise: the first
-// prompt of a fresh 5h window can project far past 100%.
-var PROJECTION_MIN_PERCENT = 10
+// A projection doesn't count before this much of the window has passed: the
+// first prompt of a fresh 5h window, or a busy first day of a weekly one,
+// projects exhaustion it rarely reaches.
+var PROJECTION_MIN_ELAPSED_PERCENT = 25
+// Providers report the same reset a few seconds or minutes apart between
+// fetches; only a move larger than this is a new period.
+var RESET_JITTER_MS = 15 * 60000
+// A failed notification (no notify-send, Plasma refusing a burst) is tried
+// again after this long, not on every poll.
+var RETRY_MS = 10 * 60000
+
+function samePeriod(old, reset) {
+    if (!old) return false
+    if (typeof old.reset === "number" && typeof reset === "number")
+        return Math.abs(old.reset - reset) < RESET_JITTER_MS
+    return old.reset === reset
+}
 
 function usage(previous, records, now, enabled) {
     var state = Object.assign({}, previous || {})
@@ -70,23 +84,25 @@ function usage(previous, records, now, enabled) {
             var key = JSON.stringify([record.id, record.sourceScope, accountId, entry.slot])
             var old = state[key]
             var level = win.usedPercent >= 95 ? 3 : win.usedPercent >= 80 ? 2
-                : win.usedPercent >= PROJECTION_MIN_PERCENT
+                : Usage.pacePercent(win, now) >= PROJECTION_MIN_ELAPSED_PERCENT
                     && Usage.projectedPercent(win, now) > 100 ? 1 : 0
-            var samePeriod = old && old.reset === reset
-            var priorLevel = samePeriod ? old.level : 0
-            var pending = samePeriod ? old.pending : []
+            var same = samePeriod(old, reset)
+            var priorLevel = same ? old.level : 0
+            var pending = same ? old.pending : []
+            var retryAt = same ? old.retryAt || 0 : 0
             var claimedLevel = Math.max.apply(Math, [priorLevel].concat(pending))
             // Unknown reset dates rearm only after observing fresh usage below 80%.
-            var cycle = samePeriod ? old.cycle : {}
+            var cycle = same ? old.cycle : {}
             if (reset === null && level === 0 && claimedLevel >= 2) {
                 priorLevel = 0
                 pending = []
                 cycle = {}
                 claimedLevel = 0
+                retryAt = 0
             }
             state[key] = { source: source, reset: reset, cycle: cycle,
-                level: priorLevel, pending: pending }
-            if (level <= claimedLevel) continue
+                level: priorLevel, pending: pending, retryAt: retryAt }
+            if (level <= claimedLevel || now < retryAt) continue
             state[key].pending = pending.concat([level])
             var detail = level === 1 ? "Projected to exhaust before reset at the current pace."
                 : Math.round(win.usedPercent) + "% of the allowance used."
@@ -100,7 +116,7 @@ function usage(previous, records, now, enabled) {
     return { state: state, events: events }
 }
 
-function delivery(previous, event, succeeded) {
+function delivery(previous, event, succeeded, now) {
     var old = event && previous[event.usageKey]
     // The in-memory cycle token also rejects callbacks after observed resets or scope retirement.
     if (!old || old.cycle !== event.cycle || old.pending.indexOf(event.level) < 0)
@@ -109,7 +125,8 @@ function delivery(previous, event, succeeded) {
     state[event.usageKey] = {
         source: old.source, reset: old.reset, cycle: old.cycle,
         level: succeeded ? Math.max(old.level, event.level) : old.level,
-        pending: old.pending.filter(function(level) { return level !== event.level })
+        pending: old.pending.filter(function(level) { return level !== event.level }),
+        retryAt: succeeded ? old.retryAt || 0 : (now || Date.now()) + RETRY_MS
     }
     return state
 }
