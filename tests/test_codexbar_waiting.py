@@ -100,6 +100,11 @@ class Case(unittest.TestCase):
         boot = mock.patch.object(waiting, "_system_boot_id", lambda: self.system_boot)
         boot.start()
         self.addCleanup(boot.stop)
+        # When this boot began, as a wall-clock timestamp; unknown unless a test sets it.
+        self.booted = None
+        booted = mock.patch.object(waiting, "_booted_at", lambda: self.booted)
+        booted.start()
+        self.addCleanup(booted.stop)
         # The Tern daemon a command runs under; tests run outside Tern unless set.
         self.creator = None
         creator = mock.patch.object(waiting, "_ancestor_daemon", lambda: self.creator)
@@ -1519,6 +1524,29 @@ class MenuRequestTests(Case):
         self.advance(seconds=5)
         self.heartbeat(SID, "--pane", "52", "--features", "menu")
         self.tick()
+        self.assertEqual(list(self.run_cli("list")["extension_panes"]), ["52"])
+
+    def test_a_report_since_the_boot_stays_before_the_sweep(self) -> None:
+        self.swept("one")
+        self.system_boot = "one"
+        self.tick()
+        self.heartbeat(OTHER, "--pane", "51", "--features", "menu")
+        self.system_boot = "two"
+        self.booted = self.clock.timestamp() + 1
+        self.advance(seconds=5)
+        self.heartbeat(SID, "--pane", "52", "--features", "menu")
+        self.tick()  # agents.json is still the last boot's
+        self.assertEqual(list(self.run_cli("list")["extension_panes"]), ["52"])
+
+    def test_a_new_daemon_keeps_the_panes_reported_since_it_started(self) -> None:
+        self.tick("--daemon", "999999999-1")  # no such process
+        self.heartbeat(OTHER, "--pane", "51", "--features", "menu")
+        self.advance(seconds=1)
+        # The new daemon starts now, 100 s into the boot.
+        self.booted = self.clock.timestamp() - 100
+        self.advance(seconds=1)
+        self.heartbeat(SID, "--pane", "52", "--features", "menu")
+        self.tick("--daemon", f"4242-{100 * os.sysconf('SC_CLK_TCK')}")
         self.assertEqual(list(self.run_cli("list")["extension_panes"]), ["52"])
 
     def test_a_resumed_session_keeps_its_pane_before_the_sweep_sees_it(self) -> None:

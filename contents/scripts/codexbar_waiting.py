@@ -2520,9 +2520,19 @@ def _after_reboot(state: dict, agents: Agents, now: datetime) -> None:
     fresh automatic resume, an extension heard from before the reboot doesn't
     hold it back, and a prompt the reboot cut off is sent again, once, saying
     so; cut off a second time it comes to me."""
+    booted = _booted_at()
+
+    def this_boots(session: str) -> bool:
+        """A live row, or a report since the sweep or since the boot. Without
+        one, a session can't be told dead from new by its id."""
+        seen = _stamp(state["extensions"].get(session))
+        return _running(state, agents, session) or None not in (seen, booted) and seen >= booted
+
     state["extensions"] = {
-        session: seen for session, seen in state["extensions"].items()
-        if _running(state, agents, session)
+        session: seen for session, seen in state["extensions"].items() if this_boots(session)
+    }
+    state["extension_panes"] = {
+        session: pane for session, pane in state["extension_panes"].items() if this_boots(session)
     }
     for record in state["sessions"].values():
         record.update(resume_prompts=[], resume_opened_at=None)
@@ -2606,19 +2616,18 @@ def _housekeeping(
                 action for action in state["actions"]
                 if action["type"] == "toast" or daemon is not None and action.get("daemon") == daemon
             ]
-            # A session absent from agents.json can't be told dead from new by
-            # its id: only a report since the sweep, or a live row, is this boot's.
-            state["extension_panes"] = {
-                session: pane for session, pane in state["extension_panes"].items()
-                if _running(state, agents, session)
-            }
         state["boot_id"] = boot
     if daemon:
         last = _ticking_daemon(state)
         if last and last != daemon and not rebooted:
-            # A new daemon: its panes are new too, and so may be the ones extensions report.
+            # A new daemon: its panes are new too, and so may be the ones
+            # extensions reported before it started.
             _panes_gone(state, now, daemon)
-            state["extension_panes"] = {}
+            started = _started_at(daemon)
+            state["extension_panes"] = {
+                session: pane for session, pane in state["extension_panes"].items()
+                if started is not None and (_stamp(state["extensions"].get(session)) or 0) >= started
+            }
         _hold_ticker(state, daemon, now)
     state["extensions"] = {
         session: seen for session, seen in state["extensions"].items()
@@ -4367,6 +4376,23 @@ def _daemon_alive(daemon: str) -> bool | None:
         return None
     stat = _proc_stat(pid)
     return stat is not None and stat[2] == start
+
+
+def _booted_at() -> float | None:
+    """When this boot began, on the wall clock (suspends included); None where
+    the system has no boot-time clock."""
+    clock = getattr(time, "CLOCK_BOOTTIME", None)
+    return None if clock is None else time.time() - time.clock_gettime(clock)
+
+
+def _started_at(daemon: str) -> float | None:
+    """When the `<pid>-<start time>` daemon started, on the wall clock: its start
+    time counts clock ticks since the boot."""
+    pid, _, start = daemon.partition("-")
+    booted = _booted_at()
+    if booted is None or not (pid.isdigit() and start.isdigit()):
+        return None
+    return booted + int(start) / os.sysconf("SC_CLK_TCK")
 
 
 def _note_tick(state: dict, now: datetime) -> None:
