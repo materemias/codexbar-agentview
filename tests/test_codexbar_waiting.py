@@ -4236,6 +4236,21 @@ class ResumeTests(Case):
         self.advance(minutes=1)
         self.closed()
 
+    def test_a_window_going_away_restarts_the_countdown(self) -> None:
+        wait = self.fired_prompt()
+        self.assertEqual(len(self.resumes()), 1)
+        self.advance(seconds=waiting.RESUME_GRACE_S - 10)
+        self.assertEqual(len(self.resumes(window=False)), 1)
+        self.advance(seconds=2 * waiting.RESUME_GRACE_S)
+        self.assertEqual(len(self.resumes(window=False)), 1)
+        self.assertEqual(len(self.resumes()), 1)  # a window again: counts from here
+        self.advance(seconds=waiting.RESUME_GRACE_S - 1)
+        self.assertEqual(len(self.resumes()), 1)
+        self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_RESUMING)
+        self.advance(seconds=1)
+        self.assertEqual(self.resumes(), [])
+        self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_CLOSED)
+
     def test_a_resume_waits_for_a_window_before_it_can_expire(self) -> None:
         wait = self.fired_prompt()
         self.assertEqual(len(self.resumes(window=False)), 1)

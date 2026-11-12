@@ -1426,8 +1426,13 @@ def _resume(state: dict, record: dict, facts: Facts, now: datetime, window: bool
     or there is no command. Each prompt gets one automatic resume."""
     session = record["session"]
     pending = _pending_resume(state, session)
-    if pending is not None and window and pending.get("window_since") is None:
-        pending["window_since"] = _iso(now)
+    if pending is not None:
+        # The countdown runs only while a window is up to carry the resume out;
+        # a window going away restarts it from the next one.
+        if not window:
+            pending["window_since"] = None
+        elif pending.get("window_since") is None:
+            pending["window_since"] = _iso(now)
     since = _stamp(pending.get("window_since")) if pending is not None else None
     if pending is not None and since is not None and now.timestamp() - since >= RESUME_GRACE_S:
         # A window was up all that time and didn't carry it out. One that comes
@@ -1466,7 +1471,7 @@ def _resume(state: dict, record: dict, facts: Facts, now: datetime, window: bool
     return True
 
 
-def _delivery_pass(state: dict, agents: Agents, now: datetime, window: bool = False) -> None:
+def _delivery_pass(state: dict, agents: Agents, now: datetime, window: bool) -> None:
     """Who can take the queued prompts: a closed session is resumed in Tern, and
     comes to me when that doesn't bring it up; one without the extension comes
     to me at once. The prompts stay queued for later."""

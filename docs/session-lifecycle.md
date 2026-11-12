@@ -191,9 +191,10 @@ A closed session comes back by itself when one of its waits has a prompt to
 send: Tern reopens it with `omp --resume` in a new tab of the Tern session it
 was last in (or Default), without switching to it, and the prompt goes in once
 omp is up. With the dashboard open, Tern waits up to 30 seconds for it to
-close. If a Tern window is up for 3 minutes without reopening the session, or
-it doesn't start, the wait comes back to you with Resume; while no window is
-up, as right after login, the reopen waits for one. Meanwhile Resume says the
+close. If a Tern window is up for 3 minutes in a row without reopening the
+session, or it doesn't start, the wait comes back to you with Resume; while no
+window is up, as right after login, the reopen waits for one, and the 3
+minutes start again when one comes up. Meanwhile Resume says the
 session is reopening. Before opening the tab, Tern takes the session's startup
 ownership, the same one History's Launch and Teleport take: it doesn't reopen a
 session that runs, is starting, or that a running omp may be writing, and
