@@ -1592,7 +1592,8 @@ def _window_runs(runs: list[list], seconds: int, now: _dt.datetime) -> list[list
 def _usage_history_prune(history: dict[str, list[list]], now: _dt.datetime) -> None:
     """Keep a week of runs plus the run in effect at its start; runs that ended
     before the last day (and a thin interval of margin) merge into one per
-    thin interval, carrying the interval's last reading."""
+    thin interval, carrying the interval's last reading. A reset or an
+    unobserved gap stays a run boundary, so graphs place it where it was."""
     now_ts = int(now.timestamp())
     detailed = now_ts - max(RECENT_LOOKBACK_HOURS.values()) * 3600 - HISTORY_THIN_SECONDS
     for key in list(history):
@@ -1604,7 +1605,9 @@ def _usage_history_prune(history: dict[str, list[list]], now: _dt.datetime) -> N
         for run in runs:
             last = kept[-1] if kept else None
             if (last is not None and run[1] < detailed
-                    and last[0] // HISTORY_THIN_SECONDS == run[0] // HISTORY_THIN_SECONDS):
+                    and last[0] // HISTORY_THIN_SECONDS == run[0] // HISTORY_THIN_SECONDS
+                    and run[0] - last[1] <= HISTORY_GAP_SECONDS
+                    and not _usage_history_new_cycle(last, run)):
                 kept[-1] = [last[0], run[1], run[2], run[3]]
             else:
                 kept.append(run)

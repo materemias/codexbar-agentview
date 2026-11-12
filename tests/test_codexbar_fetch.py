@@ -1972,6 +1972,23 @@ class RecentUsageTests(unittest.TestCase):
         self.assertEqual(len([r for r in runs if r[0] >= day + fetch.HISTORY_THIN_SECONDS]), 24 * 6 + 1)
         self.assertEqual(runs[-1][2], 100)
 
+    def test_thinning_keeps_resets_and_gaps_as_run_boundaries(self) -> None:
+        thin = fetch.HISTORY_THIN_SECONDS
+        base = int((self.NOW - dt.timedelta(days=3)).timestamp()) // thin * thin
+        old, new = base + 3600, base + 3600 + 7 * 24 * 3600
+        history = {self.KEY: [
+            [base + 60, base + 300, 95, old], [base + 360, base + 600, 96, old],
+            # The window resets within the same thin interval.
+            [base + 900, base + 1200, 2, new], [base + 1260, base + 1500, 3, new],
+            # Next interval: the same reading on both sides of an unobserved gap.
+            [base + thin, base + thin + 60, 3, new], [base + thin + 1200, base + thin + 1260, 3, new],
+        ]}
+        fetch._usage_history_prune(history, self.NOW)
+        self.assertEqual(history[self.KEY], [
+            [base + 60, base + 600, 96, old], [base + 900, base + 1500, 3, new],
+            [base + thin, base + thin + 60, 3, new], [base + thin + 1200, base + thin + 1260, 3, new],
+        ])
+
     def test_gap_across_lookback_start_is_not_counted(self) -> None:
         reset = self.NOW + dt.timedelta(hours=2)
         history: dict = {}
