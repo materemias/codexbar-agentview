@@ -1448,8 +1448,12 @@ export default function (pi) {
 			setPanel(c, errorPanel(`Not closed: the session couldn't be pinned (${answer?.pin_error ?? "no pin"}). Try /pin, then close it.`));
 			return;
 		}
-		// The CLI steps under way (an ack, a turn's end) finish first; a prompt they sent starts a turn.
-		await tail;
+		// The CLI steps under way (an ack, a turn's end) finish first, and so do the claims they chain
+		// on: a turn's end can claim a prompt, and its send starts a turn.
+		for (let seen; seen !== tail || claiming; ) {
+			seen = tail;
+			await seen;
+		}
 		// shutdown ends whichever session is open, and a switch meanwhile made it another one.
 		if (session !== sessionId || c.sessionManager.getSessionId() !== session) return;
 		// A prompt sent while the dialogs were open may have started a turn, a retry or compaction may
