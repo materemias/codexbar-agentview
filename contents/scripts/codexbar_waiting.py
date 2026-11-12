@@ -1348,6 +1348,7 @@ def _arm(wait: dict, now: datetime) -> None:
         if repeat["for_s"] is not None:
             repeat["ends_at"] = _iso(now + timedelta(seconds=repeat["for_s"]))
     wait.update(state="waiting", armed_at=_iso(now))
+    _checks_work(wait)
     _touch(wait)
 
 
@@ -1556,6 +1557,7 @@ def _attention(
     "internal" (`_quarantine`) only `retry` puts back."""
     wait["state"] = "needs_attention"
     wait.update(reason=reason, on_me=False, verify_pending=False, retry_as=retry_as)
+    _checks_work(wait)
     if retry_as == "check":
         wait["next_check_at"] = _iso(now + timedelta(seconds=RETRY_DEAD_S))
     elif retry_as == "verify":
@@ -3964,6 +3966,7 @@ def cmd_snooze(args: argparse.Namespace) -> dict:
                 snoozed_from=wait["state"], state="snoozed", refire_at=until,
                 on_me=False, overdue=False, verify_pending=False,
             )
+            _checks_work(wait)
         else:
             if wait["kind"] == "time":
                 condition["at"] = until
@@ -3978,6 +3981,7 @@ def cmd_snooze(args: argparse.Namespace) -> dict:
             wait.update(
                 state="waiting", on_me=False, overdue=False, reason=None, errors=0, verify_pending=False,
             )
+            _checks_work(wait)
         if (_stamp(wait["deadline"]) or math.inf) <= now.timestamp():
             wait.update(deadline=until, deadline_in_s=None)
         if wait.get("repeat"):

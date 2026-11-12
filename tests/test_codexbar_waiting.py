@@ -4864,6 +4864,19 @@ class TransientTests(Case):
         self.tick_through(minutes=5)
         self.assertIsNone(self.wait_of(wait)["progress"])
 
+    def test_an_outage_counts_from_when_checks_resume_after_a_snooze(self) -> None:
+        self.github(poll=lambda cond, memo, **kwargs: poll_result(
+            memo, error="error connecting to api.github.com", transient=True, next_poll_s=60,
+        ))
+        wait = self.add("--kind", "pr", "--repo", "o/r", "--number", "7")["id"]
+        self.tick()
+        self.tick_through(minutes=30)
+        self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
+        self.advance(days=1)
+        self.tick()
+        self.tick_through(minutes=30)
+        self.assertIsNone(self.wait_of(wait)["progress"])
+
     def test_a_pr_verify_of_a_command_wait_says_github_is_unreachable(self) -> None:
         self.github(poll=lambda cond, memo, **kwargs: poll_result(
             memo, error="error connecting to api.github.com", transient=True,
