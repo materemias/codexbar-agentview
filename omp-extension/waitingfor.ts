@@ -1201,7 +1201,9 @@ export default function (pi) {
 			if (record && applies(record)) applyView((await cli(["event", "--type", type, "--session", session])).view);
 		});
 	}
-	const waitingInput = (c) => report("waiting_input", (session) => session.waits?.some((wait) => wait.state === "acting"), c);
+	// A repeat's run leaves its wait `waiting`; the CLI tells whether one is with the agent.
+	const waitingInput = (c) =>
+		report("waiting_input", (session) => session.waits?.some((wait) => wait.state === "acting" || (wait.state === "waiting" && wait.repeat)), c);
 
 	function watchView() {
 		if (watcher) return;
