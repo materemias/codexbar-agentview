@@ -1384,7 +1384,9 @@ local function publishSummary()
 		end
 	end
 	local summary = {
-		usage = if store.usage then usageWidgets(store.usage, os.time()) else {},
+		-- On the minute: the graphs and "resets in" lines move with the clock,
+		-- and a summary rebuilt within the minute stays the one published.
+		usage = if store.usage then usageWidgets(store.usage, os.time() // 60 * 60) else {},
 		counts = counts,
 		restore = restore,
 		-- While another daemon ticks, the view's pane ids are its panes: none of ours.
@@ -2028,8 +2030,9 @@ local function tick()
 				fetchUsage(true)
 			end
 		end
-		-- Ages and countdowns move once a minute.
+		-- Ages and countdowns move once a minute, the widgets' among them.
 		if ticks % 120 == 0 then
+			publishSummary()
 			renderAll()
 		end
 	end)
