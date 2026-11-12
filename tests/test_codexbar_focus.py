@@ -711,6 +711,24 @@ class SessionOperationOwnershipTests(unittest.TestCase):
                 self.assertEqual(focus.launch("codex", "same-session"), 5)
             dispatch.assert_called_once()
 
+    def test_reserve_without_a_row_checks_the_folder_it_is_given(self) -> None:
+        # agents.json has no row for the session; an omp that names none of
+        # its sessions runs in the folder the caller resumes it in.
+        self.path.write_text(json.dumps({"agents": [], "history": []}))
+        with (
+            mock.patch.object(focus, "AGGREGATE_PATH", self.path),
+            mock.patch.object(focus.sys, "stderr", io.StringIO()) as stderr,
+            mock.patch.object(focus.agents, "_pgrep",
+                              side_effect=lambda _name, services=False: [] if services else [77]),
+            mock.patch.object(focus.agents, "_open_jsonl_under", return_value=("", False)),
+            mock.patch.object(focus.agents, "_omp_log_files", return_value={}),
+            mock.patch.object(focus.agents, "_argv_of", return_value=["omp"]),
+            mock.patch.object(focus.agents, "_cwd_of", return_value="/work/project"),
+            mock.patch.object(focus.state_paths, "migrate"),
+        ):
+            self.assertEqual(focus.main(["--tern", "--reserve", "omp", "sid-1", "/work/project"]), 5)
+        self.assertIn("a running omp in /work/project may be writing this session", stderr.getvalue())
+
 
 class TeleportTests(unittest.TestCase):
     AGENT, SHELL, KITTY = 500, 400, 300

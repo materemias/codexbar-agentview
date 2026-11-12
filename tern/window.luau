@@ -1347,7 +1347,12 @@ local function reserveThenResume(a: any, state: any)
 		resumes[id] = { result = result, error = err }
 		tern.kv.set("waitingResumes", resumes)
 	end
-	python("codexbar_focus.py", { "--tern", "--reserve", "omp", tostring(val(a.session)) }, function(res, cx2)
+	local args = { "--tern", "--reserve", "omp", tostring(val(a.session)) }
+	local cwd = val(a.cwd)
+	if type(cwd) == "string" and cwd ~= "" then
+		table.insert(args, cwd)
+	end
+	python("codexbar_focus.py", args, function(res, cx2)
 		if res.status == 5 then
 			settle("done")
 		elseif res.status ~= 0 then
@@ -1921,7 +1926,11 @@ local function waitingRequest(cx: WindowCx)
 				return
 			end
 			-- The same startup ownership as an automatic resume and History's Launch.
-			python("codexbar_focus.py", { "--tern", "--reserve", "omp", request.session }, function(res, cx3)
+			local args = { "--tern", "--reserve", "omp", request.session }
+			if type(request.cwd) == "string" and request.cwd ~= "" then
+				table.insert(args, request.cwd)
+			end
+			python("codexbar_focus.py", args, function(res, cx3)
 				if not cx3 then
 					return
 				elseif res.status == 0 then

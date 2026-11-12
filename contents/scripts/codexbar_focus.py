@@ -28,6 +28,11 @@ moves an idle live kitty session into a new Tern tab: it hangs up the agent
 as closing its window would, closes that kitty window, and resumes the
 session in Tern.
 
+  codexbar_focus.py --reserve <provider> <sessionId> [<cwd>]
+
+takes the session's startup ownership for a caller that starts the writer
+itself in <cwd>, as the Tern plugin does when it reopens a session for a wait.
+
 A leading --tern (e.g. `--tern --launch <provider> <sessionId>`) is passed by
 the Tern plugin, which may run outside KDE: the helper then never calls KWin.
 Kitty and Tern focus still work, T3 Code opens its thread link, kitty
@@ -512,10 +517,11 @@ def _session_writer_status(provider: str, session_id: str, cwd: str) -> str:
 
 def _session_operation(
     provider: str, session_id: str, kind: Literal["launch", "teleport"],
-    operation: Callable[[str, str, dict, str], int],
+    operation: Callable[[str, str, dict, str], int], cwd: str = "",
 ) -> int:
     """Own validation through dispatch, then reserve the writer's startup.
-    `operation` gets the session's folder as known here, else ""."""
+    `operation` gets the session's folder: its agents.json record's, else
+    `cwd`, else the last reservation's, else ""."""
     digest = hashlib.sha256(json.dumps([provider, session_id]).encode()).hexdigest()
     reservation = AGGREGATE_PATH.with_name(f"{AGGREGATE_PATH.name}.{digest}.startup.json")
     lock = reservation.with_suffix(".lock")
@@ -526,7 +532,7 @@ def _session_operation(
             (r for r in payload["agents"] + payload["history"]
              if agents._record_key(r) == (provider, session_id)), {}
         )
-        cwd = agents._text(record.get("cwd"))
+        cwd = agents._text(record.get("cwd")) or cwd
         try:
             previous = json.loads(reservation.read_text())
             if not isinstance(previous, dict):
@@ -582,13 +588,14 @@ def launch(provider: str, session_id: str) -> int:
     return _session_operation(provider, session_id, "launch", _launch)
 
 
-def reserve(provider: str, session_id: str) -> int:
+def reserve(provider: str, session_id: str, cwd: str = "") -> int:
     """Take a session's startup ownership for a caller that starts the writer
-    itself, such as the Tern plugin reopening a closed session in a tab of its
-    choosing: refused (5) while it runs, starts or may be written elsewhere,
-    and Launch, Teleport or another reserve are refused for the reservation's
-    lifetime after it."""
-    return _session_operation(provider, session_id, "launch", _writer_refusal)
+    itself in `cwd`, such as the Tern plugin reopening a closed session in a
+    tab of its choosing: refused (5) while it runs, starts or may be written
+    elsewhere, and Launch, Teleport or another reserve are refused for the
+    reservation's lifetime after it. A session agents.json has no row for is
+    checked against the processes in `cwd`."""
+    return _session_operation(provider, session_id, "launch", _writer_refusal, cwd)
 
 
 def _writer_refusal(provider: str, session_id: str, payload: dict, cwd: str) -> int:
@@ -983,10 +990,12 @@ def main(argv: list[str]) -> int:
     if not argv:
         return 1
     state_paths.migrate()
-    if argv[0] in ("--launch", "--teleport", "--reserve"):
+    if argv[0] == "--reserve":
+        return reserve(*argv[1:]) if len(argv) in (3, 4) else 1
+    if argv[0] in ("--launch", "--teleport"):
         if len(argv) != 3:
             return 1
-        action = {"--launch": launch, "--teleport": teleport, "--reserve": reserve}[argv[0]]
+        action = {"--launch": launch, "--teleport": teleport}[argv[0]]
         return action(argv[1], argv[2])
     if argv[0] == "--launch-all":
         if len(argv) != 2:
