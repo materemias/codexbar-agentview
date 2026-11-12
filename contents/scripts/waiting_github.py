@@ -74,10 +74,14 @@ GH_TIMEOUT_S = 30
 
 TRANSIENT = re.compile(
     r"HTTP (5\d\d|429)|rate limit|timed? ?out|connection (reset|refused)|\bEOF\b|"
-    r"temporar|could not resolve host|no such host|error connecting|"
-    r"network is unreachable|TLS handshake|Something went wrong",
+    r"temporar|could not resolve host|no such host|error connecting|server misbehaving|"
+    r"network is unreachable|no route to host|broken pipe|deadline exceeded|TLS handshake|"
+    r"Something went wrong",
     re.IGNORECASE,
 )
+# A quoted repo or path and a URL in an error say where it happened, not what: a
+# 404 on o/temporary-fix is not a network failure. Other quotes stay: they may be prose.
+_NAMES = re.compile(r"https?://\S+|(['\"])[\w.-]+/[\w./-]+\1")
 RATE_LIMITED = re.compile(r"HTTP 429|rate limit", re.IGNORECASE)
 REPO_RE = re.compile(r"[\w.-]+/[\w.-]+")
 PR_URL_RE = re.compile(r"https?://(?:www\.)?github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)(?:[/?#]\S*)?")
@@ -236,7 +240,13 @@ def _gh(run: Run, args: list[str]) -> str:
         return proc.stdout
     stderr = proc.stderr or ""
     message = " ".join(stderr.split())[:300] or f"gh exited {proc.returncode}"
-    raise GhError(message, bool(TRANSIENT.search(stderr)))
+    raise GhError(message, is_transient(stderr))
+
+
+def is_transient(text: str) -> bool:
+    """Whether a failed GitHub call's output means the network, GitHub's servers or
+    its rate limit, so the same call can work later unchanged."""
+    return bool(TRANSIENT.search(_NAMES.sub(" ", text)))
 
 
 def _json(text: str, expected: type) -> Any:

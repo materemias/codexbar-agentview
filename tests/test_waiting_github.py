@@ -1061,6 +1061,46 @@ class ErrorsTest(PollTestCase):
         result = self.poll(FakeGh(ok("<html>oops</html>")))
         self.assertTrue(result["transient"])
 
+    def test_network_server_and_rate_limit_failures_are_transient(self) -> None:
+        for text in (
+            "error connecting to api.github.com\ncheck your internet connection or https://githubstatus.com",
+            'Post "https://api.github.com/graphql": dial tcp: lookup api.github.com: no such host',
+            'Post "https://api.github.com/graphql": dial tcp: lookup api.github.com on 127.0.0.53:53: '
+            "server misbehaving",
+            'Get "https://api.github.com/user": dial tcp 140.82.121.6:443: connect: no route to host',
+            'Post "https://api.github.com/graphql": net/http: TLS handshake timeout',
+            'Post "https://api.github.com/graphql": context deadline exceeded',
+            'Post "https://api.github.com/graphql": unexpected EOF',
+            "gh: Gateway Timeout (HTTP 504)",
+            "gh: Too Many Requests (HTTP 429)",
+            "gh: You have exceeded a secondary rate limit. (HTTP 403)",
+            "GraphQL: Something went wrong while executing your query. This may be the result of a timeout",
+            "gh: You've exceeded a secondary rate limit; don't retry yet (HTTP 403)",
+            "GitHub's servers timed out for 'acme/widget'",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(github.is_transient(text))
+
+    def test_other_failures_are_not_transient(self) -> None:
+        for text in (
+            "gh: Bad credentials (HTTP 401)",
+            "gh: Resource not accessible by integration (HTTP 403)",
+            "gh: Not Found (HTTP 404)",
+            "gh: Validation Failed (HTTP 422)",
+            "To get started with GitHub CLI, please run:  gh auth login",
+            # Where it failed says nothing about why.
+            "gh: Not Found (HTTP 404) (https://api.github.com/repos/acme/timeout-tool/releases)",
+            "GraphQL: Could not resolve to a Repository with the name 'acme/temporary-eof'. (repository)",
+            "",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(github.is_transient(text))
+
+    def test_a_missing_repo_named_like_a_network_error_is_fatal(self) -> None:
+        stderr = "GraphQL: Could not resolve to a Repository with the name 'acme/timeout'. (repository)\n"
+        result = self.poll(FakeGh(ok(code=1, stderr=stderr)))
+        self.assertFalse(result["transient"])
+
     def test_timeout_is_transient(self) -> None:
         def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
             raise subprocess.TimeoutExpired(argv, kwargs["timeout"])
