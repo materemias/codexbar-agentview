@@ -1234,8 +1234,8 @@ export default function (pi) {
 	// Between attempts of a retry or around a compaction omp may stream nothing while the turn goes on.
 	let retrying = false;
 	let compacting = false;
-	/** omp is idle: no turn running, recovering or queued to start. */
-	const idle = () => !retrying && !compacting && ctx?.isIdle() === true && ctx.hasPendingMessages?.() !== true;
+	/** omp is idle: no turn running, recovering or queued to start. Closing the session needs it too. */
+	const idle = (c = ctx) => !retrying && !compacting && c?.isIdle() === true && c.hasPendingMessages?.() !== true;
 
 	function heartbeat() {
 		const pane = process.env.TERN_PANE;
@@ -1434,10 +1434,11 @@ export default function (pi) {
 		await tail;
 		// shutdown ends whichever session is open, and a switch meanwhile made it another one.
 		if (session !== sessionId || c.sessionManager.getSessionId() !== session) return;
-		// A prompt sent while the dialogs were open may have started a turn, and closing would cut it off.
-		if (!c.isIdle()) {
+		// A prompt sent while the dialogs were open may have started a turn, a retry or compaction may
+		// still be finishing one, and closing would cut it off.
+		if (!idle(c)) {
 			const kept = pinned ? "The session stays pinned" : "The wait is saved";
-			setPanel(c, errorPanel(`Not closed: the agent started a turn meanwhile. ${kept}; close it once the turn ends.`));
+			setPanel(c, errorPanel(`Not closed: the agent is still working. ${kept}; close it once the turn ends.`));
 			return;
 		}
 		await c.shutdown();
@@ -1449,7 +1450,7 @@ export default function (pi) {
 	 */
 	function closeOnceSettled(c, tries = 20) {
 		if (!ctx || closeAfterTurn !== sessionId) return;
-		if (!c.isIdle() && tries > 0) {
+		if (!idle(c) && tries > 0) {
 			ctx.setTimeout(() => closeOnceSettled(c, tries - 1), 250);
 			return;
 		}

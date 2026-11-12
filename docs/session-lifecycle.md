@@ -29,6 +29,8 @@ Press `Ctrl+Alt+B` or type `/wait` in omp. Both open the same menu:
 5. What to do with the session: **Close the session**, **Park it** or **Keep
    it open**. Close is offered only while the agent is idle, and it ends omp
    once the wait is saved; for a check the agent writes, once that turn ends.
+   A turn still going by then, retrying, compacting or with a message queued,
+   keeps the session open, and the row says so.
    A wait with a prompt reopens the session in Tern when it fires, and a
    repeat for each run (below); one without comes back to the Waiting tab,
    where Resume reopens it. For **When I have time** the pin brings it back
