@@ -7,6 +7,7 @@ import io
 import json
 import os
 import shlex
+import shutil
 import socket
 import sqlite3
 import subprocess
@@ -5432,6 +5433,138 @@ class PruneTests(Case):
         self.run_cli("done", "--session", SID, "--wait", first)
         self.assertEqual(self.wait_of(last)["state"], "waiting")
 
+
+EXTENSION_PATH = Path(__file__).resolve().parents[1] / "omp-extension" / "waitingfor.ts"
+
+# Loads the extension into a stand-in for omp 18.19 and moves its session the way omp's
+# SessionManager does when the file is open for writing elsewhere: a new id whose header continues
+# the old one, then each `onPersistenceNotice` observer at once (which replays earlier notices on
+# subscribe). NOTICE=1 makes two moves back to back; NOTICE=0 one with no notice, then a turn ends.
+MOVE_DRIVER = r"""
+import * as fs from "node:fs";
+const { default: install } = await import(process.env.EXTENSION);
+const [OLD, MID, NEW] = JSON.parse(process.env.IDS);
+const state = () => { try { return JSON.parse(fs.readFileSync(process.env.STATE_FILE, "utf8")); } catch { return {}; } };
+async function until(test) {
+    for (let i = 0; i < 300; i++) { if (test(state())) return true; await Bun.sleep(50); }
+    return false;
+}
+const chain = new Proxy(function () {}, { get: () => chain, apply: () => chain });
+const handlers = {};
+install({
+    zod: chain, logger: { debug() {} }, sendUserMessage() {},
+    pi: { Text: class { setText() {} render() { return []; } describe() { return {}; } } },
+    on: (name, fn) => { handlers[name] = fn; }, registerCommand() {}, registerShortcut() {}, registerTool() {},
+});
+const observers = new Set();
+const notices = [];
+let subscriptions = 0;
+const manager = {
+    id: OLD, header: { type: "session", id: OLD },
+    getSessionId() { return this.id; }, getHeader() { return this.header; }, getBranch: () => [],
+    onPersistenceNotice(fn) {
+        subscriptions += 1;
+        for (const notice of notices) fn(notice);
+        observers.add(fn);
+        return () => observers.delete(fn);
+    },
+    move(id, notify) {
+        this.header = { type: "session", id, parentSession: this.id, continuationOf: this.id };
+        this.id = id;
+        if (!notify) return;
+        const notice = { reason: "open-elsewhere", from: "a", to: "b" };
+        notices.push(notice);
+        for (const fn of observers) fn(notice);
+    },
+};
+let panelClears = 0; // a switch clears the panel; a move keeps it
+const ctx = {
+    hasUI: true, cwd: process.cwd(), isIdle: () => true, hasPendingMessages: () => false,
+    ui: { setWidget(name, widget) { if (name === "waitingfor-panel" && !widget) panelClears += 1; } },
+    sessionManager: manager,
+    setTimeout: (fn, ms) => setTimeout(fn, ms), setInterval: (fn, ms) => setInterval(fn, ms),
+    clearTimer: (timer) => clearTimeout(timer),
+};
+const out = {};
+handlers.session_start({}, ctx);
+out.started = await until((s) => s.extension_panes?.[OLD] === 52);
+panelClears = 0;
+if (process.env.NOTICE === "1") {
+    manager.move(MID, true);
+    manager.move(NEW, true);
+} else {
+    manager.move(NEW, false);
+    handlers.agent_end({}, ctx);
+}
+out.moved = await until((s) => s.extension_panes?.[NEW] === 52);
+out.panes = state().extension_panes ?? {};
+out.panelClears = panelClears;
+out.subscriptions = subscriptions;
+handlers.session_shutdown();
+out.unsubscribed = observers.size === 0;
+console.log(JSON.stringify(out));
+process.exit(0);
+"""
+MID = "01a1abf1-1111-748b-b9fa-126ebc0b88e7"
+
+
+@unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
+class ExtensionSessionMoveTests(unittest.TestCase):
+    """omp moves a session it can't write to a new file under a new id, with no session event."""
+
+    def evaluate(self, code: str, **env: str) -> dict:
+        with tempfile.TemporaryDirectory() as folder:
+            script = Path(folder) / "driver.mjs"
+            script.write_text(code)
+            done = subprocess.run(
+                ["bun", "run", str(script)], cwd=folder, capture_output=True, text=True, timeout=60,
+                env={**os.environ, "EXTENSION": str(EXTENSION_PATH), **env},
+            )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        return json.loads(done.stdout.strip().splitlines()[-1])
+
+    def test_session_change_tells_a_move_from_a_switch(self) -> None:
+        answer = self.evaluate(r"""
+const { sessionChange } = await import(process.env.EXTENSION);
+const manager = (id, continuationOf) => ({ getSessionId: () => id, getHeader: () => ({ id, continuationOf }) });
+console.log(JSON.stringify({
+    same: sessionChange(manager("a"), "a") ?? null,
+    moved: sessionChange(manager("b", "a"), "a"),
+    switched: sessionChange(manager("c", "x"), "a"),
+    first: sessionChange(manager("a"), undefined),
+    none: sessionChange(manager(undefined), "a") ?? null,
+    headerless: sessionChange({ getSessionId: () => "b" }, "a"),
+}));
+""")
+        self.assertEqual(answer, {
+            "same": None, "moved": {"id": "b", "moved": True}, "switched": {"id": "c", "moved": False},
+            "first": {"id": "a", "moved": False}, "none": None, "headerless": {"id": "b", "moved": False},
+        })
+
+    def moved(self, notice: str) -> dict:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "omp").mkdir()
+            return self.evaluate(
+                MOVE_DRIVER, NOTICE=notice, IDS=json.dumps([SID, MID, OTHER]), TERN_PANE="52",
+                XDG_STATE_HOME=str(root / "state"), OMP_AGENT_DIR=str(root / "omp"), PI_CODING_AGENT_DIR="",
+                STATE_FILE=str(root / "state" / "codexbar-agentview" / "waiting.json"),
+            )
+
+    def assert_followed(self, answer: dict) -> None:
+        self.assertTrue(answer["started"], answer)
+        self.assertTrue(answer["moved"], answer)
+        # The pane now reports the newest id, so the ids it moved from no longer claim it.
+        self.assertEqual(answer["panes"], {OTHER: 52})
+        # Each move is followed as one, not as a switch, on the one subscription.
+        self.assertEqual((answer["panelClears"], answer["subscriptions"]), (0, 1))
+        self.assertTrue(answer["unsubscribed"])
+
+    def test_the_extension_follows_omps_move_notice(self) -> None:
+        self.assert_followed(self.moved("1"))
+
+    def test_the_extension_notices_a_move_without_the_notice(self) -> None:
+        self.assert_followed(self.moved("0"))
 
 
 if __name__ == "__main__":

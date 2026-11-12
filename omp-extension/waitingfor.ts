@@ -544,6 +544,18 @@ export function healthWarning(health, now = Date.now(), uncheckedSince?: number)
 	return Number.isNaN(stale) ? undefined : `⚠ Session scan stale since ${clockTime(stale, now)}`;
 }
 
+/**
+ * What became of `known` in `manager`, undefined while it is still the session. omp moves a session it
+ * can't write to a new file under a new id ("open-elsewhere", "replaced", "contested"; it reports each
+ * through `onPersistenceNotice`), and the new header's `continuationOf` names the old id: `moved` then,
+ * where any other change is another session.
+ */
+export function sessionChange(manager, known: string | undefined): { id: string; moved: boolean } | undefined {
+	const id = manager?.getSessionId?.();
+	if (!id || id === known) return undefined;
+	return { id, moved: known !== undefined && manager.getHeader?.()?.continuationOf === known };
+}
+
 function waitFacts(wait): string {
 	return [wait.progress ?? wait.state, wait.overdue ? "overdue" : null, wait.due_at ? `due ${when(wait.due_at)}` : null, wait.reason].filter(Boolean).join(", ");
 }
@@ -990,6 +1002,9 @@ export default function (pi) {
 	let closeAfterTurn: string | undefined; // the session to close once the turn writing its described check ends
 	let menuSeq = 0; // the last menu request seen
 	let activatedAt = 0; // in whole seconds, as a request's time has no finer ones
+	let unwatchMoves; // ends the subscription to omp's notices of a session moved to a new file
+	let watched; // the SessionManager unwatchMoves listens to
+	const formerIds = new Set<string>(); // the ids omp moved this conversation from (followSession)
 	// Views applied, counted apart: one with only a failed tick's health leaves the sessions as they were.
 	let sessionsApplied = 0;
 	let healthApplied = 0;
@@ -1136,6 +1151,7 @@ export default function (pi) {
 
 	/** Applies this session's list; when the CLI fails, the view file, which holds a failed tick's error. */
 	async function refresh() {
+		if (followSession()) return; // the activation refreshes
 		const session = sessionId;
 		const applied = sessionsApplied;
 		const healthSeen = healthApplied;
@@ -1159,13 +1175,15 @@ export default function (pi) {
 	 */
 	function failIfDropped(c, session: string, prompt, since: number, sending) {
 		Promise.resolve(sending).catch((error) => {
-			if (error?.name !== "PromptDroppedError" && (session !== sessionId || landed(c, prompt.text, since))) return;
+			if (error?.name !== "PromptDroppedError" && (!ours(session) || landed(c, prompt.text, since))) return;
 			sent.delete(prompt.action);
 			inOrder(async () => applyView((await cli(["ack", "--action", prompt.action, "--result", "failed", `--error=${messageOf(error)}`])).view));
 		});
 	}
 
 	async function claimOne() {
+		// A session omp moved claims under its new id: the old one's prompts are another process's now.
+		if (followSession()) return; // the activation claims
 		const session = sessionId;
 		if (!ctx) return;
 		const claimedAt = Date.now();
@@ -1217,8 +1235,9 @@ export default function (pi) {
 
 	/** Reports `type` for a main-session event when the session's waits, as `applies` reads them, can react to it. */
 	function report(type: string, applies: (session) => boolean, c) {
-		const session = sessionId;
 		if (!ctx || c?.agent?.kind === "sub") return;
+		followSession();
+		const session = sessionId;
 		inOrder(async () => {
 			const record = (await readViewFile())?.sessions?.find((s) => s.session_id === session);
 			if (record && applies(record)) applyView((await cli(["event", "--type", type, "--session", session])).view);
@@ -1261,11 +1280,35 @@ export default function (pi) {
 	const idle = (c = ctx) => !retrying && !compacting && c?.isIdle() === true && c.hasPendingMessages?.() !== true;
 
 	function heartbeat() {
+		if (followSession()) return Promise.resolve(); // the activation heartbeats
 		const pane = process.env.TERN_PANE;
 		return cli(["heartbeat", "--session", sessionId, ...(pane ? ["--pane", pane] : []), "--features", "menu", ...(idle() ? ["--idle"] : [])]);
 	}
 
-	function activate(c) {
+	/**
+	 * Moves on with the session omp writes now, when that is no longer `sessionId`; true when it did. omp
+	 * moves a session it can't write to a new file under a new id, with no session event: the conversation
+	 * goes on there, and the old id is another process's (or nobody's). A move keeps what the turn is doing,
+	 * the described check it writes and the panel; anything else is a switch.
+	 */
+	function followSession(): boolean {
+		const c = ctx;
+		const change = c && sessionChange(c.sessionManager, sessionId);
+		if (!change) return false;
+		if (change.moved) {
+			formerIds.add(sessionId);
+			const check = checks.get(sessionId);
+			if (check) checks.set(change.id, check);
+			if (closeAfterTurn === sessionId) closeAfterTurn = change.id;
+		}
+		activate(c, change.moved);
+		return true;
+	}
+
+	/** `session` is this conversation's: the open one, or one omp moved it from. */
+	const ours = (session: string) => session === sessionId || formerIds.has(session);
+
+	function activate(c, moved = false) {
 		if (c.agent?.kind === "sub" || !c.hasUI) return;
 		clearTimers();
 		ctx = c;
@@ -1273,15 +1316,25 @@ export default function (pi) {
 		ownSession = undefined;
 		waits = [];
 		menuSeq = 0;
-		closeAfterTurn = undefined; // chosen for the session switched away from
-		retrying = false;
-		compacting = false;
+		if (!moved) {
+			formerIds.clear();
+			closeAfterTurn = undefined; // chosen for the session switched away from
+			retrying = false;
+			compacting = false;
+			setPanel(c, undefined);
+		}
 		activatedAt = Date.now() - (Date.now() % 1000);
-		setPanel(c, undefined);
 		sessionId = c.sessionManager.getSessionId();
 		// A session switched away from took its queued instruction with it.
 		for (const id of checks.keys()) if (id !== sessionId) checks.delete(id);
 		watchView();
+		// omp tells of each move here, inside the write that made it, so a tool call or claim in the same
+		// tick already sees the new id; it replays the earlier moves at once, which name this id already.
+		if (c.sessionManager !== watched) {
+			unwatchMoves?.();
+			watched = c.sessionManager;
+			unwatchMoves = watched.onPersistenceNotice?.(() => followSession());
+		}
 		timers = [
 			c.setInterval(() => quietly(refresh), REFRESH_MS),
 			c.setInterval(() => quietly(heartbeat), HEARTBEAT_MS),
@@ -1309,6 +1362,9 @@ export default function (pi) {
 		clearTimers();
 		watcher?.close();
 		watcher = undefined;
+		unwatchMoves?.();
+		unwatchMoves = undefined;
+		watched = undefined;
 		ctx = undefined;
 	});
 
@@ -1426,9 +1482,10 @@ export default function (pi) {
 		setPanel(c, (theme) => theme.fg("muted", `Asked the agent for a command that checks: ${check.description}`));
 		// A dropped instruction rejects later; the agent never got it.
 		Promise.resolve(sending).catch((error) => {
-			if (error?.name !== "PromptDroppedError" && (session !== sessionId || checkStarted(c, entry) !== undefined)) return;
-			if (checks.get(session) === entry) checks.delete(session);
-			if (ctx && session === sessionId) setPanel(ctx, errorPanel(`The check didn't reach the agent: ${messageOf(error)}`));
+			if (error?.name !== "PromptDroppedError" && (!ours(session) || checkStarted(c, entry) !== undefined)) return;
+			// A move carried the check over to the new id (followSession).
+			if (checks.get(sessionId) === entry) checks.delete(sessionId);
+			if (ctx && ours(session)) setPanel(ctx, errorPanel(`The check didn't reach the agent: ${messageOf(error)}`));
 		});
 	}
 
@@ -1459,8 +1516,10 @@ export default function (pi) {
 			seen = tail;
 			await seen;
 		}
-		// shutdown ends whichever session is open, and a switch meanwhile made it another one.
-		if (session !== sessionId || c.sessionManager.getSessionId() !== session) return;
+		// shutdown ends whichever session is open, and a switch meanwhile made it another one; a move
+		// keeps the conversation.
+		followSession();
+		if (!ours(session) || c.sessionManager.getSessionId() !== sessionId) return;
 		// A prompt sent while the dialogs were open may have started a turn, a retry or compaction may
 		// still be finishing one, and closing would cut it off.
 		if (!idle(c)) {
@@ -1506,6 +1565,7 @@ export default function (pi) {
 
 	async function openMenu(c) {
 		if (!c.hasUI || menuOpen) return;
+		followSession();
 		menuOpen = true;
 		setPanel(c, undefined);
 		try {
@@ -1545,6 +1605,7 @@ export default function (pi) {
 		description: "Set this session aside: /wait opens the menu, or /wait 2d <sentence> [-- prompt] | every 2h -- <prompt> | gh pr|babysit|release | check | for | later | list | done | help",
 		getArgumentCompletions: (prefix: string) => waitCompletions(prefix, waits),
 		handler: async (input: string, c) => {
+			followSession();
 			const parsed = parseWait(input);
 			setPanel(c, undefined);
 			if (parsed.error) setPanel(c, errorPanel(parsed.error, parsed.forms));
@@ -1620,6 +1681,7 @@ export default function (pi) {
 		loadMode: "essential",
 		async execute(_id, params, _signal, _onUpdate, c) {
 			if (c.agent?.kind === "sub") throw new Error("waitingfor belongs to the main session; report back to it instead");
+			followSession(); // the check the user described may still sit under the id omp moved from
 			const session = c.sessionManager.getSessionId();
 			let args;
 			// The user's described check this call writes; a failed add keeps it for the agent's retry.
