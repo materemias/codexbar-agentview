@@ -519,7 +519,10 @@ export function healthWarning(health, now = Date.now()): string | undefined {
 	if (!health) return undefined;
 	const checked = Date.parse(health.checked_at ?? "");
 	const since = Number.isNaN(checked) ? "never" : clockTime(checked, now);
-	if (health.error) return `⚠ Waits not checked since ${since}: ${health.error}`;
+	// One line, capped as the applet caps it: an error with a traceback must not flood the row above the composer.
+	let error = String(health.error ?? "").replace(/\s+/g, " ").trim();
+	if (error.length > 120) error = `${error.slice(0, 119)}…`;
+	if (error) return `⚠ Waits not checked since ${since}: ${error}`;
 	if (!(now - checked <= TICK_STALE_MS)) return `⚠ Waits not checked since ${since}`;
 	const stale = Date.parse(health.agents_stale_since ?? "");
 	return Number.isNaN(stale) ? undefined : `⚠ Session scan stale since ${clockTime(stale, now)}`;
