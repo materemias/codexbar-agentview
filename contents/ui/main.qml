@@ -932,7 +932,13 @@ PlasmoidItem {
             }
         }
         var onMe = view && view.counts ? Math.max(0, Math.floor(Number(view.counts.on_me) || 0)) : 0
-        var warning = root.waitingHealthWarning(view ? view.health : null, Date.now())
+        var health = view ? view.health : null
+        var nowMs = Date.now()
+        if (!health || typeof health !== "object" || health.checked_at)
+            root._waitingUncheckedSince = 0
+        else if (!root._waitingUncheckedSince)
+            root._waitingUncheckedSince = nowMs
+        var warning = root.waitingHealthWarning(health, nowMs, root._waitingUncheckedSince)
         var key = JSON.stringify([sessions, onMe, warning])
         if (key === root._waitingViewKey) return
         root._waitingViewKey = key
@@ -941,10 +947,15 @@ PlasmoidItem {
         root.waitingWarning = warning
     }
 
+    // When this applet first saw a view no tick had checked yet, in ms; 0
+    // once one has (or with no view).
+    property real _waitingUncheckedSince: 0
     // waiting_view.json `health` → the warning every waitingfor surface
-    // shows, or "" while ticks are current. A view without `health` (no
-    // tick has run yet, or an older CLI) warns of nothing.
-    function waitingHealthWarning(health, nowMs) {
+    // shows, or "" while ticks are current. Before the first tick
+    // (`checked_at` null) it warns only once this surface has seen it so
+    // for 15 minutes (`uncheckedSinceMs`), so a fresh install doesn't
+    // flash a warning. Only an older CLI writes no `health`: no warning.
+    function waitingHealthWarning(health, nowMs, uncheckedSinceMs) {
         if (!health || typeof health !== "object") return ""
         function at(value) {
             var when = value ? new Date(value) : null
@@ -957,7 +968,8 @@ PlasmoidItem {
         if (error.length > 120) error = error.slice(0, 119) + "…"
         if (error)
             return "⚠ Waits not checked since " + since + ": " + error
-        if (!checked || nowMs - checked.getTime() > root.waitingTickStaleMs)
+        var last = checked ? checked.getTime() : uncheckedSinceMs
+        if (last && nowMs - last > root.waitingTickStaleMs)
             return "⚠ Waits not checked since " + since
         var scan = at(health.agents_stale_since)
         return scan ? "⚠ Session scan stale since " + root._absoluteTime(scan, nowMs) : ""

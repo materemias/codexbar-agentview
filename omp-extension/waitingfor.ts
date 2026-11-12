@@ -514,8 +514,12 @@ function clockTime(ms: number, now: number): string {
 	return at.toDateString() === new Date(now).toDateString() ? hhmm : `${MONTHS[at.getMonth()]} ${at.getDate()}, ${hhmm}`;
 }
 
-/** The warning a view's `health` gives at `now`; undefined while the waits are being checked. */
-export function healthWarning(health, now = Date.now()): string | undefined {
+/**
+ * The warning a view's `health` gives at `now`; undefined while the waits are being checked. Before
+ * the first tick (`checked_at` null) it warns only once this process has seen that since
+ * `uncheckedSince` for 15 minutes, so a fresh install doesn't flash a warning.
+ */
+export function healthWarning(health, now = Date.now(), uncheckedSince?: number): string | undefined {
 	if (!health) return undefined;
 	const checked = Date.parse(health.checked_at ?? "");
 	const since = Number.isNaN(checked) ? "never" : clockTime(checked, now);
@@ -523,7 +527,8 @@ export function healthWarning(health, now = Date.now()): string | undefined {
 	let error = String(health.error ?? "").replace(/\s+/g, " ").trim();
 	if (error.length > 120) error = `${error.slice(0, 119)}…`;
 	if (error) return `⚠ Waits not checked since ${since}: ${error}`;
-	if (!(now - checked <= TICK_STALE_MS)) return `⚠ Waits not checked since ${since}`;
+	const last = Number.isNaN(checked) ? uncheckedSince : checked;
+	if (last !== undefined && now - last > TICK_STALE_MS) return `⚠ Waits not checked since ${since}`;
 	const stale = Date.parse(health.agents_stale_since ?? "");
 	return Number.isNaN(stale) ? undefined : `⚠ Session scan stale since ${clockTime(stale, now)}`;
 }
@@ -971,6 +976,7 @@ export default function (pi) {
 	let shownLine: string | undefined | null = null; // what drawRow last drew; null: draw next time, whatever it is
 	let ownSession; // this session's record, as the last applied view had it
 	let health; // the last applied view's health
+	let uncheckedSince: number | undefined; // when a view no tick had checked yet first came, while none has
 	let waits = []; // this session's open waits, as the last applied view had them
 	let menuOpen = false;
 	let closeAfterTurn: string | undefined; // the session to close once the turn writing its described check ends
@@ -1011,7 +1017,7 @@ export default function (pi) {
 	function drawRow() {
 		const session = ownSession;
 		const line = session?.composer_row || undefined;
-		const warning = healthWarning(health);
+		const warning = healthWarning(health, Date.now(), uncheckedSince);
 		const shown = JSON.stringify([session?.outcome, session?.headline, line, warning]);
 		if (!ctx || shown === shownLine) return;
 		shownLine = shown;
@@ -1077,7 +1083,7 @@ export default function (pi) {
 	async function showDetails(c) {
 		const loading = (theme) => theme.fg("muted", "Loading…");
 		setPanel(c, loading);
-		const warning = () => healthWarning(health);
+		const warning = () => healthWarning(health, Date.now(), uncheckedSince);
 		let details;
 		try {
 			details = detailsPanel((await cli(["card", "--session", c.sessionManager.getSessionId()])).card, warning);
@@ -1106,7 +1112,10 @@ export default function (pi) {
 	function applyView(view) {
 		if (!view || !ctx) return;
 		viewsApplied += 1;
-		if ("health" in view) health = view.health;
+		if ("health" in view) {
+			health = view.health;
+			uncheckedSince = !health || health.checked_at ? undefined : (uncheckedSince ?? Date.now());
+		}
 		if (!view.sessions) {
 			drawRow();
 			return;

@@ -1073,12 +1073,23 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 fresh.counts.on_me = 0
                 app.applyWaitingView(fresh)
                 check(!count.visible, "a fresh zero count stays hidden")
+                var unticked = { counts: { on_me: 0 }, health: { checked_at: null, error: null } }
+                app.applyWaitingView(unticked)
+                check(app.waitingWarning === "" && !count.visible && app._waitingUncheckedSince > 0,
+                    "a view no tick has checked yet warns of nothing at first")
+                app._waitingUncheckedSince -= 15 * 60 * 1000 + 1000
+                app.applyWaitingView(unticked)
+                check(app.waitingWarning === "⚠ Waits not checked since never" && countText.text === "0?",
+                    "still unchecked 15 minutes later: " + app.waitingWarning)
+                app.applyWaitingView(fresh)
+                check(app.waitingWarning === "" && app._waitingUncheckedSince === 0,
+                    "a tick ends the unchecked wait")
 
                 function local(d, h, m, s) { return new Date(2026, 10, d, h, m, s || 0) }
                 var now = local(12, 9, 20).getTime()
-                function warn(health) { return app.waitingHealthWarning(health, now) }
+                function warn(health, unchecked) { return app.waitingHealthWarning(health, now, unchecked) }
                 function iso(d) { return d.toISOString() }
-                check(warn(null) === "", "no health (older CLI or no tick yet): no warning")
+                check(warn(null) === "", "no health (an older CLI): no warning")
                 check(warn({ checked_at: iso(local(12, 9, 5, 1)) }) === "", "checked 14:59 ago is current")
                 check(warn({ checked_at: iso(local(12, 9, 4, 59)) }) === "⚠ Waits not checked since 09:04",
                     "checked over 15 min ago: " + warn({ checked_at: iso(local(12, 9, 4, 59)) }))
@@ -1091,8 +1102,11 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                     === "⚠ Waits not checked since 09:18: boom", "an error outranks a stale scan")
                 check(warn({ checked_at: iso(local(12, 9, 18)), agents_stale_since: iso(local(12, 9, 0)) })
                     === "⚠ Session scan stale since 09:00", "fresh ticks over a stale session scan")
-                check(warn({ error: " \\n " }) === "⚠ Waits not checked since never",
-                    "a blank error is no error")
+                check(warn({ checked_at: null }, local(12, 9, 5, 1).getTime()) === "",
+                    "unchecked for 14:59 is not yet a warning")
+                check(warn({ error: " \\n " }, local(12, 9, 4, 59).getTime()) === "⚠ Waits not checked since never",
+                    "a blank error is no error; unchecked for over 15 min warns")
+                check(warn({ checked_at: null }) === "", "unchecked since unknown: no warning")
                 var long = warn({ checked_at: iso(local(12, 9, 18)), error: new Array(201).join("x") })
                 check(long === "⚠ Waits not checked since 09:18: " + new Array(120).join("x") + "…",
                     "a long error is cut to 120 characters: " + long.length)

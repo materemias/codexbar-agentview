@@ -347,6 +347,7 @@ and the Plasma Agents section show one line:
 |---|---|
 | ⚠ Waits not checked since 14:20: … | the last check failed, with its error |
 | ⚠ Waits not checked since 14:20 | nothing has checked the waits for 15 minutes (Tern isn't running, say) |
+| ⚠ Waits not checked since never | no check has run yet, 15 minutes after this surface first showed the waits |
 | ⚠ Session scan stale since 14:20 | the session list is older than 2 minutes or from before a reboot |
 
 Meanwhile the panel's back-on-you count reads `2?`, dimmed, or `0?`. A Tern

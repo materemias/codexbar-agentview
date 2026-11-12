@@ -365,6 +365,7 @@ local store = {
 	openSig = "",
 	lastGoto = nil :: any,
 	waiting = nil :: any, -- the CLI's last view
+	waitingUncheckedSince = nil :: number?, -- os.time() a view no tick had checked yet first came, while none has
 	waitingError = nil :: string?, -- the last tick's failure, cleared by a tick that succeeds
 	waitingActions = nil :: any, -- the outbox as last published
 	-- os.clock() below is Luau's: seconds on the system's monotonic clock
@@ -1458,6 +1459,9 @@ local function applyWaiting(view: any)
 	local at = view.now
 	local health = val(view.health)
 	local checked = if type(health) == "table" then health.checked_at else nil
+	store.waitingUncheckedSince = if type(health) ~= "table" or val(checked) ~= nil
+		then nil
+		else store.waitingUncheckedSince or os.time()
 	view.now = nil
 	if checked then
 		health.checked_at = nil
@@ -3171,7 +3175,8 @@ end
 
 -- A line above the groups while the waits may be out of date: the last tick
 -- failed (this half saw it, or the CLI noted it in `health`), no tick finished
--- for 15 minutes, or the session scan the ticks read is stale. Without one,
+-- for 15 minutes (before the first tick: for 15 minutes since this half saw
+-- the view so), or the session scan the ticks read is stale. Without one,
 -- while another daemon ticks, a muted line says so. Without a view the empty
 -- state tells the failure instead.
 local function waitingView(b: Block, now: number, into: { Node })
@@ -3187,10 +3192,11 @@ local function waitingView(b: Block, now: number, into: { Node })
 		-- One line, capped as the applet and omp cap it.
 		local err = string.match(oneLine(store.waitingError or val(health.error)), "^%s*(.-)%s*$")
 		local scan = epoch(val(health.agents_stale_since))
+		local last = checked or store.waitingUncheckedSince
 		local text, tone = nil, "warning"
 		if err ~= "" then
 			text, tone = "⚠️ Waits not checked since " .. since .. ": " .. clip(err, 120), "error"
-		elseif checked and now - checked > 15 * 60 then
+		elseif last and now - last > 15 * 60 then
 			text = "⚠️ Waits not checked since " .. since
 		elseif scan then
 			text = "⚠️ Session scan stale since " .. absoluteTime(scan, now)
