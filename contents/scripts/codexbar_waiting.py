@@ -2599,10 +2599,12 @@ def _housekeeping(
     if boot:
         if rebooted:
             _after_reboot(state, agents, now)
-            # Pane ids don't survive a reboot, and may belong to another pane now.
-            _panes_gone(state, now)
+            # Pane ids don't survive a reboot, and may belong to another pane
+            # now: only what this boot's daemon made, before its first tick, stays.
+            _panes_gone(state, now, daemon)
             state["actions"] = [
-                action for action in state["actions"] if action["type"] == "toast"
+                action for action in state["actions"]
+                if action["type"] == "toast" or daemon is not None and action.get("daemon") == daemon
             ]
             # A session absent from agents.json can't be told dead from new by
             # its id: only a report since the sweep, or a live row, is this boot's.

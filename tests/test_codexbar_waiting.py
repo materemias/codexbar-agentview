@@ -714,6 +714,19 @@ class ConditionTests(Case):
         self.tick()
         self.assertEqual(self.run_cli("list")["panes"], [])
 
+    def test_reboot_keeps_what_the_new_daemon_made_before_its_first_tick(self) -> None:
+        self.agents(boot="one")
+        self.creator = "a"
+        self.run_cli("add", "--pane", "51", "--kind", "job")
+        self.tick("--daemon", "a")
+        self.agents(boot="two")
+        self.advance(seconds=waiting.TICKER_LEASE_S)  # "a" ran before the reboot
+        self.creator = "b"
+        self.run_cli("add", "--pane", "52", "--kind", "job", "--park")
+        actions = self.tick("--daemon", "b")["actions"]
+        self.assertEqual([action["type"] for action in actions], ["park"])
+        self.assertEqual([pane["pane"] for pane in self.run_cli("list")["panes"]], [52])
+
     def test_something_never_fires_and_ends_with_done(self) -> None:
         answer = self.add("--kind", "something", "--what", "Reply from Dóra")
         wait = answer["id"]
