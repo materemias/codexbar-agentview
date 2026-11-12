@@ -1043,7 +1043,8 @@ do
 		return math.floor(math.clamp(pct, 0, 100) + 0.5) .. "%"
 	end
 
-	local SAMPLES = 60
+	-- Tern keeps a graph widget's newest 120 samples.
+	local SAMPLES = 120
 
 	-- The window's used percent over its last span, 0–1 and oldest first, weighted
 	-- across `accounts` ({ w, weight }) from the history runs the fetch attaches
@@ -1085,16 +1086,17 @@ do
 				total += a.weight
 			end
 			if known and total > 0 then
-				table.insert(out, math.clamp(sum / total, 0, 100) / 100)
+				table.insert(out, math.floor(math.clamp(sum / total, 0, 100) * 10 + 0.5) / 1000)
 			end
 		end
 		return if #out >= 2 then out else nil
 	end
 
-	-- One provider's widget bar view: Claude's and Codex's windows plan-weighted
-	-- across every current account, the others' per window. The ring, bar and
-	-- graph show the shortest window; the tone is the worst window's.
-	local function usageWidget(id: string, recs: { any }, now: number): any
+	-- One provider's widget bar views: Claude's and Codex's windows plan-weighted
+	-- across every current account, the others' per window. `[id]` shows every
+	-- window in its text and the shortest in its ring, bar and graph, toned by the
+	-- worst; Claude and Codex add `[id-7d]` for the weekly window alone.
+	local function usageViews(id: string, recs: { any }, now: number, out: { [string]: any })
 		local ok, stale = {}, false
 		for _, r in recs do
 			if val(r.ok) == true and val(r.error) == nil then
@@ -1103,7 +1105,7 @@ do
 			end
 		end
 		if #ok == 0 then
-			return nil
+			return
 		end
 		local pooled = id == "claude" or id == "codex"
 		local windows = {}
@@ -1145,24 +1147,20 @@ do
 		end
 		local balance = balanceOf(ok[1])
 		if #windows == 0 and balance == "" then
-			return nil
+			return
 		end
-		local series = if windows[1] and not stale then seriesOf(windows[1].accounts, now) else nil
-		local name = PROVIDER_NAMES[id] or id
-		local lines = { name .. (if pooled and #ok > 1 then " · " .. #ok .. " accounts, plan-weighted" else "") .. (if stale then " · last known" else "") }
+		-- The hover text: a line per window, then each account's own percents.
+		local lines = if stale then { "Last known" } else {}
 		local parts = {}
 		local worst: string? = nil
 		for _, w in windows do
-			local pct = math.clamp(w.pct, 0, 100)
-			local lvl = if stale then nil else level(pct, if w.pace >= 3 then w.pace else -1)
-			worst = worse(worst, lvl)
-			table.insert(parts, roundPct(pct))
-			local line = w.label .. "  " .. roundPct(pct)
-			if not stale and w.pace >= 3 then
-				line ..= " · " .. roundPct(w.pace) .. " elapsed"
-			end
+			w.pct = math.clamp(w.pct, 0, 100)
+			w.lvl = if stale then nil else level(w.pct, if w.pace >= 3 then w.pace else -1)
+			worst = worse(worst, w.lvl)
+			table.insert(parts, roundPct(w.pct))
+			local line = w.label .. " " .. roundPct(w.pct)
 			if not stale and w.reset and w.reset > now then
-				line ..= " · " .. (if pooled and #ok > 1 then "next reset in " else "resets in ") .. span(w.reset - now)
+				line ..= " · resets in " .. span(w.reset - now)
 			end
 			table.insert(lines, line)
 		end
@@ -1171,31 +1169,43 @@ do
 		end
 		if pooled and #recs > 1 then
 			for i, r in recs do
-				local email = str(r.accountEmail)
 				local each = {}
 				if val(r.ok) == true and val(r.error) == nil then
 					for _, spec in POOLED_WINDOWS do
 						local w = windowOf(r, spec[1])
-						if w then
-							table.insert(each, spec[2] .. " " .. roundPct(tonumber(val(w.usedPercent)) or 0))
-						end
+						table.insert(each, if w then roundPct(tonumber(val(w.usedPercent)) or 0) else "–")
 					end
 				else
 					table.insert(each, "no reading")
 				end
+				local email = str(r.accountEmail)
 				table.insert(lines, (if email ~= "" then email else "account " .. i) .. "  " .. table.concat(each, " · "))
 			end
 		end
-		return {
-			text = (if PROVIDER_ICONS[id] then "" else name .. " ") .. (if #parts > 0 then table.concat(parts, " · ") else balance),
+		local title = table.concat(lines, "\n")
+		local function graph(w: any): { number }?
+			return if w and not stale then seriesOf(w.accounts, now) else nil
+		end
+		out[id] = {
+			text = if #parts > 0 then table.concat(parts, " · ") else balance,
 			tone = if stale then "muted" elseif worst then STATUS_TONE[worst] else nil,
-			value = if windows[1] then math.clamp(windows[1].pct, 0, 100) / 100 else nil,
-			series = series,
-			title = table.concat(lines, "\n"),
+			value = if windows[1] then windows[1].pct / 100 else nil,
+			series = graph(windows[1]),
+			title = title,
 		}
+		local weekly = if pooled then windows[#windows] else nil
+		if weekly and weekly.label == "7d" then
+			out[id .. "-7d"] = {
+				text = "7d " .. roundPct(weekly.pct),
+				tone = if stale then "muted" elseif weekly.lvl then STATUS_TONE[weekly.lvl] else nil,
+				value = weekly.pct / 100,
+				series = graph(weekly),
+				title = title,
+			}
+		end
 	end
 
-	-- Widget views by provider id, for the enabled providers with a reading.
+	-- Widget views by widget id, for the enabled providers with a reading.
 	usageWidgets = function(snap, now)
 		local byId: { [string]: { any } } = {}
 		local enabled = setting("providers")
@@ -1208,7 +1218,7 @@ do
 		end
 		local out = {}
 		for id, recs in byId do
-			out[id] = usageWidget(id, recs, now)
+			usageViews(id, recs, now, out)
 		end
 		return out
 	end

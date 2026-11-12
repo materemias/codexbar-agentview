@@ -1937,7 +1937,7 @@ class RecentUsageTests(unittest.TestCase):
         fetch._attach_recent_usage([record], history, self.NOW)
         self.assertEqual(record["primary"]["recent"], {"hours": 1, "consumedPercent": 7})
 
-    def test_five_hour_window_gets_runs_covering_its_span_and_weekly_none(self) -> None:
+    def test_windows_get_runs_covering_their_span(self) -> None:
         reset = self.NOW + dt.timedelta(hours=2)
         history: dict = {}
         for minutes, used in ((7 * 60, 5), (6 * 60, 8), (4 * 60, 20), (0, 37)):
@@ -1951,7 +1951,26 @@ class RecentUsageTests(unittest.TestCase):
         fetch._attach_recent_usage([record], history, self.NOW)
         # The run in effect five hours ago (8%, seen 6h ago) starts it; the 7h-old one is dropped.
         self.assertEqual([run[2] for run in record["primary"]["runs"]], [8, 20, 37])
-        self.assertNotIn("runs", record["secondary"])
+        self.assertEqual([run[2] for run in record["secondary"]["runs"]], [5, 8, 20, 37])
+
+    def test_prune_keeps_a_week_and_thins_all_but_the_last_day(self) -> None:
+        reset = self.NOW + dt.timedelta(days=1)
+        history: dict = {}
+        # A reading every 10 minutes for nine days, each one different.
+        for step in range(9 * 24 * 6, -1, -1):
+            self.observe(history, step * 10, 100 - step / 20, reset)
+        fetch._usage_history_prune(history, self.NOW)
+        runs = history[self.KEY]
+        week = int((self.NOW - dt.timedelta(days=7)).timestamp())
+        day = int((self.NOW - dt.timedelta(hours=24, minutes=30)).timestamp())
+        self.assertLessEqual(runs[0][0], week)
+        self.assertGreater(runs[1][0], week)
+        older = [r for r in runs if r[1] < day]
+        self.assertLessEqual(len(older), 6 * 24 * 2 + 2)
+        self.assertEqual(len({r[0] // fetch.HISTORY_THIN_SECONDS for r in older}), len(older))
+        # The last day keeps every reading, so recent consumption is unchanged.
+        self.assertEqual(len([r for r in runs if r[0] >= day + fetch.HISTORY_THIN_SECONDS]), 24 * 6 + 1)
+        self.assertEqual(runs[-1][2], 100)
 
     def test_gap_across_lookback_start_is_not_counted(self) -> None:
         reset = self.NOW + dt.timedelta(hours=2)

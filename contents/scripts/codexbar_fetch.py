@@ -1177,6 +1177,10 @@ FETCH_CLAIM_NAME = "fetch_claim"
 USAGE_CACHE_TTL = 24 * 60 * 60
 # Recent-consumption lookback per window length: minutes → hours.
 RECENT_LOOKBACK_HOURS = {10080: 24, 300: 1}
+# History kept for usage graphs: a week, the last day of it as observed (recent
+# consumption reads it) and older runs thinned to one per THIN interval.
+HISTORY_KEEP_SECONDS = 7 * 24 * 60 * 60
+HISTORY_THIN_SECONDS = 30 * 60
 # Observations further apart than this leave the time between them unobserved.
 HISTORY_GAP_SECONDS = 15 * 60
 # A reset time moving later by more than this, or usage dropping by more than
@@ -1575,8 +1579,12 @@ def _usage_history_observe(history: dict[str, list[list]], record: dict) -> None
 
 
 def _usage_history_prune(history: dict[str, list[list]], now: _dt.datetime) -> None:
-    """Keep runs inside the longest lookback plus the run in effect at its start."""
-    start = int(now.timestamp()) - max(RECENT_LOOKBACK_HOURS.values()) * 3600
+    """Keep a week of runs plus the run in effect at its start; runs that ended
+    before the last day (and a thin interval of margin) merge into one per
+    thin interval, carrying the interval's last reading."""
+    now_ts = int(now.timestamp())
+    start = now_ts - HISTORY_KEEP_SECONDS
+    detailed = now_ts - max(RECENT_LOOKBACK_HOURS.values()) * 3600 - HISTORY_THIN_SECONDS
     for key in list(history):
         runs = history[key]
         if runs[-1][1] < start:
@@ -1585,7 +1593,15 @@ def _usage_history_prune(history: dict[str, list[list]], now: _dt.datetime) -> N
         first = 0
         while first + 1 < len(runs) and runs[first + 1][0] <= start:
             first += 1
-        del runs[:first]
+        kept: list[list] = []
+        for run in runs[first:]:
+            last = kept[-1] if kept else None
+            if (last is not None and run[1] < detailed
+                    and last[0] // HISTORY_THIN_SECONDS == run[0] // HISTORY_THIN_SECONDS):
+                kept[-1] = [last[0], run[1], run[2], run[3]]
+            else:
+                kept.append(run)
+        history[key] = kept
 
 
 def _recent_consumption(runs: list[list], hours: int, now: _dt.datetime) -> dict | None:
@@ -1629,9 +1645,8 @@ def _window_runs(runs: list[list], seconds: int, now: _dt.datetime) -> list[list
 
 
 def _attach_recent_usage(records: list[dict], history: dict[str, list[list]], now: _dt.datetime) -> None:
-    """Adds each window's recent consumption and, for windows the kept history
-    spans whole (5h), its runs over the window's length, for usage graphs."""
-    kept = max(RECENT_LOOKBACK_HOURS.values()) * 3600
+    """Adds each window's recent consumption and its runs over the window's
+    length (5h, 7d), for usage graphs."""
     for record in records:
         if record.get("ok") is not True:
             continue
@@ -1640,11 +1655,9 @@ def _attach_recent_usage(records: list[dict], history: dict[str, list[list]], no
             recent = _recent_consumption(runs, RECENT_LOOKBACK_HOURS[window["windowMinutes"]], now)
             if recent is not None:
                 window["recent"] = recent
-            span = window["windowMinutes"] * 60
-            if span <= kept:
-                covering = _window_runs(runs, span, now)
-                if covering:
-                    window["runs"] = covering
+            covering = _window_runs(runs, min(window["windowMinutes"] * 60, HISTORY_KEEP_SECONDS), now)
+            if covering:
+                window["runs"] = covering
 
 
 def _last_known(record: dict, error: str = "") -> dict:

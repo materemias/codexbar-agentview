@@ -367,25 +367,25 @@ tern.chrome.status(function(pane)
 end)
 
 -- Widget bar ------------------------------------------------------------------
--- The host half publishes each provider's view under `summary.usage[id]`; same
--- ids and order as its PROVIDER_ORDER.
+-- The host half publishes each widget's view under `summary.usage[id]`; same
+-- provider order as its PROVIDER_ORDER. Widgets without a provider logo lead with its name.
+local POOLED = "plan-weighted across all your accounts"
 local USAGE_WIDGETS = {
-	{ "claude", "Claude usage", "app-claude" },
-	{ "codex", "Codex usage", "app-codex" },
-	{ "zai", "z.ai usage", "gauge" },
-	{ "opencodego", "OpenCode Go usage", "gauge" },
-	{ "openrouter", "OpenRouter usage", "gauge" },
-	{ "kilo", "Kilo usage", "gauge" },
-	{ "typesafe", "TypeSafe usage", "gauge" },
+	{ "claude", "Claude usage", "provider-anthropic", "5h and weekly use, " .. POOLED .. "; the ring, bar and graph show the 5h window" },
+	{ "claude-7d", "Claude weekly usage", "provider-anthropic", "Weekly use, " .. POOLED .. "; the graph spans the week" },
+	{ "codex", "Codex usage", "provider-openai", "5h and weekly use, " .. POOLED .. "; the ring, bar and graph show the 5h window" },
+	{ "codex-7d", "Codex weekly usage", "provider-openai", "Weekly use, " .. POOLED .. "; the graph spans the week" },
+	{ "zai", "z.ai usage", "provider-zai" },
+	{ "opencodego", "OpenCode Go usage", "provider-opencode" },
+	{ "openrouter", "OpenRouter usage", "gauge", nil, "OpenRouter" },
+	{ "kilo", "Kilo usage", "provider-kilo" },
+	{ "typesafe", "TypeSafe usage", "gauge", nil, "TypeSafe" },
 }
 for _, spec in USAGE_WIDGETS do
-	local id = spec[1]
-	local pooled = id == "claude" or id == "codex"
+	local id, lead = spec[1], if spec[5] then spec[5] .. " " else ""
 	tern.chrome.widget(id, {
 		name = spec[2],
-		description = if pooled
-			then "5h and weekly use, plan-weighted across all your accounts; the ring, bar and graph show the 5h window"
-			else "Use per window, or the balance; the ring, bar and graph show the shortest window",
+		description = spec[4] or "Use per window, or the balance; the ring, bar and graph show the shortest window",
 		icon = spec[3],
 		styles = { "ring", "graph", "bar", "text" },
 		render = function()
@@ -394,7 +394,7 @@ for _, spec in USAGE_WIDGETS do
 			if type(u) ~= "table" then
 				return nil
 			end
-			return { text = u.text, tone = u.tone, title = u.title, value = u.value, series = u.series, command = "plugin.codexbar-agentview.usage" }
+			return { text = lead .. u.text, tone = u.tone, title = u.title, value = u.value, series = u.series, command = "plugin.codexbar-agentview.usage" }
 		end,
 	})
 end
