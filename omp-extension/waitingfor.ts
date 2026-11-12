@@ -979,6 +979,7 @@ export default function (pi) {
 	let sessionId: string | undefined;
 	let timers = [];
 	let debounce;
+	let settle; // the heartbeat that settles a prompt delivered while idle
 	let watcher;
 	let shownLine: string | undefined | null = null; // what drawRow last drew; null: draw next time, whatever it is
 	let ownSession; // this session's record, as the last applied view had it
@@ -1188,10 +1189,11 @@ export default function (pi) {
 		}
 		if (!delivered || session !== sessionId || !idle()) return;
 		// Idle right after the ack, no turn runs for the prompt: it landed before (a resend after a
-		// crash), or its turn ended before the ack. The CLI settles it on an idle heartbeat once
-		// the delivery is old enough: this one says so now, the one after SETTLE_IDLE_MS settles it.
-		await heartbeat();
-		if (ctx && session === sessionId) timers.push(ctx.setTimeout(() => quietly(heartbeat), SETTLE_IDLE_MS));
+		// crash), or its turn ended before the ack. The CLI settles it on an idle heartbeat once the
+		// delivery is 2 minutes old, so one goes after SETTLE_IDLE_MS. One timer will do: the next
+		// prompt is claimed only once this one settled.
+		if (settle) ctx.clearTimer(settle);
+		settle = ctx.setTimeout(() => quietly(heartbeat), SETTLE_IDLE_MS);
 	}
 
 	async function claimPrompts() {
@@ -1243,10 +1245,10 @@ export default function (pi) {
 	}
 
 	function clearTimers() {
-		for (const timer of timers) ctx?.clearTimer(timer);
-		if (debounce) ctx?.clearTimer(debounce);
+		for (const timer of [...timers, debounce, settle]) if (timer) ctx?.clearTimer(timer);
 		timers = [];
 		debounce = undefined;
+		settle = undefined;
 	}
 
 	// Between attempts of a retry or around a compaction omp may stream nothing while the turn goes on.
