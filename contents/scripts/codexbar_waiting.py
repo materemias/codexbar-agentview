@@ -2542,6 +2542,12 @@ def _housekeeping(
             state["actions"] = [
                 action for action in state["actions"] if action["type"] == "toast"
             ]
+            # A session absent from agents.json can't be told dead from new by
+            # its id: only a report since the sweep, or a live row, is this boot's.
+            state["extension_panes"] = {
+                session: pane for session, pane in state["extension_panes"].items()
+                if _running(state, agents, session)
+            }
         state["boot_id"] = boot
     if daemon:
         last = _ticking_daemon(state)

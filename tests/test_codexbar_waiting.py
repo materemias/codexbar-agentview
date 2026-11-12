@@ -1479,6 +1479,34 @@ class MenuRequestTests(Case):
         answer = self.run_cli("menu-request", "--pane", "52")
         self.assertEqual((answer["menu"], answer["reason"]), (False, waiting.REASON_MENU_NO_PANE))
 
+    def swept(self, boot: str) -> None:
+        """agents.json of `boot`, swept now, listing neither session."""
+        self.agents(boot=boot)
+        payload = json.loads((self.state_dir / "agents.json").read_text())
+        payload["updatedAt"] = int(self.clock.timestamp() * 1000)
+        (self.state_dir / "agents.json").write_text(json.dumps(payload))
+
+    def test_a_reboot_drops_a_fresh_report_from_before_it(self) -> None:
+        self.swept("one")
+        self.tick()
+        self.advance(seconds=5)
+        self.heartbeat(SID, "--pane", "52", "--features", "menu")
+        self.advance(seconds=5)
+        self.swept("two")
+        self.tick()
+        self.assertEqual(self.run_cli("list")["extension_panes"], {})
+        answer = self.run_cli("menu-request", "--pane", "52")
+        self.assertEqual((answer["menu"], answer["reason"]), (False, waiting.REASON_MENU_NO_PANE))
+
+    def test_a_report_after_the_reboots_sweep_stays(self) -> None:
+        self.swept("one")
+        self.tick()
+        self.advance(seconds=5)
+        self.swept("two")
+        self.advance(seconds=5)
+        self.heartbeat(SID, "--pane", "52", "--features", "menu")
+        self.tick()
+        self.assertEqual(list(self.run_cli("list")["extension_panes"]), ["52"])
 
     def test_a_resumed_session_keeps_its_pane_before_the_sweep_sees_it(self) -> None:
         self.agents(closed=[{"sessionId": SID, "cwd": "/w", "windowTitle": "x"}])
