@@ -1085,6 +1085,5 @@ class StartupLockTests(unittest.TestCase):
             thread.join(5)
 
 
-
 if __name__ == "__main__":
     unittest.main()

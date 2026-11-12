@@ -512,9 +512,10 @@ def _session_writer_status(provider: str, session_id: str, cwd: str) -> str:
 
 def _session_operation(
     provider: str, session_id: str, kind: Literal["launch", "teleport"],
-    operation: Callable[[str, str, dict], int],
+    operation: Callable[[str, str, dict, str], int],
 ) -> int:
-    """Own validation through dispatch, then reserve the writer's startup."""
+    """Own validation through dispatch, then reserve the writer's startup.
+    `operation` gets the session's folder as known here, else ""."""
     digest = hashlib.sha256(json.dumps([provider, session_id]).encode()).hexdigest()
     reservation = AGGREGATE_PATH.with_name(f"{AGGREGATE_PATH.name}.{digest}.startup.json")
     lock = reservation.with_suffix(".lock")
@@ -564,7 +565,7 @@ def _session_operation(
         # An exception may follow dispatch; leave its bounded reservation
         # intact, just as when the helper is killed at that boundary.
         try:
-            result = operation(provider, session_id, payload)
+            result = operation(provider, session_id, payload, cwd)
         except _DispatchAckUnknown:
             result = 8
         else:
@@ -587,45 +588,37 @@ def reserve(provider: str, session_id: str) -> int:
     choosing: refused (5) while it runs, starts or may be written elsewhere,
     and Launch, Teleport or another reserve are refused for the reservation's
     lifetime after it."""
-    return _session_operation(provider, session_id, "launch", _reserve)
+    return _session_operation(provider, session_id, "launch", _writer_refusal)
 
 
-def _reserve(provider: str, session_id: str, payload: dict) -> int:
+def _writer_refusal(provider: str, session_id: str, payload: dict, cwd: str) -> int:
+    """5, saying why, when the session runs or a running process may write it."""
     if any(agents._record_key(r) == (provider, session_id) for r in payload["agents"]):
-        sys.stderr.write("codexbar_focus: session is already running\n")
-        return 5
-    record = next(
-        (r for r in payload["history"] if agents._record_key(r) == (provider, session_id)), {}
+        status = "running"
+    else:
+        status = _session_writer_status(provider, session_id, cwd)
+    if status == "absent":
+        return 0
+    message = (
+        "session is already running" if status == "running"
+        else f"a running {provider} in {cwd} may be writing this session"
     )
-    cwd = agents._text(record.get("cwd"))
-    status = _session_writer_status(provider, session_id, cwd)
-    if status != "absent":
-        sys.stderr.write(f"codexbar_focus: a running {provider} may be writing this session\n")
-        return 5
-    return 0
+    sys.stderr.write(f"codexbar_focus: {message}\n")
+    return 5
 
 
-
-def _launch(provider: str, session_id: str, payload: dict) -> int:
+def _launch(provider: str, session_id: str, payload: dict, cwd: str) -> int:
+    if refused := _writer_refusal(provider, session_id, payload, cwd):
+        return refused
     key = (provider, session_id)
-    if any(agents._record_key(r) == key for r in payload["agents"]):
-        sys.stderr.write("codexbar_focus: session is already running\n")
-        return 5
     record = next(
         (r for r in payload["history"] if agents._record_key(r) == key), None
     )
     if record is None:
         sys.stderr.write("codexbar_focus: no history record for session\n")
         return 2
+    # The folder its resume command was saved for.
     cwd = record.get("cwd") if isinstance(record.get("cwd"), str) else ""
-    status = _session_writer_status(provider, session_id, cwd)
-    if status != "absent":
-        message = (
-            "session is already running" if status == "running"
-            else f"a running {provider} in {cwd} may be writing this session"
-        )
-        sys.stderr.write(f"codexbar_focus: {message}\n")
-        return 5
     command = record.get("resumeCommand")
     if not command or command != agents._resume_command(
         provider, session_id, cwd, True, record.get("codexHome")
@@ -732,7 +725,7 @@ def teleport(provider: str, session_id: str) -> int:
     return _session_operation(provider, session_id, "teleport", _teleport)
 
 
-def _teleport(provider: str, session_id: str, payload: dict) -> int:
+def _teleport(provider: str, session_id: str, payload: dict, _cwd: str) -> int:
     if not agents.tern_bin():
         sys.stderr.write("codexbar_focus: Tern is not installed\n")
         return 7
@@ -791,7 +784,6 @@ def _teleport(provider: str, session_id: str, payload: dict) -> int:
     if window_shell:
         _signal(window_shell, signal.SIGHUP)
     return _launch_tern(cwd, _user_shell(), command)
-
 
 
 def _tern_ready() -> bool:
