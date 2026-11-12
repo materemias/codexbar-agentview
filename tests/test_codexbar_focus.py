@@ -682,14 +682,17 @@ class SessionOperationOwnershipTests(unittest.TestCase):
                 self.assertEqual(focus.launch("codex", "same-session"), 5)
             dispatch.assert_called_once()
 
-    def test_expired_reservation_does_not_treat_unresolved_writer_as_absent(self) -> None:
+    def check_expired_codex_launch(self, files_visible: bool) -> list[int]:
+        """Launch codes for an ended codex session after its reservation
+        expired, while a codex in its folder runs a session it can't name."""
+        codes = []
         with (
             mock.patch.object(focus, "AGGREGATE_PATH", self.path),
-            mock.patch.object(focus, "_launch_tern", return_value=0) as dispatch,
+            mock.patch.object(focus, "_launch_tern", return_value=0),
             mock.patch.object(focus.sys, "stderr", io.StringIO()),
-            mock.patch.object(focus.agents, "_held_rollouts", return_value=set()),
             mock.patch.object(focus.agents, "_resume_arg", return_value=""),
             mock.patch.object(focus.agents, "_codex_home", return_value=str(self.root)),
+            mock.patch.object(focus, "_fds_visible", return_value=files_visible),
         ):
             self.assertEqual(focus.launch("codex", "same-session"), 0)
             expired = focus.time.monotonic() + focus.SESSION_START_RESERVATION_SECONDS + 1
@@ -697,13 +700,44 @@ class SessionOperationOwnershipTests(unittest.TestCase):
                 with (
                     self.subTest(info=info),
                     mock.patch.object(focus.time, "monotonic", return_value=expired),
+                    # A TUI and the app-server holding another session's rollout.
                     mock.patch.object(focus.agents, "_pgrep",
-                                      side_effect=lambda _provider, services=False: [] if services else [77]),
+                                      side_effect=lambda _provider, services=False: [78] if services else [77]),
+                    mock.patch.object(focus.agents, "_held_rollouts", side_effect=lambda pid, _needle: (
+                        {str(self.root / "sessions" / "rollout-other.jsonl")} if pid == 78 else set())),
                     mock.patch.object(focus.agents, "_cwd_of", return_value=str(self.root)),
-                    mock.patch.dict(focus.agents._INFO_FN, {"codex": lambda _pid: info}),
+                    mock.patch.dict(focus.agents._INFO_FN, {"codex": lambda pid: (
+                        {"sessionId": "other", "identityExact": True} if pid == 78 else info)}),
                 ):
-                    self.assertEqual(focus.launch("codex", "same-session"), 11)
-            dispatch.assert_called_once()
+                    codes.append(focus.launch("codex", "same-session"))
+                    # A launch leaves a fresh reservation; expire it for the next.
+                    focus._reservation_path("codex", "same-session").unlink(missing_ok=True)
+        return codes
+
+    def test_expired_reservation_does_not_treat_unresolved_writer_as_absent(self) -> None:
+        # Without the processes' open files nothing says which session runs.
+        self.assertEqual(self.check_expired_codex_launch(files_visible=False), [11, 11])
+
+    def test_a_codex_holding_another_rollout_does_not_block_a_launch(self) -> None:
+        # Every codex writer holds its rollout open, and none holds this one.
+        self.assertEqual(self.check_expired_codex_launch(files_visible=True), [0, 0])
+
+    def test_fd_visibility_needs_every_link(self) -> None:
+        def readlink(path):
+            if path.endswith("/4"):
+                raise PermissionError(path)
+            if path.endswith("/5"):
+                raise FileNotFoundError(path)  # closed while looking
+            return "/dev/null"
+        for entries, visible in ((["3", "5"], True), (["3", "4"], False)):
+            with (
+                self.subTest(entries=entries),
+                mock.patch.object(focus.os, "listdir", return_value=entries),
+                mock.patch.object(focus.os, "readlink", side_effect=readlink),
+            ):
+                self.assertEqual(focus._fds_visible(77), visible)
+        with mock.patch.object(focus.os, "listdir", side_effect=PermissionError("denied")):
+            self.assertFalse(focus._fds_visible(77))
 
     def test_expired_reservation_refuses_when_provider_inspection_is_unavailable(self) -> None:
         with (

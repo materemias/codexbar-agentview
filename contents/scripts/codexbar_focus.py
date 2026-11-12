@@ -497,38 +497,70 @@ def _session_writer_status(provider: str, session_id: str, cwd: str) -> str:
                 else (agents._RESUME_PREFIXES[provider][-1],)
             )
             held, unresolved = set(), set()
-            for services in (False, True):
-                for pid in agents._pgrep(provider, services=services):
-                    for flag in flags:
-                        resumed = agents._resume_arg(pid, flag)
-                        if provider == "pi":
-                            resumed = resumed or agents._shell_resume_arg(pid, provider, flag)
-                        if resumed:
-                            held.add(resumed)
-                    # A Codex app-server can hold several sessions; its
-                    # selected info record alone does not name every writer.
-                    if provider == "codex":
-                        paths = agents._held_rollouts(
-                            pid, agents._codex_home(pid) + "/sessions/"
-                        )
-                        if any(path.endswith(f"-{session_id}.jsonl") for path in paths):
-                            held.add(session_id)
-                    try:
-                        info = info_fn(pid)
-                    except (OSError, ValueError, TypeError, AttributeError, OverflowError):
-                        info = {}
-                    info = info if isinstance(info, dict) else {}
-                    sid = agents._session_id(info.get("sessionId"))
-                    if sid:
-                        held.add(sid)
-                    if not sid or info.get("identityExact") is not True:
-                        if directory := agents._cwd_of(pid):
-                            unresolved.add(directory)
-                        if directory := agents._text(info.get("cwd")):
-                            unresolved.add(directory)
+            pids = [
+                pid for services in (False, True)
+                for pid in agents._pgrep(provider, services=services)
+            ]
+            # Codex writes a session only through its rollout, held open by
+            # the TUI or the app-server that loaded it. With every codex
+            # process's files in view, the check below sees a writer of this
+            # session, and one whose own session is a guess isn't writing it.
+            rollouts_seen = provider == "codex" and all(map(_fds_visible, pids))
+            for pid in pids:
+                for flag in flags:
+                    resumed = agents._resume_arg(pid, flag)
+                    if provider == "pi":
+                        resumed = resumed or agents._shell_resume_arg(pid, provider, flag)
+                    if resumed:
+                        held.add(resumed)
+                # A Codex app-server can hold several sessions; its
+                # selected info record alone does not name every writer.
+                if provider == "codex":
+                    paths = agents._held_rollouts(
+                        pid, agents._codex_home(pid) + "/sessions/"
+                    )
+                    if any(path.endswith(f"-{session_id}.jsonl") for path in paths):
+                        held.add(session_id)
+                try:
+                    info = info_fn(pid)
+                except (OSError, ValueError, TypeError, AttributeError, OverflowError):
+                    info = {}
+                info = info if isinstance(info, dict) else {}
+                sid = agents._session_id(info.get("sessionId"))
+                if sid:
+                    held.add(sid)
+                if not rollouts_seen and (not sid or info.get("identityExact") is not True):
+                    if directory := agents._cwd_of(pid):
+                        unresolved.add(directory)
+                    if directory := agents._text(info.get("cwd")):
+                        unresolved.add(directory)
     if session_id in held:
         return "running"
     return "uncertain" if cwd and cwd in unresolved else "absent"
+
+
+def _fds_visible(pid: int) -> bool:
+    """Whether this helper can read every file `pid` holds open. An fd closed
+    while looking is no loss; any other failure hides what it held."""
+    fd_dir = f"/proc/{pid}/fd"
+    try:
+        entries = os.listdir(fd_dir)
+    except OSError:
+        return False
+    for entry in entries:
+        try:
+            os.readlink(os.path.join(fd_dir, entry))
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+    return True
+
+
+def _reservation_path(provider: str, session_id: str) -> Path:
+    """A session's startup reservation; its lock has the suffix `.lock`."""
+    digest = hashlib.sha256(json.dumps([provider, session_id]).encode()).hexdigest()
+    return AGGREGATE_PATH.with_name(f"{AGGREGATE_PATH.name}.{digest}.startup.json")
 
 
 def _session_operation(
