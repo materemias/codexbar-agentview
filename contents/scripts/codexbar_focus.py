@@ -550,19 +550,20 @@ def _session_operation(
             status = _session_writer_status(provider, session_id, cwd)
             if status == "running":
                 reservation.unlink(missing_ok=True)
-                blocked = kind == "launch"
+                if kind == "launch":
+                    return _refusal(provider, cwd, status)
             else:
                 deadline = previous.get("expiresAt")
                 now = time.monotonic()
-                pending = (
+                if (
                     previous.get("bootId") == boot_id
                     and isinstance(deadline, (int, float)) and not isinstance(deadline, bool)
                     and now < deadline <= now + SESSION_START_RESERVATION_SECONDS
-                )
-                blocked = status != "absent" or pending
-            if blocked:
-                sys.stderr.write("codexbar_focus: session is already running or starting\n")
-                return 5
+                ):
+                    sys.stderr.write("codexbar_focus: session is already starting\n")
+                    return 5
+                if refused := _refusal(provider, cwd, status):
+                    return refused
         owner = {
             "bootId": boot_id, "cwd": cwd,
             "expiresAt": time.monotonic() + SESSION_START_RESERVATION_SECONDS,
@@ -591,10 +592,10 @@ def launch(provider: str, session_id: str) -> int:
 def reserve(provider: str, session_id: str, cwd: str = "") -> int:
     """Take a session's startup ownership for a caller that starts the writer
     itself in `cwd`, such as the Tern plugin reopening a closed session in a
-    tab of its choosing: refused (5) while it runs, starts or may be written
-    elsewhere, and Launch, Teleport or another reserve are refused for the
-    reservation's lifetime after it. A session agents.json has no row for is
-    checked against the processes in `cwd`."""
+    tab of its choosing. Refused as `_refusal` says, or with 5 while another
+    launcher starts it, and Launch, Teleport or another reserve are refused
+    for the reservation's lifetime after it. A session agents.json has no row
+    for is checked against the processes in `cwd`."""
     return _session_operation(provider, session_id, "launch", _writer_refusal, cwd)
 
 
@@ -607,23 +608,28 @@ def _listed_writer_runs(record: dict) -> bool:
     return not _exited(pid)
 
 
+def _refusal(provider: str, cwd: str, status: str) -> int:
+    """Refuse a new writer, saying why: 5 while the session runs, 11 while a
+    running process may be writing it, which nothing here can confirm and a
+    caller should not count as running. 0 for an absent writer."""
+    if status == "running":
+        sys.stderr.write("codexbar_focus: session is already running\n")
+        return 5
+    if status == "uncertain":
+        folder = f" in {cwd}" if cwd else ""
+        sys.stderr.write(f"codexbar_focus: a running {provider}{folder} may be writing this session\n")
+        return 11
+    return 0
+
+
 def _writer_refusal(provider: str, session_id: str, payload: dict, cwd: str) -> int:
-    """5, saying why, when the session runs or a running process may write it."""
+    """`_refusal` of the session, by agents.json, then the processes."""
     if any(
         agents._record_key(r) == (provider, session_id) and _listed_writer_runs(r)
         for r in payload["agents"]
     ):
-        status = "running"
-    else:
-        status = _session_writer_status(provider, session_id, cwd)
-    if status == "absent":
-        return 0
-    message = (
-        "session is already running" if status == "running"
-        else f"a running {provider} in {cwd} may be writing this session"
-    )
-    sys.stderr.write(f"codexbar_focus: {message}\n")
-    return 5
+        return _refusal(provider, cwd, "running")
+    return _refusal(provider, cwd, _session_writer_status(provider, session_id, cwd))
 
 
 def _launch(provider: str, session_id: str, payload: dict, cwd: str) -> int:

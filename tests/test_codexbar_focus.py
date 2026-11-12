@@ -104,9 +104,9 @@ class LaunchTests(unittest.TestCase):
     def test_session_a_process_outside_the_saved_list_may_write_is_refused(self) -> None:
         # A headless resume, or a host the sweep doesn't list: one holds the
         # transcript open, the other holds none in the record's folder.
-        for held, cwd, message in (
-            ("/s/-work/2026_sid-1.jsonl", "/elsewhere", "already running"),
-            ("", "/work/project", "may be writing this session"),
+        for held, cwd, expected, message in (
+            ("/s/-work/2026_sid-1.jsonl", "/elsewhere", 5, "already running"),
+            ("", "/work/project", 11, "may be writing this session"),
         ):
             with (
                 self.subTest(message),
@@ -119,7 +119,7 @@ class LaunchTests(unittest.TestCase):
                 mock.patch.object(focus.agents, "_omp_log_files", return_value={}),
             ):
                 code, popen, *_rest, stderr = self.launch({"agents": [], "history": [entry()]})
-            self.assertEqual(code, 5)
+            self.assertEqual(code, expected)
             popen.assert_not_called()
             self.assertIn(message, stderr)
 
@@ -550,7 +550,7 @@ class SessionOperationOwnershipTests(unittest.TestCase):
         self.assertEqual(result[0], 0, result[1])
         retry, _ = self.start_helper(provider="pi", mode="unresolved-same-cwd")
         result = self.finish_helper(retry)
-        self.assertEqual(result[0], 5, result[1])
+        self.assertEqual(result[0], 11, result[1])
         self.assertEqual(len(self.dispatches()), 1,
                          "an unresolved writer in the same cwd must still prevent dispatch")
 
@@ -702,7 +702,7 @@ class SessionOperationOwnershipTests(unittest.TestCase):
                     mock.patch.object(focus.agents, "_cwd_of", return_value=str(self.root)),
                     mock.patch.dict(focus.agents._INFO_FN, {"codex": lambda _pid: info}),
                 ):
-                    self.assertEqual(focus.launch("codex", "same-session"), 5)
+                    self.assertEqual(focus.launch("codex", "same-session"), 11)
             dispatch.assert_called_once()
 
     def test_expired_reservation_refuses_when_provider_inspection_is_unavailable(self) -> None:
@@ -717,7 +717,7 @@ class SessionOperationOwnershipTests(unittest.TestCase):
                 mock.patch.object(focus.time, "monotonic", return_value=expired),
                 mock.patch.dict(focus.agents._INFO_FN, {}, clear=True),
             ):
-                self.assertEqual(focus.launch("codex", "same-session"), 5)
+                self.assertEqual(focus.launch("codex", "same-session"), 11)
             dispatch.assert_called_once()
 
     def test_reserve_without_a_row_checks_the_folder_it_is_given(self) -> None:
@@ -735,7 +735,7 @@ class SessionOperationOwnershipTests(unittest.TestCase):
             mock.patch.object(focus.agents, "_cwd_of", return_value="/work/project"),
             mock.patch.object(focus.state_paths, "migrate"),
         ):
-            self.assertEqual(focus.main(["--tern", "--reserve", "omp", "sid-1", "/work/project"]), 5)
+            self.assertEqual(focus.main(["--tern", "--reserve", "omp", "sid-1", "/work/project"]), 11)
         self.assertIn("a running omp in /work/project may be writing this session", stderr.getvalue())
 
 

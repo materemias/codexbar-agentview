@@ -235,8 +235,10 @@ window is up, as right after login, the reopen waits for one, and the 3
 minutes start again when one comes up. Meanwhile Resume says the
 session is reopening. Before opening the tab, Tern takes the session's startup
 ownership, the same one History's Launch and Teleport take: it doesn't reopen a
-session that runs, is starting, or that a running omp may be writing, and
-for a minute after it neither do they, nor the Waiting tab's Resume. A session
+session that runs or is starting, and for a minute after it neither do they,
+nor the Waiting tab's Resume. An omp running in the session's folder that no
+log or transcript ties to a session may be writing this one: Tern doesn't
+reopen it, and the wait comes back to you saying which folder. A session
 whose extension was heard from in the last 6 minutes may still be running and
 isn't reopened. A wait without a prompt only comes back to you. A live session
 without the extension can't take prompts; its wait comes back to you saying

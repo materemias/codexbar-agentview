@@ -1334,10 +1334,23 @@ end
 
 -- A session file has one live writer. Before a tab starts omp on it, the focus
 -- helper takes the session's startup ownership, the one History's Launch and
--- Teleport use: it refuses (5) while omp runs it, starts it, or may write it,
--- and holds off every other launcher for a minute after. A refusal means
--- someone else has the session, so the resume is done; the CLI puts the wait
--- on me if it still doesn't run within its grace.
+-- Teleport use, and holds off every other launcher for a minute after. It
+-- refuses with 5 while omp runs the session or another launcher starts it, and
+-- with 11 when an omp that names none of its sessions runs in its folder and
+-- may be writing it. `done` gets that status and the helper's reason.
+local function reserveSession(session: string, cwd: any, done: (number, string, WindowCx?) -> ())
+	local args = { "--tern", "--reserve", "omp", session }
+	if type(cwd) == "string" and cwd ~= "" then
+		table.insert(args, cwd)
+	end
+	python("codexbar_focus.py", args, function(res, cx)
+		done(res.status, (string.gsub(firstLine(res.stderr), "^codexbar_focus: ", "")), cx)
+	end)
+end
+
+-- A 5 means someone else has the session, so the resume is done; the CLI puts
+-- the wait on me if it still doesn't run within its grace. Any other refusal,
+-- 11 included, fails the resume with its reason, which puts the wait on me now.
 local function reserveThenResume(a: any, state: any)
 	local id = tostring(a.id)
 	local function settle(result: string, err: string?)
@@ -1347,16 +1360,11 @@ local function reserveThenResume(a: any, state: any)
 		resumes[id] = { result = result, error = err }
 		tern.kv.set("waitingResumes", resumes)
 	end
-	local args = { "--tern", "--reserve", "omp", tostring(val(a.session)) }
-	local cwd = val(a.cwd)
-	if type(cwd) == "string" and cwd ~= "" then
-		table.insert(args, cwd)
-	end
-	python("codexbar_focus.py", args, function(res, cx2)
-		if res.status == 5 then
+	reserveSession(tostring(val(a.session)), val(a.cwd), function(status, why, cx2)
+		if status == 5 then
 			settle("done")
-		elseif res.status ~= 0 then
-			settle("failed", firstLine(res.stderr) ~= "" and firstLine(res.stderr) or "couldn't reserve the session")
+		elseif status ~= 0 then
+			settle("failed", if why ~= "" then why else "couldn't reserve the session")
 		elseif not cx2 then
 			settle("failed", "the Tern window closed before it could open the session")
 		else
@@ -1926,19 +1934,15 @@ local function waitingRequest(cx: WindowCx)
 				return
 			end
 			-- The same startup ownership as an automatic resume and History's Launch.
-			local args = { "--tern", "--reserve", "omp", request.session }
-			if type(request.cwd) == "string" and request.cwd ~= "" then
-				table.insert(args, request.cwd)
-			end
-			python("codexbar_focus.py", args, function(res, cx3)
+			reserveSession(request.session, request.cwd, function(status, why, cx3)
 				if not cx3 then
 					return
-				elseif res.status == 0 then
+				elseif status == 0 then
 					open(cx3 :: WindowCx)
-				elseif res.status == 5 then
+				elseif status == 5 then
 					cx3:toast("info", "CodexBar AgentView: that session is running or opening already")
 				else
-					waitingFailed("resume", firstLine(res.stderr), cx3)
+					waitingFailed("resume", why, cx3)
 				end
 			end)
 			return
