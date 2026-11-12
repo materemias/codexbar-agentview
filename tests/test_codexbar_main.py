@@ -1013,11 +1013,9 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
 ''', {"waitingView": view}, views=True)
 
     def test_waiting_health_warns_and_marks_the_panel_count_uncertain(self):
-        # Yesterday noon: the date prefix cannot flip while the test runs.
-        checked = (dt.datetime.now() - dt.timedelta(days=1)).replace(
-            hour=12, minute=0, second=0, microsecond=0).astimezone()
-        months = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
-        since = f"{months[checked.month - 1]} {checked.day}, 12:00"
+        # A fixed past day: never today, whatever the clock reads.
+        checked = dt.datetime(2026, 1, 5, 12, 0).astimezone()
+        since = "Jan 5, 12:00"
         warning = f"⚠ Waits not checked since {since}: waiting.json: unknown version 9"
         view = {"ok": True, "counts": {"on_me": 2},
                 "health": {"checked_at": checked.isoformat(),
