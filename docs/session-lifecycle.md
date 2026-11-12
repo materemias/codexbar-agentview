@@ -335,6 +335,56 @@ session's own wait saw merged reads merged at once.
 - **tern-awui** shows the same groups on the phone, with Snooze 1d, Done and a
   push notification when a session comes back to you.
 
+## When waits can't be checked
+
+Every surface says so when checking stops, instead of showing a list that has
+quietly frozen. The Waiting tab, the row above the omp composer, `/wait list`
+and the Plasma Agents section show one line:
+
+| Line | Means |
+|---|---|
+| ⚠ Waits not checked since 14:20: … | the last check failed, with its error |
+| ⚠ Waits not checked since 14:20 | nothing has checked the waits for 15 minutes (Tern isn't running, say) |
+| ⚠ Session scan stale since 14:20 | the session list is older than 2 minutes or from before a reboot |
+
+Meanwhile the panel's back-on-you count reads `2?`, dimmed, or `0?`. A Tern
+daemon that isn't the one checking (a second daemon on the same state) says
+"Another Tern daemon checks these waits" and leaves checks, actions and pane
+events to the other one.
+
+One broken session doesn't stop the rest: its waits come to you as
+"internal error: …", once.
+
+A wait whose checks fail is still watched:
+
+- **GitHub or the network down:** the checks keep retrying. After an hour the
+  wait shows "GitHub unreachable since 14:20" (or "`<command>` failing since
+  14:20") and logs one line; "Checks work again" when they do.
+- **Real errors** (an expired `gh` login, a command that can't run): after five
+  in a row the wait comes to you. **Retry** (`F5` on the Waiting tab, on the
+  card, in the omp menu, or `retry --wait`) watches it again, and it is retried
+  by itself once an hour. Retry also puts back a wait stopped by an internal
+  error.
+
+Other things that used to stall:
+
+- A prompt that reached the session without a turn running, as after an omp
+  crash, settles about 2 minutes later instead of staying "agent on it".
+- After sleep or a reboot, "omp extension not loaded" waits until the
+  extension has been silent for 15 minutes and the prompt queued for 6,
+  counted from the wake.
+- While the session scan is stale nothing is flagged and no session is
+  reopened; Resume still works, guarded by the session's startup lock.
+- With no Tern window, a reopen comes to you after 3 minutes as "open a Tern
+  window to reopen it" and runs when one opens. More than three toasts nobody
+  saw for an hour fold into one.
+- A job wait whose pane disappeared without an event ends as "pane closed"
+  within about 10 seconds; one from a previous Tern daemon ends too.
+- A check time a clock jump pushed far ahead comes back to its interval, and
+  Tern schedules on a clock that doesn't jump.
+- Ended waits older than a week, unused PR cache rows and old startup locks are
+  cleaned up.
+
 ## How it works
 
 Everything goes through one program, `contents/scripts/codexbar_waiting.py`.
