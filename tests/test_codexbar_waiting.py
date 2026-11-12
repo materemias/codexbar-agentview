@@ -1911,7 +1911,7 @@ class ViewTests(Case):
             {
                 "id", "kind", "label", "summary", "state", "ball", "overdue", "outcome",
                 "fired_text", "fired_at", "progress", "mark", "reason", "created_at", "due_at", "deadline",
-                "condition", "has_prompt", "next", "by",
+                "condition", "has_prompt", "next", "by", "repeat",
             },
         )
         seen = self.session()
@@ -1923,7 +1923,7 @@ class ViewTests(Case):
                 "size", "set_aside_at", "pinned", "ball", "unseen", "outcome", "headline",
                 "status", "line", "composer_row",
                 "next_step", "threads", "still_waiting", "waiting_for", "recap", "recap_at", "recap_stale", "due_at", "prompts_queued", "waits",
-                "schedules", "history", "prs",
+                "history", "prs",
             },
         )
         self.assertEqual(seen["status"], "⏲ Retry · in 2h")
@@ -1964,8 +1964,7 @@ class ViewTests(Case):
     def test_sort_ball_then_due_then_set_aside(self) -> None:
         sids = [f"aaaa000{index}" for index in range(5)]
         timer = "aaaa0006"
-        self.agents(timer)
-        self.write_schedule(timer, [{"id": 1, "prompt": "p", "dueAt": int(T0.timestamp() * 1000)}])
+        self.add("--kind", "repeat", "--every", "1h", "--prompt", "p", session=timer)
         self.add("--kind", "later", session=sids[0])
         self.add("--kind", "something", "--what", "x", session=sids[1])
         self.add("--kind", "job", "--pane", "51", session=sids[2])
@@ -1979,7 +1978,7 @@ class ViewTests(Case):
         view = self.run_cli("list")
         self.assertEqual(
             [item["session_id"] for item in view["sessions"]],
-            [fired, sids[2], sids[3], sids[4], timer, sids[1], sids[0]],
+            [fired, sids[2], sids[3], timer, sids[4], sids[1], sids[0]],
         )
         self.assertEqual(
             view["counts"],
@@ -2035,58 +2034,6 @@ class ViewTests(Case):
         history = self.session()["history"]
         self.assertEqual(len(history), 20)
         self.assertEqual(history[-1]["text"], "29")
-
-    def write_schedule(self, sid: str, jobs: object) -> None:
-        folder = self.omp / "schedule"
-        folder.mkdir(exist_ok=True)
-        (folder / f"{sid}.json").write_text(json.dumps(jobs))
-
-    def test_schedule_jobs_of_a_waiting_session(self) -> None:
-        due = int((T0 + timedelta(hours=1)).timestamp() * 1000)
-        self.write_schedule(SID, [
-            {"id": 2, "prompt": "later", "dueAt": due + 3600000},
-            {"id": 1, "prompt": "check", "everyMs": 7200000, "dueAt": due},
-            {"id": 3},
-        ])
-        self.add("--kind", "later", "--label", "Big one")
-        seen = self.session()
-        self.assertEqual(
-            seen["schedules"][0],
-            {"id": 1, "prompt": "check", "every_s": 7200, "due_at": (T0 + timedelta(hours=1)).isoformat()},
-        )
-        self.assertEqual(len(seen["schedules"]), 2)
-        self.assertTrue(seen["line"].endswith("↻ every 2h · next 13:00"), seen["line"])
-        self.assertNotIn("↻", seen["composer_row"])
-
-    def test_schedule_only_session_shows_while_live(self) -> None:
-        due = int((T0 + timedelta(hours=1)).timestamp() * 1000)
-        self.write_schedule(SID, [{"id": 1, "prompt": "check", "everyMs": 5400000, "dueAt": due}])
-        self.assertEqual(self.run_cli("list")["sessions"], [])
-        self.agents(SID)
-        seen = self.session()
-        self.assertEqual(seen["ball"], "on_timer")
-        self.assertEqual(self.run_cli("list")["counts"]["on_timer"], 1)
-        self.assertEqual(seen["line"], "↻ every 90m · next 13:00")
-        self.assertEqual(seen["composer_row"], "")
-
-    def test_a_wait_or_a_pin_keeps_its_ball_beside_schedules(self) -> None:
-        due = int((T0 + timedelta(hours=1)).timestamp() * 1000)
-        self.write_schedule(SID, [{"id": 1, "prompt": "check", "dueAt": due}])
-        self.agents(SID)
-        wait = self.add("--kind", "something", "--what", "x")["id"]
-        seen = self.session()
-        self.assertEqual((seen["ball"], len(seen["schedules"])), ("on_someone", 1))
-        self.run_cli("done", "--session", SID, "--wait", wait)
-        self.assertEqual(self.session()["ball"], "on_timer")
-        self.pin(SID)
-        self.assertEqual(self.session()["ball"], "on_my_time")
-
-    def test_broken_schedule_file_means_no_jobs(self) -> None:
-        folder = self.omp / "schedule"
-        folder.mkdir()
-        (folder / f"{SID}.json").write_text("{")
-        self.add("--kind", "later")
-        self.assertEqual(self.session()["schedules"], [])
 
     def pin(self, *sids: str) -> None:
         (self.omp / "session-pins.json").write_text(json.dumps(list(sids)))
@@ -3957,6 +3904,485 @@ class WhatTests(Case):
     def test_needs_a_target_and_text(self) -> None:
         self.run_cli("what", "--text", "x", expect=2)
         self.run_cli("what", "--session", SID, expect=2)
+
+
+class RepeatTests(Case):
+    """A prompt sent every interval until it ends: by count, window, the agent, or a condition."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.agents(SID)
+        self.heartbeat()
+
+    def repeat(self, *argv: str, every: str = "1h") -> str:
+        return self.add("--kind", "repeat", "--every", every, "--prompt", "check it", *argv)["id"]
+
+    def at(self, **delta) -> dict:
+        """Tick at T0 + delta, the extension still heard from."""
+        self.clock = T0 + timedelta(**delta)
+        self.heartbeat()
+        return self.tick()
+
+    def claim(self) -> list[dict]:
+        return self.run_cli("claim-prompts", "--session", SID)["prompts"]
+
+    def deliver(self) -> dict:
+        prompt = self.claim()[0]
+        self.run_cli("ack", "--action", prompt["action"], "--result", "delivered")
+        return prompt
+
+    def finish_turn(self) -> None:
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+
+    def runs(self) -> list[str]:
+        return [
+            line["text"] for line in self.session()["history"]
+            if line["text"].startswith(("Run ", "Skipped"))
+        ]
+
+    def test_runs_at_the_interval_and_says_so(self) -> None:
+        wait = self.repeat()
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["label"], seen["ball"], seen["state"]), ("Every 1h", "on_timer", "waiting"))
+        self.assertEqual(seen["repeat"], {
+            "every": "1h", "next_at": (T0 + timedelta(hours=1)).isoformat(), "runs": 0,
+            "times": None, "ends_at": None, "until": None,
+        })
+        self.assertEqual(seen["summary"], "↻ every 1h · next 13:00")
+        self.assertTrue(seen["has_prompt"])
+        session = self.session()
+        self.assertEqual(session["status"], "↻ every 1h · next 13:00")
+        self.assertEqual(session["line"], "↻ every 1h · next 13:00")
+        self.assertEqual(session["composer_row"], session["line"])
+        self.at(minutes=59)
+        self.assertEqual(self.claim(), [])
+        self.assertEqual(self.at(hours=1)["actions"], [])
+        self.assertEqual(self.deliver()["text"], "check it")
+        seen = self.session()
+        self.assertFalse(seen["unseen"])
+        self.assertEqual(seen["waits"][0]["state"], "waiting")
+        self.finish_turn()
+        self.assertEqual(self.wait_of(wait)["repeat"]["next_at"], (T0 + timedelta(hours=2)).isoformat())
+        self.at(hours=2)
+        self.assertEqual(self.deliver()["text"], "check it")
+        self.assertEqual(self.wait_of(wait)["repeat"]["runs"], 2)
+        self.assertEqual(self.runs(), ["Run 1: Every 1h", "Run 2: Every 1h"])
+
+    def test_a_run_due_during_the_last_ones_turn_is_skipped(self) -> None:
+        wait = self.repeat()
+        self.at(hours=1)
+        self.deliver()
+        self.at(hours=2)
+        self.at(hours=2, minutes=10)
+        self.assertEqual(self.runs(), ["Run 1: Every 1h", "Skipped a run: the last one is still going"])
+        self.assertEqual(self.wait_of(wait)["summary"], "↻ every 1h · next after this run")
+        self.clock = T0 + timedelta(hours=2, minutes=30)
+        self.finish_turn()
+        self.assertEqual(
+            self.wait_of(wait)["repeat"]["next_at"], (T0 + timedelta(hours=3, minutes=30)).isoformat(),
+        )
+        self.at(hours=3, minutes=29)
+        self.assertEqual(self.claim(), [])
+        self.at(hours=3, minutes=30)
+        self.assertEqual(self.claim()[0]["text"], "check it")
+        self.assertEqual(self.wait_of(wait)["repeat"]["runs"], 2)
+
+    def test_ends_after_its_runs(self) -> None:
+        wait = self.repeat("--times", "2")
+        self.assertEqual(self.wait_of(wait)["summary"], "↻ every 1h · next 13:00 · 0/2")
+        self.at(hours=1)
+        self.deliver()
+        self.finish_turn()
+        self.at(hours=2)
+        self.deliver()
+        self.assertEqual(self.wait_of(wait)["summary"], "↻ every 1h · last run · 2/2")
+        self.at(hours=3)
+        self.assertEqual(self.wait_of(wait)["state"], "waiting")
+        self.finish_turn()
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["ball"], seen["outcome"]), ("fired", "on_me", "fulfilled"))
+        self.assertEqual(seen["fired_text"], "Every 1h: ended after 2 runs")
+        self.assertEqual(self.session()["history"][-1]["kind"], "fired")
+        self.at(hours=4)
+        self.assertEqual(self.claim(), [])
+
+    def test_ends_with_its_window_and_drops_a_run_not_sent(self) -> None:
+        wait = self.repeat("--for", "90m")
+        self.assertEqual(self.wait_of(wait)["summary"], "↻ every 1h · next 13:00 · until 13:30")
+        self.at(hours=1)
+        self.at(minutes=90)
+        self.assertEqual(self.wait_of(wait)["fired_text"], "Every 1h: ended after 0 runs")
+        self.assertEqual(self.claim(), [])
+
+    def test_the_agent_ends_it(self) -> None:
+        wait = self.repeat("--until", "the deploy is green")
+        self.assertEqual(self.wait_of(wait)["label"], "Every 1h until the deploy is green")
+        self.run_cli("note", "--session", SID, "--text", "ship it")
+        self.assertEqual(
+            self.session()["line"], '↻ every 1h · next 13:00 · until the deploy is green · "ship it"',
+        )
+        self.at(hours=1)
+        text = self.deliver()["text"]
+        self.assertTrue(
+            text.startswith("check it\n\n(This prompt repeats every 1h until: the deploy is green."), text,
+        )
+        self.assertIn(f'action "end_repeat", wait "{wait}"', text)
+        answer = self.run_cli("end-repeat", "--session", SID, "--wait", wait, "--reason", "all green")
+        self.assertEqual(
+            answer["wait"]["fired_text"],
+            "Every 1h until the deploy is green: the agent ended it: all green after 1 run",
+        )
+        self.finish_turn()
+        self.assertEqual(self.wait_of(wait)["state"], "fired")
+        self.run_cli("end-repeat", "--session", SID, "--wait", wait, expect=2)
+        self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
+        self.assertEqual(self.wait_of(wait)["state"], "snoozed")
+        self.run_cli("end-repeat", "--session", SID, "--wait", wait, expect=2)
+
+    def test_ending_during_a_run_keeps_its_turn_in_the_queue(self) -> None:
+        wait = self.repeat("--until", "done")
+        other = self.add("--kind", "time", "--in", "1h", "--prompt", "other")["id"]
+        self.at(hours=1)
+        self.deliver()
+        self.run_cli("end-repeat", "--session", SID, "--wait", wait)
+        self.assertEqual(self.claim(), [])
+        self.finish_turn()
+        self.assertEqual(self.wait_of(other)["state"], "acting")
+        self.assertEqual(self.claim()[0]["text"], "other")
+
+    def test_a_question_during_a_run_comes_to_me(self) -> None:
+        wait = self.repeat()
+        self.at(hours=1)
+        self.run_cli("event", "--type", "waiting_input", "--session", SID)
+        self.assertEqual(self.wait_of(wait)["reason"], None)
+        self.deliver()
+        self.run_cli("event", "--type", "waiting_input", "--session", SID)
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["ball"], seen["reason"]), ("on_me", waiting.REASON_QUESTION))
+        self.finish_turn()
+        self.assertEqual(self.wait_of(wait)["ball"], "on_timer")
+
+    def test_a_label_of_its_own_comes_first(self) -> None:
+        self.repeat("--label", "Ping reviewers")
+        session = self.session()
+        self.assertEqual(session["status"], "↻ Ping reviewers · every 1h · next 13:00")
+        self.assertEqual(session["line"], "↻ Ping reviewers · every 1h · next 13:00")
+
+    def test_only_a_repeat_can_be_ended(self) -> None:
+        wait = self.add("--kind", "time", "--in", "1h")["id"]
+        self.run_cli("end-repeat", "--session", SID, "--wait", wait, expect=2)
+
+    def test_another_kind_keeps_its_label_before_the_repeat(self) -> None:
+        self.add(
+            "--kind", "command", "--argv", "true", "--label", "Deploy green",
+            "--every", "30m", "--prompt", "check it",
+        )
+        self.assertEqual(self.session()["line"], "⏳ Deploy green · ↻ every 30m · next 12:30")
+
+    def test_a_command_that_holds_ends_the_repeat_and_its_queued_run(self) -> None:
+        marker = self.root / "done"
+        script = f"import os, sys; sys.exit(0 if os.path.exists({str(marker)!r}) else 1)"
+        wait = self.add(
+            "--kind", "command", "--argv", json.dumps([sys.executable, "-c", script]),
+            "--interval", "90m", "--every", "1h", "--prompt", "check it",
+        )["id"]
+        self.at(hours=1)
+        marker.touch()
+        self.at(hours=2, minutes=30)
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["fired_text"]), ("fired", "command exited 0"))
+        self.assertTrue(self.session()["history"][-1]["text"].endswith(" · repeat ended after 0 runs"))
+        self.assertEqual(self.claim(), [])
+
+    def test_a_pr_that_fires_ends_the_repeat(self) -> None:
+        merged: list[bool] = []
+        self.github(poll=lambda cond, memo, **kwargs: poll_result(
+            memo, fired=bool(merged), fire_text="PR#7 merged",
+        ))
+        wait = self.add(
+            "--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "merged",
+            "--every", "1h", "--prompt", "nudge the reviewers",
+        )["id"]
+        self.assertEqual(self.wait_of(wait)["summary"], "PR#7 merged · ↻ every 1h · next 13:00")
+        self.at(hours=1)
+        self.assertEqual(self.claim()[0]["text"], "nudge the reviewers")
+        merged.append(True)
+        self.at(hours=1, minutes=4)
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["fired_text"]), ("fired", "PR#7 merged"))
+        self.assertEqual(self.session()["history"][-1]["text"], "PR#7 merged · repeat ended after 1 run")
+        # The run the extension is sending keeps its place until its turn ends.
+        self.assertEqual([entry["state"] for entry in self.state()["sessions"][SID]["prompt_queue"]], ["sending"])
+
+    def test_one_more_day_moves_the_next_run_and_lets_a_running_one_finish(self) -> None:
+        wait = self.repeat()
+        self.at(hours=1)
+        self.deliver()
+        self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
+        next_at = (T0 + timedelta(days=1, hours=1)).isoformat()
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["repeat"]["next_at"]), ("waiting", next_at))
+        self.finish_turn()
+        self.assertEqual(self.wait_of(wait)["repeat"]["next_at"], next_at)
+        self.at(hours=5)
+        self.assertEqual(self.claim(), [])
+        self.at(days=1, hours=1)
+        self.assertEqual(self.claim()[0]["text"], "check it")
+
+    def test_one_more_day_drops_a_run_not_sent_yet(self) -> None:
+        wait = self.repeat()
+        self.at(hours=1)
+        self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
+        self.assertEqual(self.claim(), [])
+        repeat = self.state()["sessions"][SID]["waits"][0]["repeat"]
+        self.assertEqual((repeat["running"], repeat["runs"]), (None, 0))
+
+    def test_a_failed_run_stops_it_until_one_more_day(self) -> None:
+        wait = self.repeat()
+        self.at(hours=1)
+        action = self.claim()[0]["action"]
+        self.run_cli("ack", "--action", action, "--result", "failed", "--error", "no")
+        self.assertEqual(self.wait_of(wait)["state"], "needs_attention")
+        self.at(hours=3)
+        self.assertEqual(self.claim(), [])
+        self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1h")
+        self.assertEqual(self.wait_of(wait)["state"], "waiting")
+        self.at(hours=4)
+        self.assertEqual(self.claim()[0]["text"], "check it")
+
+    def test_a_repeat_in_a_chain_counts_from_its_step(self) -> None:
+        first = self.add("--kind", "something", "--what", "x")["id"]
+        wait = self.repeat("--after", first)
+        self.assertIsNone(self.wait_of(wait)["repeat"]["next_at"])
+        self.at(hours=2)
+        self.assertEqual(self.claim(), [])
+        self.run_cli("done", "--session", SID, "--wait", first)
+        self.assertEqual(self.wait_of(wait)["repeat"]["next_at"], (T0 + timedelta(hours=3)).isoformat())
+
+    def test_a_session_closed_during_a_run_keeps_repeating(self) -> None:
+        wait = self.repeat()
+        self.at(hours=1)
+        self.deliver()
+        self.agents()
+        self.clock = T0 + timedelta(hours=1, minutes=5)
+        self.tick()
+        self.assertEqual(self.wait_of(wait)["state"], "waiting")
+        self.assertEqual(self.session()["history"][-1]["text"], "The session closed during a run")
+        self.assertEqual(self.state()["sessions"][SID]["prompt_queue"], [])
+
+    def test_the_next_run_sets_the_next_tick(self) -> None:
+        self.repeat(every="2m")
+        self.assertEqual(self.tick()["next_tick_s"], 120)
+
+    def test_every_rules(self) -> None:
+        for argv in (
+            ["--kind", "repeat", "--prompt", "x"],
+            ["--kind", "repeat", "--every", "30s", "--prompt", "x"],
+            ["--kind", "repeat", "--every", "366d", "--prompt", "x"],
+            ["--kind", "repeat", "--every", "1h"],
+            ["--kind", "repeat", "--every", "1h", "--for", "30m", "--prompt", "x"],
+            ["--kind", "repeat", "--every", "1h", "--times", "0", "--prompt", "x"],
+            ["--kind", "repeat", "--every", "1h", "--prompt", "x",
+             "--verify", '{"type": "command", "argv": ["true"]}'],
+            ["--kind", "time", "--in", "1h", "--every", "1h", "--prompt", "x"],
+            ["--kind", "something", "--what", "x", "--every", "1h", "--prompt", "x"],
+            ["--kind", "command", "--argv", "true", "--for", "2h"],
+            ["--kind", "command", "--argv", "true", "--times", "2"],
+            ["--kind", "time", "--in", "1h", "--until", "done"],
+            ["--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "soon"],
+        ):
+            with self.subTest(argv=argv):
+                self.run_cli("add", "--session", SID, *argv, expect=2)
+        self.run_cli(
+            "add", "--pane", "4", "--kind", "command", "--argv", "true",
+            "--every", "1h", "--prompt", "x", expect=2,
+        )
+
+
+class ResumeTests(Case):
+    """A closed session whose wait sends a prompt comes back in Tern by itself."""
+
+    def live(self, tern_session: str | None = "work") -> None:
+        self.agents(SID)
+        payload = json.loads((self.state_dir / "agents.json").read_text())
+        if tern_session is None:
+            del payload["agents"][0]["ternSession"]
+        else:
+            payload["agents"][0]["ternSession"] = tern_session
+        (self.state_dir / "agents.json").write_text(json.dumps(payload))
+
+    def closed(self, command: str | None = f"omp --resume {SID}") -> None:
+        row = {"sessionId": SID, "cwd": "/w", "windowTitle": "x"}
+        if command:
+            row["resumeCommand"] = command
+        self.agents(closed=[row])
+
+    def resumes(self) -> list[dict]:
+        return [action for action in self.tick()["actions"] if action["type"] == "resume"]
+
+    def fired_prompt(self) -> str:
+        """A time wait whose prompt is due while its session, last seen in Tern
+        session "work", is closed."""
+        self.live()
+        self.tick()
+        wait = self.add("--kind", "time", "--in", "1s", "--prompt", "go", "--label", "Retry")["id"]
+        self.closed()
+        self.advance(seconds=2)
+        return wait
+
+    def test_a_closed_session_is_resumed_once_where_it_ran(self) -> None:
+        wait = self.fired_prompt()
+        resumes = self.resumes()
+        self.assertEqual(resumes, [{
+            "id": mock.ANY, "type": "resume", "session": SID, "command": f"omp --resume {SID}",
+            "cwd": "/w", "tern_session": "work",
+        }])
+        self.assertEqual(self.resumes(), resumes)
+        self.assertEqual(self.run_cli("list")["sessions"][0]["waits"][0]["id"], wait)
+        seen = self.wait_of(wait)
+        self.assertEqual(
+            (seen["ball"], seen["outcome"], seen["reason"], seen["progress"]),
+            ("on_machine", None, waiting.REASON_RESUMING, waiting.REASON_RESUMING),
+        )
+        self.assertEqual(self.session()["history"][-1]["text"], "Resuming the session to send: Retry")
+        self.assertEqual(self.session()["prompts_queued"], 1)
+
+    def test_after_it_opened_it_waits_then_comes_to_me(self) -> None:
+        wait = self.fired_prompt()
+        action = self.resumes()[0]["id"]
+        self.run_cli("ack", "--action", action, "--result", "done")
+        self.assertEqual(self.state()["sessions"][SID]["resume_opened_at"], self.clock.isoformat())
+        self.advance(seconds=waiting.RESUME_GRACE_S - 1)
+        self.assertEqual(self.resumes(), [])
+        self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_RESUMING)
+        self.advance(seconds=1)
+        self.assertEqual(self.resumes(), [])
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["ball"], seen["reason"]), ("on_me", waiting.REASON_CLOSED))
+        self.assertIsNotNone(self.session()["resume_command"])
+        self.advance(hours=1)
+        self.assertEqual(self.resumes(), [])
+
+    def test_the_next_prompt_gets_its_own_resume(self) -> None:
+        self.fired_prompt()
+        first = self.resumes()[0]["id"]
+        self.run_cli("ack", "--action", first, "--result", "done")
+        self.advance(minutes=5)
+        self.assertEqual(self.resumes(), [])
+        self.add("--kind", "time", "--in", "1s", "--prompt", "again")
+        self.advance(seconds=2)
+        second = self.resumes()
+        self.assertEqual(len(second), 1)
+        self.assertNotEqual(second[0]["id"], first)
+
+    def test_a_manual_resume_waits_while_any_resume_is_queued(self) -> None:
+        self.fired_prompt()
+        self.assertEqual(len(self.resumes()), 1)
+        # Past the grace, before a tick drops it: a window may still take it.
+        self.advance(seconds=waiting.RESUME_GRACE_S + 60)
+        self.run_cli("resume", "--session", SID, expect=2)
+        self.assertEqual(self.resumes(), [])
+        self.assertEqual(self.run_cli("resume", "--session", SID)["command"], f"omp --resume {SID}")
+
+    def test_a_manual_resume_waits_for_the_automatic_one(self) -> None:
+        self.fired_prompt()
+        action = self.resumes()[0]["id"]
+        refused = self.run_cli("resume", "--session", SID, expect=2)
+        self.assertEqual(refused["error"], "that session is reopening already")
+        self.run_cli("ack", "--action", action, "--result", "done")
+        self.advance(seconds=waiting.RESUME_GRACE_S - 1)
+        self.run_cli("resume", "--session", SID, expect=2)
+        self.advance(seconds=1)
+        self.assertEqual(self.run_cli("resume", "--session", SID)["command"], f"omp --resume {SID}")
+
+    def test_a_failed_resume_comes_to_me_with_its_error(self) -> None:
+        wait = self.fired_prompt()
+        action = self.resumes()[0]["id"]
+        self.run_cli("ack", "--action", action, "--result", "failed", "--error", "no Tern window")
+        self.assertEqual(self.resumes(), [])
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["ball"], seen["reason"]), ("on_me", "no Tern window"))
+
+    def test_a_resume_no_window_takes_is_dropped(self) -> None:
+        wait = self.fired_prompt()
+        self.assertEqual(len(self.resumes()), 1)
+        self.advance(seconds=waiting.RESUME_GRACE_S)
+        self.assertEqual(self.resumes(), [])
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["ball"], seen["reason"]), ("on_me", waiting.REASON_CLOSED))
+
+    def test_a_session_back_by_itself_cancels_the_resume(self) -> None:
+        wait = self.fired_prompt()
+        self.assertEqual(len(self.resumes()), 1)
+        self.live()
+        self.heartbeat()
+        self.assertEqual(self.resumes(), [])
+        self.assertIsNone(self.wait_of(wait)["reason"])
+
+    def test_no_resume_while_it_runs_or_without_a_command(self) -> None:
+        self.live()
+        wait = self.add("--kind", "time", "--in", "1s", "--prompt", "go")["id"]
+        self.advance(minutes=20)
+        self.assertEqual(self.resumes(), [])
+        self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_NO_EXTENSION)
+        self.closed(command=None)
+        self.assertEqual(self.resumes(), [])
+        self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_CLOSED)
+
+    def test_the_last_tern_session_is_kept_and_a_repeat_run_resumes_too(self) -> None:
+        self.live()
+        self.add("--kind", "repeat", "--every", "1h", "--prompt", "check it")
+        self.live(tern_session=None)
+        self.tick()
+        self.closed()
+        self.advance(hours=1)
+        self.assertEqual([action["tern_session"] for action in self.resumes()], ["work"])
+
+    def test_a_session_in_a_background_tab_resumes_in_its_tern_session(self) -> None:
+        self.live(tern_session=None)
+        payload = json.loads((self.state_dir / "agents.json").read_text())
+        payload["agents"][0]["ternHome"] = "side work"
+        (self.state_dir / "agents.json").write_text(json.dumps(payload))
+        self.add("--kind", "repeat", "--every", "1h", "--prompt", "check it")
+        self.closed()
+        self.advance(hours=1)
+        self.assertEqual([action["tern_session"] for action in self.resumes()], ["side work"])
+
+    def test_an_extension_heard_lately_holds_the_resume(self) -> None:
+        """agents.json may not list a running omp: a second one on its session
+        file waits until its extension has been quiet for a heartbeat."""
+        self.closed()
+        self.heartbeat()
+        wait = self.add("--kind", "time", "--in", "1s", "--prompt", "go")["id"]
+        self.advance(seconds=2)
+        self.assertEqual(self.resumes(), [])
+        self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_RESUMING)
+        self.advance(seconds=waiting.RESUME_QUIET_S)
+        self.assertEqual(len(self.resumes()), 1)
+
+    def test_removing_the_session_drops_its_resume(self) -> None:
+        self.fired_prompt()
+        self.assertEqual(len(self.resumes()), 1)
+        self.run_cli("remove", "--session", SID)
+        self.assertEqual(self.resumes(), [])
+
+    def test_an_overdue_wait_keeps_saying_so_while_resuming(self) -> None:
+        self.closed()
+        wait = self.add(
+            "--kind", "pr", "--repo", "o/r", "--number", "7", "--every", "1h",
+            "--prompt", "nudge", "--deadline-in", "30m",
+        )["id"]
+        self.github()
+        self.advance(hours=1)
+        self.assertEqual(len(self.resumes()), 1)
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["outcome"], seen["reason"], seen["progress"]), ("overdue", waiting.REASON_OVERDUE, None))
+
+    def test_a_session_never_seen_in_tern_resumes_without_one(self) -> None:
+        self.add("--kind", "time", "--in", "1s", "--prompt", "go")
+        self.closed()
+        self.advance(seconds=2)
+        self.assertEqual([action["tern_session"] for action in self.resumes()], [None])
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 {
   "items": [
     {"id": "time", "label": "Retry later", "command": "/wait 2d", "detail": "after a while or at a time", "targets": ["session", "pane"]},
+    {"id": "every", "label": "Repeat a prompt", "command": "/wait every", "detail": "once per interval, until something happens or for a while", "targets": ["session"]},
     {"id": "pr", "label": "GitHub PR", "command": "/wait gh pr", "detail": "until reviewed, ready, merged, released or new activity", "targets": ["session", "pane"]},
     {"id": "babysit", "label": "Babysit a PR", "command": "/wait gh babysit", "detail": "bot review, the agent fixes, then ready and merged", "targets": ["session"]},
     {"id": "release", "label": "GitHub release", "command": "/wait gh release", "detail": "a repo's next release", "targets": ["session", "pane"]},

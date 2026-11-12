@@ -94,8 +94,7 @@ _XXH_P4 = 0x85EBCA77C2B2AE63
 _XXH_P5 = 0x27D4EB2F165667C5
 _U64 = (1 << 64) - 1
 
-# `on_timer`: nothing to do but wait for the clock: a time wait, or a live
-# session listed only for its /schedule jobs.
+# `on_timer`: nothing to do but wait for the clock: a time wait, or a repeat.
 BALLS = ("on_me", "on_machine", "on_timer", "on_someone", "on_my_time")
 BALL_RANK = {ball: rank for rank, ball in enumerate(BALLS)}
 # Worst first; a wait with no outcome ranks after them all.
@@ -105,6 +104,9 @@ OUTCOME_MARKS = {"attention": "⚠️ ", "overdue": "⏰ ", "fulfilled": "✅ "}
 # A wait whose prompt the agent runs now: no outcome yet.
 WORKING_MARK = "🔧 "
 WORKING_TEXT = "agent on it"
+# A prompt sent every interval: a `repeat` wait's mark, and before its timing
+# wherever another kind of wait repeats one.
+REPEAT_MARK = "↻ "
 # The session line names this many threads besides its primary one.
 OTHER_TRACKS_SHOWN = 2
 SIZE_RANK = {"S": 0, "M": 1, "L": 2}
@@ -116,7 +118,7 @@ PR_UNTIL = {
     "activity": "New activity",
 }
 # `release` is only an `add` shorthand: it stores a `command` wait.
-KINDS = ("time", "command", "job", "pr", "release", "something", "later")
+KINDS = ("time", "command", "job", "pr", "release", "something", "later", "repeat")
 KIND_OPTIONS = {
     "time": {"at", "in_"},
     "command": {"argv", "interval", "predicate"},
@@ -125,13 +127,26 @@ KIND_OPTIONS = {
     "release": {"repo", "interval"},
     "something": {"what"},
     "later": {"size"},
+    # A repeat's `until` is the agent's judgment in words, a PR's is a state.
+    "repeat": {"until"},
 }
+# The kinds a prompt may repeat on until they fire; `repeat` only repeats.
+REPEAT_KINDS = ("repeat", "command", "pr", "release")
+REPEAT_MIN_S = 60
+REPEAT_MAX_S = 365 * 24 * 3600
+# How long a resume the Tern window opened, or still has to open, may take to
+# bring the session up before the wait comes back to me.
+RESUME_GRACE_S = 3 * 60
+# The omp extension heartbeats every 5 min; one heard from within this may
+# still run, whatever agents.json says.
+RESUME_QUIET_S = 6 * 60
 FEATURE_MENU = "menu"
 # The set-aside items both menus show (the omp extension reads it too).
 MENU_PATH = Path(__file__).resolve().with_name("waiting_menu.json")
 MENU_TARGETS = ("session", "pane")
 
 REASON_CLOSED = "session closed: resume it to deliver the prompt"
+REASON_RESUMING = "resuming the session in Tern"
 REASON_NO_EXTENSION = "omp extension not loaded"
 REASON_QUESTION = "agent asks a question"
 REASON_REVIEW = "ran, take a look"
@@ -139,6 +154,12 @@ REASON_OVERDUE = "past its deadline"
 REASON_MENU_NO_EXTENSION = "omp extension not loaded in this session"
 REASON_MENU_OLD_EXTENSION = "this session runs an older waitingfor extension: /restart it"
 REASON_MENU_NO_PANE = "no omp extension in this pane"
+# Who can take a queued prompt: these go away once the session can take it.
+DELIVERY_REASONS = (REASON_CLOSED, REASON_NO_EXTENSION, REASON_RESUMING)
+# What "resuming" may say over; a closed session also over the deadline note.
+# Anything else on me (an error, a PR's news) says more than either.
+RESUMING_REPLACES = (None, REASON_QUESTION, *DELIVERY_REASONS)
+CLOSED_REPLACES = (*RESUMING_REPLACES, REASON_OVERDUE)
 
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -400,26 +421,6 @@ class Omp:
         """The file as it is now, for code that is about to change it or just did."""
         self._pins = None
         return self.pins()
-
-    def schedules(self, session: str) -> list[dict]:
-        """The /schedule extension's jobs; a missing file means none."""
-        data = self._json(self.root / "schedule" / f"{session}.json")
-        jobs = []
-        for job in data if isinstance(data, list) else []:
-            if not isinstance(job, dict) or type(job.get("dueAt")) not in (int, float):
-                continue
-            every = job.get("everyMs")
-            every_s = round(every / 1000) if type(every) in (int, float) and every > 0 else None
-            try:
-                due = datetime.fromtimestamp(job["dueAt"] / 1000).astimezone()
-            except (ValueError, OverflowError, OSError):
-                continue
-            jobs.append({
-                "id": job.get("id"), "prompt": _text(job.get("prompt")),
-                "every_s": every_s, "due_at": _iso(due),
-            })
-        jobs.sort(key=lambda job: job["due_at"])
-        return jobs
 
     def transcript(self, session: str) -> Path | None:
         if self._transcripts is None:
@@ -1017,6 +1018,9 @@ def _new_record(session: str | None, pane: int | None) -> dict:
         "session": session, "pane": pane, "note": None, "suggested_note": None,
         "size": None, "set_aside_at": None, "unseen": False, "closed_at": None,
         "prs": [], "waits": [], "prompt_queue": [], "history": [], "pin_wanted": None,
+        # The Tern session it last ran in, and its automatic resumes (`_resume`).
+        # Records from before these have none: read them with `.get`.
+        "tern_session": None, "resume_opened_at": None, "resume_prompts": [],
     }
 
 
@@ -1037,6 +1041,16 @@ def _ensure(state: dict, session: str | None, pane: int | None) -> dict:
         else:
             state["panes"][str(pane)] = record
     return record
+
+
+def _remember_tern_session(record: dict, agents: Agents) -> None:
+    """Where a closed session's automatic resume opens it: the Tern session
+    whose tab held it (`ternHome`), else the one showing it. A row outside Tern
+    names none, which keeps the last one."""
+    row = (agents.live.get(record["session"]) if record["session"] else None) or {}
+    name = _text(row.get("ternHome")) or _text(row.get("ternSession"))
+    if name:
+        record["tern_session"] = name
 
 
 def _open_waits(record: dict) -> list[dict]:
@@ -1095,7 +1109,7 @@ def _new_wait(state: dict, now: datetime, **fields: object) -> dict:
         "refire_at": None, "errors": 0, "memo": {}, "snapshot": None,
         "verify_pending": False, "verify_claim_until": None, "verify_memo": {},
         "event_flag": False, "armed_at": None, "fired_text": None, "fired_at": None,
-        "snoozed_from": None,
+        "snoozed_from": None, "repeat": None,
     }
     wait.update(fields)
     return wait
@@ -1114,18 +1128,27 @@ def _arm(wait: dict, now: datetime) -> None:
         wait["deadline"] = _iso(now + timedelta(seconds=wait["deadline_in_s"]))
     if wait["kind"] in ("command", "pr"):
         wait["next_check_at"] = _iso(now)
+    repeat = wait.get("repeat")
+    if repeat:
+        repeat["next_at"] = _iso(now + timedelta(seconds=repeat["every_s"]))
+        if repeat["for_s"] is not None:
+            repeat["ends_at"] = _iso(now + timedelta(seconds=repeat["for_s"]))
     wait.update(state="waiting", armed_at=_iso(now))
     _touch(wait)
 
 
-def _disarm(wait: dict) -> None:
+def _disarm(record: dict, wait: dict) -> None:
     """Back to a chain step not reached yet: the times `_arm` counted from that
-    moment are counted again when the chain reaches it."""
+    moment are counted again when the chain reaches it, and a repeat sends no
+    run until then."""
     condition = wait["condition"]
     if condition.get("in_s") is not None or condition.get("clock") is not None:
         condition["at"] = None
     if wait["deadline_in_s"] is not None:
         wait["deadline"] = None
+    if wait.get("repeat"):
+        _stop_repeat(record, wait)
+        wait["repeat"]["ends_at"] = None
     wait.update(state="pending", next_check_at=None, armed_at=None)
     _touch(wait)
 
@@ -1149,6 +1172,50 @@ def _cancel_prompts(record: dict, wait: dict) -> None:
     record["prompt_queue"] = [
         entry for entry in record["prompt_queue"] if entry["wait"] != wait["id"]
     ]
+
+
+def _queue_prompt(state: dict, record: dict, wait: dict, text: str, **extra: object) -> str:
+    state["action_seq"] += 1
+    action = f"a{state['action_seq']}"
+    record["prompt_queue"].append({
+        "action": action, "wait": wait["id"], "text": text, "state": "queued",
+        "claimed_at": None, **extra,
+    })
+    return action
+
+
+def _queued(record: dict, action: str | None) -> bool:
+    return action is not None and any(entry["action"] == action for entry in record["prompt_queue"])
+
+
+def _cancel_queued_runs(record: dict, wait: dict) -> None:
+    """Drop the repeat's runs the agent hasn't got, which then never counted;
+    one it has runs to its end."""
+    repeat = wait["repeat"]
+    was_queued = _queued(record, repeat["running"])
+    record["prompt_queue"] = [
+        entry for entry in record["prompt_queue"]
+        if entry["wait"] != wait["id"] or entry["state"] != "queued"
+    ]
+    if not _queued(record, repeat["running"]):
+        if was_queued:
+            repeat["runs"] -= 1
+        repeat["running"] = None
+
+
+def _stop_repeat(record: dict, wait: dict) -> None:
+    """No more runs: the ones not sent go and nothing is due. A run the agent
+    has keeps its place, so its turn's end settles it and nothing else."""
+    _cancel_queued_runs(record, wait)
+    wait["repeat"]["next_at"] = None
+
+
+def _runs_text(count: int) -> str:
+    return f"{count} run" if count == 1 else f"{count} runs"
+
+
+def _repeat_spent(repeat: dict) -> bool:
+    return repeat["times"] is not None and repeat["runs"] >= repeat["times"]
 
 
 def _settle(state: dict, record: dict, now: datetime) -> None:
@@ -1209,12 +1276,20 @@ def _prompt_text(wait: dict) -> str:
 def _fire(
     state: dict, record: dict, wait: dict, now: datetime,
     text: str | None = None, level: str = "info", fired: str | None = None,
+    ending: bool = False,
 ) -> None:
     """The condition held. With a prompt the wait stays with the machine; without
     one the step is over, so the chain moves on while the wait waits for my Done.
     `text` is the history's and the toast's, `fired` the surfaces' "what happened"
-    when that reads differently."""
+    when that reads differently. A repeat stops here; `ending` says `text`
+    already tells how (`_end_repeat`)."""
     text = text or wait["label"]
+    repeat = wait.get("repeat")
+    if repeat:
+        _stop_repeat(record, wait)
+        if not ending:
+            fired = fired or text
+            text = f"{text} · repeat ended after {_runs_text(repeat['runs'])}"
     wait.update(
         on_me=False, overdue=False, reason=None, refire_at=None,
         fired_text=fired or text, fired_at=_iso(now),
@@ -1224,15 +1299,36 @@ def _fire(
     record["unseen"] = True
     if wait["prompt"]:
         wait["state"] = "acting"
-        state["action_seq"] += 1
-        record["prompt_queue"].append({
-            "action": f"a{state['action_seq']}", "wait": wait["id"],
-            "text": _prompt_text(wait), "state": "queued", "claimed_at": None,
-        })
+        _queue_prompt(state, record, wait, _prompt_text(wait))
     else:
         wait["state"] = "fired"
         _activate_next(record, wait, now)
     _toast(state, record, wait, now, level, text)
+
+
+def _end_repeat(state: dict, record: dict, wait: dict, now: datetime, how: str = "ended") -> None:
+    """The repeat is over, the condition it served aside: the wait fires with no
+    prompt. Runs not sent go first, so the count says what ran."""
+    _stop_repeat(record, wait)
+    text = f"{wait['label']}: {how} after {_runs_text(wait['repeat']['runs'])}"
+    _fire(state, record, wait, now, text, ending=True)
+
+
+def _run_over(state: dict, record: dict, entry: dict, now: datetime) -> None:
+    """A repeat's run is over: a skipped next run counts from now, and the last
+    one ends the repeat."""
+    wait = _wait_in(record, entry["wait"])
+    repeat = wait.get("repeat") if wait else None
+    if not repeat:
+        return
+    if repeat["running"] == entry["action"]:
+        repeat["running"] = None
+    if wait["state"] != "waiting":
+        return
+    if _repeat_spent(repeat):
+        _end_repeat(state, record, wait, now)
+    elif repeat["next_at"] is None:
+        repeat["next_at"] = _iso(now + timedelta(seconds=repeat["every_s"]))
 
 
 def _attention(state: dict, record: dict, wait: dict, now: datetime, reason: str) -> None:
@@ -1259,7 +1355,7 @@ def _flag_on_me(
 
 def _clear_delivery_flags(record: dict) -> None:
     for wait in _open_waits(record):
-        if wait["reason"] in (REASON_CLOSED, REASON_NO_EXTENSION):
+        if wait["reason"] in DELIVERY_REASONS:
             wait.update(on_me=False, reason=None)
 
 
@@ -1288,28 +1384,123 @@ def _running(state: dict, agents: Agents, session: str) -> bool:
     )
 
 
+def _pending_resume(state: dict, session: str) -> dict | None:
+    return next((
+        action for action in state["actions"]
+        if action["type"] == "resume" and action["session"] == session
+    ), None)
+
+
+def _drop_resume(state: dict, session: str) -> None:
+    """A session that came back, or has nothing to send any more, needs no
+    second omp: a session file has one live writer."""
+    pending = _pending_resume(state, session)
+    if pending is not None:
+        state["actions"].remove(pending)
+
+
+def _resume_opened_lately(record: dict, now: datetime) -> bool:
+    opened = _stamp(record.get("resume_opened_at"))
+    return opened is not None and now.timestamp() - opened < RESUME_GRACE_S
+
+
+def _mark_resuming(record: dict) -> None:
+    """An overdue wait keeps saying so: it is on me either way."""
+    for entry in record["prompt_queue"]:
+        wait = _wait_in(record, entry["wait"])
+        if wait is not None and not wait["overdue"] and wait["reason"] in RESUMING_REPLACES:
+            wait.update(on_me=False, reason=REASON_RESUMING)
+
+
+def _heard_lately(state: dict, session: str, now: datetime) -> bool:
+    seen = _stamp(state["extensions"].get(session))
+    return seen is not None and now.timestamp() - seen < RESUME_QUIET_S
+
+
+def _resume(state: dict, record: dict, facts: Facts, now: datetime) -> bool:
+    """Have the Tern window resume a closed session whose prompts wait in its
+    queue. True while that is under way; False when the prompts wait for me:
+    the resume opened and the session didn't come up, failed, found no window,
+    or there is no command. Each prompt gets one automatic resume."""
+    session = record["session"]
+    pending = _pending_resume(state, session)
+    if pending is not None and now.timestamp() - _stamp(pending["created_at"]) >= RESUME_GRACE_S:
+        # No window carried it out. One that comes up much later would open a
+        # session nobody expects by then.
+        state["actions"].remove(pending)
+        return False
+    queued = [entry["action"] for entry in record["prompt_queue"]]
+    covered = record.get("resume_prompts") or []
+    if pending is not None or _resume_opened_lately(record, now):
+        # Prompts queued meanwhile wait for this resume, not one of their own.
+        record["resume_prompts"] = list(dict.fromkeys([*covered, *queued]))
+        _mark_resuming(record)
+        return True
+    if set(queued) <= set(covered):
+        return False
+    info = facts.describe(session)
+    if not info["resume_command"]:
+        return False
+    if _heard_lately(state, session, now):
+        # agents.json may not list a running omp yet, or list it as untracked:
+        # until its extension has been quiet for a heartbeat, a second omp could
+        # open on its session file. A running one claims the prompt meanwhile.
+        _mark_resuming(record)
+        return True
+    head = record["prompt_queue"][0]["wait"]
+    _enqueue(state, now, {
+        "type": "resume", "session": session, "command": info["resume_command"],
+        "cwd": info["cwd"], "tern_session": record.get("tern_session"), "wait": head,
+    })
+    record.update(resume_prompts=queued, resume_opened_at=None)
+    wait = _wait_in(record, head)
+    _log(record, now, wait, f"Resuming the session to send: {wait['label'] if wait else 'a prompt'}")
+    _mark_resuming(record)
+    return True
+
+
 def _delivery_pass(state: dict, agents: Agents, now: datetime) -> None:
-    """Who can take the queued prompts: a closed session or one without the
-    extension puts the wait on me; the prompt stays queued for later."""
+    """Who can take the queued prompts: a closed session is resumed in Tern, and
+    comes to me when that doesn't bring it up; one without the extension comes
+    to me at once. The prompts stay queued for later."""
     if not agents.known:
         return
+    facts = Facts(agents)
     for session, record in state["sessions"].items():
         queue = record["prompt_queue"]
-        if not queue:
-            continue
         live = _running(state, agents, session)
-        if not live and queue[0]["state"] == "delivered":
+        if live and _extension_fresh(state, session, now):
+            # Back for good: a later close may be resumed again at once.
+            record["resume_opened_at"] = None
+        if not live and queue and queue[0]["state"] == "delivered":
             entry = queue.pop(0)
             wait = _wait_in(record, entry["wait"])
-            if wait is not None:
+            if entry.get("repeat"):
+                # The repeat goes on: its next run resumes the session.
+                if wait is not None:
+                    _log(record, now, wait, "The session closed during a run")
+                _run_over(state, record, entry, now)
+            elif wait is not None:
                 _attention(state, record, wait, now, "session closed before the prompt's turn ended")
+        # Cancelling prompts replaces the list.
+        queue = record["prompt_queue"]
+        if live or not queue:
+            _drop_resume(state, session)
+        if not queue:
+            continue
         if live and _extension_fresh(state, session, now):
             _clear_delivery_flags(record)
             continue
+        if live and _resume_opened_lately(record, now):
+            # Up again, its extension about to say so.
+            _mark_resuming(record)
+            continue
+        if not live and _resume(state, record, facts, now):
+            continue
         reason = REASON_NO_EXTENSION if live else REASON_CLOSED
-        for entry in list(record["prompt_queue"]):
+        for entry in list(queue):
             wait = _wait_in(record, entry["wait"])
-            if wait is not None:
+            if wait is not None and (live or wait["reason"] in CLOSED_REPLACES):
                 _flag_on_me(state, record, wait, now, reason)
 
 
@@ -1629,7 +1820,7 @@ def _apply_recheck(state: dict, record: dict, wait: dict, result: dict, now: dat
         following is not None and following["state"] == "waiting"
         and not following["on_me"] and not following["overdue"]
     ):
-        _disarm(following)
+        _disarm(record, following)
     _toast(state, record, wait, now, "info", line)
 
 
@@ -1800,6 +1991,8 @@ def _housekeeping(state: dict, agents: Agents, omp: Omp, now: datetime) -> None:
         for session in [session for session in known if session not in state["extensions"]]:
             del known[session]
     state["menu_requests"] = _fresh_menu_requests(state, now)
+    for record in state["sessions"].values():
+        _remember_tern_session(record, agents)
     pins = set(omp.pins())
 
     def keep(session: str, record: dict) -> bool:
@@ -1841,7 +2034,54 @@ def _unsnooze(state: dict, record: dict, wait: dict, now: datetime) -> None:
         record["unseen"] = True
         _toast(state, record, wait, now, "info", f"{wait['label']}: {REASON_REVIEW}")
     else:
-        _fire(state, record, wait, now, fired=wait.get("fired_text"))
+        # A repeat ended when it fired; it isn't ending again.
+        _fire(state, record, wait, now, fired=wait.get("fired_text"), ending=True)
+
+
+def _run_text(wait: dict) -> str:
+    repeat = wait["repeat"]
+    text = repeat["prompt"]
+    if repeat["until"]:
+        text += (
+            f"\n\n(This prompt repeats every {_interval_text(repeat['every_s'])} until:"
+            f" {repeat['until']}. When that holds, end it with the waitingfor tool:"
+            f' action "end_repeat", wait "{wait["id"]}".)'
+        )
+    return text
+
+
+def _repeat_step(state: dict, record: dict, wait: dict, now: datetime) -> None:
+    """A waiting repeat: end it, skip a run while the last one's turn goes on,
+    or queue the run that is due. Runs neither toast nor mark the target unseen."""
+    repeat = wait["repeat"]
+    stamp = now.timestamp()
+    if not _queued(record, repeat["running"]):
+        repeat["running"] = None
+    ends = _stamp(repeat["ends_at"])
+    if (ends is not None and ends <= stamp) or (_repeat_spent(repeat) and repeat["running"] is None):
+        _end_repeat(state, record, wait, now)
+        return
+    if _repeat_spent(repeat):
+        return  # Its last run is still going.
+    due = _stamp(repeat["next_at"])
+    if due is None:
+        # A skipped run counts from the end of the one going on (`_run_over`);
+        # this catches a run that left the queue some other way.
+        if repeat["running"] is None:
+            repeat["next_at"] = _iso(now + timedelta(seconds=repeat["every_s"]))
+        return
+    if due > stamp:
+        return
+    if repeat["running"] is not None:
+        repeat["next_at"] = None
+        _log(record, now, wait, "Skipped a run: the last one is still going")
+        return
+    action = _queue_prompt(state, record, wait, _run_text(wait), repeat=True)
+    repeat.update(runs=repeat["runs"] + 1, running=action, last_run_at=_iso(now))
+    # The last run has no next one.
+    spent = _repeat_spent(repeat)
+    repeat["next_at"] = None if spent else _iso(now + timedelta(seconds=repeat["every_s"]))
+    _log(record, now, wait, f"Run {repeat['runs']}: {wait['label']}")
 
 
 def _evaluate(state: dict, now: datetime) -> None:
@@ -1851,6 +2091,8 @@ def _evaluate(state: dict, now: datetime) -> None:
         for wait in list(record["waits"]):
             if wait["state"] == "snoozed" and _stamp(wait["refire_at"]) <= stamp:
                 _unsnooze(state, record, wait, now)
+            if wait["state"] == "waiting" and wait.get("repeat"):
+                _repeat_step(state, record, wait, now)
             if wait["state"] != "waiting":
                 continue
             condition = wait["condition"]
@@ -1870,6 +2112,11 @@ def _next_tick_s(state: dict, now: datetime) -> int:
     stamp = now.timestamp()
     times: list[float | None] = []
     for record in _records(state):
+        if _resume_opened_lately(record, now):
+            times.append(_stamp(record["resume_opened_at"]) + RESUME_GRACE_S)
+        if record["prompt_queue"] and _heard_lately(state, record["session"] or "", now):
+            # When a closed session's extension has been quiet long enough to resume it.
+            times.append(_stamp(state["extensions"][record["session"]]) + RESUME_QUIET_S)
         for wait in record["waits"]:
             if wait["state"] == "acting" and wait["verify_pending"]:
                 times.append(_stamp(wait["verify_claim_until"]) or stamp)
@@ -1880,6 +2127,8 @@ def _next_tick_s(state: dict, now: datetime) -> int:
             if wait["state"] != "waiting":
                 continue
             times.append(_stamp(wait["next_check_at"]))
+            if wait.get("repeat"):
+                times += [_stamp(wait["repeat"]["next_at"]), _stamp(wait["repeat"]["ends_at"])]
             if not wait["overdue"]:
                 times.append(_stamp(wait["deadline"]))
             if wait["kind"] == "time":
@@ -1907,6 +2156,9 @@ def _wait_due(wait: dict) -> float | None:
     times = [_stamp(wait["deadline"]), _stamp(wait["refire_at"])]
     if wait["kind"] == "time":
         times.append(_stamp(wait["condition"]["at"]))
+    repeat = wait.get("repeat")
+    if repeat and wait["state"] == "waiting":
+        times += [_stamp(repeat["next_at"]), _stamp(repeat["ends_at"])]
     return min((moment for moment in times if moment is not None), default=None)
 
 
@@ -1919,7 +2171,7 @@ def _wait_ball(wait: dict) -> str:
     if wait["state"] == "snoozed":
         return "on_timer"
     return {
-        "something": "on_someone", "later": "on_my_time", "time": "on_timer",
+        "something": "on_someone", "later": "on_my_time", "time": "on_timer", "repeat": "on_timer",
     }.get(wait["kind"], "on_machine")
 
 
@@ -1934,7 +2186,47 @@ def _outcome(wait: dict) -> str | None:
     return "fulfilled" if wait["state"] in ("fired", "review") else None
 
 
-def _summary(wait: dict, now: datetime) -> str:
+def _repeat_view(repeat: dict | None) -> dict | None:
+    if not repeat:
+        return None
+    return {
+        "every": _interval_text(repeat["every_s"]), "next_at": repeat["next_at"],
+        "runs": repeat["runs"], "times": repeat["times"], "ends_at": repeat["ends_at"],
+        "until": repeat["until"],
+    }
+
+
+def _default_repeat_label(repeat: dict) -> str:
+    """`Every 2h`, or `Every 2h until <until>`, from a wait view's `repeat`."""
+    label = f"Every {repeat['every']}"
+    return f"{label} until {repeat['until']}" if repeat["until"] else label
+
+
+def _repeat_text(repeat: dict, state: str, now: datetime) -> str:
+    """`every 2h · next 16:00 · 3/5 · until 18:00`, from a wait view's `repeat`."""
+    parts = [f"every {repeat['every']}"]
+    spent = _repeat_spent(repeat)
+    if state == "waiting":
+        if repeat["next_at"]:
+            parts.append(f"next {_clock(_parse_time(repeat['next_at']), now)}")
+        else:
+            parts.append("last run" if spent else "next after this run")
+    if repeat["times"] is not None:
+        parts.append(f"{repeat['runs']}/{repeat['times']}")
+    if repeat["ends_at"]:
+        parts.append(f"until {_clock(_parse_time(repeat['ends_at']), now)}")
+    return " · ".join(parts)
+
+
+def _summary(wait: dict, repeat: dict | None, now: datetime) -> str:
+    """`repeat` is the wait view's."""
+    if repeat is None:
+        return _condition_summary(wait, now)
+    text = REPEAT_MARK + _repeat_text(repeat, wait["state"], now)
+    return text if wait["kind"] == "repeat" else f"{_condition_summary(wait, now)} · {text}"
+
+
+def _condition_summary(wait: dict, now: datetime) -> str:
     condition = wait["condition"]
     kind = wait["kind"]
     if kind == "pr":
@@ -1961,22 +2253,27 @@ def _wait_view(wait: dict, now: datetime) -> dict:
     due = _wait_due(wait)
     outcome = _outcome(wait)
     fulfilled = outcome == "fulfilled"
+    repeat = _repeat_view(wait.get("repeat"))
+    summary = _summary(wait, repeat, now)
     view = {
         "id": wait["id"], "kind": wait["kind"], "label": wait["label"],
-        "summary": _summary(wait, now), "state": wait["state"],
+        "summary": summary, "state": wait["state"],
         "ball": _wait_ball(wait), "overdue": wait["overdue"],
         "outcome": outcome,
         # A wait that fired before these were kept has only its label and start;
         # a PR's summary ("PR#20 merged") says more than a chain step's label ("Merged").
-        "fired_text": (wait.get("fired_text") or (_summary(wait, now) if wait["kind"] == "pr" else wait["label"]))
+        "fired_text": (wait.get("fired_text") or (summary if wait["kind"] == "pr" else wait["label"]))
         if fulfilled else None,
         "fired_at": (wait.get("fired_at") or wait["created_at"]) if fulfilled else None,
-        # What the wait does right now, beyond waiting: the agent runs its prompt.
-        "progress": WORKING_TEXT if wait["state"] == "acting" and outcome is None else None,
+        # What the wait does right now, beyond waiting: the agent runs its prompt,
+        # or Tern resumes the session for it.
+        "progress": REASON_RESUMING if wait["reason"] == REASON_RESUMING
+        else WORKING_TEXT if wait["state"] == "acting" and outcome is None else None,
         "reason": wait["reason"], "created_at": wait["created_at"],
         "due_at": None if due is None else _iso(datetime.fromtimestamp(due).astimezone()),
         "deadline": wait["deadline"], "condition": wait["condition"],
-        "has_prompt": bool(wait["prompt"]), "next": wait["next"], "by": wait["by"],
+        "has_prompt": bool(wait["prompt"] or wait.get("repeat")), "next": wait["next"], "by": wait["by"],
+        "repeat": repeat,
     }
     view["mark"] = _wait_mark(view)
     return view
@@ -2013,14 +2310,6 @@ def _when(view: dict, now: datetime) -> str:
     return _compact(now.timestamp() - _stamp(view["created_at"]))
 
 
-def _schedule_text(schedules: list[dict], now: datetime) -> str:
-    if not schedules:
-        return ""
-    job = schedules[0]
-    every = f"every {_interval_text(job['every_s'])} · " if job["every_s"] else ""
-    return f"↻ {every}next {_clock(_parse_time(job['due_at']), now)}"
-
-
 def _outcome_headline(views: list[dict]) -> tuple[str | None, str | None]:
     """(outcome, headline) of the target: its worst open wait's."""
     if not views:
@@ -2039,6 +2328,8 @@ def _outcome_headline(views: list[dict]) -> tuple[str | None, str | None]:
 def _wait_mark(view: dict) -> str:
     if view["outcome"] is None and view["state"] == "acting":
         return WORKING_MARK
+    if view["outcome"] is None and view["kind"] == "repeat" and view["state"] != "snoozed":
+        return REPEAT_MARK
     waits_for_time = view["kind"] == "time" or view["state"] == "snoozed"
     return OUTCOME_MARKS.get(view["outcome"]) or ("⏲ " if waits_for_time else "⏳ ")
 
@@ -2067,8 +2358,26 @@ def _track_text(view: dict) -> str:
     if view["outcome"] == "attention" and view["reason"]:
         name = f"PR#{view['condition']['number']}" if view["kind"] == "pr" else view["label"]
         return f"{name}: {view['reason']}"
-    text = view["summary"] if view["kind"] in ("pr", "something") else view["label"]
+    if _repeats_alone(view):
+        # Its mark is the summary's `↻`.
+        text = view["summary"].removeprefix(REPEAT_MARK)
+        own = _own_repeat_label(view)
+        text = f"{own} · {text}" if own else text
+    else:
+        text = view["summary"] if view["kind"] in ("pr", "something") else view["label"]
     return f"{text}, {view['progress']}" if view["progress"] else text
+
+
+def _repeats_alone(view: dict) -> bool:
+    """A `repeat` wait that its timing tells all about: a snoozed one is hidden
+    until a time, like any other."""
+    return view["kind"] == "repeat" and view["state"] != "snoozed"
+
+
+def _own_repeat_label(view: dict) -> str | None:
+    """A label given to a `repeat` wait; the default one only repeats its timing."""
+    return None if view["label"] == _default_repeat_label(view["repeat"]) else view["label"]
+
 
 
 def _track_texts(views: list[dict]) -> list[str]:
@@ -2092,10 +2401,10 @@ def _still_waiting(views: list[dict]) -> list[str]:
 
 
 def _status_lines(
-    views: list[dict], note: str | None, pinned: bool, schedule: str, now: datetime,
-) -> tuple[str, str, str]:
-    """(status segment, line, composer row). The row leaves the schedule out:
-    omp-schedule draws its own row above the composer."""
+    views: list[dict], note: str | None, pinned: bool, now: datetime,
+) -> tuple[str, str]:
+    """(status segment, line). A repeat says when it runs next instead of how
+    long it has been; a `repeat` wait is only that, so it says it once."""
     status = line = ""
     if views:
         primary = _primary(views)
@@ -2105,6 +2414,16 @@ def _status_lines(
             age = _compact(now.timestamp() - _stamp(primary["fired_at"]))
             ran = [f"prompt {REASON_REVIEW}"] if primary["state"] == "review" else []
             parts = [primary["fired_text"], *ran, age]
+            glance = f"{short} · {age}"
+        elif _repeats_alone(primary):
+            timing = _repeat_text(primary["repeat"], primary["state"], now)
+            own = _own_repeat_label(primary)
+            until = primary["repeat"]["until"]
+            detail = primary["reason"] if primary["outcome"] else None
+            parts = [text for text in (
+                own, timing, until and f"until {until}", detail, primary["progress"],
+            ) if text]
+            glance = f"{_clip(own, SHORT_LABEL_CHARS)} · {timing}" if own else timing
         else:
             if primary["kind"] == "pr":
                 short = f"PR#{primary['condition']['number']}"
@@ -2113,8 +2432,12 @@ def _status_lines(
             detail = (primary["reason"] if primary["outcome"] else None) or primary["label"]
             if primary["progress"]:
                 detail = f"{detail}, {primary['progress']}"
-            age = _when(primary, now)
+            if primary["repeat"] and primary["state"] == "waiting":
+                age = REPEAT_MARK + _repeat_text(primary["repeat"], primary["state"], now)
+            else:
+                age = _when(primary, now)
             parts = [short] + ([detail] if detail != short else []) + [age]
+            glance = f"{short} · {age}"
         # The session's other threads, each by its current step: one line tells them all.
         others = _track_texts(views)[1:]
         parts += [f"+ {text}" for text in others[:OTHER_TRACKS_SHOWN]]
@@ -2122,16 +2445,12 @@ def _status_lines(
             parts.append(f"+{len(others) - OTHER_TRACKS_SHOWN} more")
         if note:
             parts.append(f'"{_clip(note, NOTE_IN_LINE_CHARS)}"')
-        status = f"{mark}{short} · {age}" + (f" +{len(others)}" if others else "")
+        status = mark + glance + (f" +{len(others)}" if others else "")
         line = mark + " · ".join(parts)
     elif pinned:
         status = "📌 pinned"
         line = status + (f' · "{_clip(note, NOTE_IN_LINE_CHARS)}"' if note else "")
-    row = line
-    if schedule:
-        status = status or schedule
-        line = f"{line} · {schedule}" if line else schedule
-    return status, line, row
+    return status, line
 
 
 def _claimable(record: dict) -> dict | None:
@@ -2223,7 +2542,7 @@ def _target_view(record: dict | None, now: datetime) -> dict:
 
 def _session_view(
     session: str, record: dict | None, facts: Facts, pinned: bool,
-    schedules: list[dict], state: dict, now: datetime, prs: PrCache,
+    state: dict, now: datetime, prs: PrCache,
 ) -> dict:
     info = facts.describe(session)
     target = _target_view(record, now)
@@ -2232,11 +2551,9 @@ def _session_view(
     agent_state = live.get("state")
     note = record["note"] if record else None
     if not views:
-        # Listed only for its /schedule jobs: those run on their own.
-        target["ball"] = "on_my_time" if pinned else "on_timer" if schedules else "on_machine"
-    status, line, composer_row = _status_lines(
-        views, note, pinned, _schedule_text(schedules, now), now,
-    )
+        # A card may show any session; a listed one without waits is pinned.
+        target["ball"] = "on_my_time" if pinned else "on_machine"
+    status, line = _status_lines(views, note, pinned, now)
     pane = info["pane"]
     if pane is None:
         pane = _reported_pane(state, facts.agents, session, now)
@@ -2253,18 +2570,17 @@ def _session_view(
         "size": record["size"] if record else None,
         "set_aside_at": record["set_aside_at"] if record else None,
         "pinned": pinned, "unseen": bool(record and record["unseen"]),
-        "status": status, "line": line, "composer_row": composer_row,
+        "status": status, "line": line, "composer_row": line,
         "next_step": _next_step(views),
         "recap": info["recap"], "recap_at": info["recap_at"], "recap_stale": info["recap_stale"],
         "prompts_queued": _prompts_queued(record, now),
-        "schedules": schedules,
         "prs": prs.session_prs(session, facts.omp.transcript(session), record),
     }
 
 
 def _pane_view(record: dict, now: datetime) -> dict:
     target = _target_view(record, now)
-    status, line, _ = _status_lines(target["waits"], record["note"], False, "", now)
+    status, line = _status_lines(target["waits"], record["note"], False, now)
     return {
         **target,
         "pane": record["pane"],
@@ -2288,21 +2604,17 @@ def _build_view(
     facts = Facts(agents, omp)
     pins = set(facts.omp.pins())
     chosen = []
-    for session in sorted({*state["sessions"], *pins, *agents.live}):
+    for session in sorted({*state["sessions"], *pins}):
         if not _SESSION_ID.fullmatch(session):
             continue
         record = state["sessions"].get(session)
-        has_waits = bool(record and _open_waits(record))
-        if not (has_waits or session in pins or session in agents.live):
-            continue
-        schedules = facts.omp.schedules(session)
-        if has_waits or session in pins or schedules:
-            chosen.append((session, record, schedules))
-    facts.prefetch([session for session, _, _ in chosen])
+        if (record and _open_waits(record)) or session in pins:
+            chosen.append((session, record))
+    facts.prefetch([session for session, _ in chosen])
     prs = PrCache()
     sessions = [
-        _session_view(session, record, facts, session in pins, schedules, state, now, prs)
-        for session, record, schedules in chosen
+        _session_view(session, record, facts, session in pins, state, now, prs)
+        for session, record in chosen
     ]
     prs.save()
     sessions.sort(key=_sort_key)
@@ -2478,6 +2790,8 @@ def _condition(args: argparse.Namespace) -> dict:
         return {"type": "something", "what": _text(args.what)}
     if kind == "pr":
         repo, number = _pr_reference(args)
+        if args.until is not None and args.until not in PR_UNTIL:
+            raise BadInput(f"bad --until for pr: {args.until!r}; one of {', '.join(PR_UNTIL)}")
         condition = {
             "type": "pr", "repo": repo, "number": number, "until": args.until or "ready",
         }
@@ -2485,6 +2799,39 @@ def _condition(args: argparse.Namespace) -> dict:
             condition["bots"] = _comma_list(args.bots)
         return condition
     return {"type": kind}
+
+
+def _repeat_options(args: argparse.Namespace) -> dict | None:
+    """The `repeat` of a new wait, None without `--every`. Its prompt is the one
+    that repeats, so the wait itself fires none."""
+    kind = args.kind
+    if args.every is None:
+        if kind == "repeat":
+            raise BadInput("repeat needs --every")
+        for value, flag in ((args.for_, "--for"), (args.times, "--times")):
+            if value is not None:
+                raise BadInput(f"{flag} needs --every")
+        return None
+    if kind not in REPEAT_KINDS:
+        raise BadInput(f"--every does not apply to {kind}")
+    every = _parse_duration(args.every)
+    if not REPEAT_MIN_S <= every <= REPEAT_MAX_S:
+        raise BadInput("--every must be between 1m and 365d")
+    for_s = None if args.for_ is None else _parse_duration(args.for_)
+    if for_s is not None and for_s < every:
+        raise BadInput("--for must be at least --every")
+    if args.times is not None and args.times < 1:
+        raise BadInput("--times must be at least 1")
+    prompt = _text(args.prompt)
+    if not prompt:
+        raise BadInput("--every needs --prompt: the prompt to repeat")
+    if args.verify:
+        raise BadInput("--verify does not apply to a repeating prompt")
+    return {
+        "every_s": every, "prompt": prompt, "for_s": for_s, "ends_at": None,
+        "times": args.times, "runs": 0, "next_at": None, "running": None,
+        "last_run_at": None, "until": (_text(args.until) or None) if kind == "repeat" else None,
+    }
 
 
 def _begin(record: dict, omp: Omp, now: datetime) -> None:
@@ -2610,6 +2957,7 @@ def cmd_add(args: argparse.Namespace) -> dict:
     else:
         session, pane = _target(args)
     condition = _condition(args)
+    repeat = _repeat_options(args)
     kind = condition["type"] if kind == "release" else kind
     if args.prompt and session is None:
         raise BadInput("a prompt needs --session")
@@ -2631,6 +2979,7 @@ def cmd_add(args: argparse.Namespace) -> dict:
 
     def apply(state: dict, now: datetime) -> dict:
         record = _ensure(state, session, pane)
+        _remember_tern_session(record, agents)
         existed = _wait_in(record, args.after) if args.after else None
         if args.after and existed is None:
             raise BadInput(f"unknown wait: {args.after}")
@@ -2646,9 +2995,13 @@ def cmd_add(args: argparse.Namespace) -> dict:
             after = None if record["closed_at"] is not None else args.after
             wait = _start_wait(
                 state, record, facts.omp, now, after, kind=kind, condition=condition, by=args.by,
-                label=_text(args.label) or _default_label(kind, condition),
+                label=_text(args.label) or (
+                    _default_repeat_label(_repeat_view(repeat)) if kind == "repeat"
+                    else _default_label(kind, condition)
+                ),
                 deadline=deadline, deadline_in_s=deadline_in_s,
-                prompt=args.prompt or None, verify=verify, toast=not args.no_toast,
+                prompt=None if repeat else args.prompt or None, verify=verify,
+                toast=not args.no_toast, repeat=repeat,
                 close_on_success=args.close_on_success,
             )
         _apply_note(record, args.note, args.by)
@@ -2692,6 +3045,7 @@ def cmd_babysit_pr(args: argparse.Namespace) -> dict:
 
     def apply(state: dict, now: datetime) -> dict:
         record = _ensure(state, args.session, None)
+        _remember_tern_session(record, agents)
         _begin(record, omp, now)
         orphans = _drop_old_chain(record, repo, number, now)
         steps = ["review_on_head", "ready", "merged"]
@@ -2776,6 +3130,7 @@ def cmd_what(args: argparse.Namespace) -> dict:
         wait = _set_something(state, record, what, "", "user", now)
         if wait is None:
             record = _ensure(state, session, pane)
+            _remember_tern_session(record, agents)
             wait = _start_wait(
                 state, record, omp, now, None, kind="something",
                 condition={"type": "something", "what": what}, by="user", label=what,
@@ -2856,7 +3211,8 @@ def cmd_snooze(args: argparse.Namespace) -> dict:
             raise BadInput(f"{args.wait} waits for my time: nothing brings it back")
         if wait["kind"] == "job" and wait["state"] == "waiting" and not wait["overdue"]:
             raise BadInput(f"{args.wait} is a job that still runs: it comes back when it ends")
-        if wait["kind"] != "time" and _prompt_handed_over(record, wait):
+        # A repeat's run goes on whatever the wait does next.
+        if wait["kind"] != "time" and not wait.get("repeat") and _prompt_handed_over(record, wait):
             raise BadInput(f"{args.wait}: the agent runs its prompt now")
         until = _iso(now + delay)
         condition = wait["condition"]
@@ -2878,17 +3234,43 @@ def cmd_snooze(args: argparse.Namespace) -> dict:
             elif wait["kind"] == "something":
                 # A deadline is the only time it has, so a snooze sets one.
                 wait.update(deadline=until, deadline_in_s=None)
-            else:
+            elif wait["kind"] != "repeat":
                 wait["next_check_at"] = until
+            if wait.get("repeat"):
+                wait["repeat"]["next_at"] = until
             wait.update(
                 state="waiting", on_me=False, overdue=False, reason=None, errors=0, verify_pending=False,
             )
         if (_stamp(wait["deadline"]) or math.inf) <= now.timestamp():
             wait.update(deadline=until, deadline_in_s=None)
-        _cancel_prompts(record, wait)
+        if wait.get("repeat"):
+            _cancel_queued_runs(record, wait)
+        else:
+            _cancel_prompts(record, wait)
         _touch(wait)
         _log(record, now, wait, f"Snoozed until {_clock(_parse_time(until), now)}")
         return {}
+
+    return _mutate(apply)
+
+
+def cmd_end_repeat(args: argparse.Namespace) -> dict:
+    """The agent saw the repeat's `until` hold: the wait fires, with no prompt."""
+    reason = _text(args.reason)
+
+    def apply(state: dict, now: datetime) -> dict:
+        record = state["sessions"].get(args.session)
+        wait = _target_wait(record, args.wait)
+        if not wait.get("repeat"):
+            raise BadInput(f"{args.wait} does not repeat")
+        if wait["state"] == "pending":
+            raise BadInput(f"{args.wait} has not started yet")
+        # A snoozed repeat had ended: only a fired one is hidden that way.
+        if wait["state"] not in ("waiting", "needs_attention"):
+            raise BadInput(f"{args.wait} has already ended")
+        why = f": {reason}" if reason else ""
+        _end_repeat(state, record, wait, now, f"the agent ended it{why}")
+        return {"wait": _wait_view(wait, now)}
 
     return _mutate(apply)
 
@@ -2909,6 +3291,7 @@ def cmd_remove(args: argparse.Namespace) -> dict:
     def apply(state: dict, now: datetime) -> dict:
         if session:
             state["sessions"].pop(session, None)
+            _drop_resume(state, session)
         else:
             state["panes"].pop(str(pane), None)
         return {}
@@ -2922,6 +3305,9 @@ def _settle_turn(state: dict, record: dict, now: datetime) -> None:
     if not queue or queue[0]["state"] != "delivered":
         return
     entry = queue.pop(0)
+    if entry.get("repeat"):
+        _run_over(state, record, entry, now)
+        return
     wait = _wait_in(record, entry["wait"])
     if wait is None or wait["state"] != "acting":
         return
@@ -2958,7 +3344,13 @@ def cmd_event(args: argparse.Namespace) -> dict:
                     wait.update(on_me=False, reason=None)
         elif kind == "waiting_input" and record:
             for wait in _open_waits(record):
-                if wait["state"] == "acting":
+                # A repeat stays `waiting` while its run is with the agent.
+                running = (wait.get("repeat") or {}).get("running")
+                with_agent = any(
+                    entry["action"] == running and entry["state"] != "queued"
+                    for entry in record["prompt_queue"]
+                )
+                if wait["state"] == "acting" or with_agent:
                     _flag_on_me(state, record, wait, now, REASON_QUESTION)
         elif kind == "job_finished":
             finished_jobs = [
@@ -3057,7 +3449,9 @@ def _ack_prompt(
     entry["state"] = "delivered"
     if wait is not None:
         wait.update(on_me=False, reason=None)
-        _log(record, now, wait, f"Prompt delivered: {wait['label']}")
+        # A run logged itself when it was queued.
+        if not entry.get("repeat"):
+            _log(record, now, wait, f"Prompt delivered: {wait['label']}")
     return {}
 
 
@@ -3069,6 +3463,10 @@ def cmd_ack(args: argparse.Namespace) -> dict:
             if args.result == "delivered":
                 raise BadInput(f"{args.action} is a window action: ack done or failed")
             state["actions"].remove(action)
+            if action["type"] == "resume" and args.result == "done":
+                record = state["sessions"].get(action["session"])
+                if record is not None:
+                    record["resume_opened_at"] = _iso(now)
             found = _find_wait(state, action["wait"]) if action.get("wait") else None
             # A toast that didn't show is no reason to stop watching.
             if args.result == "failed" and action["type"] != "toast" and found:
@@ -3140,9 +3538,18 @@ def cmd_resume(args: argparse.Namespace) -> dict:
     facts = Facts(_read_agents())
     if not facts.agents.known:
         raise BadInput("agents.json is unreadable: can't tell whether the session runs")
-    if _running(_load_state(), facts.agents, args.session):
+    state = _load_state()
+    if _running(state, facts.agents, args.session):
         # A session file has one live writer.
         raise BadInput("session is running")
+    record = state["sessions"].get(args.session)
+    if _pending_resume(state, args.session) is not None or (
+        record is not None and _resume_opened_lately(record, _now())
+    ):
+        # Tern opens it, or just did, and agents.json doesn't list it yet. A
+        # queued resume counts until a tick drops it: until then a window may
+        # still take it.
+        raise BadInput("that session is reopening already")
     facts.prefetch([args.session])
     info = facts.describe(args.session)
     if not info["resume_command"]:
@@ -3199,9 +3606,7 @@ def cmd_card(args: argparse.Namespace) -> dict:
         )
         cache = PrCache()
     facts.prefetch([session])
-    view = _session_view(
-        session, record, facts, pinned, omp.schedules(session), state, now, cache,
-    )
+    view = _session_view(session, record, facts, pinned, state, now, cache)
     cache.save()
     prompt = _clip(_text(row.get("lastPrompt")), LAST_PROMPT_CHARS)
     return {"ok": True, "card": {
@@ -3345,7 +3750,8 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--predicate")
     add.add_argument("--what")
     _add_pr_options(add)
-    add.add_argument("--until", choices=tuple(PR_UNTIL))
+    # A PR's state for `pr`, the agent's words for `repeat`.
+    add.add_argument("--until")
     add.add_argument("--bots")
     add.add_argument("--size", choices=tuple(SIZE_RANK))
     add.add_argument("--label")
@@ -3359,6 +3765,14 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--close-on-success", action="store_true")
     add.add_argument("--after")
     add.add_argument("--park", action="store_true")
+    add.add_argument("--every")
+    add.add_argument("--for", dest="for_")
+    add.add_argument("--times", type=int)
+
+    end_repeat = command("end-repeat", cmd_end_repeat)
+    end_repeat.add_argument("--session", type=_session_arg, required=True)
+    end_repeat.add_argument("--wait", required=True)
+    end_repeat.add_argument("--reason")
 
     babysit = command("babysit-pr", cmd_babysit_pr)
     babysit.add_argument("--session", type=_session_arg, required=True)
