@@ -2098,10 +2098,12 @@ def _claim_checks(state: dict, now: datetime) -> list[dict]:
 
 
 def _transient_text(wait: dict, now: datetime) -> str:
+    """Says what fails: a command check's own command, else GitHub. Only a PR
+    verification fails transiently, so a verifying wait waits on GitHub."""
     since = _clock(_parse_time(wait["transient_since"]), now)
-    condition = wait["condition"]
-    if wait["kind"] == "command":
-        return f"{Path(condition['argv'][0]).name} failing since {since}"
+    verifying = wait["state"] == "acting" and wait["verify_pending"]
+    if wait["kind"] == "command" and not verifying:
+        return f"{Path(wait['condition']['argv'][0]).name} failing since {since}"
     return f"GitHub unreachable since {since}"
 
 

@@ -4843,6 +4843,32 @@ class TransientTests(Case):
         self.tick_through(minutes=5)
         self.assertIsNone(self.wait_of(wait)["progress"])
 
+    def test_a_pr_verify_of_a_command_wait_says_github_is_unreachable(self) -> None:
+        self.github(poll=lambda cond, memo, **kwargs: poll_result(
+            memo, error="error connecting to api.github.com", transient=True,
+        ))
+        self.agents(SID)
+        self.heartbeat()
+        verify = json.dumps({"type": "pr", "repo": "o/r", "number": 7, "until": "merged"})
+        wait = self.add(
+            "--kind", "command", "--argv", json.dumps([sys.executable, "-c", "pass"]),
+            "--prompt", "merge it", "--verify", verify,
+        )["id"]
+        self.tick()
+        action = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]["action"]
+        self.run_cli("ack", "--action", action, "--result", "delivered")
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.tick()
+        since = self.clock
+        for _ in range(13):
+            self.advance(minutes=5)
+            self.heartbeat()
+            self.tick()
+        seen = self.wait_of(wait)
+        self.assertEqual(
+            (seen["state"], seen["progress"]), ("acting", f"GitHub unreachable since {since:%H:%M}"),
+        )
+
     def test_a_release_check_passes_over_network_failures(self) -> None:
         self.github()
         script = "import sys; sys.stderr.write(sys.argv[1] + '\\n'); sys.exit(1)"
