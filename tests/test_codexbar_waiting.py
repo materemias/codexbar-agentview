@@ -4988,6 +4988,16 @@ class DaemonTests(Case):
             self.run_cli("tick", "--daemon", "a")
         self.assertEqual(self.state()["ticker"]["at"], self.clock.isoformat())
 
+    def test_another_daemons_pane_actions_stay_out_of_the_outbox(self) -> None:
+        self.tick("--daemon", "a")
+        self.creator = "b"
+        self.run_cli("add", "--pane", "52", "--kind", "later", "--park")
+        self.creator = None
+        self.run_cli("add", "--pane", "53", "--kind", "later", "--park")
+        actions = self.tick("--daemon", "a")["actions"]
+        self.assertEqual([action["pane"] for action in actions if action["type"] == "park"], [53])
+        self.assertEqual([action["pane"] for action in self.state()["actions"]], [52, 53])
+
     def test_a_daemon_that_is_gone_holds_no_lease(self) -> None:
         self.tick("--daemon", "999999999-1")  # no such process
         self.advance(minutes=1)

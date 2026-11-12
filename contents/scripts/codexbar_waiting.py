@@ -4245,6 +4245,15 @@ def cmd_tick(args: argparse.Namespace) -> dict:
         raise
 
 
+def _for_other_panes(action: dict, daemon: str | None) -> bool:
+    """A park or close_pane another daemon's pane ids name: this daemon's
+    windows would act on the wrong pane. It stays queued until it expires."""
+    return (
+        daemon is not None and action["type"] in PANE_ACTIONS
+        and action.get("daemon") not in (None, daemon)
+    )
+
+
 def _ticked_elsewhere(state: dict, daemon: str, now: datetime) -> bool:
     """Another Tern daemon holds the ticker. One that still runs keeps it however
     long it slept; one whose life can't be checked keeps it while its last tick
@@ -4299,7 +4308,10 @@ def _tick(args: argparse.Namespace) -> dict:
             state["ticker"] = {"daemon": args.daemon, "at": _iso(now)}
         return {
             "ok": True,
-            "actions": [_public_action(action) for action in state["actions"]],
+            "actions": [
+                _public_action(action) for action in state["actions"]
+                if not _for_other_panes(action, args.daemon)
+            ],
             "next_tick_s": _next_tick_s(state, now),
             "view": _publish(state, now, agents, omp, ticked=True),
         }
