@@ -318,8 +318,9 @@ while it has nothing to show, and a click opens the matching dashboard tab.
 | Sessions to restore | Sessions a reboot closed |
 
 Usage widgets take the pace colours of the Usage tab, from their worst window,
-and offer ring, graph, bar and text styles. The graph needs the readings of
-the past five hours, so it fills in as usage is polled. The focused pane's set-aside status stays in the **Plugin
+and offer ring, graph, bar and text styles. The graph needs readings from
+every pooled account; it stays empty while one has none and fills in as usage
+is polled. The focused pane's set-aside status stays in the **Plugin
 segments** widget.
 
 ### Tern specifics

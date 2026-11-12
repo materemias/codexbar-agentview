@@ -1048,16 +1048,18 @@ do
 	-- The window's used percent over its last span, 0–1 and oldest first, weighted
 	-- across `accounts` ({ w, weight }) from the history runs the fetch attaches
 	-- ([firstSeen, lastSeen, usedPercent, resetsAt]). Starts once every account
-	-- with runs has a reading; nil when none has runs.
+	-- has a reading; nil when any account has no runs, so the graph never pools
+	-- fewer accounts than the ring.
 	local function seriesOf(accounts: { any }, now: number): { number }?
 		local tracked = {}
 		local spanSecs = 0
 		for _, a in accounts do
 			local runs = val(a.w.runs)
-			if type(runs) == "table" and #runs > 0 then
-				table.insert(tracked, { runs = runs, weight = a.weight })
-				spanSecs = math.max(spanSecs, (tonumber(val(a.w.windowMinutes)) or 0) * 60)
+			if type(runs) ~= "table" or #runs == 0 then
+				return nil
 			end
+			table.insert(tracked, { runs = runs, weight = a.weight })
+			spanSecs = math.max(spanSecs, (tonumber(val(a.w.windowMinutes)) or 0) * 60)
 		end
 		if #tracked == 0 or spanSecs <= 0 then
 			return nil
