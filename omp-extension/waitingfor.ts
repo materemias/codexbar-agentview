@@ -29,6 +29,8 @@ const GH_TIMEOUT_MS = 15_000;
 /** A guess for a prefill must not hold the next dialog for long. */
 const GH_GUESS_MS = 3_000;
 const VIEW_DEBOUNCE_MS = 300;
+/** The CLI settles a delivered prompt on an idle heartbeat once the delivery is 2 minutes old (SETTLE_IDLE_S). */
+const SETTLE_IDLE_MS = 125_000;
 const REFRESH_MS = 60_000;
 const HEARTBEAT_MS = 5 * 60_000;
 /** How long a menu request from Tern stays worth answering. */
@@ -1143,6 +1145,7 @@ export default function (pi) {
 		if (!ctx) return;
 		const claimedAt = Date.now();
 		const { prompts = [] } = await cli(["claim-prompts", "--session", session]);
+		let delivered = false;
 		for (const prompt of prompts) {
 			// Switched away: the prompt stays `sending`, and this session's next claim checks it.
 			if (!ctx || session !== sessionId) return;
@@ -1160,7 +1163,14 @@ export default function (pi) {
 			}
 			applyView((await cli(["ack", "--action", prompt.action, "--result", "delivered"])).view);
 			sent.delete(prompt.action);
+			delivered = true;
 		}
+		if (!delivered || session !== sessionId || !idle()) return;
+		// Idle right after the ack, no turn runs for the prompt: it landed before (a resend after a
+		// crash), or its turn ended before the ack. The CLI settles it on an idle heartbeat once
+		// the delivery is old enough: this one says so now, the one after SETTLE_IDLE_MS settles it.
+		await heartbeat();
+		if (ctx && session === sessionId) timers.push(ctx.setTimeout(() => quietly(heartbeat), SETTLE_IDLE_MS));
 	}
 
 	async function claimPrompts() {
@@ -1216,9 +1226,15 @@ export default function (pi) {
 		debounce = undefined;
 	}
 
+	// Between attempts of a retry or around a compaction omp may stream nothing while the turn goes on.
+	let retrying = false;
+	let compacting = false;
+	/** omp is idle: no turn running, recovering or queued to start. */
+	const idle = () => !retrying && !compacting && ctx?.isIdle() === true && ctx.hasPendingMessages?.() !== true;
+
 	function heartbeat() {
 		const pane = process.env.TERN_PANE;
-		return cli(["heartbeat", "--session", sessionId, ...(pane ? ["--pane", pane] : []), "--features", "menu"]);
+		return cli(["heartbeat", "--session", sessionId, ...(pane ? ["--pane", pane] : []), "--features", "menu", ...(idle() ? ["--idle"] : [])]);
 	}
 
 	function activate(c) {
@@ -1230,6 +1246,8 @@ export default function (pi) {
 		waits = [];
 		menuSeq = 0;
 		closeAfterTurn = undefined; // chosen for the session switched away from
+		retrying = false;
+		compacting = false;
 		activatedAt = Date.now() - (Date.now() % 1000);
 		setPanel(c, undefined);
 		sessionId = c.sessionManager.getSessionId();
@@ -1264,6 +1282,20 @@ export default function (pi) {
 		watcher?.close();
 		watcher = undefined;
 		ctx = undefined;
+	});
+
+	// The main session's only: a subagent's retry or compaction leaves this one's idle as it is.
+	pi.on("auto_retry_start", (_event, c) => {
+		if (c?.agent?.kind !== "sub") retrying = true;
+	});
+	pi.on("auto_retry_end", (_event, c) => {
+		if (c?.agent?.kind !== "sub") retrying = false;
+	});
+	pi.on("auto_compaction_start", (_event, c) => {
+		if (c?.agent?.kind !== "sub") compacting = true;
+	});
+	pi.on("auto_compaction_end", (_event, c) => {
+		if (c?.agent?.kind !== "sub") compacting = false;
 	});
 
 	// A non-final agent_end hands over to a queued follow-up, which may be the prompt being settled

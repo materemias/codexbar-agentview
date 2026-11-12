@@ -56,6 +56,8 @@ MAX_CHECKS_PER_TICK = CHECK_WORKERS * CHECK_CLAIM_S // (COMMAND_TIMEOUT_S + 5)
 SENDING_FRESH_S = 2 * 60
 EXTENSION_FRESH_S = 15 * 60
 EXTENSION_KEPT_S = 24 * 3600
+# A delivered prompt whose session has sat idle this long ran its turn, or never will.
+SETTLE_IDLE_S = 2 * 60
 # The sweep writes agents.json every few seconds: older than this, nobody sweeps.
 AGENTS_STALE_S = 2 * 60
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
@@ -3573,6 +3575,25 @@ def _settle_turn(state: dict, record: dict, now: datetime) -> None:
         _touch(wait)
 
 
+def _turn_finished(state: dict, record: dict, now: datetime) -> None:
+    _settle_turn(state, record, now)
+    for wait in _open_waits(record):
+        if wait["reason"] == REASON_QUESTION:
+            wait.update(on_me=False, reason=None)
+
+
+def _settle_idle(state: dict, record: dict, now: datetime) -> None:
+    """An idle session whose delivered prompt has had time to run: its turn
+    ended unseen (the event got lost), or never ran (omp died after the prompt
+    landed). Either way it is over, as `turn_finished` would say."""
+    queue = record["prompt_queue"]
+    if not queue or queue[0]["state"] != "delivered":
+        return
+    delivered = _stamp(queue[0].get("delivered_at") or queue[0].get("claimed_at"))
+    if delivered is not None and now.timestamp() - delivered > SETTLE_IDLE_S:
+        _turn_finished(state, record, now)
+
+
 def cmd_event(args: argparse.Namespace) -> dict:
     kind = args.type
     if kind in ("job_finished", "pane_closed") and args.pane is None:
@@ -3587,10 +3608,7 @@ def cmd_event(args: argparse.Namespace) -> dict:
     def apply(state: dict, now: datetime) -> dict:
         record = state["sessions"].get(session) if session else None
         if kind == "turn_finished" and record:
-            _settle_turn(state, record, now)
-            for wait in _open_waits(record):
-                if wait["reason"] == REASON_QUESTION:
-                    wait.update(on_me=False, reason=None)
+            _turn_finished(state, record, now)
         elif kind == "waiting_input" and record:
             for wait in _open_waits(record):
                 # A repeat stays `waiting` while its run is with the agent.
@@ -3631,6 +3649,8 @@ def cmd_heartbeat(args: argparse.Namespace) -> dict:
         record = state["sessions"].get(args.session)
         if record:
             _clear_delivery_flags(record)
+            if args.idle:
+                _settle_idle(state, record, now)
         return {}
 
     return _mutate(apply)
@@ -3695,7 +3715,7 @@ def _ack_prompt(
         return {}
     if entry["state"] == "delivered":
         return {"ignored": True}
-    entry["state"] = "delivered"
+    entry.update(state="delivered", delivered_at=_iso(now))
     if wait is not None:
         wait.update(on_me=False, reason=None)
         # A run logged itself when it was queued.
@@ -4086,6 +4106,8 @@ def _parser() -> argparse.ArgumentParser:
     heartbeat.add_argument("--session", type=_session_arg, required=True)
     heartbeat.add_argument("--pane", type=_pane_arg)
     heartbeat.add_argument("--features")
+    # omp runs no turn and streams nothing (`_settle_idle`).
+    heartbeat.add_argument("--idle", action="store_true")
 
     menu_request = command("menu-request", cmd_menu_request)
     _add_target(menu_request)

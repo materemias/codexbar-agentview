@@ -4623,6 +4623,25 @@ class IsolationTests(Case):
         self.assertEqual(len(self.state()["sessions"][OTHER]["history"]), lines)
 
 
+class SettleTests(Case):
+    def setUp(self) -> None:
+        super().setUp()
+        self.agents(SID)
+        self.heartbeat()
+
+    def test_an_idle_heartbeat_settles_a_prompt_delivered_a_while_ago(self) -> None:
+        wait, _ = self.queued_prompt()
+        self.assertEqual(self.state()["sessions"][SID]["prompt_queue"][0]["delivered_at"], self.clock.isoformat())
+        self.advance(seconds=waiting.SETTLE_IDLE_S)
+        self.heartbeat(SID, "--idle")
+        self.assertEqual(self.wait_of(wait)["state"], "acting")
+        self.advance(seconds=1)
+        self.heartbeat(SID)  # busy: its turn may still run
+        self.assertEqual(self.wait_of(wait)["state"], "acting")
+        self.heartbeat(SID, "--idle")
+        self.assertEqual(self.wait_of(wait)["state"], "review")
+
+
 class StaleAgentsTests(Case):
     def sweep(self, age_s: int, *live: str, closed: list[dict] | None = None, boot: str = "") -> None:
         self.agents(*live, closed=closed, boot=boot)
