@@ -113,6 +113,10 @@ PlasmoidItem {
     // sessionId → { line, onMe } for every session the view lists.
     property var waitingBySession: ({})
     property int waitingOnMeCount: 0
+    // One "⚠ …" line while the view's `health` says waits are not being
+    // checked (waitingHealthWarning); the panel count then reads as uncertain.
+    property string waitingWarning: ""
+    readonly property int waitingTickStaleMs: 15 * 60 * 1000
     onTernIntegrationChanged: {
         if (root.ternIntegration) return
         var xhr = root.waitingRequest
@@ -204,10 +208,16 @@ PlasmoidItem {
         zai:    ["primary", "secondary"],
         opencodego: ["primary", "secondary"]
     })
+    function _html(text) {
+        return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+    }
     toolTipSubText: {
         var arr = root.snapshot.providers || []
+        // The waitingfor health line rides along under the usage rows.
+        var waitingWarning = root._html(root.waitingWarning)
         if (arr.length === 0)
-            return root.lastError || (root.loading ? "Loading…" : "No providers enabled")
+            return root._html(root.lastError || (root.loading ? "Loading…" : "No providers enabled"))
+                + (waitingWarning ? "<br>" + waitingWarning : "")
         var labels = { codex: "Codex", claude: "Claude", zai: "z.ai", opencodego: "OpenCode Go" }
         // width="240" widens the tooltip a touch so the columns don't crowd.
         // Cellpadding gives horizontal breathing room between label / pct /
@@ -225,8 +235,7 @@ PlasmoidItem {
             if (!allowedSlots) continue
             var name = labels[rec.id] || rec.id
             if (rec.accountEmail && (rec.id === "codex" || (rec.id === "claude" && claudeAccounts > 1))) {
-                var account = root.accountDisplayName(rec)
-                    .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+                var account = root._html(root.accountDisplayName(rec))
                 name += " · " + account
             }
             if (rec.stale === true) {
@@ -272,8 +281,12 @@ PlasmoidItem {
                   + t.toLocaleTimeString(Qt.locale(), Locale.ShortFormat)
                   + '</td></tr>'
         }
+        if (waitingWarning) {
+            if (anyData) html += '<tr><td colspan="3" style="font-size: 6px">&nbsp;</td></tr>'
+            html += '<tr><td colspan="3">' + waitingWarning + '</td></tr>'
+        }
         html += '</table>'
-        return anyData ? html : ""
+        return anyData || waitingWarning ? html : ""
     }
 
     function dispatchNotifications(events) {
@@ -874,7 +887,12 @@ PlasmoidItem {
             if (root.waitingRequest !== xhr) return
             root.waitingRequest = null
             if (!root.ternIntegration) return
-            if (xhr.status !== 0 && xhr.status !== 200) return
+            // A read that fails keeps the last view, judged again by the
+            // clock so its health can still turn stale.
+            if (xhr.status !== 0 && xhr.status !== 200) {
+                root.applyWaitingView(root._waitingView)
+                return
+            }
             // No file yet: nothing is waiting. The CLI replaces it
             // atomically, so a parse error is a broken file; keep the
             // last view rather than blinking the markers off.
@@ -884,17 +902,23 @@ PlasmoidItem {
                 return
             }
             try {
-                root.applyWaitingView(JSON.parse(text))
+                var view = JSON.parse(text)
             } catch (err) {
                 console.warn("waiting_view.json: " + err.message)
+                view = root._waitingView
             }
+            root.applyWaitingView(view)
         }
         xhr.open("GET", root.waitingViewFileUrl)
         xhr.send()
     }
 
     // Replaced only on change: the CLI restamps `now` on every rewrite.
+    // Every poll re-reads the file, so a view whose ticks stopped turns
+    // stale here by the local clock.
+    property var _waitingView: null
     function applyWaitingView(view) {
+        root._waitingView = view
         var sessions = {}
         var list = view && Array.isArray(view.sessions) ? view.sessions : []
         for (var i = 0; i < list.length; i++) {
@@ -906,11 +930,35 @@ PlasmoidItem {
             }
         }
         var onMe = view && view.counts ? Math.max(0, Math.floor(Number(view.counts.on_me) || 0)) : 0
-        var key = JSON.stringify([sessions, onMe])
+        var warning = root.waitingHealthWarning(view ? view.health : null, Date.now())
+        var key = JSON.stringify([sessions, onMe, warning])
         if (key === root._waitingViewKey) return
         root._waitingViewKey = key
         root.waitingBySession = sessions
         root.waitingOnMeCount = onMe
+        root.waitingWarning = warning
+    }
+
+    // waiting_view.json `health` → the warning every waitingfor surface
+    // shows, or "" while ticks are current. A view without `health` (no
+    // tick has run yet, or an older CLI) warns of nothing.
+    function waitingHealthWarning(health, nowMs) {
+        if (!health || typeof health !== "object") return ""
+        function at(value) {
+            var when = value ? new Date(value) : null
+            return when && !isNaN(when.getTime()) ? when : null
+        }
+        var checked = at(health.checked_at)
+        var since = checked ? root._absoluteTime(checked, nowMs) : "never"
+        // Capped: both tooltips show it in full, on every waiting row.
+        var error = String(health.error || "").replace(/\s+/g, " ").trim()
+        if (error.length > 120) error = error.slice(0, 119) + "…"
+        if (error)
+            return "⚠ Waits not checked since " + since + ": " + error
+        if (!checked || nowMs - checked.getTime() > root.waitingTickStaleMs)
+            return "⚠ Waits not checked since " + since
+        var scan = at(health.agents_stale_since)
+        return scan ? "⚠ Session scan stale since " + root._absoluteTime(scan, nowMs) : ""
     }
 
     function refresh(automatic = false) {

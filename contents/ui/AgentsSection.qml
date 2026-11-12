@@ -435,6 +435,21 @@ ColumnLayout {
         text: root.teleportError
     }
 
+    // waitingfor health: waits are not being checked, so the row markers
+    // and the panel count may be out of date. Kept to two lines.
+    PC3.Label {
+        objectName: "waitingWarning"
+        visible: text.length > 0
+        Layout.fillWidth: true
+        wrapMode: Text.WordWrap
+        maximumLineCount: 2
+        elide: Text.ElideRight
+        textFormat: Text.PlainText
+        font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+        color: Kirigami.Theme.neutralTextColor
+        text: root.waitingWarning || ""
+    }
+
     // Folder-grouped session rows. Each group is a card: a small
     // uppercase folder header followed by its session rows.
     Repeater {
@@ -921,8 +936,10 @@ ColumnLayout {
             readonly property string cwdHoverText: (record.cwd || "")
                 + (record.host ? "  (" + record.host + ")" : "")
                 + "\nclick to focus · peek button or Space for recent messages"
+            // A stale view's line may be out of date: the health warning follows it.
             readonly property string waitingHoverText: waiting
-                ? [waiting.line, record.cwd ? cwdHoverText : ""].filter(Boolean).join("\n") : ""
+                ? [waiting.line, root.waitingWarning || "",
+                   record.cwd ? cwdHoverText : ""].filter(Boolean).join("\n") : ""
             PC3.ToolTip.visible: rowMouse.containsMouse && !waiting
                 && (record.cwd || "").length > 0
             PC3.ToolTip.text: cwdHoverText

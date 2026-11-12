@@ -1012,6 +1012,95 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 }
 ''', {"waitingView": view}, views=True)
 
+    def test_waiting_health_warns_and_marks_the_panel_count_uncertain(self):
+        # Yesterday noon: the date prefix cannot flip while the test runs.
+        checked = (dt.datetime.now() - dt.timedelta(days=1)).replace(
+            hour=12, minute=0, second=0, microsecond=0).astimezone()
+        months = "Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dec".split()
+        since = f"{months[checked.month - 1]} {checked.day}, 12:00"
+        warning = f"⚠ Waits not checked since {since}: waiting.json: unknown version 9"
+        view = {"ok": True, "counts": {"on_me": 2},
+                "health": {"checked_at": checked.isoformat(),
+                           "error": "waiting.json:\n unknown version 9",
+                           "error_since": checked.isoformat(), "agents_stale_since": None},
+                "sessions": [{"session_id": "back", "ball": "on_me", "line": "● PR#7 merged"}]}
+        self.applet('''
+                if (app.cacheRestoring || app.loading) return
+                function find(item, name, out) {
+                    out = out || []
+                    if (item.objectName === name) out.push(item)
+                    var kids = item.children || []
+                    for (var i = 0; i < kids.length; i++) find(kids[i], name, out)
+                    return out
+                }
+                if (fixture.stage === 0) {
+                    app.agentSnapshot = { counts: { working: 0, blocked: 0, idle: 1, untracked: 0, total: 1 },
+                        agents: [{ provider: "omp", sessionId: "back", state: "idle", cwd: "/w/back" }] }
+                    fixture.compact = app.compactRepresentation.createObject(fixture, { width: 400, height: 24 })
+                    fixture.popup = app.fullRepresentation.createObject(fixture, { width: 600, height: 400 })
+                    Plasmoid.configuration.ternIntegration = true
+                    fixture.stage = 1
+                    return
+                }
+                if (app.waitingOnMeCount === 0) return
+                var expected = ''' + json.dumps(warning) + '''
+                var count = find(fixture.compact, "waitingOnMeCount")[0]
+                var label = find(fixture.popup, "waitingWarning")[0]
+                var row = null
+                ;(function walk(item) {
+                    if (item.waitingHoverText !== undefined && item.waiting) row = item
+                    ;(item.children || []).forEach(walk)
+                })(fixture.popup)
+                check(app.waitingWarning === expected, "failed tick read from the file: " + app.waitingWarning)
+                check(label.visible && label.text === expected, "Agents section shows the warning")
+                check(count.visible && count.children[1].text === "2?" && count.opacity < 1,
+                    "stale panel count reads as uncertain")
+                check(row.waitingHoverText === "● PR#7 merged\\n" + expected + "\\n/w/back"
+                    + "\\nclick to focus · peek button or Space for recent messages",
+                    "row tooltip follows the line with the warning: " + row.waitingHoverText)
+                check(app.toolTipSubText.indexOf("unknown version 9") >= 0, "panel tooltip carries the warning")
+
+                var fresh = ''' + json.dumps(view) + '''
+                fresh.health = { checked_at: new Date().toISOString(), error: null,
+                                 error_since: null, agents_stale_since: null }
+                app.applyWaitingView(fresh)
+                check(app.waitingWarning === "" && !label.visible, "a successful tick clears the warning")
+                check(count.children[1].text === "2" && count.opacity === 1, "fresh count is plain")
+                check(row.waitingHoverText.indexOf("⚠") < 0, "fresh row tooltip has no warning")
+                check(app.toolTipSubText.indexOf("⚠") < 0, "fresh panel tooltip has no warning")
+                app.applyWaitingView({ health: { checked_at: null, error: "tern: no daemon" } })
+                check(count.visible && count.children[1].text === "0?",
+                    "a failed first tick still marks the panel at zero")
+                fresh.counts.on_me = 0
+                app.applyWaitingView(fresh)
+                check(!count.visible, "a fresh zero count stays hidden")
+
+                function local(d, h, m, s) { return new Date(2026, 10, d, h, m, s || 0) }
+                var now = local(12, 9, 20).getTime()
+                function warn(health) { return app.waitingHealthWarning(health, now) }
+                function iso(d) { return d.toISOString() }
+                check(warn(null) === "", "no health (older CLI or no tick yet): no warning")
+                check(warn({ checked_at: iso(local(12, 9, 5, 1)) }) === "", "checked 14:59 ago is current")
+                check(warn({ checked_at: iso(local(12, 9, 4, 59)) }) === "⚠ Waits not checked since 09:04",
+                    "checked over 15 min ago: " + warn({ checked_at: iso(local(12, 9, 4, 59)) }))
+                check(warn({ checked_at: iso(local(11, 23, 50)) }) === "⚠ Waits not checked since Nov 11, 23:50",
+                    "an older day shows the date")
+                check(warn({ error: "boom" }) === "⚠ Waits not checked since never: boom",
+                    "a failure before any successful tick")
+                check(warn({ checked_at: iso(local(12, 9, 18)), error: "boom",
+                             agents_stale_since: iso(local(12, 9, 0)) })
+                    === "⚠ Waits not checked since 09:18: boom", "an error outranks a stale scan")
+                check(warn({ checked_at: iso(local(12, 9, 18)), agents_stale_since: iso(local(12, 9, 0)) })
+                    === "⚠ Session scan stale since 09:00", "fresh ticks over a stale session scan")
+                check(warn({ error: " \\n " }) === "⚠ Waits not checked since never",
+                    "a blank error is no error")
+                var long = warn({ checked_at: iso(local(12, 9, 18)), error: new Array(201).join("x") })
+                check(long === "⚠ Waits not checked since 09:18: " + new Array(120).join("x") + "…",
+                    "a long error is cut to 120 characters: " + long.length)
+                console.log("PASS actual main waiting health")
+                Qt.exit(0)
+''', {"waitingView": view}, views=True)
+
 
 if __name__ == "__main__":
     unittest.main()
