@@ -65,7 +65,6 @@ EXTENSION_KEPT_S = 24 * 3600
 SETTLE_IDLE_S = 2 * 60
 # The sweep writes agents.json every few seconds: older than this, nobody sweeps.
 AGENTS_STALE_S = 2 * 60
-BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 PROC = Path("/proc")
 # How long a menu request stands: a key press, not a wait. Later nobody is there.
 MENU_REQUEST_FRESH_S = 15
@@ -506,14 +505,10 @@ def _read_agents() -> Agents:
 
 
 def _system_boot_id() -> str:
-    """This boot's id as codexbar_agents.py writes it, or "" where there is none."""
-    if sys.platform == "darwin":
-        import proc_darwin
-        return proc_darwin.boot_id()
-    try:
-        return BOOT_ID_PATH.read_text(encoding="ascii").strip()
-    except (OSError, ValueError):
-        return ""
+    """This boot's id, read as codexbar_agents.py reads it for agents.json, or
+    "" where there is none."""
+    import codexbar_agents
+    return codexbar_agents._read_boot_id()
 
 
 def _boot_id(agents: Agents) -> str:
@@ -1009,14 +1004,15 @@ class PrCache:
     read is dropped rather than failing every command. A session nobody showed,
     and a PR nobody asked about, for PR_CACHE_KEPT_S go too."""
 
-    def __init__(self, scan: bool = True):
-        """Without `scan`, sessions keep what the last scan saved: no transcript is read."""
+    def __init__(self, scan: bool = True, now: datetime | None = None):
+        """Without `scan`, sessions keep what the last scan saved: no transcript is
+        read. `now` is the command's time, `tick --now` included."""
         self.scan = scan
         self.path = state_paths.state_dir() / "pr_cache.json"
         self.sessions: dict[str, dict] = {}
         self.statuses: dict[str, dict] = {}
         self.dirty = False
-        self.now = _now()
+        self.now = now or _now()
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -1160,7 +1156,7 @@ def _refresh_prs(prs: list[dict], now: datetime) -> None:
         answers = list(pool.map(ask, prs))
     # Loaded only now: the calls take seconds, and another process may have
     # scanned a transcript meanwhile.
-    cache = PrCache()
+    cache = PrCache(now=now)
     for pr, answer in zip(prs, answers):
         cache.remember(pr, answer, now)
     cache.save()
@@ -3322,7 +3318,7 @@ def _build_view(
         if (record and _open_waits(record)) or session in pins:
             chosen.append((session, record))
     facts.prefetch([session for session, _ in chosen])
-    prs = PrCache()
+    prs = PrCache(now=now)
     errors = list(problems)
 
     def shown(name: str, build) -> list[dict]:
@@ -4307,24 +4303,19 @@ def _daemon_alive(daemon: str) -> bool | None:
     is gone or is another one now (a restart, a reboot). None when /proc can't
     tell, or the id is in another form."""
     pid, _, start = daemon.partition("-")
-    if not (pid.isdigit() and start.isdigit()) or not Path("/proc/self/stat").exists():
+    if not (pid.isdigit() and start.isdigit()) or not (PROC / "self" / "stat").exists():
         return None
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return False
-    fields = stat[stat.rfind(")") + 2:].split()
-    return len(fields) > 19 and fields[19] == start
+    stat = _proc_stat(pid)
+    return stat is not None and stat[2] == start
 
 
-def _note_tick(state: dict, now: datetime, stale: bool) -> None:
+def _note_tick(state: dict, now: datetime) -> None:
     """A tick long after the last one follows a sleep (or a stopped daemon):
     extensions get a heartbeat's time from then (`_extension_lost`)."""
     last = _stamp(state.get("last_tick_at"))
     if last is not None and now.timestamp() - last > 2 * TICK_MAX_S:
         state["woke_at"] = _iso(now)
     state["last_tick_at"] = _iso(now)
-    state["agents_stale_since"] = (state.get("agents_stale_since") or _iso(now)) if stale else None
 
 
 def _tick(args: argparse.Namespace) -> dict:
@@ -4339,6 +4330,8 @@ def _tick(args: argparse.Namespace) -> dict:
     problems: list[str] = []
 
     def finish(state: dict, agents: Agents) -> dict:
+        # As agents.json read last: after slow checks, not before them.
+        state["agents_stale_since"] = (state.get("agents_stale_since") or _iso(now)) if stale else None
         if args.daemon:
             # The lease runs from the end of the tick: slow checks don't shorten it.
             state["ticker"] = {"daemon": args.daemon, "at": _iso(now)}
@@ -4358,7 +4351,7 @@ def _tick(args: argparse.Namespace) -> dict:
                 "ok": True, "skipped": TICK_SKIPPED, "actions": [], "next_tick_s": TICK_MAX_S,
                 "view": _build_view(state, now, agents, omp=omp),
             }
-        _note_tick(state, now, stale)
+        _note_tick(state, now)
         _housekeeping(state, agents, omp, now, args.daemon)
         _clamp(state, now, problems)
         _pin_pass(state, omp, now)
@@ -4377,14 +4370,14 @@ def _tick(args: argparse.Namespace) -> dict:
             _merge(state, finished, now)
             _delivery_pass(state, agents, now, args.window, stale)
             answer = finish(state, agents)
-    cache = PrCache()
+    cache = PrCache(now=now)
     due = cache.stale(
         [pr for session in answer["view"]["sessions"] for pr in session["prs"]], now,
     )
     if due:
         _refresh_prs(due, now)
-        cache = PrCache()
         now = moment()
+        cache = PrCache(now=now)
     merged = _merged_prs(cache, _load_state())
     if due or merged:
         with _transaction() as state:

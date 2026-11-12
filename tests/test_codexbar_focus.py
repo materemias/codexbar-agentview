@@ -1042,6 +1042,19 @@ class StartupLockTests(unittest.TestCase):
         focus._prune_startup_locks(self.root, keep=mine)
         self.assertEqual([path.exists() for path in (old, fresh, held, mine)], [False, True, True, True])
 
+    def test_it_looks_at_most_once_an_hour(self) -> None:
+        day = focus.STARTUP_LOCK_KEPT_SECONDS
+        mine = self.lock_file("mine", 0)
+        first = self.lock_file("first", day + 60)
+        focus._prune_startup_locks(self.root, keep=mine)
+        second = self.lock_file("second", day + 60)
+        focus._prune_startup_locks(self.root, keep=mine)
+        self.assertEqual([first.exists(), second.exists()], [False, True])
+        later = time.time() + focus.STARTUP_PRUNE_EVERY_SECONDS + 1
+        with mock.patch.object(focus.time, "time", return_value=later):
+            focus._prune_startup_locks(self.root, keep=mine)
+        self.assertFalse(second.exists())
+
     def test_a_waiter_on_a_removed_lock_takes_the_new_one(self) -> None:
         path = self.lock_file("s", 0)
         holder = os.open(path, os.O_RDWR)

@@ -390,6 +390,8 @@ def _kwin_place(pid: int, desktop: str) -> bool:
 SESSION_START_RESERVATION_SECONDS = 60.0
 # A session's startup lock file nobody has taken for this long is removed.
 STARTUP_LOCK_KEPT_SECONDS = 24 * 3600.0
+# How often a startup looks for those files at all.
+STARTUP_PRUNE_EVERY_SECONDS = 3600.0
 
 
 def _names_inode(fd: int, path: Path) -> bool:
@@ -424,8 +426,18 @@ def _startup_lock(path: Path):
 def _prune_startup_locks(directory: Path, keep: Path) -> None:
     """Remove the startup lock files of other sessions unused for a day. One
     goes only while nobody holds it and its path still names the inode locked,
-    so a waiter on it notices (`_startup_lock`)."""
-    cutoff = time.time() - STARTUP_LOCK_KEPT_SECONDS
+    so a waiter on it notices (`_startup_lock`). At most once an hour: a
+    marker file's age says when the last look was."""
+    now = time.time()
+    marker = directory / f"{AGGREGATE_PATH.name}.startup-pruned"
+    try:
+        if now - marker.stat().st_mtime < STARTUP_PRUNE_EVERY_SECONDS:
+            return
+    except OSError:
+        pass
+    with contextlib.suppress(OSError):
+        marker.touch()
+    cutoff = now - STARTUP_LOCK_KEPT_SECONDS
     for path in directory.glob(f"{AGGREGATE_PATH.name}.*.startup.lock"):
         if path == keep:
             continue

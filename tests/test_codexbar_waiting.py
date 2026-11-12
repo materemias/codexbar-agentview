@@ -4790,6 +4790,19 @@ class StaleAgentsTests(Case):
         self.assertEqual(len(self.resumes()), 1)
         self.assertIsNone(self.run_cli("list")["health"]["agents_stale_since"])
 
+    def test_a_sweep_that_goes_stale_during_slow_checks_is_reported(self) -> None:
+        self.sweep(0)
+        self.add("--kind", "command", "--argv", json.dumps([sys.executable, "-c", "raise SystemExit(1)"]))
+        real = waiting._run_jobs
+
+        def slow(jobs, now):
+            self.advance(seconds=waiting.AGENTS_STALE_S + 1)
+            return real(jobs, now)
+
+        with mock.patch.object(waiting, "_run_jobs", slow):
+            health = self.run_cli("tick")["view"]["health"]
+        self.assertEqual(health["agents_stale_since"], self.clock.isoformat())
+
     def test_a_sweep_from_before_the_reboot_runs_nothing(self) -> None:
         self.system_boot = "one"
         self.sweep(0, SID, boot="one")
@@ -5269,6 +5282,14 @@ class PruneTests(Case):
         self.assertEqual(saved["sessions"]["unstamped"]["used_at"], self.clock.isoformat())
         self.advance(days=8)
         self.assertEqual(list(waiting.PrCache().sessions), [])
+
+    def test_the_pr_cache_counts_from_tick_now(self) -> None:
+        entry = {"path": "/t", "offset": 0, "calls": [], "prs": [], "used_at": (self.clock - timedelta(days=1)).isoformat()}
+        (self.state_dir / "pr_cache.json").write_text(json.dumps({
+            "version": waiting.PR_CACHE_VERSION, "sessions": {"old": entry}, "statuses": {},
+        }))
+        self.run_cli("tick", "--now", (self.clock + timedelta(days=7)).isoformat())
+        self.assertEqual(json.loads((self.state_dir / "pr_cache.json").read_text())["sessions"], {})
 
     def test_a_chain_runs_on_past_a_pruned_step(self) -> None:
         first = self.add("--kind", "later")["id"]
