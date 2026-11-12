@@ -86,6 +86,11 @@ class Case(unittest.TestCase):
         clock = mock.patch.object(waiting, "_now", lambda: self.clock)
         clock.start()
         self.addCleanup(clock.stop)
+        # agents.json's bootId stands for the system's, unless a test sets one.
+        self.system_boot = ""
+        boot = mock.patch.object(waiting, "_system_boot_id", lambda: self.system_boot)
+        boot.start()
+        self.addCleanup(boot.stop)
 
     def agents(self, *live: str, closed: list[dict] | None = None, boot: str = "") -> None:
         for sid in live:
@@ -4525,6 +4530,7 @@ class HealthTests(Case):
     def test_a_tick_says_when_it_checked(self) -> None:
         self.assertEqual(self.tick()["view"]["health"], {
             "checked_at": self.clock.isoformat(), "error": None, "error_since": None,
+            "agents_stale_since": None,
         })
 
     def test_a_failed_tick_leaves_its_error_in_the_view_and_only_a_tick_clears_it(self) -> None:
@@ -4543,6 +4549,7 @@ class HealthTests(Case):
         self.assertEqual(len(view["sessions"]), 1)
         self.assertEqual(view["health"], {
             "checked_at": checked, "error": "RuntimeError: boom", "error_since": first,
+            "agents_stale_since": None,
         })
         # Any other command's view keeps saying so.
         self.assertEqual(self.run_cli("list")["health"]["error"], "RuntimeError: boom")
@@ -4614,6 +4621,65 @@ class IsolationTests(Case):
         lines = len(record["history"])
         self.tick_through(minutes=10)
         self.assertEqual(len(self.state()["sessions"][OTHER]["history"]), lines)
+
+
+class StaleAgentsTests(Case):
+    def sweep(self, age_s: int, *live: str, closed: list[dict] | None = None, boot: str = "") -> None:
+        self.agents(*live, closed=closed, boot=boot)
+        payload = json.loads((self.state_dir / "agents.json").read_text())
+        payload["updatedAt"] = int((self.clock.timestamp() - age_s) * 1000)
+        (self.state_dir / "agents.json").write_text(json.dumps(payload))
+
+    CLOSED = [{"sessionId": SID, "cwd": "/w", "windowTitle": "x", "resumeCommand": f"omp --resume {SID}"}]
+
+    def resumes(self) -> list[dict]:
+        return [action for action in self.tick("--window")["actions"] if action["type"] == "resume"]
+
+    def test_nothing_is_flagged_or_resumed_on_a_stale_sweep(self) -> None:
+        wait = self.add("--kind", "time", "--in", "1s", "--prompt", "go")["id"]
+        self.sweep(waiting.AGENTS_STALE_S + 1, closed=self.CLOSED)
+        self.advance(seconds=2)
+        self.assertEqual(self.resumes(), [])
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["ball"], seen["reason"]), ("on_machine", None))
+        stale_since = self.clock.isoformat()
+        self.advance(minutes=1)
+        self.assertEqual(self.tick()["view"]["health"]["agents_stale_since"], stale_since)
+        self.sweep(0, closed=self.CLOSED)
+        self.assertEqual(len(self.resumes()), 1)
+        self.assertIsNone(self.run_cli("list")["health"]["agents_stale_since"])
+
+    def test_a_sweep_from_before_the_reboot_runs_nothing(self) -> None:
+        self.system_boot = "one"
+        self.sweep(0, SID, boot="one")
+        self.heartbeat()
+        wait, _ = self.queued_prompt()
+        self.system_boot = "two"
+        self.advance(hours=9)
+        answer = self.tick()
+        self.assertFalse(answer["view"]["sessions"][0]["live"])
+        self.assertEqual(answer["view"]["health"]["agents_stale_since"], self.clock.isoformat())
+        actions = answer["actions"]
+        self.assertFalse([action for action in actions if waiting.REASON_NO_EXTENSION in action.get("text", "")])
+        self.assertNotEqual(self.wait_of(wait)["reason"], waiting.REASON_NO_EXTENSION)
+        self.assertEqual(self.state()["sessions"][SID]["prompt_queue"][0]["state"], "queued")
+        self.assertEqual(self.state()["boot_id"], "two")
+
+    def test_resume_reopens_a_session_a_stale_sweep_lists_as_running(self) -> None:
+        self.sweep(10 * 60, SID)
+        self.assertEqual(self.run_cli("resume", "--session", SID)["command"], f"omp --resume {SID}")
+        self.system_boot = "two"
+        self.sweep(0, SID, boot="one")
+        self.assertEqual(self.run_cli("resume", "--session", SID)["command"], f"omp --resume {SID}")
+
+    def test_resume_trusts_no_stale_sweep_to_say_it_runs(self) -> None:
+        self.sweep(10 * 60, closed=self.CLOSED)
+        self.heartbeat()  # heard after the sweep: "running" by that sweep
+        self.assertEqual(self.run_cli("resume", "--session", SID)["command"], f"omp --resume {SID}")
+        self.sweep(0, closed=self.CLOSED)
+        self.advance(seconds=1)
+        self.heartbeat()
+        self.run_cli("resume", "--session", SID, expect=2)
 
 
 if __name__ == "__main__":

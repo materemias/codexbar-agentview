@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import contextlib
+import copy
 import errno
 import fcntl
 import json
@@ -55,6 +56,9 @@ MAX_CHECKS_PER_TICK = CHECK_WORKERS * CHECK_CLAIM_S // (COMMAND_TIMEOUT_S + 5)
 SENDING_FRESH_S = 2 * 60
 EXTENSION_FRESH_S = 15 * 60
 EXTENSION_KEPT_S = 24 * 3600
+# The sweep writes agents.json every few seconds: older than this, nobody sweeps.
+AGENTS_STALE_S = 2 * 60
+BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
 # How long a menu request stands: a key press, not a wait. Later nobody is there.
 MENU_REQUEST_FRESH_S = 15
 CLOSED_RECORD_KEPT_S = 7 * 24 * 3600
@@ -373,6 +377,7 @@ def _health(state: dict, now: datetime, error: str | None, ticked: bool) -> dict
         "checked_at": state.get("last_tick_at"),
         "error": error,
         "error_since": (since or _iso(now)) if error else None,
+        "agents_stale_since": state.get("agents_stale_since"),
     }
 
 
@@ -387,7 +392,7 @@ def _report_tick_failure(error: BaseException) -> None:
                 view = None
             view = view if isinstance(view, dict) else {}
             last = view.get("health") if isinstance(view.get("health"), dict) else {}
-            health = {"checked_at": None, **last}
+            health = {"checked_at": None, "agents_stale_since": None, **last}
             health.update(
                 error=_error_line(error),
                 error_since=(last.get("error") and last.get("error_since")) or _iso(_now()),
@@ -420,14 +425,26 @@ class Agents:
     """agents.json, by session id. `known` is False without a readable file:
     liveness is then unknown, which is not the same as every session closed."""
 
-    def __init__(self, payload: object = None):
+    def __init__(self, payload: object = None, foreign: bool = False):
+        """`foreign`: the file is from another boot, so every session it lists has
+        ended, and when it was swept says nothing about this boot."""
+        self.foreign = foreign
         self.known = isinstance(payload, dict)
         data = payload if isinstance(payload, dict) else {}
         self.boot_id = _text(data.get("bootId"))
         updated = data.get("updatedAt")
-        self.updated_at = updated / 1000 if type(updated) in (int, float) else None
+        self.updated_at = updated / 1000 if type(updated) in (int, float) and not foreign else None
         self.live = self._by_session(data.get("agents"))
         self.closed = self._by_session(data.get("history"))
+        if foreign:
+            self.closed.update(self.live)
+            self.live = {}
+
+    def untrusted(self) -> "Agents":
+        """These rows with no session taken for running: for a stale file."""
+        agents = copy.copy(self)
+        agents.live, agents.closed = {}, {**self.closed, **self.live}
+        return agents
 
     @staticmethod
     def _by_session(rows: object) -> dict[str, dict]:
@@ -449,11 +466,42 @@ class Agents:
 
 
 def _read_agents() -> Agents:
+    """agents.json; one from before the reboot lists no session that runs now."""
     try:
         text = (state_paths.state_dir() / "agents.json").read_text(encoding="utf-8")
-        return Agents(json.loads(text))
+        payload = json.loads(text)
     except (OSError, ValueError):
         return Agents()
+    agents = Agents(payload)
+    boot = _system_boot_id()
+    return Agents(payload, foreign=True) if boot and agents.boot_id and agents.boot_id != boot else agents
+
+
+def _system_boot_id() -> str:
+    """This boot's id as codexbar_agents.py writes it, or "" where there is none."""
+    if sys.platform == "darwin":
+        import proc_darwin
+        return proc_darwin.boot_id()
+    try:
+        return BOOT_ID_PATH.read_text(encoding="ascii").strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def _boot_id(agents: Agents) -> str:
+    return _system_boot_id() or agents.boot_id
+
+
+def _agents_stale(agents: Agents, now: datetime) -> bool:
+    """Nobody has swept lately, or not since the reboot: who runs is unknown,
+    whatever the file says. A file that doesn't say when it was written can't
+    be judged."""
+    if agents.foreign:
+        return True
+    return (
+        agents.known and agents.updated_at is not None
+        and now.timestamp() - agents.updated_at > AGENTS_STALE_S
+    )
 
 
 class Omp:
@@ -1565,25 +1613,31 @@ def _resume(state: dict, record: dict, facts: Facts, now: datetime, window: bool
     return True
 
 
-def _delivery_pass(state: dict, agents: Agents, now: datetime, window: bool) -> None:
+def _delivery_pass(
+    state: dict, agents: Agents, now: datetime, window: bool, stale: bool = False,
+) -> None:
     """Who can take the queued prompts: a closed session is resumed in Tern, and
     comes to me when that doesn't bring it up; one without the extension comes
-    to me at once. The prompts stay queued for later."""
+    to me at once. The prompts stay queued for later.
+    While agents.json is `stale` only an extension heard from says anything."""
     if not agents.known:
         return
     facts = Facts(agents)
     for session, record in state["sessions"].items():
         with _isolated(state, record, now):
-            _deliver(state, record, agents, facts, now, window)
+            _deliver(state, record, agents, facts, now, window, stale)
 
 
 def _deliver(
-    state: dict, record: dict, agents: Agents, facts: Facts, now: datetime, window: bool,
+    state: dict, record: dict, agents: Agents, facts: Facts, now: datetime,
+    window: bool, stale: bool,
 ) -> None:
     session = record["session"]
     queue = record["prompt_queue"]
     live = _running(state, agents, session)
     fresh = live and _extension_fresh(state, session, now)
+    if stale and not fresh:
+        return
     if fresh:
         # Back for good: a later close may be resumed again at once.
         record["resume_opened_at"] = None
@@ -2108,8 +2162,9 @@ def _after_reboot(state: dict, agents: Agents, now: datetime) -> None:
 
 def _housekeeping(state: dict, agents: Agents, omp: Omp, now: datetime) -> None:
     stamp = now.timestamp()
-    if agents.boot_id:
-        if state["boot_id"] and state["boot_id"] != agents.boot_id:
+    boot = _boot_id(agents)
+    if boot:
+        if state["boot_id"] and state["boot_id"] != boot:
             _after_reboot(state, agents, now)
             # Pane ids don't survive a reboot, and may belong to another pane now.
             panes = {int(pane) for pane in state["panes"]} | {
@@ -2122,7 +2177,7 @@ def _housekeeping(state: dict, agents: Agents, omp: Omp, now: datetime) -> None:
             state["actions"] = [
                 action for action in state["actions"] if action["type"] == "toast"
             ]
-        state["boot_id"] = agents.boot_id
+        state["boot_id"] = boot
     state["extensions"] = {
         session: seen for session, seen in state["extensions"].items()
         if stamp - _parse_time(seen).timestamp() <= EXTENSION_KEPT_S
@@ -3686,12 +3741,18 @@ def cmd_tick(args: argparse.Namespace) -> dict:
         raise
 
 
+def _note_tick(state: dict, now: datetime, stale: bool) -> None:
+    state["last_tick_at"] = _iso(now)
+    state["agents_stale_since"] = (state.get("agents_stale_since") or _iso(now)) if stale else None
+
+
 def _tick(args: argparse.Namespace) -> dict:
     def moment() -> datetime:
         return _parse_time(args.now) if args.now else _now()
 
     now = moment()
     agents = _read_agents()
+    stale = _agents_stale(agents, now)
     omp = Omp()
 
     def finish(state: dict, agents: Agents) -> dict:
@@ -3703,33 +3764,34 @@ def _tick(args: argparse.Namespace) -> dict:
         }
 
     with _transaction() as state:
-        state["last_tick_at"] = _iso(now)
+        _note_tick(state, now, stale)
         _housekeeping(state, agents, omp, now)
         _pin_pass(state, omp, now)
         _evaluate(state, now)
-        _delivery_pass(state, agents, now, args.window)
+        _delivery_pass(state, agents, now, args.window, stale)
         jobs = _claim_checks(state, now)
         answer = None if jobs else finish(state, agents)
     if jobs:
         finished = _run_jobs(jobs, now)
         # The slow checks may have taken minutes: a session can have come back,
         # and what they found is counted from now (`finish` reads the new `now`).
-        agents = _read_agents()
         now = moment()
+        agents = _read_agents()
+        stale = _agents_stale(agents, now)
         with _transaction() as state:
             _merge(state, finished, now)
-            _delivery_pass(state, agents, now, args.window)
+            _delivery_pass(state, agents, now, args.window, stale)
             answer = finish(state, agents)
     cache = PrCache()
-    stale = cache.stale(
+    due = cache.stale(
         [pr for session in answer["view"]["sessions"] for pr in session["prs"]], now,
     )
-    if stale:
-        _refresh_prs(stale, now)
+    if due:
+        _refresh_prs(due, now)
         cache = PrCache()
         now = moment()
     merged = _merged_prs(cache, _load_state())
-    if stale or merged:
+    if due or merged:
         with _transaction() as state:
             for pr in merged:
                 _pr_merged(state, pr, now)
@@ -3738,13 +3800,18 @@ def _tick(args: argparse.Namespace) -> dict:
 
 
 def cmd_resume(args: argparse.Namespace) -> dict:
-    facts = Facts(_read_agents())
-    if not facts.agents.known:
+    agents = _read_agents()
+    if not agents.known:
         raise BadInput("agents.json is unreadable: can't tell whether the session runs")
     state = _load_state()
-    if _running(state, facts.agents, args.session):
+    if _agents_stale(agents, _now()):
+        # It can't say which session runs: codexbar_focus.py --reserve, which
+        # the reopen goes through, checks the processes.
+        agents = agents.untrusted()
+    elif _running(state, agents, args.session):
         # A session file has one live writer.
         raise BadInput("session is running")
+    facts = Facts(agents)
     record = state["sessions"].get(args.session)
     if _pending_resume(state, args.session) is not None or (
         record is not None and _resume_opened_lately(record, _now())
