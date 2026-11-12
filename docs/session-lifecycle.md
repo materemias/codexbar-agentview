@@ -24,11 +24,15 @@ Press `Ctrl+Alt+B` or type `/wait` in omp. Both open the same menu:
    the same in one line.
 3. Your sentence: why you left it, what comes next. It starts with the
    session's current sentence.
-4. Optionally, a prompt to send into the session when the wait fires.
-5. Whether to park the pane: **Park it** or **Keep it open**. For **When I
-   have time** the first choice is **Close the session**: it ends omp once the
-   wait is saved, and the pin brings it back from the When I have time group.
-   It's offered only while the agent is idle.
+4. Optionally, a prompt to send into the session when the wait fires; Repeat
+   a prompt needs one.
+5. What to do with the session: **Close the session**, **Park it** or **Keep
+   it open**. Close is offered only while the agent is idle, and it ends omp
+   once the wait is saved; for a check the agent writes, once that turn ends.
+   A wait with a prompt reopens the session in Tern when it fires, and a
+   repeat for each run (below); one without comes back to the Waiting tab,
+   where Resume reopens it. For **When I have time** the pin brings it back
+   from that group.
 
 A one-line `/wait` command always parks. Parked cards stay as Tern draws them.
 
@@ -48,6 +52,7 @@ Type `/wait ` for completions. `/wait help` lists them above the composer.
 | Command | Waits for |
 |---|---|
 | `/wait 2d <sentence> [-- prompt]` | a while: `3h`, `1h30m`, `1w` |
+| `/wait every 2h [for 1d\|3 times] [until …] [sentence] -- <prompt>` | sends the prompt every 2 hours (below) |
 | `/wait 2026-11-07 09:00 <sentence> [-- prompt]` | a date and time, or just `18:00` (the next one) |
 | `/wait gh pr [N\|URL] [until] <sentence> [-- prompt]` | a pull request (see below) |
 | `/wait gh babysit [N\|URL] [sentence]` | a bot review; then the agent fixes what's real, and the wait follows the PR to ready and merged |
@@ -68,11 +73,28 @@ Without a number, `gh pr` and `gh babysit` take the PR the agent named last,
 else the current branch's PR. `gh release` without a repo takes the current
 one.
 
+**Repeating a prompt.** `/wait every 2h -- <prompt>` sends the prompt every
+2 hours, the first time 2 hours from now, until you press Done. It can stop by
+itself:
+
+| Ends | Form |
+|---|---|
+| after a while, or a number of runs | `for 1d`, `3 times` |
+| when the agent says so | `until <in your words>`: each prompt tells the agent the condition, and it ends the repeat with its `waitingfor` tool |
+| when a command passes | `until ! <command>`, or `until check <what to check>` for a command the agent writes once |
+| when a pull request or release gets there | `until gh pr 42 merged`, `until gh release owner/repo` |
+
+A run that comes due while the previous run's turn is still going is skipped,
+and the next one counts from when that turn ends. When the repeat ends, the
+session comes back to you with how many runs it made. Repeats replace the
+omp-schedule extension; the agent asks for one with its `waitingfor` tool.
+
 ## What each wait watches
 
 | Wait | How it's checked | Fires when |
 |---|---|---|
 | Time | the clock | the time comes |
+| Repeat | the clock, and its `until` check if it has one | never by itself: it sends the prompt each interval and ends as above |
 | GitHub PR | `gh`, every 3 minutes | the PR reaches the state you picked |
 | Babysit | `gh`, every 3 minutes | each step of the chain is done (below) |
 | GitHub release | `gh api …/releases/latest`, hourly | the latest tag changes; a repo with no release yet keeps waiting |
@@ -149,13 +171,12 @@ The Waiting tab, Plasma and tern-awui group sessions the same way:
 |---|---|
 | On me | a wait was fulfilled, needs you, or is overdue |
 | Machine watching | code is checking something: a PR, a release, a command, a job |
-| On a timer | only time has to pass: a Retry later wait, or `/schedule` jobs that prompt the session on their own |
+| On a timer | only time has to pass: a Retry later wait or a repeating prompt |
 | Waiting on something | something else waits, with your words for it |
 | When I have time | sessions you pinned or set aside for later |
 
-A session's group is its most urgent wait's. Sessions with `/schedule` jobs
-show them as `↻ every 2h · next 16:00` in their status and card wherever they
-are listed.
+A session's group is its most urgent wait's. A repeating prompt shows as
+`↻ every 2h · next 16:00` in the session's status, row and card.
 
 ## Follow-up prompts
 
@@ -166,10 +187,16 @@ turn ends, verification is queued for a background tick, not run inside the
 extension's turn-finished event. Without a check, the wait comes back to you
 as "ran, take a look".
 
-A closed session never restarts by itself. Its wait comes back to you with
-Resume, which reopens the session in a new Tern tab and then sends the
-prompt. A live session without the extension can't take prompts; its wait
-comes back to you saying so.
+A closed session comes back by itself when one of its waits has a prompt to
+send: Tern reopens it with `omp --resume` in a new tab of the Tern session it
+was last in (or Default), without switching to it, and the prompt goes in once
+omp is up. With the dashboard open, Tern waits up to 30 seconds for it to
+close. If Tern doesn't reopen the session within 3 minutes, or it doesn't
+start, the wait comes back to you with Resume; meanwhile Resume says the
+session is reopening. A session whose extension was heard from in the last
+6 minutes may still be running and isn't reopened. A wait without a prompt
+only comes back to you. A live session without the extension can't take
+prompts; its wait comes back to you saying so.
 
 ## When a wait is fulfilled
 
@@ -211,7 +238,7 @@ closed and the merged step fires at once.
 
 | Key | Does |
 |---|---|
-| `Space` | details: your sentence, what it waits for, what happened since, the next step, the recap, the session's pull requests and schedules |
+| `Space` | details: your sentence, what it waits for, what happened since, the next step, the recap and the session's pull requests |
 | `Enter` | open the session in its own tab, or resume a closed one |
 | `Shift+Enter` | the session card |
 | `+` | +1 day (below) |
@@ -230,6 +257,7 @@ had queued is cancelled until it fires again.
 | Wait | +1 day |
 |---|---|
 | Time | moves the time to 24 hours from now; the prompt runs then |
+| Repeat | moves the next run to 24 hours from now; a run already going finishes |
 | GitHub PR, release, command check still waiting | pauses the checks for 24 hours |
 | Something else | reminds you in 24 hours |
 | Anything that already happened: a job that ended, a fulfilled PR or check, a fired chain step | hides it for 24 hours (⏲, On a timer), then brings it back as it was; its prompt doesn't run again |
@@ -242,9 +270,9 @@ had queued is cancelled until it fires again.
 you focus a session whose wait fired, and on demand with `Ctrl+Alt+I`, a click
 on the row above the composer or on the status segment, or `Shift+Enter` in
 the dashboard. It shows your sentence, the folder, branch and model, the
-session's pull requests with their state, its waits and schedules, what
-happened since you set it aside (each line with its time), the next step,
-and omp's latest recap of the session with the time omp wrote it. A recap
+session's pull requests with their state, its waits, what happened since you
+set it aside (each line with its time), the next step, and omp's latest recap
+of the session with the time omp wrote it. A recap
 written before the session's later turns is headed "Earlier recap" and
 dimmed. Focus the card to use its buttons and links. An open card keeps itself
 current: it redraws as soon as the session's waits change, rereads times, agent

@@ -278,10 +278,12 @@ while it starts asks you to retry; the startup reservation lasts up to
 For sessions you leave and come back to later. `Ctrl+Alt+B` or `/wait` sets
 one aside with your own sentence and what it waits for: a while or a date, a
 GitHub pull request or release, a check the agent writes for you, anything
-else in your words, or the time you have for it. Code watches the wait, sends
-the session your follow-up prompt when it fires, and the Waiting tab
-(`Ctrl+Alt+W`), the row above the omp composer and the session card
-(`Ctrl+Alt+I`) tell you what happened since and what's next.
+else in your words, or the time you have for it. `/wait every 2h` repeats a
+prompt, for a while or until the agent, a command or a PR says it's done.
+Code watches the wait, sends the session your follow-up prompt when it fires,
+reopening it in Tern if you closed it, and the Waiting tab (`Ctrl+Alt+W`), the
+row above the omp composer and the session card (`Ctrl+Alt+I`) tell you what
+happened since and what's next.
 
 Command checks run in the captured project or Tern pane directory. If that
 directory disappears, the check reports failure rather than running elsewhere.
