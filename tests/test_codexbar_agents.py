@@ -760,6 +760,111 @@ class ResumeAndIdentityTests(unittest.TestCase):
         self.assertEqual(info["sessionId"], "01a0-resumed")
         self.assertTrue(info["identityExact"])
 
+    def _continuation_folder(self, home: Path) -> Path:
+        slug = home / ".omp" / "agent" / "sessions" / "-work"
+        slug.mkdir(parents=True)
+        return slug
+
+    @staticmethod
+    def _rollout(slug: Path, name: str, sid: str, turns: list[tuple[str, str]],
+                 continuation_of: str = "") -> Path:
+        header = {"type": "session", "id": sid, "cwd": "/work",
+                  "timestamp": "2026-09-28T10:00:00.000Z"}
+        if continuation_of:
+            header["continuationOf"] = continuation_of
+            header["parentSession"] = continuation_of
+        lines = [{"type": "title", "title": "t"}, header] + [
+            {"type": "message", "id": entry_id, "timestamp": stamp,
+             "message": {"role": "user", "content": "hi"}}
+            for entry_id, stamp in turns
+        ]
+        path = slug / f"{name}_{sid}.jsonl"
+        path.write_text("".join(json.dumps(line) + "\n" for line in lines))
+        return path
+
+    def _resumed_info(self, home: Path, argv: list[str], held: str = "") -> dict:
+        with (
+            mock.patch.object(agents.Path, "home", return_value=home),
+            mock.patch.object(agents, "_open_jsonl_under", return_value=(held, bool(held))),
+            mock.patch.object(agents, "_argv_of", return_value=argv),
+            mock.patch.object(agents, "_ppid_of", return_value=0),
+            mock.patch.object(agents, "_cwd_of", return_value="/work"),
+        ):
+            return agents._pi_info(42)
+
+    def test_omp_restored_into_a_fork_is_named_by_the_copy_it_went_on_in(self) -> None:
+        # /restart re-runs omp with --restore <parent>; omp resumes the fork
+        # whose header continues the parent and holds no file open meanwhile.
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            slug = self._continuation_folder(home)
+            parent = self._rollout(slug, "2026-09-28T10-00-00-000Z", "01a0-parent",
+                                   [("a1", "2026-09-28T10:01:00.000Z")])
+            self._rollout(slug, "2026-09-28T11-00-00-000Z", "01a0-fork",
+                          [("a1", "2026-09-28T10:01:00.000Z"), ("b1", "2026-09-28T11:05:00.000Z")],
+                          continuation_of="01a0-parent")
+            info = self._resumed_info(home, ["omp", "--restore", str(parent)])
+        self.assertEqual(info["sessionId"], "01a0-fork")
+        self.assertFalse(info["identityExact"])
+
+    def test_omp_follows_a_copy_chain_to_its_newest_leaf(self) -> None:
+        # A copy written because another process held the file continues the
+        # fork with the same turns, so the fork is superseded by it.
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            slug = self._continuation_folder(home)
+            self._rollout(slug, "2026-09-28T10-00-00-000Z", "01a0-parent",
+                          [("a1", "2026-09-28T10:01:00.000Z")])
+            turns = [("a1", "2026-09-28T10:01:00.000Z"), ("b1", "2026-09-28T11:05:00.000Z")]
+            self._rollout(slug, "2026-09-28T11-00-00-000Z", "01a0-fork", turns,
+                          continuation_of="01a0-parent")
+            self._rollout(slug, "2026-09-28T12-00-00-000Z", "01a0-copy", turns,
+                          continuation_of="01a0-fork")
+            info = self._resumed_info(home, ["omp", "--resume", "01a0-parent"])
+        self.assertEqual(info["sessionId"], "01a0-copy")
+        self.assertFalse(info["identityExact"])
+
+    def test_omp_parent_with_the_newest_turn_stays_itself(self) -> None:
+        # The fork branched off and went quiet; the parent's last turn is in
+        # no child and is the newest, so it is resumed as named.
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            slug = self._continuation_folder(home)
+            self._rollout(slug, "2026-09-28T10-00-00-000Z", "01a0-parent",
+                          [("a1", "2026-09-28T10:01:00.000Z"), ("p2", "2026-09-28T13:00:00.000Z")])
+            self._rollout(slug, "2026-09-28T11-00-00-000Z", "01a0-fork",
+                          [("a1", "2026-09-28T10:01:00.000Z"), ("b1", "2026-09-28T11:05:00.000Z")],
+                          continuation_of="01a0-parent")
+            info = self._resumed_info(home, ["omp", "--resume", "01a0-parent"])
+        self.assertEqual(info["sessionId"], "01a0-parent")
+        self.assertTrue(info["identityExact"])
+
+    def test_omp_without_continuations_keeps_the_named_session(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            slug = self._continuation_folder(home)
+            self._rollout(slug, "2026-09-28T10-00-00-000Z", "01a0-parent",
+                          [("a1", "2026-09-28T10:01:00.000Z")])
+            self._rollout(slug, "2026-09-28T11-00-00-000Z", "01a0-unrelated",
+                          [("z1", "2026-09-28T12:00:00.000Z")])
+            info = self._resumed_info(home, ["omp", "--resume", "01a0-parent"])
+        self.assertEqual(info["sessionId"], "01a0-parent")
+        self.assertTrue(info["identityExact"])
+
+    def test_omp_holding_its_file_ignores_continuations(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            slug = self._continuation_folder(home)
+            parent = self._rollout(slug, "2026-09-28T10-00-00-000Z", "01a0-parent",
+                                   [("a1", "2026-09-28T10:01:00.000Z")])
+            fork = self._rollout(slug, "2026-09-28T11-00-00-000Z", "01a0-fork",
+                                 [("a1", "2026-09-28T10:01:00.000Z"), ("b1", "2026-09-28T11:05:00.000Z")],
+                                 continuation_of="01a0-parent")
+            held_fork = self._resumed_info(home, ["omp", "--restore", str(parent)], held=str(fork))
+            held_parent = self._resumed_info(home, ["omp", "--restore", str(parent)], held=str(parent))
+        self.assertEqual((held_fork["sessionId"], held_fork["identityExact"]), ("01a0-fork", True))
+        self.assertEqual((held_parent["sessionId"], held_parent["identityExact"]), ("01a0-parent", True))
+
     def test_omp_without_its_transcript_open_holds_every_session_its_log_names(self) -> None:
         started = 1_790_000_000_000
         day = datetime.fromtimestamp(started / 1000, timezone.utc).strftime("%Y-%m-%d")

@@ -1227,6 +1227,170 @@ def _rollout_named(session_id: str) -> str:
     return ""
 
 
+# Entry types omp counts as a turn when it picks the newest copy of a session.
+_OMP_TURN_TYPES = {"message", "custom_message", "branch_summary", "reset_boundary"}
+_OMP_NOT_A_TURN = "eval-state-context"
+_ROLLOUT_NAME = re.compile(r"^(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2})-(\d{3})Z_(.+)\.jsonl$")
+
+
+def _rollout_name_ms(path: Path) -> int | None:
+    """Creation time from an omp rollout's `<time>_<id>.jsonl` name."""
+    match = _ROLLOUT_NAME.match(path.name)
+    if not match:
+        return None
+    return _ts_ms(f"{match[1]}:{match[2]}:{match[3]}.{match[4]}Z") or None
+
+
+def _session_header(path: Path) -> dict:
+    """The `type: session` header of a pi/omp rollout. omp may write a title
+    line before it, so the first few lines are read."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            for _ in range(4):
+                line = f.readline()
+                if not line:
+                    break
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(entry, dict) and entry.get("type") == "session":
+                    return entry
+    except OSError:
+        pass
+    return {}
+
+
+def _newest_turn(path: Path, header: dict) -> tuple[int, str]:
+    """(time, entry id) of a rollout's last turn, read from its tail; the
+    header time and no id when it has none, as omp does."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as f:
+            chunk = 64 * 1024
+            while True:
+                f.seek(max(0, size - chunk))
+                lines = f.read(chunk).decode("utf-8", "replace").split("\n")
+                if chunk < size:
+                    lines = lines[1:]  # the first line may be cut
+                for line in reversed(lines):
+                    if not line.startswith("{"):
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(entry, dict) or entry.get("type") == "session":
+                        chunk = size
+                        break
+                    kind = entry.get("type")
+                    message = entry.get("message")
+                    custom = (entry.get("customType") if kind == "custom_message"
+                              else message.get("customType") if isinstance(message, dict) else None)
+                    stamp = _ts_ms(entry.get("timestamp"))
+                    if kind in _OMP_TURN_TYPES and custom != _OMP_NOT_A_TURN and stamp:
+                        entry_id = entry.get("id")
+                        return stamp, entry_id if isinstance(entry_id, str) else ""
+                if chunk >= size:
+                    break
+                chunk *= 4
+    except OSError:
+        pass
+    return _ts_ms(header.get("timestamp")), ""
+
+
+_ENTRY_SEEN: dict[tuple[str, int, int, str], bool] = {}
+
+
+def _has_entry(path: Path, entry_id: str) -> bool:
+    """True when the rollout holds a non-header entry with `entry_id`.
+    Cached by file size and mtime: a copy only grows."""
+    try:
+        st = path.stat()
+    except OSError:
+        return False
+    key = (str(path), st.st_mtime_ns, st.st_size, entry_id)
+    if key not in _ENTRY_SEEN:
+        needle = f'"{entry_id}"'
+        found = False
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if needle not in line:
+                        continue
+                    try:
+                        entry = json.loads(line)
+                    except ValueError:
+                        continue
+                    if (isinstance(entry, dict) and entry.get("type") != "session"
+                            and entry.get("id") == entry_id):
+                        found = True
+                        break
+        except OSError:
+            pass
+        if len(_ENTRY_SEEN) > 256:
+            _ENTRY_SEEN.clear()
+        _ENTRY_SEEN[key] = found
+    return _ENTRY_SEEN[key]
+
+
+def _continued_rollout(rollout: str) -> str:
+    """The copy of `rollout`'s session that omp resumes. A session whose
+    conversation went on in other files (forks, or a copy written because
+    another process held the file) carries `continuationOf` in their headers;
+    omp walks to the chain's root, drops each copy a child continues past its
+    last turn, and resumes the one with the newest turn, the named file
+    winning ties. Only the named file's folder is scanned, and only files
+    created after the chain's root."""
+    start = Path(rollout)
+    folder = start.parent
+    headers: dict[Path, dict] = {}
+
+    def header(path: Path) -> dict:
+        if path not in headers:
+            headers[path] = _session_header(path)
+        return headers[path]
+
+    try:
+        files = [p for p in folder.glob("*.jsonl") if _rollout_name_ms(p) is not None]
+    except OSError:
+        return rollout
+    root, chain = start, {start}
+    while parent_id := header(root).get("continuationOf"):
+        parent = next((p for p in files if p.name.endswith(f"_{parent_id}.jsonl")
+                       and header(p).get("id") == parent_id), None)
+        if parent is None or parent in chain:
+            break
+        chain.add(parent)
+        root = parent
+    root_ms = _rollout_name_ms(root) or _ts_ms(header(root).get("timestamp"))
+    children: dict[str, list[Path]] = {}
+    for path in files:
+        if path != root and (_rollout_name_ms(path) or 0) >= root_ms:
+            if (parent_id := header(path).get("continuationOf")) and isinstance(parent_id, str):
+                children.setdefault(parent_id, []).append(path)
+    if root == start and header(root).get("id") not in children:
+        return rollout
+
+    queue, seen, leaves = [root], {root}, []
+    turns: dict[Path, tuple[int, str]] = {}
+    for node in queue:
+        kids = [p for p in children.get(header(node).get("id"), []) if p not in seen]
+        seen.update(kids)
+        queue.extend(kids)
+        turns[node] = _newest_turn(node, header(node))
+        last_id = turns[node][1]
+        if not any(not last_id or _has_entry(kid, last_id) for kid in kids):
+            leaves.append(node)
+    best = start if start in leaves else None
+    best_ms = turns[start][0] if best else float("-inf")
+    for node in leaves:
+        if turns[node][0] > best_ms:
+            best, best_ms = node, turns[node][0]
+    return str(best) if best else rollout
+
+
+
 # pi writes a new session's header right after startup and never keeps the
 # rollout open, so the header time is what ties a rollout to its process.
 _FRESH_SESSION_MS = 30_000
@@ -1267,7 +1431,7 @@ def _created_by(pid: int, rollout: str) -> bool:
     return not any(fresh(p) for p in siblings)
 
 
-def _pi_info(pid: int, resume_flags: tuple[str, ...] = ("--resume",)) -> dict:
+def _pi_info(pid: int, resume_flags: tuple[str, ...] = ("--resume", "--restore")) -> dict:
     """pi and omp share the same JSONL layout. omp keeps the active file open
     on an fd (so we can see it via /proc/<pid>/fd); pi closes it between
     writes, so we fall back to the cwd → slug lookup.
@@ -1291,7 +1455,10 @@ def _pi_info(pid: int, resume_flags: tuple[str, ...] = ("--resume",)) -> dict:
     if not direct and resume_id:
         # A resumed session opens its rollout only after startup; until then
         # the argv names it, where the slug lookup would pick another session.
-        rollout = _rollout_named(resume_id) or rollout
+        if named := _rollout_named(resume_id):
+            # omp resumes the copy its conversation went on in, not always
+            # the file argv names; holding neither, the row stays unproven.
+            rollout = _continued_rollout(named)
     if not rollout:
         # A run started with an explicit --session-dir doesn't live under the
         # cwd slug, and the slug lookup would hand it a *different* session's
