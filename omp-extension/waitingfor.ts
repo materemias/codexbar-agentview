@@ -43,10 +43,17 @@ const PR_WINDOW = 4;
 const CHECK_EVERY = "15m";
 /** How long the agent has to turn a described check into a command. */
 const CHECK_TTL_MS = 10 * 60_000;
+/** Why omp moved a session to a new id (its persistence notice); the CLI re-keys the old record on all but open-elsewhere. */
+const MOVE_REASONS = ["open-elsewhere", "replaced", "contested"];
 
 const DURATION = /^(\d+[smhdw])+$/;
-const REPO = /^[\w.-]+\/[\w.-]+$/;
-const PR_REF = /^(?:#?\d+|https?:\/\/\S+|[\w.-]+\/[\w.-]+#\d+)$/;
+// GitHub's name rules: an account of up to 39 letters, digits and single inner hyphens; a repo of up to
+// 100 letters, digits, `.`, `-` and `_`, but not `.` or `..`.
+const OWNER_REPO = String.raw`(?=[A-Za-z0-9-]{1,39}\/)[A-Za-z0-9](?:-?[A-Za-z0-9])*\/(?!\.\.?(?:#|$))[\w.-]{1,100}`;
+const REPO = new RegExp(`^${OWNER_REPO}$`);
+const PR_REF = new RegExp(String.raw`^(?:#?\d+|https?:\/\/\S+|${OWNER_REPO}#\d+)$`);
+/** A lone `--` right after a gh form's arguments ends them: the sentence follows, whatever its first word. */
+const ARGS_END = "--";
 const AT = /^(?:(\d{4}-\d{2}-\d{2})(?:[T ](\d{1,2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?))?|(\d{1,2}:\d{2}))(?:\s+([\s\S]*))?$/;
 // `ready` leads: it is what a PR wait does by default, and Enter takes the first choice.
 const UNTILS = [
@@ -94,7 +101,7 @@ const FORMS = [
 	{
 		word: "pr",
 		gh: true,
-		usage: "/wait gh pr [N|URL] [until] <sentence> [-- prompt]",
+		usage: "/wait gh pr [N|URL] [until] [--] <sentence> [-- prompt]",
 		what: "until ready (default), review, merged, released or activity",
 		example: "gh pr 42 ready waiting for review -- Merge it if the checks pass",
 		featured: true,
@@ -102,14 +109,14 @@ const FORMS = [
 	{
 		word: "babysit",
 		gh: true,
-		usage: "/wait gh babysit [N|URL] [sentence]",
+		usage: "/wait gh babysit [N|URL] [--] [sentence]",
 		what: "bot review, the agent fixes, then ready and merged",
 		example: "gh babysit 42 ship the backoff fix",
 	},
 	{
 		word: "release",
 		gh: true,
-		usage: "/wait gh release [owner/repo] <sentence> [-- prompt]",
+		usage: "/wait gh release [owner/repo] [--] <sentence> [-- prompt]",
 		what: "a repo's next release",
 		example: "gh release owner/repo try the new version -- Upgrade and rerun the failing case",
 	},
@@ -286,19 +293,39 @@ function repeatError(every: string, span?: string): string | undefined {
 	return undefined;
 }
 
-/** The PR reference, its `--until` options and the sentence of what follows `gh pr`. */
-function prParts(text: string) {
-	const [head, tail] = cut(text);
-	const ref = PR_REF.test(head) ? head : undefined;
-	const [next, after] = cut(ref ? tail : text);
-	const until = UNTILS.find((item) => item.label === next)?.until;
-	return { ref, options: until ? [`--until=${until}`] : [], sentence: until ? after : ref ? tail : text };
+/**
+ * A gh form's arguments, read off the front of `text`: `take(read)` takes the next word when `read`
+ * gives it a value, and `rest()` gives what follows them, past a lone ARGS_END (`ended`).
+ */
+function ghArgs(text: string) {
+	let body = text;
+	return {
+		take<T>(read: (word: string) => T | undefined): T | undefined {
+			const [head, tail] = cut(body);
+			const value = head === ARGS_END ? undefined : read(head);
+			if (value !== undefined) body = tail;
+			return value;
+		},
+		rest() {
+			const [head, tail] = cut(body);
+			return head === ARGS_END ? { body: tail, ended: true } : { body, ended: false };
+		},
+	};
 }
 
-/** The `--repo` options and the sentence of what follows `gh release`; without a repo, `needs` it from this directory. */
+/** What follows `gh pr`, or `gh babysit` without `states`: the PR reference, the `--until` options and the rest. */
+function prParts(text: string, states = true) {
+	const args = ghArgs(text);
+	const ref = args.take((word) => (PR_REF.test(word) ? word : undefined));
+	const until = states ? args.take((word) => UNTILS.find((item) => item.label === word)?.until) : undefined;
+	return { ref, options: until ? [`--until=${until}`] : [], ...args.rest() };
+}
+
+/** What follows `gh release`: the repo, when the first word can be one, and the rest. */
 function releaseParts(text: string) {
-	const [head, tail] = cut(text);
-	return REPO.test(head) ? { options: [`--repo=${head}`], sentence: tail } : { options: [], sentence: text, needs: "repo" };
+	const args = ghArgs(text);
+	const repo = args.take((word) => (REPO.test(word) ? word : undefined));
+	return { repo, ...args.rest() };
 }
 
 /**
@@ -345,7 +372,9 @@ function whatRequest(text: string, park = true) {
 /**
  * `{command, args}` for one /wait line, `{check}` for a check the agent is to write, `{error,
  * forms}` for a bad line. `needs: "pr"|"repo"`: a target still to resolve, `pr` being the
- * reference the line gave.
+ * reference the line gave. `gh`: a GitHub wait, whose reading is shown once it is saved.
+ * `guessedRepo`: a first word taken for the repo that gh is to confirm, `withoutRepo` the request
+ * when it is no repo after all.
  */
 export function parseWait(input: string) {
 	const [first, line] = cut(input.trim());
@@ -353,12 +382,23 @@ export function parseWait(input: string) {
 	const [word, text] = first === "gh" ? [`gh ${sub}`.trim(), subLine] : [first, line];
 	const key = DURATION.test(word) ? "<duration>" : /^\d/.test(word) ? "<date>" : word;
 	const bad = (error: string, about = key) => ({ error, forms: FORMS.filter((form) => form.usage.startsWith(`/wait ${about}`)) });
-	const [rest, prompt] = NO_PROMPT[key] ? [text, undefined] : splitPrompt(text);
+	// A gh form's arguments come off first: a lone -- right after them starts the sentence, and only
+	// a later one starts the prompt.
+	const gh = key === "gh pr" ? prParts(text) : key === "gh babysit" ? prParts(text, false) : key === "gh release" ? releaseParts(text) : undefined;
+	const [rest, prompt] = NO_PROMPT[key] ? [text, undefined] : splitPrompt(gh ? gh.body : text);
 	if (prompt === "") return bad("Nothing follows --: put the prompt after it, or drop the --.");
 	const add = (kind: string, options: string[], sentence: string) => ({
 		command: "add",
 		args: ["--kind", kind, ...options, ...userArgs(sentence, prompt)],
 	});
+	// A first word that can be a repo may still be the sentence's (try/catch): unless a -- after it
+	// says it is the repo, gh tells before the add (confirmRepo).
+	const release = (parts, repeat: string[], sentence: string) => {
+		if (!parts.repo) return { ...add("release", repeat, sentence), needs: "repo", gh: true };
+		const request = { ...add("release", [`--repo=${parts.repo}`, ...repeat], sentence), gh: true };
+		if (parts.ended) return request;
+		return { ...request, guessedRepo: parts.repo, withoutRepo: { ...add("release", repeat, `${parts.repo} ${sentence}`.trimEnd()), needs: "repo", gh: true } };
+	};
 	switch (key) {
 		case "":
 			return { command: "menu", args: [] };
@@ -403,29 +443,20 @@ export function parseWait(input: string) {
 			const [sub, ghText] = cut(tail);
 			if (sub === "pr") {
 				const pr = prParts(ghText);
-				return { ...add("pr", [...pr.options, ...repeat], pr.sentence), needs: "pr", pr: pr.ref };
+				return { ...add("pr", [...pr.options, ...repeat], pr.body), needs: "pr", pr: pr.ref, gh: true };
 			}
 			// gh is taken, as check is: words for the agent to judge start with another word.
 			if (sub !== "release") return bad("until gh takes pr or release; words for the agent to judge can't start with gh.");
-			const release = releaseParts(ghText);
-			return { ...add("release", [...release.options, ...repeat], release.sentence), needs: release.needs };
+			const target = releaseParts(ghText);
+			return release(target, repeat, target.body);
 		}
-		case "gh pr": {
-			const pr = prParts(rest);
-			if (!pr.sentence) return bad("gh pr needs a sentence.");
-			return { ...add("pr", pr.options, pr.sentence), needs: "pr", pr: pr.ref };
-		}
-		case "gh babysit": {
+		case "gh pr":
+			return rest ? { ...add("pr", gh.options, rest), needs: "pr", pr: gh.ref, gh: true } : bad("gh pr needs a sentence.");
+		case "gh babysit":
 			if (prompt !== undefined) return bad("gh babysit takes no prompt: its review step already has the fix prompt.");
-			const [head, tail] = cut(rest);
-			const ref = PR_REF.test(head) ? head : undefined;
-			return { command: "babysit-pr", args: userArgs(ref ? tail : rest), needs: "pr", pr: ref };
-		}
-		case "gh release": {
-			const release = releaseParts(rest);
-			if (!release.sentence) return bad("gh release needs a sentence.");
-			return { ...add("release", release.options, release.sentence), needs: release.needs };
-		}
+			return { command: "babysit-pr", args: userArgs(rest), needs: "pr", pr: gh.ref, gh: true };
+		case "gh release":
+			return rest ? release(gh, [], rest) : bad("gh release needs a sentence.");
 		case "<duration>":
 			return rest ? add("time", [`--in=${word}`], rest) : bad("A sentence must follow the time.");
 		case "<date>": {
@@ -459,9 +490,12 @@ function everyChoices(words: string[]) {
 	if (rest[0] !== "until") return [];
 	if (rest.length === 1) return UNTIL_CHOICES;
 	if (rest[1] !== "gh") return [];
-	const gh = choicesAfter(rest.slice(1), []);
+	// Here the first -- starts the prompt: until's gh arguments have no end of their own.
+	const gh = choicesAfter(rest.slice(1), []).filter((item) => item !== SENTENCE_START);
 	return rest.length === 2 ? gh.filter((item) => item.label !== "babysit") : gh;
 }
+
+const SENTENCE_START = { label: ARGS_END, description: "the sentence starts here, even with a word that reads as a PR, state or repo" };
 
 /** What can follow the finished words of a /wait line. */
 function choicesAfter(words: string[], waits) {
@@ -469,7 +503,8 @@ function choicesAfter(words: string[], waits) {
 	if (!path) return TOP_CHOICES;
 	if (words[0] === "every") return everyChoices(words.slice(1));
 	if (path === "gh") return GH_CHOICES;
-	if (path === "gh pr" || (words.length === 3 && path.startsWith("gh pr ") && PR_REF.test(words[2]))) return UNTILS;
+	if (path === "gh pr" || (words.length === 3 && path.startsWith("gh pr ") && PR_REF.test(words[2]))) return [...UNTILS, SENTENCE_START];
+	if (path === "gh babysit" || path === "gh release" || (words.length === 3 && path.startsWith("gh release ") && REPO.test(words[2]))) return [SENTENCE_START];
 	if (path === "later") return SIZES;
 	if (path === "check") return CHECK_CHOICES;
 	if (words.length === 3 && path.startsWith("check every ") && DURATION.test(words[2])) return [BANG];
@@ -527,21 +562,26 @@ function clockTime(ms: number, now: number): string {
 /**
  * The warning a view's `health` gives at `now`; undefined while the waits are being checked. Before
  * the first tick (`checked_at` null) it warns only once this process has seen that since
- * `uncheckedSince` for 15 minutes, so a fresh install doesn't flash a warning.
+ * `uncheckedSince` for 15 minutes, so a fresh install doesn't flash a warning. A recent tick whose
+ * error came from one check (`error_kind` "partial") checked the rest: the waits count as checked,
+ * and only the error shows. A CLI without `error_kind` means the tick failed.
  */
 export function healthWarning(health, now = Date.now(), uncheckedSince?: number): string | undefined {
 	if (!health) return undefined;
 	const checked = Date.parse(health.checked_at ?? "");
 	const since = Number.isNaN(checked) ? "never" : clockTime(checked, now);
+	const stale = Date.parse(health.agents_stale_since ?? "");
+	const scanSince = Number.isNaN(stale) ? undefined : clockTime(stale, now);
 	// One line, capped as the applet caps it: an error with a traceback must not flood the row above
 	// the composer. Capped by code points, as a cut through a surrogate pair would draw garbage.
 	const chars = Array.from(String(health.error ?? "").replace(/\s+/g, " ").trim());
 	const error = chars.length > 120 ? `${chars.slice(0, 119).join("")}…` : chars.join("");
+	const fresh = !Number.isNaN(checked) && now - checked <= TICK_STALE_MS;
+	if (error && fresh && health.error_kind === "partial") return `⚠ Last check: ${error}${scanSince ? ` · session scan stale since ${scanSince}` : ""}`;
 	if (error) return `⚠ Waits not checked since ${since}: ${error}`;
 	const last = Number.isNaN(checked) ? uncheckedSince : checked;
 	if (last !== undefined && now - last > TICK_STALE_MS) return `⚠ Waits not checked since ${since}`;
-	const stale = Date.parse(health.agents_stale_since ?? "");
-	return Number.isNaN(stale) ? undefined : `⚠ Session scan stale since ${clockTime(stale, now)}`;
+	return scanSince && `⚠ Session scan stale since ${scanSince}`;
 }
 
 /**
@@ -577,6 +617,7 @@ function helpPanel(theme, width: number): string {
 		"A prompt after -- goes into the session when the wait fires; with every, at each run.",
 		"A run due while the last run's turn still goes is skipped. A command with its own -- goes through the menu.",
 		"Without a PR, /wait takes the one in the last messages or on this branch; without a repo, this directory's.",
+		"In gh forms a lone -- right after the PR, state or repo starts the sentence: gh pr -- review the patch.",
 		"",
 		theme.fg("muted", "Examples"),
 		...FORMS.flatMap((form) => (form.featured ? `/wait ${form.example}` : [])),
@@ -665,6 +706,28 @@ export function lastPr(c): string | undefined {
 		if (latest) return latest.pr;
 	}
 	return undefined;
+}
+
+/** `request` as the line meant it: a guessed repo gh can't find was the sentence's first word; any other gh failure keeps it. */
+async function confirmRepo(request, cwd: string) {
+	if (!request.guessedRepo) return request;
+	const { failed, stderr } = await run("gh", ["repo", "view", request.guessedRepo, "--json", "nameWithOwner"], { timeout: GH_TIMEOUT_MS, cwd });
+	return failed && /Could not resolve to a Repository/i.test(stderr) ? request.withoutRepo : request;
+}
+
+/**
+ * What a GitHub wait's CLI `args` were read as, so a word taken for a PR, a state or a repo shows;
+ * `dropped`: the first word gh found no repo for, which stayed in the sentence.
+ */
+export function ghReading(command: string, args: string[], dropped?: string): string {
+	const value = (name: string) => args.find((arg) => arg.startsWith(`--${name}=`))?.slice(name.length + 3);
+	const number = value("number");
+	const pr = value("pr") ?? (number && `${value("repo")}#${number}`);
+	const until = UNTILS.find((item) => item.until === value("until"))?.label ?? "ready";
+	const what = command === "babysit-pr" ? `Babysitting PR ${pr}` : pr ? `Waiting on PR ${pr} until ${until}` : `Waiting for the next release of ${value("repo")}`;
+	const note = value("note");
+	const every = value("every");
+	return [what, every && `prompt every ${every}`, note && `"${note}"`, dropped && `${dropped} is no GitHub repo, so it stays in the sentence`].filter(Boolean).join(" · ");
 }
 
 /** The options for what a /wait line left out: a PR from the last messages or this branch, a repo from `cwd`. */
@@ -1005,6 +1068,7 @@ export default function (pi) {
 	let unwatchMoves; // ends the subscription to omp's notices of a session moved to a new file
 	let watched; // the SessionManager unwatchMoves listens to
 	const formerIds = new Set<string>(); // the ids omp moved this conversation from (followSession)
+	let moves: { from: string; reason: string }[] = []; // the moves to this id the CLI has yet to hear of, oldest first (followSession)
 	// Views applied, counted apart: one with only a failed tick's health leaves the sessions as they were.
 	let sessionsApplied = 0;
 	let healthApplied = 0;
@@ -1187,7 +1251,9 @@ export default function (pi) {
 		const session = sessionId;
 		if (!ctx) return;
 		const claimedAt = Date.now();
-		const { prompts = [] } = await cli(["claim-prompts", "--session", session]);
+		// In Tern the pane says which process may take them: a session open in two panes is the exact one's.
+		const pane = process.env.TERN_PANE;
+		const { prompts = [] } = await cli(["claim-prompts", "--session", session, ...(pane ? ["--pane", pane] : [])]);
 		let delivered = false;
 		for (const prompt of prompts) {
 			// Switched away: the prompt stays `sending`, and this session's next claim checks it.
@@ -1282,16 +1348,26 @@ export default function (pi) {
 	function heartbeat() {
 		if (followSession()) return Promise.resolve(); // the activation heartbeats
 		const pane = process.env.TERN_PANE;
-		return cli(["heartbeat", "--session", sessionId, ...(pane ? ["--pane", pane] : []), "--features", "menu", ...(idle() ? ["--idle"] : [])]);
+		const move = moves[0];
+		const moveArgs = move ? ["--moved-from", move.from, "--move-reason", move.reason] : [];
+		const beat = cli(["heartbeat", "--session", sessionId, ...(pane ? ["--pane", pane] : []), "--features", "menu", ...(idle() ? ["--idle"] : []), ...moveArgs]);
+		if (!move) return beat;
+		// Heartbeats carry the moves one at a time, each until one gets through: the CLI's re-key is idempotent.
+		return beat.then((answer) => {
+			if (moves[0] === move) moves.shift();
+			if (moves.length > 0) quietly(heartbeat);
+			return answer;
+		});
 	}
 
 	/**
 	 * Moves on with the session omp writes now, when that is no longer `sessionId`; true when it did. omp
 	 * moves a session it can't write to a new file under a new id, with no session event: the conversation
 	 * goes on there, and the old id is another process's (or nobody's). A move keeps what the turn is doing,
-	 * the described check it writes and the panel; anything else is a switch.
+	 * the described check it writes and the panel; anything else is a switch. `notice`, omp's report of
+	 * the move, says why; a move seen without one counts as open-elsewhere, which the CLI leaves alone.
 	 */
-	function followSession(): boolean {
+	function followSession(notice?): boolean {
 		const c = ctx;
 		const change = c && sessionChange(c.sessionManager, sessionId);
 		if (!change) return false;
@@ -1300,6 +1376,11 @@ export default function (pi) {
 			const check = checks.get(sessionId);
 			if (check) checks.set(change.id, check);
 			if (closeAfterTurn === sessionId) closeAfterTurn = change.id;
+			const reason = MOVE_REASONS.includes(notice?.reason) ? notice.reason : "open-elsewhere";
+			// Back-to-back moves all go to the newest id, but none across an open-elsewhere: the id moved
+			// from there is another process's, and so is the record an earlier move would have handed it.
+			// The CLI refuses a move from the id itself.
+			moves = [...(reason === "open-elsewhere" ? [] : moves), { from: sessionId, reason }].filter((move) => move.from !== change.id);
 		}
 		activate(c, change.moved);
 		return true;
@@ -1318,6 +1399,7 @@ export default function (pi) {
 		menuSeq = 0;
 		if (!moved) {
 			formerIds.clear();
+			moves = [];
 			closeAfterTurn = undefined; // chosen for the session switched away from
 			retrying = false;
 			compacting = false;
@@ -1333,7 +1415,7 @@ export default function (pi) {
 		if (c.sessionManager !== watched) {
 			unwatchMoves?.();
 			watched = c.sessionManager;
-			unwatchMoves = watched.onPersistenceNotice?.(() => followSession());
+			unwatchMoves = watched.onPersistenceNotice?.((notice) => followSession(notice));
 		}
 		timers = [
 			c.setInterval(() => quietly(refresh), REFRESH_MS),
@@ -1410,9 +1492,9 @@ export default function (pi) {
 		const items = open.map((wait) => ({ label: `${wait.id}  ${wait.label}`, description: waitFacts(wait), wait }));
 		const chosen = await pick(c, "This session's waits", items);
 		if (!chosen) return;
-		const { id, state, kind, retryable } = chosen.wait;
+		const { id, retryable, snoozable } = chosen.wait;
 		// Retry comes first for a wait that check errors stopped: after fixing the cause it is the step to take.
-		const actions = [...(retryable ? ["Retry"] : []), "Done", ...(state === "pending" || kind === "later" ? [] : ["Snooze 1d"]), "Back"];
+		const actions = [...(retryable ? ["Retry"] : []), "Done", ...(snoozable ? ["Snooze 1d"] : []), "Back"];
 		const action = await c.ui.select(chosen.label, actions);
 		if (action === "Retry") await act(c, ["retry", "--session", session, `--wait=${id}`]);
 		else if (action === "Done") await act(c, ["done", "--session", session, `--wait=${id}`]);
@@ -1496,8 +1578,14 @@ export default function (pi) {
 			if (c.sessionManager.getSessionId() !== session) throw new Error("The session changed: ask for the check again.");
 			return requestCheck(c, request.check);
 		}
-		const target = await targetOptions(request, c);
-		return act(c, [request.command, "--session", session, ...target, ...request.args]);
+		const resolved = await confirmRepo(request, c.cwd);
+		const args = [...(await targetOptions(resolved, c)), ...resolved.args];
+		const answer = await act(c, [resolved.command, "--session", session, ...args]);
+		if (resolved.gh && c.sessionManager.getSessionId() === session) {
+			const reading = ghReading(resolved.command, args, resolved === request ? undefined : request.guessedRepo);
+			setPanel(c, (theme) => theme.fg("muted", reading));
+		}
+		return answer;
 	}
 
 	/**

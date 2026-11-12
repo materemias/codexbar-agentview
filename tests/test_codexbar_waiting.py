@@ -5744,5 +5744,207 @@ console.log(JSON.stringify({
         self.assert_followed(self.moved("0"))
 
 
+def run_extension_driver(test: unittest.TestCase, code: str, **env: str) -> dict:
+    """Runs `code` under bun with the extension's path in EXTENSION; the JSON of its last line."""
+    with tempfile.TemporaryDirectory() as folder:
+        script = Path(folder) / "driver.mjs"
+        script.write_text(code)
+        done = subprocess.run(
+            ["bun", "run", str(script)], cwd=folder, capture_output=True, text=True, timeout=60,
+            env={**os.environ, "EXTENSION": str(EXTENSION_PATH), **env},
+        )
+    test.assertEqual(done.returncode, 0, done.stderr)
+    return json.loads(done.stdout.strip().splitlines()[-1])
+
+
+@unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
+class ExtensionWaitLineTests(unittest.TestCase):
+    """/wait gh lines: a sentence's first word is read as a PR, state or repo only where the form
+    takes one, a lone -- ends the arguments, and gh confirms a repo that could be a word."""
+
+    def parse(self, *lines: str) -> dict:
+        return run_extension_driver(self, r"""
+const { parseWait } = await import(process.env.EXTENSION);
+const read = (p) => ({ args: p.args ?? null, error: p.error ?? null, needs: p.needs ?? null, pr: p.pr ?? null,
+    guessed: p.guessedRepo ?? null, without: p.withoutRepo?.args ?? null });
+console.log(JSON.stringify(Object.fromEntries(JSON.parse(process.env.LINES).map((line) => [line, read(parseWait(line))]))));
+""", LINES=json.dumps(lines))
+
+    def test_a_state_word_stays_a_state_unless_a_lone_dash_dash_ends_the_arguments(self) -> None:
+        user = ["--by", "user", "--park"]
+        answer = self.parse(
+            "gh pr review the patch", "gh pr -- review the patch", "gh pr -- review the patch -- Merge it",
+            "gh pr 42 -- merged at last", "gh pr 42 ready waiting -- Merge it", "gh pr", "gh pr 42 --",
+        )
+        self.assertEqual(answer["gh pr review the patch"]["args"], ["--kind", "pr", "--until=review_on_head", "--note=the patch", *user])
+        self.assertEqual(answer["gh pr -- review the patch"]["args"], ["--kind", "pr", "--note=review the patch", *user])
+        self.assertEqual(answer["gh pr -- review the patch -- Merge it"]["args"], ["--kind", "pr", "--note=review the patch", "--prompt=Merge it", *user])
+        self.assertEqual((answer["gh pr 42 -- merged at last"]["args"], answer["gh pr 42 -- merged at last"]["pr"]), (["--kind", "pr", "--note=merged at last", *user], "42"))
+        self.assertEqual(answer["gh pr 42 ready waiting -- Merge it"]["args"], ["--kind", "pr", "--until=ready", "--note=waiting", "--prompt=Merge it", *user])
+        self.assertEqual(answer["gh pr"]["error"], "gh pr needs a sentence.")
+        self.assertEqual(answer["gh pr 42 --"]["error"], "gh pr needs a sentence.")
+
+    def test_a_pr_reference_follows_githubs_name_rules(self) -> None:
+        answer = self.parse("gh pr owner/repo#5 merged done", "gh pr -bad/repo#5 x", "gh babysit -- 42 is the answer")
+        self.assertEqual(answer["gh pr owner/repo#5 merged done"]["pr"], "owner/repo#5")
+        self.assertEqual((answer["gh pr -bad/repo#5 x"]["pr"], answer["gh pr -bad/repo#5 x"]["args"][2]), (None, "--note=-bad/repo#5 x"))
+        self.assertEqual((answer["gh babysit -- 42 is the answer"]["pr"], answer["gh babysit -- 42 is the answer"]["args"][0]), (None, "--note=42 is the answer"))
+
+    def test_a_word_that_can_be_a_repo_waits_for_gh_unless_dash_dash_says_it_is(self) -> None:
+        answer = self.parse(
+            "gh release try/catch cleanup landed", "gh release try/catch -- cleanup landed",
+            "gh release -- try/catch cleanup landed", "gh release ../x hi", "every 2h until gh release try/catch -- Upgrade",
+        )
+        guessed = answer["gh release try/catch cleanup landed"]
+        self.assertEqual((guessed["args"][2:4], guessed["guessed"], guessed["needs"]), (["--repo=try/catch", "--note=cleanup landed"], "try/catch", None))
+        self.assertEqual(guessed["without"][2], "--note=try/catch cleanup landed")
+        explicit = answer["gh release try/catch -- cleanup landed"]
+        self.assertEqual((explicit["args"][2], explicit["guessed"]), ("--repo=try/catch", None))
+        for line in ("gh release -- try/catch cleanup landed", "gh release ../x hi"):
+            self.assertEqual((answer[line]["needs"], answer[line]["guessed"]), ("repo", None), line)
+        repeat = answer["every 2h until gh release try/catch -- Upgrade"]
+        self.assertEqual((repeat["guessed"], repeat["without"][2:4]), ("try/catch", ["--every=2h", "--note=try/catch"]))
+
+    def test_completions_offer_the_end_of_the_arguments_where_it_works(self) -> None:
+        answer = run_extension_driver(self, r"""
+const { waitCompletions } = await import(process.env.EXTENSION);
+const labels = (prefix) => (waitCompletions(prefix) ?? []).map((item) => item.label);
+console.log(JSON.stringify(Object.fromEntries(["gh pr ", "gh pr 42 ", "gh release ", "gh babysit ", "every 2h until gh pr "].map((p) => [p, labels(p)]))));
+""")
+        states = ["ready", "review", "merged", "released", "activity"]
+        self.assertEqual(answer, {
+            "gh pr ": [*states, "--"], "gh pr 42 ": [*states, "--"], "gh release ": ["--"], "gh babysit ": ["--"],
+            # There the first -- starts the prompt.
+            "every 2h until gh pr ": states,
+        })
+
+    def test_the_reading_names_what_the_line_was_taken_for(self) -> None:
+        answer = run_extension_driver(self, r"""
+const { ghReading } = await import(process.env.EXTENSION);
+console.log(JSON.stringify([
+    ghReading("add", ["--repo=o/r", "--number=42", "--kind", "pr", "--until=review_on_head", "--note=x"]),
+    ghReading("add", ["--repo=me/here", "--kind", "release", "--note=try/catch cleanup"], "try/catch"),
+    ghReading("babysit-pr", ["--pr=https://github.com/o/r/pull/1"]),
+]));
+""")
+        self.assertEqual(answer, [
+            'Waiting on PR o/r#42 until review · "x"',
+            'Waiting for the next release of me/here · "try/catch cleanup" · try/catch is no GitHub repo, so it stays in the sentence',
+            "Babysitting PR https://github.com/o/r/pull/1",
+        ])
+
+
+@unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
+class ExtensionHealthWarningTests(unittest.TestCase):
+    def test_a_recent_partial_error_reads_as_the_last_check(self) -> None:
+        answer = run_extension_driver(self, r"""
+const { healthWarning } = await import(process.env.EXTENSION);
+const now = Date.parse("2026-11-12T12:00:00");
+const at = (minutes) => new Date(now - minutes * 60_000).toISOString();
+const error = "session abcd can't be shown: boom";
+console.log(JSON.stringify([
+    healthWarning({ checked_at: at(1), error, error_kind: "partial" }, now),
+    healthWarning({ checked_at: at(1), error, error_kind: "partial", agents_stale_since: at(30) }, now),
+    healthWarning({ checked_at: at(1), error, error_kind: "failed" }, now),
+    healthWarning({ checked_at: at(1), error }, now),
+    healthWarning({ checked_at: at(20), error, error_kind: "partial" }, now),
+    healthWarning({ checked_at: at(1), agents_stale_since: at(30) }, now),
+    healthWarning({ checked_at: at(1) }, now) ?? null,
+    Array.from(healthWarning({ checked_at: at(1), error: "😀".repeat(130), error_kind: "partial" }, now)).length,
+]));
+""")
+        self.assertEqual(answer, [
+            "⚠ Last check: session abcd can't be shown: boom",
+            "⚠ Last check: session abcd can't be shown: boom · session scan stale since 11:30",
+            "⚠ Waits not checked since 11:59: session abcd can't be shown: boom",
+            # A CLI from before error_kind: the tick may have failed.
+            "⚠ Waits not checked since 11:59: session abcd can't be shown: boom",
+            "⚠ Waits not checked since 11:40: session abcd can't be shown: boom",
+            "⚠ Session scan stale since 11:30",
+            None,
+            len("⚠ Last check: ") + 120,
+        ])
+
+
+# Loads the extension with a wait under OLD, then omp moves the session once per REASONS entry (two:
+# through MID): the heartbeats tell the CLI, which re-keys the record when it was replaced.
+MOVE_REASON_DRIVER = r"""
+import * as fs from "node:fs";
+import { execFileSync } from "node:child_process";
+const { default: install } = await import(process.env.EXTENSION);
+const [OLD, MID, NEW] = JSON.parse(process.env.IDS);
+const reasons = JSON.parse(process.env.REASONS);
+execFileSync("python3", [process.env.CLI, "add", "--session", OLD, "--kind", "later", "--label", "Keep"]);
+const state = () => { try { return JSON.parse(fs.readFileSync(process.env.STATE_FILE, "utf8")); } catch { return {}; } };
+async function until(test) {
+    for (let i = 0; i < 300; i++) { if (test(state())) return true; await Bun.sleep(50); }
+    return false;
+}
+const chain = new Proxy(function () {}, { get: () => chain, apply: () => chain });
+const handlers = {};
+install({
+    zod: chain, logger: { debug() {} }, sendUserMessage() {},
+    pi: { Text: class { setText() {} render() { return []; } describe() { return {}; } } },
+    on: (name, fn) => { handlers[name] = fn; }, registerCommand() {}, registerShortcut() {}, registerTool() {},
+});
+const observers = new Set();
+const manager = {
+    id: OLD, header: { type: "session", id: OLD },
+    getSessionId() { return this.id; }, getHeader() { return this.header; }, getBranch: () => [],
+    onPersistenceNotice(fn) { observers.add(fn); return () => observers.delete(fn); },
+    move(id, reason) {
+        this.header = { type: "session", id, continuationOf: this.id };
+        this.id = id;
+        for (const fn of observers) fn({ reason, from: "a", to: "b" });
+    },
+};
+const ctx = {
+    hasUI: true, cwd: process.cwd(), isIdle: () => true, hasPendingMessages: () => false, ui: { setWidget() {} },
+    sessionManager: manager,
+    setTimeout: (fn, ms) => setTimeout(fn, ms), setInterval: (fn, ms) => setInterval(fn, ms),
+    clearTimer: (timer) => clearTimeout(timer),
+};
+const labels = (s, id) => (s.sessions?.[id]?.waits ?? []).map((wait) => wait.label);
+handlers.session_start({}, ctx);
+await until((s) => s.extension_panes?.[OLD] === 52);
+if (reasons.length === 2) manager.move(MID, reasons[0]);
+manager.move(NEW, reasons.at(-1));
+await until((s) => s.extension_panes?.[NEW] === 52 && (reasons.includes("open-elsewhere") || labels(s, NEW).length > 0));
+await Bun.sleep(300); // a second move's heartbeat
+handlers.session_shutdown();
+console.log(JSON.stringify({ old: labels(state(), OLD), new: labels(state(), NEW) }));
+process.exit(0);
+"""
+
+
+@unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
+class ExtensionMoveReasonTests(unittest.TestCase):
+    def moved(self, *reasons: str) -> dict:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "omp").mkdir()
+            env = {
+                "XDG_STATE_HOME": str(root / "state"), "OMP_AGENT_DIR": str(root / "omp"), "PI_CODING_AGENT_DIR": "",
+                "TERN_PANE": "52",
+            }
+            return run_extension_driver(
+                self, MOVE_REASON_DRIVER, REASONS=json.dumps(reasons), IDS=json.dumps([SID, MID, OTHER]),
+                CLI=str(SCRIPT_PATH), STATE_FILE=str(root / "state" / "codexbar-agentview" / "waiting.json"), **env,
+            )
+
+    def test_a_replaced_session_takes_its_waits_along(self) -> None:
+        self.assertEqual(self.moved("replaced"), {"old": [], "new": ["Keep"]})
+
+    def test_back_to_back_moves_reach_the_newest_id(self) -> None:
+        self.assertEqual(self.moved("contested", "replaced"), {"old": [], "new": ["Keep"]})
+
+    def test_a_session_open_elsewhere_keeps_its_waits(self) -> None:
+        self.assertEqual(self.moved("open-elsewhere"), {"old": ["Keep"], "new": []})
+
+    def test_no_move_crosses_into_a_session_open_elsewhere(self) -> None:
+        # OLD's record was MID's to take, and MID is another process's now: it stays, and nothing reaches NEW.
+        self.assertEqual(self.moved("replaced", "open-elsewhere"), {"old": ["Keep"], "new": []})
+
+
 if __name__ == "__main__":
     unittest.main()
