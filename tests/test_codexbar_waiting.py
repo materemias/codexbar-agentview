@@ -129,7 +129,8 @@ class Case(unittest.TestCase):
         return self.run_cli("tick", "--now", self.clock.isoformat(), *extra)
 
     def tick_through(self, *extra: str, **delta) -> dict:
-        """Ticks as the host makes them, every TICK_MAX_S at most, for `delta`."""
+        """Ticks as the host makes them, every TICK_MAX_S at most, for `delta`:
+        a longer gap is a sleep (`_note_tick`)."""
         end = self.clock + timedelta(**delta)
         while True:
             self.clock = min(self.clock + timedelta(seconds=waiting.TICK_MAX_S), end)
@@ -1687,8 +1688,7 @@ class PromptTests(Case):
 
     def test_live_without_extension(self) -> None:
         wait = self.add("--kind", "time", "--in", "1s", "--prompt", "go")["id"]
-        self.advance(minutes=20)
-        self.tick()
+        self.tick_through(minutes=20)
         seen = self.wait_of(wait)
         self.assertEqual((seen["ball"], seen["reason"]), ("on_me", waiting.REASON_NO_EXTENSION))
         self.assertFalse(self.session()["extension"])
@@ -1706,8 +1706,7 @@ class PromptTests(Case):
 
     def test_extension_dying_during_a_turn_comes_to_me(self) -> None:
         wait, _ = self.queued_prompt()
-        self.advance(minutes=20)
-        self.tick()
+        self.tick_through(minutes=20)
         seen = self.wait_of(wait)
         self.assertEqual((seen["ball"], seen["reason"]), ("on_me", waiting.REASON_NO_EXTENSION))
 
@@ -4457,7 +4456,7 @@ class ResumeTests(Case):
     def test_no_resume_while_it_runs_or_without_a_command(self) -> None:
         self.live()
         wait = self.add("--kind", "time", "--in", "1s", "--prompt", "go")["id"]
-        self.advance(minutes=20)
+        self.tick_through("--window", minutes=20)
         self.assertEqual(self.resumes(), [])
         self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_NO_EXTENSION)
         self.closed(command=None)
@@ -4640,6 +4639,33 @@ class SettleTests(Case):
         self.assertEqual(self.wait_of(wait)["state"], "acting")
         self.heartbeat(SID, "--idle")
         self.assertEqual(self.wait_of(wait)["state"], "review")
+
+
+class WakeTests(Case):
+    def setUp(self) -> None:
+        super().setUp()
+        self.agents(SID)
+        self.heartbeat()
+
+    def test_after_a_sleep_the_extension_gets_time_to_say_it_runs(self) -> None:
+        wait = self.add("--kind", "time", "--in", "2h", "--prompt", "go")["id"]
+        self.tick()
+        self.advance(hours=3)  # asleep: no tick
+        self.tick()
+        self.tick_through(minutes=10)
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["ball"], seen["reason"]), ("acting", "on_machine", None))
+        self.tick_through(minutes=10)
+        self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_NO_EXTENSION)
+
+    def test_a_prompt_queued_just_now_waits_a_heartbeat(self) -> None:
+        self.tick_through(minutes=20)
+        wait = self.add("--kind", "time", "--in", "1s", "--prompt", "go")["id"]
+        self.advance(seconds=2)
+        self.tick()
+        self.assertIsNone(self.wait_of(wait)["reason"])
+        self.tick_through(minutes=7)
+        self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_NO_EXTENSION)
 
 
 class StaleAgentsTests(Case):

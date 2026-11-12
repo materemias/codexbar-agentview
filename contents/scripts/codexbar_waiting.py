@@ -1283,12 +1283,14 @@ def _cancel_prompts(record: dict, wait: dict) -> None:
     ]
 
 
-def _queue_prompt(state: dict, record: dict, wait: dict, text: str, **extra: object) -> str:
+def _queue_prompt(
+    state: dict, record: dict, wait: dict, text: str, now: datetime, **extra: object,
+) -> str:
     state["action_seq"] += 1
     action = f"a{state['action_seq']}"
     record["prompt_queue"].append({
         "action": action, "wait": wait["id"], "text": text, "state": "queued",
-        "claimed_at": None, **extra,
+        "claimed_at": None, "queued_at": _iso(now), **extra,
     })
     return action
 
@@ -1408,7 +1410,7 @@ def _fire(
     record["unseen"] = True
     if wait["prompt"]:
         wait["state"] = "acting"
-        _queue_prompt(state, record, wait, _prompt_text(wait))
+        _queue_prompt(state, record, wait, _prompt_text(wait), now)
     else:
         wait["state"] = "fired"
         _activate_next(record, wait, now)
@@ -1508,6 +1510,20 @@ def _clear_delivery_flags(record: dict) -> None:
 def _extension_fresh(state: dict, session: str, now: datetime) -> bool:
     seen = _stamp(state["extensions"].get(session))
     return seen is not None and now.timestamp() - seen <= EXTENSION_FRESH_S
+
+
+def _extension_lost(state: dict, record: dict, now: datetime) -> bool:
+    """A live session's extension is missing, not just quiet: silent for
+    EXTENSION_FRESH_S and the queue's head waiting longer than a heartbeat, both
+    counted from the wake when the machine slept since."""
+    woke = _stamp(state.get("woke_at")) or 0.0
+    heard = _stamp(state["extensions"].get(record["session"])) or 0.0
+    queued = _stamp(record["prompt_queue"][0].get("queued_at")) or 0.0
+    stamp = now.timestamp()
+    return (
+        stamp - max(heard, woke) > EXTENSION_FRESH_S
+        and stamp - max(queued, woke) > RESUME_QUIET_S
+    )
 
 
 def _fresh_menu_requests(state: dict, now: datetime) -> dict:
@@ -1620,7 +1636,7 @@ def _delivery_pass(
 ) -> None:
     """Who can take the queued prompts: a closed session is resumed in Tern, and
     comes to me when that doesn't bring it up; one without the extension comes
-    to me at once. The prompts stay queued for later.
+    to me once it has been missing a while. The prompts stay queued for later.
     While agents.json is `stale` only an extension heard from says anything."""
     if not agents.known:
         return
@@ -1667,6 +1683,9 @@ def _deliver(
         _mark_resuming(record)
         return
     if not live and _resume(state, record, facts, now, window):
+        return
+    if live and not _extension_lost(state, record, now):
+        # Quiet, or the machine just woke: its next heartbeat may come yet.
         return
     reason = REASON_NO_EXTENSION if live else REASON_CLOSED
     for entry in list(queue):
@@ -2154,7 +2173,7 @@ def _after_reboot(state: dict, agents: Agents, now: datetime) -> None:
             if entry["state"] == "queued" or entry.get("rebooted"):
                 continue
             entry.update(
-                state="queued", claimed_at=None, rebooted=True,
+                state="queued", claimed_at=None, rebooted=True, queued_at=_iso(now),
                 text=f"{REBOOT_NOTE}\n\n{entry['text']}",
             )
             wait = _wait_in(record, entry["wait"])
@@ -2274,7 +2293,7 @@ def _repeat_step(state: dict, record: dict, wait: dict, now: datetime) -> None:
         repeat["next_at"] = None
         _log(record, now, wait, "Skipped a run: the last one is still going")
         return
-    action = _queue_prompt(state, record, wait, _run_text(wait), repeat=True)
+    action = _queue_prompt(state, record, wait, _run_text(wait), now, repeat=True)
     repeat.update(runs=repeat["runs"] + 1, running=action, last_run_at=_iso(now))
     # The last run has no next one.
     spent = _repeat_spent(repeat)
@@ -3762,6 +3781,11 @@ def cmd_tick(args: argparse.Namespace) -> dict:
 
 
 def _note_tick(state: dict, now: datetime, stale: bool) -> None:
+    """A tick long after the last one follows a sleep (or a stopped daemon):
+    extensions get a heartbeat's time from then (`_extension_lost`)."""
+    last = _stamp(state.get("last_tick_at"))
+    if last is not None and now.timestamp() - last > 2 * TICK_MAX_S:
+        state["woke_at"] = _iso(now)
     state["last_tick_at"] = _iso(now)
     state["agents_stale_since"] = (state.get("agents_stale_since") or _iso(now)) if stale else None
 
