@@ -1339,7 +1339,9 @@ end
 -- Teleport use, and holds off every other launcher for a minute after. It
 -- refuses with 5 while omp runs the session or another launcher starts it, and
 -- with 11 when an omp that names none of its sessions runs in its folder and
--- may be writing it. `done` gets that status and the helper's reason.
+-- may be writing it. `done` gets that status and the helper's reason. Only omp
+-- sessions have session-keyed waits: the omp extension and `paneSession` name
+-- them, and pins are omp's. So the provider is omp.
 local function reserveSession(session: string, cwd: any, done: (number, string, WindowCx?) -> ())
 	local args = { "--tern", "--reserve", "omp", session }
 	if type(cwd) == "string" and cwd ~= "" then
