@@ -990,7 +990,9 @@ export default function (pi) {
 	let closeAfterTurn: string | undefined; // the session to close once the turn writing its described check ends
 	let menuSeq = 0; // the last menu request seen
 	let activatedAt = 0; // in whole seconds, as a request's time has no finer ones
-	let viewsApplied = 0;
+	// Views applied, counted apart: one with only a failed tick's health leaves the sessions as they were.
+	let sessionsApplied = 0;
+	let healthApplied = 0;
 	let panel; // what the panel shows, as a function (see helpPanel); undefined: nothing
 	// CLI steps of the turn lifecycle run one at a time, so a turn's end can't overtake its ack.
 	let tail = Promise.resolve();
@@ -1119,8 +1121,8 @@ export default function (pi) {
 	/** Applies a view; one without `sessions` is a failed tick's health alone, and the row stays as it was. */
 	function applyView(view) {
 		if (!view || !ctx) return;
-		viewsApplied += 1;
 		if ("health" in view) {
+			healthApplied += 1;
 			health = view.health;
 			uncheckedSince = !health || health.checked_at ? undefined : (uncheckedSince ?? Date.now());
 		}
@@ -1128,6 +1130,7 @@ export default function (pi) {
 			drawRow();
 			return;
 		}
+		sessionsApplied += 1;
 		ownSession = view.sessions.find((session) => session.session_id === sessionId);
 		waits = ownSession?.waits ?? [];
 		drawRow();
@@ -1138,7 +1141,8 @@ export default function (pi) {
 	/** Applies this session's list; when the CLI fails, the view file, which holds a failed tick's error. */
 	async function refresh() {
 		const session = sessionId;
-		const applied = viewsApplied;
+		const applied = sessionsApplied;
+		const healthSeen = healthApplied;
 		let view;
 		try {
 			view = await cli(["list", "--session", session]);
@@ -1146,8 +1150,11 @@ export default function (pi) {
 			log(error);
 			view = await readViewFile();
 		}
-		// A view applied meanwhile came from a later command than this answer.
-		if (session === sessionId && applied === viewsApplied) applyView(view);
+		// A view applied meanwhile came from a later command than this answer: its sessions win, and
+		// so does a failed tick's health that came alone.
+		if (!view || session !== sessionId || applied !== sessionsApplied) return;
+		if (healthSeen !== healthApplied) delete view.health;
+		applyView(view);
 	}
 
 	/**
