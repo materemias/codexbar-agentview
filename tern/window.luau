@@ -1370,6 +1370,14 @@ end
 -- 11 included, fails the resume with its reason, which puts the wait on me now.
 -- Done or Snooze may take the resume back while the helper runs: then nothing
 -- opens, and with the action gone nothing acks it either.
+--
+-- While the helper runs, `waitingResumes` marks the resume with when it began
+-- (`since`). A plugin reload loses the helper's answer, and the reservation it
+-- may have taken refuses the next one with 5 for a minute, as if the session
+-- ran. A mark older than `python`'s 30 s timeout plus that minute
+-- (codexbar_focus.py's SESSION_START_RESERVATION_SECONDS) lost its answer, and
+-- the resume starts over.
+local RESERVE_LOST_S = 30 + 60 + 5
 local function reserveThenResume(a: any, state: any)
 	local id = tostring(a.id)
 	local function settle(result: string, err: string?)
@@ -1403,9 +1411,15 @@ local function runActions(cx: WindowCx, leader: boolean)
 	-- a plugin reload or a leader's lease: how each resume went stays in
 	-- `tern.kv` until its action leaves the outbox, however long its ack fails.
 	local stored = tern.kv.get("waitingResumes")
-	local resumes: { [string]: { result: string, error: string? } } = {}
+	local resumes: { [string]: { result: string?, error: string?, since: number? } } = {}
 	for id, r in (if type(stored) == "table" then stored else {}) do
-		resumes[id] = { result = tostring(r.result), error = if type(r.error) == "string" then r.error else nil }
+		if type(r) == "table" then
+			resumes[id] = {
+				result = if type(r.result) == "string" then r.result else nil,
+				error = if type(r.error) == "string" then r.error else nil,
+				since = if type(r.since) == "number" then r.since else nil,
+			}
+		end
 	end
 	local resumesChanged = false
 	local listed: { [string]: boolean } = {}
@@ -1415,13 +1429,24 @@ local function runActions(cx: WindowCx, leader: boolean)
 		local state = acted[id]
 		local pane = if a.type ~= "toast" then tonumber(a.pane) else nil
 		local info = if pane then paneInfo(cx, pane) else nil
-		if not state and ownsAction(a, info, leader) and a.type == "resume" and not resumes[id] then
+		local owns = not state and ownsAction(a, info, leader)
+		local before = if a.type == "resume" then resumes[id] else nil
+		if owns and before and not before.result then
+			local age = os.clock() - (before.since or 0)
+			if age >= 0 and age < RESERVE_LOST_S then
+				owns = false -- its helper may still answer
+			else
+				before = nil -- lost, or ahead of now: from before a reboot
+			end
+		end
+		if owns and a.type == "resume" and not before then
 			-- Held (`sending`) until the helper answers, so nothing acks it meanwhile.
 			state = { result = "failed", error = nil, sending = true, acked = false, retryAt = 0, tries = 0 }
 			acted[id] = state
+			resumes[id] = { since = os.clock() }
+			resumesChanged = true
 			reserveThenResume(a, state)
-		elseif not state and ownsAction(a, info, leader) then
-			local before = if a.type == "resume" then resumes[id] else nil
+		elseif owns then
 			local ok, result, err = true, nil, nil
 			if before then
 				result, err = before.result, before.error
