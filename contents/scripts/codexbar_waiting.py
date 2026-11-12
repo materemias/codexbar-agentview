@@ -2807,6 +2807,12 @@ def _record_times(state: dict, record: dict, now: datetime) -> list[float | None
     times: list[float | None] = []
     if _resume_opened_lately(record, now):
         times.append(_stamp(record["resume_opened_at"]) + RESUME_GRACE_S)
+    pending = _pending_resume(state, record["session"]) if record["session"] else None
+    if pending is not None:
+        # When the resume expires, or comes to me for want of a window (`_resume`).
+        for since in (_stamp(pending.get("window_since")), _stamp(pending.get("windowless_since"))):
+            if since is not None and since + RESUME_GRACE_S > stamp:
+                times.append(since + RESUME_GRACE_S)
     if record["prompt_queue"] and _heard_lately(state, record["session"] or "", now):
         # When a closed session's extension has been quiet long enough to resume it.
         times.append(_stamp(state["extensions"][record["session"]]) + RESUME_QUIET_S)

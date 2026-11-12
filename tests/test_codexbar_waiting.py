@@ -4367,6 +4367,13 @@ class ResumeTests(Case):
         self.assertEqual(self.resumes(), [])
         self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_CLOSED)
 
+    def test_the_next_tick_comes_when_a_resume_expires(self) -> None:
+        self.fired_prompt()
+        self.assertEqual(len(self.resumes(window=False)), 1)
+        # A window comes up long after the resume was queued: its outbox is old.
+        self.advance(minutes=10)
+        self.assertEqual(self.tick("--window")["next_tick_s"], waiting.RESUME_GRACE_S)
+
     def test_a_reboot_resumes_again_and_sends_the_cut_prompt_once_more(self) -> None:
         wait = self.fired_prompt()
         self.resumed_and_delivered()
