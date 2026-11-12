@@ -1853,7 +1853,7 @@ local REQUEST_TTL_S = 15
 -- Dashboard buttons that need a window: like picking from a popup, they close
 -- the dashboard, and what they do waits for its layout to come back. The list
 -- spans windows, so the window holding the target answers too, and marks it
--- taken in `waitingRequestTaken`. "Waiting for…" asks over the dashboard
+-- taken in `waitingRequestTaken`. "Manual wait…" asks over the dashboard
 -- instead, which shows the new text once the CLI answers.
 local function waitingRequest(cx: WindowCx)
 	local request = tern.kv.get("waitingRequest")

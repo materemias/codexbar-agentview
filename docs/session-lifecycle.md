@@ -99,7 +99,7 @@ omp-schedule extension; the agent asks for one with its `waitingfor` tool.
 | Babysit | `gh`, every 3 minutes | each step of the chain is done (below) |
 | GitHub release | `gh api …/releases/latest`, hourly | the latest tag changes; a repo with no release yet keeps waiting |
 | Command check | the command, every 15 minutes, without a shell | it exits 0 |
-| Something else | nothing | you mark it done |
+| Manual wait | nothing | you mark it done |
 | When I have time | nothing | never; it's a list |
 | Job (shell pane) | Tern's command and pane events | the command ends; it can close the pane on exit 0 |
 
@@ -257,13 +257,13 @@ closed and the merged step fires at once.
 | `Enter` | open the session in its own tab, or resume a closed one |
 | `Shift+Enter` | the session card |
 | `+` | Snooze 1d (below) |
-| `F2` | Waiting for…: edit the free-text status |
+| `F2` | Manual wait…: edit the free-text wait |
 | `Delete` | Done |
 
-A row shows what the session waits for in your words when it has a free-text
-status (`/wait for`), and `F2` or the row's **Waiting for…** button edits it. A
-session has one free-text status; setting it again replaces it, and an empty
-one removes it.
+A row shows what the session waits for in your words when it has a manual wait
+(`/wait for`), and `F2` or the row's **Manual wait…** button edits it. A
+session has one manual wait; setting it again replaces it, and an empty text
+removes it.
 
 **Snooze 1d** pushes the row's most pressing wait: the one that's on you, else
 the one due first. It always takes the wait off you, and a prompt that wait
@@ -274,7 +274,7 @@ had queued is cancelled until it fires again.
 | Time | moves the time to 24 hours from now; the prompt runs then |
 | Repeat | moves the next run to 24 hours from now; a run already going finishes |
 | GitHub PR, release, command check still waiting | pauses the checks for 24 hours |
-| Something else | reminds you in 24 hours |
+| Manual wait | reminds you in 24 hours |
 | Anything that already happened: a job that ended, a fulfilled PR or check, a fired chain step | hides it for 24 hours (⏲, On a timer), then brings it back as it was; its prompt doesn't run again |
 | Anything overdue | moves the deadline to 24 hours from now |
 | When I have time, a chain step not started yet, a job still running, a wait whose prompt the agent has | not offered |

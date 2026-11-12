@@ -3006,7 +3006,7 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	if cardPane(r, true) then
 		table.insert(buttons, button("Card", "wait_card", { keys = { "shift", "enter" } }))
 	end
-	table.insert(buttons, button("Waiting for…", "wait_what", { keys = { "f2" } }))
+	table.insert(buttons, button("Manual wait…", "wait_what", { keys = { "f2" } }))
 	local peekKeys = if b.filter == "" then { "space" } else nil
 	table.insert(buttons, button(if b.peek then "Hide details" else "Details", "peek", { icon = "message", keys = peekKeys, on = b.peek }))
 	table.insert(kids, withp(ui.row(buttons), { key = "actions", wrap = true }))
