@@ -2000,9 +2000,10 @@ local function tick()
 			-- action. While another daemon ticks, the outbox is its business, but
 			-- the view it writes still names this daemon's job waits: reconcilePanes
 			-- and jobFinished read it, without a Python process.
-			if not store.waitingTicking and readWaiting(WAITING_FILE) ~= store.waitingRaw then
+			local raw = if store.waitingTicking then nil else readWaiting(WAITING_FILE)
+			if raw ~= nil and raw ~= store.waitingRaw then
 				if store.waitingSkipped then
-					store.waitingRaw = readWaiting(WAITING_FILE)
+					store.waitingRaw = raw
 					local okv, view = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
 					if okv and type(view) == "table" and type(val(view.panes)) == "table" then
 						applyWaiting(view)
