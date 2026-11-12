@@ -9,7 +9,7 @@ Identities: applet `io.github.materemias.codexbaragentview`, Tern plugin `codexb
 - `codexbar_fetch.py` is the only provider normalization path and `contents/config/main.xml` the only config schema; extend them rather than adding another.
 - QML never writes `agents.json`; dismissal goes through `codexbar_agents.py --dismiss` under the writer lock.
 - Run processes from QML through `native/` (`QProcess`): unique executable DataSource names make Plasma's metadata grow.
-- Usage fetches are expensive: each is a Claude OAuth call, and a rate-limited one starts a real Claude Code session. The applet polls; the Tern plugin reads the cache and fetches only when nothing measured usage for 2 × `refreshSeconds`. The `fetch_claim` lock keeps every poller to one fetch per interval.
+- Usage fetches are expensive: each is a Claude OAuth call, and a rate-limited one starts a real Claude Code session. The applet polls; the Tern plugin reads the cache and fetches only when nothing measured usage for 2 × `refreshSeconds`. The `fetch_claim` lock keeps every poller to one fetch per provider per interval.
 - Meridian is optional and read once per refresh (`_Meridian` in `codexbar_fetch.py`). Every Claude fact (roster, usage, saved resets, email, plan) is Meridian first, then the login directory, then Anthropic or the CLI; per-account facts go through `_ClaudeLogin` on both paths, so add new ones there. Saved resets need Meridian 1.87+, else one Anthropic ask per account per hour. Its ChatGPT seats add Codex accounts; the CLI's reading wins per email. A missing CLI is fatal only when Meridian served nothing either. Keep the README's Meridian compatibility table current.
 - The Tern plugin passes `--tern` to `codexbar_focus.py`, which skips every KWin step.
 

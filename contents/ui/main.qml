@@ -387,7 +387,7 @@ PlasmoidItem {
                     && (parsed.cacheOnly !== true || parsed.sharedCache === true)
                 var fresh = current && parsed.cacheOnly !== true
                 if (current && parsed.sharedCache === true) {
-                    // A claim refusal omits network metadata, but rereads local rotation.
+                    // A claim refusal carries the forecast but no CLI version; it rereads local rotation.
                     if (parsed.forecast == null && root.codexForecastState(root.snapshot.forecast))
                         parsed.forecast = root.snapshot.forecast
                     if (parsed.cliVersion == null && typeof root.snapshot.cliVersion === "string"
