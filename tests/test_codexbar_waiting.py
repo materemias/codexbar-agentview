@@ -4723,6 +4723,20 @@ class IsolationTests(Case):
         self.tick()
         self.assertEqual(self.wait_of(wait)["state"], "waiting")
 
+    def test_retry_sends_a_prompt_the_quarantine_cancelled_before_the_agent_got_it(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        wait = self.add("--kind", "time", "--in", "1s", "--prompt", "go")["id"]
+        self.advance(seconds=2)
+        self.tick()
+        with mock.patch.object(waiting, "_evaluate_record", side_effect=RuntimeError("boom")):
+            self.tick()
+        self.assertEqual(self.session()["prompts_queued"], 0)
+        self.run_cli("retry", "--session", SID, "--wait", wait)
+        self.assertEqual(self.wait_of(wait)["state"], "acting")
+        prompts = self.run_cli("claim-prompts", "--session", SID)["prompts"]
+        self.assertEqual([prompt["text"] for prompt in prompts], ["go"])
+
     def test_a_record_that_keeps_failing_says_so_once(self) -> None:
         self.agents(OTHER)
         wait = self.add("--kind", "later", session=OTHER)["id"]

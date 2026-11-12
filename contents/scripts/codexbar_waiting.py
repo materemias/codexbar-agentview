@@ -1616,16 +1616,30 @@ def _quarantine(state: dict, record: dict, now: datetime, error: Exception) -> N
                 _stamp(wait.get(key))
             except Exception:
                 wait[key] = None
-        # What `retry` puts it back to (`_rearm`).
+        # What `retry` puts it back to (`_rearm`), with the prompts the
+        # quarantine cancels before the agent got them.
         wait["quarantined"] = {
             key: wait.get(key) for key in ("state", "reason", "on_me", "verify_pending", "retry_as")
         }
+        wait["quarantined"]["prompts"] = _unsent_prompts(record, wait)
         try:
             _attention(state, record, wait, now, reason, retry_as="internal")
         except Exception:  # the record is too broken for its prompts to be cancelled
             wait.update(state="needs_attention", reason=reason, on_me=False, retry_as="internal")
             with contextlib.suppress(Exception):
                 _log(record, now, wait, reason, "attention")
+
+
+def _unsent_prompts(record: dict, wait: dict) -> list[dict]:
+    """The wait's queued prompts the agent hasn't got; none from a queue too
+    broken to read."""
+    try:
+        return [
+            dict(entry) for entry in record["prompt_queue"]
+            if entry["wait"] == wait["id"] and entry["state"] == "queued"
+        ]
+    except Exception:
+        return []
 
 
 def _clear_delivery_flags(record: dict) -> None:
@@ -2130,12 +2144,12 @@ def _checks_work(wait: dict) -> None:
     wait.update(transient_since=None, transient_logged=False)
 
 
-def _rearm(wait: dict, now: datetime) -> None:
+def _rearm(record: dict, wait: dict, now: datetime) -> None:
     """Back from check errors to what failed: its checks, or its verification.
     A quarantined wait goes back to what it was; if its record still raises, it
     is quarantined again."""
     if wait["retry_as"] == "internal":
-        _unquarantine(wait, now)
+        _unquarantine(record, wait, now)
         _touch(wait)
         return
     if wait["retry_as"] == "verify":
@@ -2147,15 +2161,20 @@ def _rearm(wait: dict, now: datetime) -> None:
     _touch(wait)
 
 
-def _unquarantine(wait: dict, now: datetime) -> None:
+def _unquarantine(record: dict, wait: dict, now: datetime) -> None:
     before = wait.pop("quarantined", None) or {"state": "waiting"}
     wait.update(
         state=before["state"], reason=before.get("reason"), on_me=bool(before.get("on_me")),
         verify_pending=bool(before.get("verify_pending")), retry_as=before.get("retry_as"),
         errors=0,
     )
-    if wait["state"] == "acting" and not wait["verify_pending"]:
-        # The quarantine cancelled its prompt: whatever ran is mine to look at.
+    # A prompt the agent hasn't got goes out as it would have.
+    unsent = before.get("prompts") or []
+    if unsent:
+        record["prompt_queue"] += [{**entry, "queued_at": _iso(now)} for entry in unsent]
+    if wait["state"] == "acting" and not wait["verify_pending"] and not unsent:
+        # The quarantine cancelled its prompt after the agent got it: whatever
+        # ran is mine to look at.
         wait.update(state="review", reason=REASON_REVIEW)
     elif wait["state"] == "acting":
         wait["verify_claim_until"] = None
@@ -2389,7 +2408,7 @@ def _apply_retry(state: dict, record: dict, wait: dict, job: dict, now: datetime
                 else:
                     _log(record, now, wait, event["text"])
         return
-    _rearm(wait, now)
+    _rearm(record, wait, now)
     _log(record, now, wait, f"Checks work again: {wait['label']}")
     _apply_result(state, record, wait, job, now)
 
@@ -4018,7 +4037,7 @@ def cmd_retry(args: argparse.Namespace) -> dict:
         wait = _target_wait(record, args.wait)
         if wait["state"] != "needs_attention" or not wait.get("retry_as"):
             raise BadInput(f"{args.wait} did not stop on failed checks or an internal error")
-        _rearm(wait, now)
+        _rearm(record, wait, now)
         _log(record, now, wait, f"Retry: {wait['label']}")
         return {}
 
