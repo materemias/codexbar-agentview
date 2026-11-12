@@ -449,7 +449,8 @@ function everyChoices(words: string[]) {
 	const rest = text ? text.split(" ") : [];
 	const given = { span, times };
 	if (rest.length === 0) return EVERY_ENDS.filter((item) => item.end === undefined || given[item.end] === undefined);
-	if (rest.length === 1 && rest[0] === "for" && span === undefined) return FOR_CHOICES;
+	// Only a span the repeat takes: after `every 1d`, `for 1d` would end it by the first run.
+	if (rest.length === 1 && rest[0] === "for" && span === undefined) return FOR_CHOICES.filter((item) => !repeatError(words[0], item.label));
 	if (rest.length === 1 && /^\d+$/.test(rest[0]) && times === undefined) return [TIMES];
 	if (rest[0] !== "until") return [];
 	if (rest.length === 1) return UNTIL_CHOICES;
@@ -817,7 +818,8 @@ const ENDS = [
 		label: "For a while",
 		description: "then it ends: 1d, 1w",
 		async ask(c, _pr, every) {
-			const typed = await ask(c, "For how long? 1d, 1w", "1d");
+			// The prefill is one the repeat takes: 1d would end a daily repeat by its first run.
+			const typed = await ask(c, "For how long? 1d, 1w", FOR_CHOICES.find((item) => !repeatError(every, item.label))?.label ?? "");
 			if (!typed) return undefined;
 			const span = durationOf(typed);
 			if (!DURATION.test(span)) throw new Error(`For a while takes a duration such as 1d, not ${typed}.`);
