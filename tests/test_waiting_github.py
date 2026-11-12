@@ -1118,6 +1118,8 @@ class ErrorsTest(PollTestCase):
             "GraphQL: Something went wrong while executing your query. This may be the result of a timeout",
             "gh: You've exceeded a secondary rate limit; don't retry yet (HTTP 403)",
             "GitHub's servers timed out for 'acme/widget'",
+            'Get "https://api.github.com/user": read tcp 10.0.0.2:51234->140.82.121.6:443: i/o timeout',
+            '{"documentation_url":"https://docs.github.com/rest","message":"timeout"}',
         ):
             with self.subTest(text=text):
                 self.assertTrue(github.is_transient(text))
@@ -1132,6 +1134,7 @@ class ErrorsTest(PollTestCase):
             # Where it failed says nothing about why.
             "gh: Not Found (HTTP 404) (https://api.github.com/repos/acme/timeout-tool/releases)",
             "GraphQL: Could not resolve to a Repository with the name 'acme/temporary-eof'. (repository)",
+            "release not found in acme/eof-parser",
             "",
         ):
             with self.subTest(text=text):

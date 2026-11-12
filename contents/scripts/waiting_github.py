@@ -79,9 +79,10 @@ TRANSIENT = re.compile(
     r"Something went wrong",
     re.IGNORECASE,
 )
-# A quoted repo or path and a URL in an error say where it happened, not what: a
-# 404 on o/temporary-fix is not a network failure. Other quotes stay: they may be prose.
-_NAMES = re.compile(r"https?://\S+|(['\"])[\w.-]+/[\w./-]+\1")
+# A repo or path and a URL in an error say where it happened, not what: a 404 on
+# o/temporary-fix is not a network failure. A URL ends at a quote, bracket or
+# comma, so a message glued after it in compact JSON stays.
+_NAMES = re.compile(r"https?://[^\s\"'<>()\[\]{},]+|[\w.-]+/[\w./-]+")
 RATE_LIMITED = re.compile(r"HTTP 429|rate limit", re.IGNORECASE)
 # How many keys memo.seen keeps, or every key a poll met when it met more.
 SEEN_KEPT = 500
