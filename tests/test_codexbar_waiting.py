@@ -4628,6 +4628,11 @@ class HealthTests(Case):
         health = self.tick()["view"]["health"]
         self.assertEqual((health["error"], health["error_since"]), (None, None))
 
+    def test_a_mistyped_now_is_no_failed_tick(self) -> None:
+        self.tick()
+        self.run_cli("tick", "--now", "yesterday", expect=2)
+        self.assertIsNone(self.view_file()["health"]["error"])
+
     def test_only_a_tick_sets_the_error(self) -> None:
         self.add("--kind", "later", session=OTHER)
         state = self.state()

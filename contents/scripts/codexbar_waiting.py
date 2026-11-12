@@ -4284,6 +4284,8 @@ def cmd_ack(args: argparse.Namespace) -> dict:
 
 
 def cmd_tick(args: argparse.Namespace) -> dict:
+    if args.now:
+        _parse_time(args.now)  # a mistyped `--now` is the caller's error, not a failed tick
     try:
         return _tick(args)
     except Exception as error:
