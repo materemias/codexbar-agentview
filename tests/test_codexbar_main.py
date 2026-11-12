@@ -974,7 +974,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 } else if (fixture.stage === 2) {
                     if (app.waitingOnMeCount === 0) return
                     var shown = find(fixture.compact, "waitingOnMeCount")[0]
-                    check(shown.visible && shown.children[1].text === "2", "switch on: panel shows on_me")
+                    check(shown.visible && find(shown, "waitingOnMeCountLabel")[0].text === "2", "switch on: panel shows on_me")
                     var marks = markers()
                     var line = "● ⏳ PR#7 · Q&A <b>on</b> head · 2 days"
                     check(marks[line] === "●", "on_me session gets ●")
@@ -1043,6 +1043,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 if (app.waitingOnMeCount === 0) return
                 var expected = ''' + json.dumps(warning) + '''
                 var count = find(fixture.compact, "waitingOnMeCount")[0]
+                var countText = find(count, "waitingOnMeCountLabel")[0]
                 var label = find(fixture.popup, "waitingWarning")[0]
                 var row = null
                 ;(function walk(item) {
@@ -1051,7 +1052,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 })(fixture.popup)
                 check(app.waitingWarning === expected, "failed tick read from the file: " + app.waitingWarning)
                 check(label.visible && label.text === expected, "Agents section shows the warning")
-                check(count.visible && count.children[1].text === "2?" && count.opacity < 1,
+                check(count.visible && countText.text === "2?" && count.opacity < 1,
                     "stale panel count reads as uncertain")
                 check(row.waitingHoverText === "● PR#7 merged\\n" + expected + "\\n/w/back"
                     + "\\nclick to focus · peek button or Space for recent messages",
@@ -1063,11 +1064,11 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                                  error_since: null, agents_stale_since: null }
                 app.applyWaitingView(fresh)
                 check(app.waitingWarning === "" && !label.visible, "a successful tick clears the warning")
-                check(count.children[1].text === "2" && count.opacity === 1, "fresh count is plain")
+                check(countText.text === "2" && count.opacity === 1, "fresh count is plain")
                 check(row.waitingHoverText.indexOf("⚠") < 0, "fresh row tooltip has no warning")
                 check(app.toolTipSubText.indexOf("⚠") < 0, "fresh panel tooltip has no warning")
                 app.applyWaitingView({ health: { checked_at: null, error: "tern: no daemon" } })
-                check(count.visible && count.children[1].text === "0?",
+                check(count.visible && countText.text === "0?",
                     "a failed first tick still marks the panel at zero")
                 fresh.counts.on_me = 0
                 app.applyWaitingView(fresh)

@@ -429,6 +429,7 @@ Item {
                 Layout.alignment: Qt.AlignVCenter
             }
             PC3.Label {
+                objectName: "waitingOnMeCountLabel"
                 text: root.waitingOnMeCount + (waitingOnMe.uncertain ? "?" : "")
                 color: Kirigami.Theme.neutralTextColor
                 font.pixelSize: Math.max(6, Math.floor(compact.ringSize * 0.42 * waitingOnMe._scale))
