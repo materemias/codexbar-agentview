@@ -703,7 +703,14 @@ function detailsPanel(card, close?) {
 			...prs.filter((pr) => pr.source !== "mentioned").map(prLine),
 			mentioned.length > 0 && muted("Mentioned"),
 			...mentioned.map((pr) => muted(prLine(pr))),
-			...waits.map((wait) => `${wait.id}  ${wait.mark ?? ""}${wait.summary || wait.label} (${waitFacts(wait)})`),
+			...waits.map((wait) => {
+				// The wait's own words first, then how it's watched, unless one says the other.
+				const label = wait.label ?? "", how = wait.summary ?? "";
+				const [l, h] = [label.toLowerCase(), how.toLowerCase()];
+				const words = !label || (how && h.includes(l)) ? how : label;
+				const tail = words === how || l.includes(h) ? "" : `  ${muted(how.length > 60 ? `${how.slice(0, 59)}…` : how)}`;
+				return `${wait.id}  ${wait.mark ?? ""}${words}${tail} (${waitFacts(wait)})`;
+			}),
 			close && `${muted("Closing:")} ${theme.fg(close.verdict === "park" ? "warning" : "muted", close.text)}`,
 			history.length > 0 && muted("Since set aside"),
 			...history.map(({ at, text }) => `${when(at)}  ${text}`),

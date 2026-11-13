@@ -854,16 +854,28 @@ local function clockTime(t: number, now: number): string
 	return MONTHS[d.month] .. " " .. d.day .. ", " .. hhmm
 end
 
--- Each wait with its mark; a fulfilled one in green. A chain's later steps are
--- muted: nothing watches them yet.
+-- Each wait with its mark: its label (what it waits for, in words) first, then
+-- how it is watched (`summary`: a command, a time), muted, unless one already
+-- says the other ("Merged" in "PR#20 merged"). A fulfilled one in green. A
+-- chain's later steps are muted: nothing watches them yet.
 -- `stoppable` adds the × that ends that wait alone.
 local function waitRow(w: any, now: number, stoppable: boolean): Node
-	local text = tostring(val(w.summary) or val(w.label) or w.kind)
+	local label, how = tostring(val(w.label) or ""), tostring(val(w.summary) or "")
+	local l, h = string.lower(label), string.lower(how)
+	if label == "" or (how ~= "" and string.find(h, l, 1, true)) then
+		label, how = how, ""
+	elseif how ~= "" and string.find(l, h, 1, true) then
+		how = ""
+	end
+	local text = if label ~= "" then label else tostring(w.kind)
 	local spans: { Span | string } = {}
 	if w.state == "pending" then
 		table.insert(spans, ui.span("Then: " .. text, "muted"))
 	else
 		table.insert(spans, ui.span(tostring(val(w.mark) or "") .. text, if w.outcome == "fulfilled" then "success" else nil))
+	end
+	if how ~= "" then
+		table.insert(spans, ui.span("  " .. clipped(how, 60), "muted"))
 	end
 	if type(w.progress) == "string" and w.progress ~= "" then
 		table.insert(spans, ui.span("  " .. w.progress, "info")) -- the mark is 🔧 already

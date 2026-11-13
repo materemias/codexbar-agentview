@@ -28,6 +28,7 @@
 - The Tern dashboard's buttons no longer show their keys; the footer lists them.
 - Done is split in two, so it no longer ends every wait when nothing is on you: **Seen** (`Delete`, `/wait seen`) closes only what came to you and is offered only then, and **Stop** ends watched waits, one with `×` on the card or `/wait stop w1`, all with `Stop N waits…` and a second press or `/wait stop all`. Stopping a wait never starts the step chained after it; the steps behind it stop too. The card lists what's on you under **On you**, with the start of the agent's report for "ran, take a look", and "Since set aside" records each `Seen:` and `Stopped:`. The agent tool's `done` action is now `stop`.
 - A session is `park only` while closing it would kill work: a command the agent started still runs (`park only: work runs in this session`) or the agent is mid-turn on your request (`park only: the agent is working`). The agent can park its own session through the `waitingfor` tool when you ask it to set the session aside.
+- The session card and `/wait list` name each wait in its own words first ("Archive sessions indexed in cass"), with the command or time that watches it after it, muted, instead of only `bash -c '…'` or `until Nov 14 08:00`.
 
 ### Fixes
 
