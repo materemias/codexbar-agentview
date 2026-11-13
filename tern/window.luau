@@ -651,7 +651,11 @@ local ui = tern.ui
 local seenAsked: { [number]: boolean } = {}
 -- An open card's refresh state by canvas pane: what it last read and when, and
 -- the branch, which only the full read (`card` without `--cached`) brings.
-type CardLive = { sig: string, cachedAt: number, fullAt: number, busy: boolean, branch: any }
+-- `shown`, the card last drawn, redraws it when Stop waits… disarms; `armedAt`
+-- is when Stop waits… was pressed once (os.clock()): a second press within
+-- CARD_STOP_ARM_S stops them.
+type CardLive = { sig: string, cachedAt: number, fullAt: number, busy: boolean, branch: any, shown: any?, armedAt: number? }
+local CARD_STOP_ARM_S = 4
 local cardLive: { [number]: CardLive } = {}
 
 -- JSON null (`tern.json.null`, truthy) as nil, as in the host half.
@@ -802,7 +806,7 @@ local function cardBanner(r: any, now: number): Node?
 	local head, detail, tail = "⏰ Overdue", val(wait.label), nil
 	if r.outcome == "fulfilled" then
 		local at = epoch(wait.fired_at)
-		-- "Done" would read as the button: the banner just says what came.
+		-- "Fulfilled" alone, never a verb a button uses: the banner just says what came.
 		head = if #open > 0 then "✅" else "✅ Fulfilled"
 		detail, tail = val(wait.fired_text), if at then age(now - at) .. " ago" else nil
 	elseif r.outcome == "attention" then
@@ -852,7 +856,8 @@ end
 
 -- Each wait with its mark; a fulfilled one in green. A chain's later steps are
 -- muted: nothing watches them yet.
-local function waitRow(w: any, now: number): Node
+-- `stoppable` adds the × that ends that wait alone.
+local function waitRow(w: any, now: number, stoppable: boolean): Node
 	local text = tostring(val(w.summary) or val(w.label) or w.kind)
 	local spans: { Span | string } = {}
 	if w.state == "pending" then
@@ -870,6 +875,13 @@ local function waitRow(w: any, now: number): Node
 		table.insert(spans, ui.span("  due", "warning"))
 	elseif due then
 		table.insert(spans, ui.span("  due in " .. age(due - now), "muted"))
+	end
+	if stoppable and w.state ~= "pending" and type(w.id) == "string" and w.id ~= "" then
+		local label = tostring(val(w.label) or text)
+		return ui.row({
+			ui.text(spans),
+			ui.button("×", { key = "stop-" .. w.id, size = "sm", variant = "quiet", title = "Stop waiting for " .. label, actions = { click = "card_stop:" .. w.id } }),
+		})
 	end
 	return ui.text(spans)
 end
@@ -914,9 +926,23 @@ local function cardView(cx: WindowCx, pane: number, r: any, reading: boolean): N
 		local text = if unchecked then "park only: nothing checks waits" else tostring(val(close.text) or "")
 		table.insert(kids, ui.text({ ui.span(text, if verdict == "safe" then "success" elseif verdict == "park" then "warning" else "muted") }))
 	end
-	local banner = cardBanner(r, now)
-	if banner then
-		table.insert(kids, banner)
+	-- What is on the user, with what came: the fired text or reason, and for a
+	-- review the agent's last report. Shown, it replaces the outcome banner.
+	local onYou: { Node } = {}
+	for _, o in (if type(r.on_you) == "table" then r.on_you else {}) do
+		table.insert(onYou, ui.text({ ui.span(tostring(val(o.mark) or "") .. clipped(tostring(val(o.label) or ""), 80), "strong"), ui.span("  " .. clipped(tostring(val(o.text) or ""), 160), "warning") }))
+		local report = val(o.report)
+		if type(report) == "string" and report ~= "" then
+			table.insert(onYou, ui.text({ ui.span(clipped(report, 400), "muted") }))
+		end
+	end
+	if #onYou > 0 then
+		table.insert(kids, ui.node("row", { role = "codexbar.banner", tone = "warning" }, { cardSection("On you", onYou) }))
+	else
+		local banner = cardBanner(r, now)
+		if banner then
+			table.insert(kids, banner)
+		end
 	end
 	local function section(head: string, rows: { Node })
 		if #rows > 0 then
@@ -948,8 +974,10 @@ local function cardView(cx: WindowCx, pane: number, r: any, reading: boolean): N
 	section("Pull requests", prs)
 	section("Mentioned", mentioned)
 	local waits: { Node } = {}
+	local entry = waitingEntry(pane) -- the dock's test: the × acts on the pane's entry
+	local stoppable = entry ~= nil and entry.session == r.session_id and r.has_record ~= false
 	for _, w in list("waits") do
-		table.insert(waits, waitRow(w, now))
+		table.insert(waits, waitRow(w, now, stoppable))
 	end
 	section("Waiting for", waits)
 	local since: { Node } = {}
@@ -982,35 +1010,52 @@ local function cardTitle(cx: WindowCx, pane: number, r: any): string
 	return clipped(if type(title) == "string" and title ~= "" then title else "Session", 70)
 end
 
--- Done, Retry and Snooze 1d need waits of a record; Retry one whose checks kept
--- failing, Snooze 1d one that snoozing moves. They act on the pane's entry, so it
--- has to be the card's session: a link can name one the agents scan has not
--- mapped to the pane yet.
-local function cardDock(pane: number, r: any): Node
+-- Seen, Retry, Snooze 1d and Stop waits… need waits of a record; Seen only
+-- with something on the user, Retry one whose checks kept failing, Snooze 1d
+-- one that snoozing moves. They act on the pane's entry, so it has to be the
+-- card's session: a link can name one the agents scan has not mapped to the
+-- pane yet. `armed`: Stop waits… was pressed once; the next press stops them.
+local function cardDock(pane: number, r: any, armed: boolean): Node
 	local function act(text: string, name: string, variant: string?): Node
 		return ui.button(text, { key = name, size = "sm", variant = variant, actions = { click = name } })
 	end
 	local kids: { Node } = {}
 	local entry = waitingEntry(pane)
 	if entry and entry.session == r.session_id and r.has_record ~= false and type(r.waits) == "table" and #r.waits > 0 then
-		table.insert(kids, act("Done", "card_done", "primary"))
+		if type(r.on_you) == "table" and #r.on_you > 0 then
+			table.insert(kids, act("Seen", "card_seen", "primary"))
+		end
 		if entry.retry then
 			table.insert(kids, act("Retry", "card_retry"))
 		end
 		if entry.wait then
 			table.insert(kids, act("Snooze 1d", "card_snooze"))
 		end
+		local n = tonumber(val(r.stoppable)) or 0
+		if n > 0 then
+			local what = n .. (if n == 1 then " wait" else " waits")
+			table.insert(kids, act(if armed then "Press again to stop " .. what else "Stop " .. what .. "…", "card_stop_all", "quiet"))
+		end
 	end
 	table.insert(kids, act("Close", "card_close", "quiet"))
 	return ui.row(kids)
 end
 
+local function cardArmed(canvas: number): boolean
+	local live = cardLive[canvas]
+	return live ~= nil and live.armedAt ~= nil and os.clock() - live.armedAt < CARD_STOP_ARM_S
+end
+
 -- Draws `card` into the open card `canvas` of `pane`.
 local function showCard(cx: WindowCx, canvas: number, pane: number, card: any, reading: boolean)
+	local live = cardLive[canvas]
+	if live then
+		live.shown = card
+	end
 	cx.canvas:set(canvas, {
 		title = cardTitle(cx, pane, card),
 		view = cardView(cx, pane, card, reading),
-		dock = cardDock(pane, card),
+		dock = cardDock(pane, card, cardArmed(canvas)),
 	})
 end
 
@@ -1038,10 +1083,11 @@ local function openCard(cx: WindowCx, pane: number, known: string?)
 	local canvas, err = cx.canvas:open({
 		title = cardTitle(cx, pane, shown),
 		view = cardView(cx, pane, shown, session ~= nil),
-		dock = cardDock(pane, shown),
+		dock = cardDock(pane, shown, false),
 		about = CARD_ABOUT .. pane .. (if session then " for session " .. session else "")
-			.. ". Done, when shown, ends what's on you, Retry, when shown, checks a failed wait again,"
-			.. " Snooze 1d, when shown, pushes the first due one by a day, Close only closes this card.",
+			.. ". Seen, when shown, closes what's on you, Retry, when shown, checks a failed wait again,"
+			.. " Snooze 1d, when shown, pushes the first due one by a day, Stop waits… ends every open wait"
+			.. " on a second press, × beside a wait ends that one, Close only closes this card.",
 		how = "beside",
 		target = pane,
 		focus = false,
@@ -1068,7 +1114,7 @@ local function openCard(cx: WindowCx, pane: number, known: string?)
 		showCard(cx2, canvas, pane, card, reading)
 	end
 	-- What opened it counts as the first refresh of both kinds.
-	cardLive[canvas] = { sig = cardSig(session, pane), cachedAt = os.time(), fullAt = os.time(), busy = false }
+	cardLive[canvas] = { sig = cardSig(session, pane), cachedAt = os.time(), fullAt = os.time(), busy = false, shown = record }
 	local function closed(cx2: WindowCx?): boolean
 		return not cx2 or cardOf(cx2, pane) ~= canvas
 	end
@@ -1239,8 +1285,36 @@ tern.on("canvas_action", function(ev: CanvasAction, cx: WindowCx): boolean?
 	if entry and entry.session ~= cardSession(ev.about) then
 		entry = nil
 	end
-	if entry and ev.act == "card_done" then
-		waitingSend("done", targetArgs("done", pane, entry.session))
+	local stopId = string.match(ev.act, "^card_stop:(.+)$")
+	if entry and stopId then -- one wait: the card stays for the rest
+		waitingSend("stop", targetArgs("stop", pane, entry.session, { "--wait", stopId }))
+		return true
+	end
+	if entry and ev.act == "card_stop_all" then
+		local canvas = ev.pane
+		if not cardArmed(canvas) then
+			-- A pane record's card is the view's; a session card taken over after a
+			-- reload has nothing drawn to relabel until its next read: the press waits for it.
+			local live = cardLive[canvas] or { sig = "", cachedAt = os.time(), fullAt = os.time(), busy = false }
+			cardLive[canvas] = live
+			local function card(): any
+				return live.shown or (if cardSession(ev.about) then nil else waitingRecord(pane, true))
+			end
+			if card() then
+				live.armedAt = os.clock()
+				showCard(cx, canvas, pane, card(), false)
+				tern.timer(CARD_STOP_ARM_S * 1000 + 100, function(cx2)
+					local shown = card()
+					if cx2 and cardLive[canvas] == live and shown and cardOf(cx2, pane) == canvas then
+						showCard(cx2, canvas, pane, shown, false)
+					end
+				end)
+			end
+			return true
+		end
+		waitingSend("stop", targetArgs("stop", pane, entry.session, { "--all" }))
+	elseif entry and ev.act == "card_seen" then
+		waitingSend("seen", targetArgs("mark-seen", pane, entry.session))
 	elseif entry and ev.act == "card_retry" and entry.retry then
 		waitingSend("retry", targetArgs("retry", pane, entry.session, { "--wait", entry.retry }))
 	elseif entry and ev.act == "card_snooze" and entry.wait then
@@ -1426,7 +1500,7 @@ end
 -- A 5 means someone else has the session, so the resume is done; the CLI puts
 -- the wait on me if it still doesn't run within its grace. Any other refusal,
 -- 11 included, fails the resume with its reason, which puts the wait on me now.
--- Done or Snooze may take the resume back while the helper runs: then nothing
+-- Seen, Stop or Snooze may take the resume back while the helper runs: then nothing
 -- opens, and with the action gone nothing acks it either.
 --
 -- While the helper runs, `waitingResumes` marks the resume with when it began

@@ -411,6 +411,7 @@ type Block = {
 	filter: string,
 	launched: { [string]: number }, -- row key -> os.clock() of its launch: the wall clock may be set back
 	busy: string?,
+	stopArmed: { key: string, at: number }?, -- the Waiting row whose Stop waits the next press within 4 s confirms
 	closed: boolean?,
 }
 
@@ -3297,11 +3298,15 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	local rowKey = waitKey(r)
 	local live = waitLive(r)
 	local buttons: { Node } = {}
+	local onYou = if type(r.on_you) == "table" and #r.on_you > 0 then r.on_you else nil
+	if onYou then
+		table.insert(buttons, button("Seen", "wait_seen", { variant = "primary", title = "Close what came: " .. oneLine(onYou[1].label) .. (if #onYou > 1 then " and " .. (#onYou - 1) .. " more" else "") }))
+	end
 	if live then
-		table.insert(buttons, button("Open", "wait_open", { variant = "primary" }))
+		table.insert(buttons, button("Open", "wait_open", { variant = if onYou then nil else "primary" }))
 	else
 		local busy = b.busy == rowKey or (b.launched[rowKey] ~= nil and os.clock() - b.launched[rowKey] < 60)
-		table.insert(buttons, button("Resume", "wait_open", { variant = "primary", busy = busy }))
+		table.insert(buttons, button("Resume", "wait_open", { variant = if onYou then nil else "primary", busy = busy }))
 	end
 	local due, retry = firstDue(r)
 	if retry then -- any of the row's waits, not only the one its headline tells: each is a dead end without it
@@ -3310,7 +3315,12 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	table.insert(buttons, button("Snooze 1d", "wait_snooze", {
 		disabled = if due then false else "Nothing to snooze",
 	}))
-	table.insert(buttons, button("Done", "wait_done"))
+	local stoppable = tonumber(val(r.stoppable)) or 0
+	if stoppable > 0 then
+		local armed = b.stopArmed and b.stopArmed.key == rowKey and os.clock() - b.stopArmed.at < 4
+		local n = stoppable .. (if stoppable == 1 then " wait" else " waits")
+		table.insert(buttons, button(if armed then "Press again to stop " .. n else "Stop " .. n .. "…", "wait_stop", { variant = "quiet" }))
+	end
 	if cardPane(r, true) then
 		table.insert(buttons, button("Card", "wait_card"))
 	end
@@ -3477,8 +3487,10 @@ local function dockView(b: Block, now: number): Node
 				table.insert(hints, key("+"))
 				table.insert(hints, ui.span("\u{a0}1\u{a0}day   ", "dim"))
 			end
-			table.insert(hints, key("del"))
-			table.insert(hints, ui.span("\u{a0}done   ", "dim"))
+			if row and row.waiting and type(row.record.on_you) == "table" and #row.record.on_you > 0 then
+				table.insert(hints, key("del"))
+				table.insert(hints, ui.span("\u{a0}seen   ", "dim"))
+			end
 			table.insert(hints, key("f2"))
 			table.insert(hints, ui.span("\u{a0}manual\u{a0}wait   ", "dim"))
 			if row and row.waiting and select(2, firstDue(row.record)) then
@@ -3731,8 +3743,24 @@ end
 local function waitingAct(b: Block, name: string, r: any)
 	if name == "wait_open" then
 		waitingOpen(b, r)
-	elseif name == "wait_done" then
-		waitingRun(b.cx, "done", waitArgs("done", r))
+	elseif name == "wait_seen" then
+		if type(r.on_you) == "table" and #r.on_you > 0 then
+			waitingRun(b.cx, "seen", waitArgs("mark-seen", r))
+		end
+	elseif name == "wait_stop" then
+		local key = waitKey(r)
+		if b.stopArmed and b.stopArmed.key == key and os.clock() - b.stopArmed.at < 4 then
+			b.stopArmed = nil
+			waitingRun(b.cx, "stop", waitArgs("stop", r, { "--all" }))
+		else
+			b.stopArmed = { key = key, at = os.clock() }
+			tern.timer(4000, function()
+				if not b.closed then
+					b.cx:render()
+				end
+			end)
+		end
+		b.cx:render()
 	elseif name == "wait_snooze" then
 		local wait = firstDue(r)
 		if wait then
@@ -3947,7 +3975,7 @@ tern.block.define("dashboard", {
 		elseif name == "delete" and b.tab == "history" then
 			act(b, "dismiss")
 		elseif name == "delete" and b.tab == "waiting" then
-			act(b, "wait_done")
+			act(b, "wait_seen")
 		elseif k.text == "+" and b.tab == "waiting" and b.filter == "" then
 			act(b, "wait_snooze")
 		elseif name == "f2" and b.tab == "waiting" then
