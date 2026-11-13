@@ -87,7 +87,7 @@ for it.
 | KDE Plasma 6 with KWin | Required | | The widget |
 | [Tern](https://stencil.so/tern) 0.9.18 or later | | Required | The extension |
 | Python 3.10+ | Required | Required | The shared helpers |
-| [`codexbar`](https://github.com/steipete/CodexBar) CLI | Required | Required | Usage. Agents and History work without it; with Meridian, so do Claude and Codex seats |
+| [`codexbar`](https://github.com/steipete/CodexBar) CLI | Optional | Optional | Usage, which you can turn off. Agents, History and Waiting work without it; with Meridian, so do Claude and Codex seats |
 | [Meridian](https://github.com/rynfar/meridian) | Optional | Optional | Claude accounts and ChatGPT seats read from its usage poll |
 | CMake 3.21+, C++17 compiler, Qt 6 QML headers | Required | | Building the widget (Arch: `base-devel cmake qt6-declarative`) |
 | `qdbus6` | Optional | | Click to focus and desktop switching |
@@ -234,6 +234,13 @@ System Settings → Shortcuts → KWin, or Tern never sees the key.
 - **Warnings.** A desktop alert at 80% and 95%, or earlier when the pace says
   the window runs out before it resets, once a quarter of the window has
   passed. Alerts from one refresh arrive as one notification. Plasma only.
+- **Optional.** Usage tracking is on by default. Turn it off when you don't
+  have the `codexbar` CLI or track usage elsewhere: Plasma's **Track usage**
+  switch (Settings → Backend), or Tern's **Usage tracking** (Settings →
+  General). Off, nothing fetches usage and
+  no meters, cards or alerts show; Agents, History and Waiting work as before.
+  When it's on but the CLI is missing, the usage area says what to install
+  and offers to turn tracking off.
 
 ### Agents
 
