@@ -357,7 +357,8 @@ local function summary(): any
 end
 
 -- The line the host publishes while the waits may be out of date (a failed or
--- partial check, no check for 15 minutes, a stale session scan): { text, tone }.
+-- partial check, no check for 15 minutes, a stale session scan): { text, tone },
+-- with `unchecked` when nothing checks the waits.
 local function waitingHealth(): any
 	local s = summary()
 	local w = if s then s.waiting else nil
@@ -904,6 +905,14 @@ local function cardView(cx: WindowCx, pane: number, r: any, reading: boolean): N
 	local health = waitingHealth()
 	if health then
 		table.insert(kids, ui.text({ ui.span(health.text, health.tone) }))
+	end
+	-- Whether closing it is safe (the card's `close`); nothing reopens it while nothing checks the waits.
+	local close = r.close
+	if type(close) == "table" and type(close.verdict) == "string" and close.verdict ~= "" then
+		local unchecked = health and health.unchecked == true
+		local verdict = if unchecked then "park" else close.verdict
+		local text = if unchecked then "park only: nothing checks waits" else tostring(val(close.text) or "")
+		table.insert(kids, ui.text({ ui.span(text, if verdict == "safe" then "success" elseif verdict == "park" then "warning" else "muted") }))
 	end
 	local banner = cardBanner(r, now)
 	if banner then

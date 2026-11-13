@@ -1437,9 +1437,9 @@ local function publishSummary()
 		if err ~= "" and checked and not stale and not store.waitingError and val(health.error_kind) == "partial" then
 			line = { text = "⚠️ Last check: " .. err .. (if scan then " · session scan stale since " .. absoluteTime(scan, now) else ""), tone = "warning" }
 		elseif err ~= "" then
-			line = { text = "⚠️ Waits not checked since " .. since .. ": " .. err, tone = "error" }
+			line = { text = "⚠️ Waits not checked since " .. since .. ": " .. err, tone = "error", unchecked = true }
 		elseif stale then
-			line = { text = "⚠️ Waits not checked since " .. since, tone = "warning" }
+			line = { text = "⚠️ Waits not checked since " .. since, tone = "warning", unchecked = true }
 		elseif scan then
 			line = { text = "⚠️ Session scan stale since " .. absoluteTime(scan, now), tone = "warning" }
 		end
@@ -2776,12 +2776,27 @@ local function waitSummary(r: any, rest: boolean?): string
 	return if own ~= "" then "" else oneLine(r.status)
 end
 
+-- Whether closing the row's session or pane is safe (the view's `close`): its
+-- verdict and text, nil without one (no open waits, or an older CLI). While the
+-- health line says nothing checks the waits, nothing would reopen it: park.
+local function closeVerdict(r: any): (string?, string)
+	local c = val(r.close)
+	if type(c) ~= "table" or str(c.verdict) == "" then
+		return nil, ""
+	end
+	if store.waitingHealth and store.waitingHealth.unchecked then
+		return "park", "park only: nothing checks waits"
+	end
+	return str(c.verdict), oneLine(c.text)
+end
+
 local function waitMatches(r: any, q: string, state: string): boolean
 	local words = queryWords(q)
 	if #words == 0 then
 		return true
 	end
-	local fields = { waitTitle(r), oneLine(r.note), oneLine(r.project), waitSummary(r), oneLine(r.waiting_for), oneLine(r.headline), state }
+	local verdict, closeText = closeVerdict(r)
+	local fields = { waitTitle(r), oneLine(r.note), oneLine(r.project), waitSummary(r), oneLine(r.waiting_for), oneLine(r.headline), state, verdict or "", closeText }
 	for _, w in words do
 		local ok = false
 		for _, text in fields do
@@ -2804,7 +2819,8 @@ end
 -- view, query and pane states.
 local function waitingGroups(q: string): { { ball: any, rows: { any }, states: { [any]: string } } }
 	local memo = store.waitingMemo
-	if memo and memo.view == store.waiting and memo.q == q and memo.panes == store.paneStates then
+	local unchecked = store.waitingHealth ~= nil and store.waitingHealth.unchecked == true
+	if memo and memo.view == store.waiting and memo.q == q and memo.panes == store.paneStates and memo.unchecked == unchecked then
 		return memo.out
 	end
 	-- closed: the session's agent stopped, or a shell row's pane is gone from
@@ -2855,7 +2871,7 @@ local function waitingGroups(q: string): { { ball: any, rows: { any }, states: {
 			table.insert(out, { ball = ball, rows = rows, states = states })
 		end
 	end
-	store.waitingMemo = { view = store.waiting, q = q, panes = store.paneStates, out = out }
+	store.waitingMemo = { view = store.waiting, q = q, panes = store.paneStates, unchecked = unchecked, out = out }
 	return out
 end
 
@@ -3166,6 +3182,8 @@ do
 	}
 	-- waitingGroups' states; open and elsewhere stay plain.
 	local STATE_TONE = { running = "success", parked = "info", closed = "muted" }
+	-- The close verdict's mark, left of the state.
+	local CLOSE_MARK = { safe = { "✓", "success" }, manual = { "↺", "muted" }, park = { "⏸", "warning" } }
 
 	-- The row, then what happened under it, in the outcome's tone.
 	addWaitingRow = function(kids, r, now, q, state)
@@ -3201,6 +3219,8 @@ do
 		local detail = waitSummary(r, headline ~= "")
 		-- Where the session is, left of the time: as wide as `elsewhere` and a space, so the times line up.
 		local value: { Span } = {}
+		local mark = CLOSE_MARK[closeVerdict(r) or ""]
+		table.insert(value, ui.span((if mark then mark[1] else " ") .. " ", if mark then mark[2] else nil))
 		for _, s in highlighted(pad(state, 10), q) do
 			table.insert(value, if type(s) == "string" then ui.span(s, STATE_TONE[state]) else s)
 		end
@@ -3228,30 +3248,33 @@ local function detailLines(key: string, head: string, lines: { Node }): Node
 	return withp(ui.lines(kids), { key = key })
 end
 
--- The same colors as the session card's badges in the window half.
-local PR_STATE_TOKEN = { open = "success", draft = "muted", merged = "info", closed = "error" }
+local prNodes: (r: any, mentioned: boolean) -> { Node }
+do
+	-- The same colors as the session card's badges in the window half.
+	local PR_STATE_TOKEN = { open = "success", draft = "muted", merged = "info", closed = "error" }
 
--- The session's PRs as links, in the CLI's order: the ones it waits on or created, each saying
--- which, or with `mentioned` the ones it only mentions, muted.
-local function prNodes(r: any, mentioned: boolean): { Node }
-	local out: { Node } = {}
-	for _, pr in val(r.prs) or {} do
-		if (pr.source == "mentioned") ~= mentioned then
-			continue
+	-- The session's PRs as links, in the CLI's order: the ones it waits on or created, each saying
+	-- which, or with `mentioned` the ones it only mentions, muted.
+	prNodes = function(r, mentioned)
+		local out: { Node } = {}
+		for _, pr in val(r.prs) or {} do
+			if (pr.source == "mentioned") ~= mentioned then
+				continue
+			end
+			local text = "PR#" .. str(pr.number) .. " " .. clip(oneLine(val(pr.title) or pr.repo), 60)
+			local spans: { any } = { ui.link(text, str(pr.url), if mentioned then "muted" else nil) }
+			local source = if pr.source == "wait" then "waiting on" elseif pr.source == "created" then "created" else ""
+			if source ~= "" then
+				table.insert(spans, ui.span("  " .. source, "dim"))
+			end
+			local state = str(pr.state)
+			if state ~= "" then
+				table.insert(spans, ui.span("  " .. state, PR_STATE_TOKEN[state] or "muted"))
+			end
+			table.insert(out, withp(ui.text(spans), { key = "pr-" .. nodeKey(str(pr.repo)) .. "-" .. str(pr.number), role = "codexbar.pr" }))
 		end
-		local text = "PR#" .. str(pr.number) .. " " .. clip(oneLine(val(pr.title) or pr.repo), 60)
-		local spans: { any } = { ui.link(text, str(pr.url), if mentioned then "muted" else nil) }
-		local source = if pr.source == "wait" then "waiting on" elseif pr.source == "created" then "created" else ""
-		if source ~= "" then
-			table.insert(spans, ui.span("  " .. source, "dim"))
-		end
-		local state = str(pr.state)
-		if state ~= "" then
-			table.insert(spans, ui.span("  " .. state, PR_STATE_TOKEN[state] or "muted"))
-		end
-		table.insert(out, withp(ui.text(spans), { key = "pr-" .. nodeKey(str(pr.repo)) .. "-" .. str(pr.number), role = "codexbar.pr" }))
+		return out
 	end
-	return out
 end
 
 -- The selected row: my sentence and the buttons; Space adds the rest of the record.
@@ -3260,6 +3283,10 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	local note = oneLine(r.note)
 	if note ~= "" then
 		table.insert(kids, withp(ui.text({ ui.span(note, "strong") }), { key = "note" }))
+	end
+	local verdict, closeText = closeVerdict(r)
+	if verdict then
+		table.insert(kids, withp(ui.text({ ui.span(closeText, if verdict == "safe" then "success" elseif verdict == "park" then "warning" else "muted") }), { key = "close", role = "codexbar.close" }))
 	end
 	local prs = prNodes(r, false)
 	if #prs > 0 then
