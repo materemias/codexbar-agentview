@@ -15,6 +15,7 @@ Identities: applet `io.github.materemias.codexbaragentview`, Tern plugin `codexb
 
 ## Development
 
+- Run the Python tests with `python tests/run.py`: parallel workers, about 12 s against 80 s for `unittest discover`; pass module, class or test names to narrow it.
 - The native plugin can't be replaced while Plasma runs it: `systemctl --user stop plasma-plasmashell.service`, `kpackagetool6 -t Plasma/Applet -u build/package`, then start. `kquitapp6` returns before plasmashell exits, and the restart leaves the panel down.
 - `plasmoidviewer` is unreliable on Wayland; check changes in the real panel.
 - Test `tern/` changes on a scratch daemon: `tern --control <sock> <dir>` with `TERN_DAEMON_SOCKET` set to a scratch socket and `XDG_STATE_HOME` to a scratch dir, driven by `tern ctl --control <sock>`. Without the scratch state, its host ticks the real `waiting.json`. On the user's daemon, `ctl` input reaches their focused pane.

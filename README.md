@@ -520,7 +520,9 @@ tern plugin unlink codexbar-agentview
 ## Development
 
 Build and test with `cmake -S . -B build -DCODEXBAR_BUILD_TESTS=ON`,
-`cmake --build build` and `ctest --test-dir build`. Re-render the films with
+`cmake --build build` and `ctest --test-dir build`, and run the Python tests
+with `python tests/run.py` (parallel; `-j N` sets the workers, names narrow
+it). Re-render the films with
 `uv run film/take_kde.py && uv run film/compose.py kde`, or `take_tern.py` and
 `compose.py tern`; the Tern take opens a window on a scratch daemon for about
 a minute.
