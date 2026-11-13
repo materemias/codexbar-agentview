@@ -169,6 +169,9 @@ RESUME_GRACE_S = 3 * 60
 # still run, whatever agents.json says.
 RESUME_QUIET_S = 6 * 60
 FEATURE_MENU = "menu"
+# The extension heartbeats each time a turn or omp's own work starts or ends
+# (`cmd_heartbeat`), so its last report is what runs now.
+FEATURE_ACTIVITY = "activity"
 # The set-aside items both menus show (the omp extension reads it too).
 MENU_PATH = Path(__file__).resolve().with_name("waiting_menu.json")
 MENU_TARGETS = ("session", "pane")
@@ -192,6 +195,10 @@ CHECK_UNWRITTEN = "the agent writes its command"
 CLOSE_REASONS = {
     "job": ("park", "park only: job runs in this pane"),
     "shell": ("park", "park only: its waits end with the pane"),
+    # omp's own background job or command: closing kills it, and nothing runs it again.
+    "work": ("park", "park only: work runs in this session"),
+    # A turn no wait sent: closing cuts it off, and nothing sends it again.
+    "busy": ("park", "park only: the agent is working"),
     "turn": ("park", "park only: turn cut off once already"),
     "unresumable": ("park", "park only: it can't be resumed"),
     "manual": ("manual", "closable · you reopen"),
@@ -351,7 +358,8 @@ def _empty_state() -> dict:
     return {
         "version": STATE_VERSION, "wait_seq": 0, "action_seq": 0, "boot_id": "",
         "sessions": {}, "panes": {}, "actions": [], "extensions": {},
-        "extension_features": {}, "extension_panes": {}, "menu_seq": 0, "menu_requests": {},
+        "extension_features": {}, "extension_panes": {}, "extension_activity": {},
+        "menu_seq": 0, "menu_requests": {},
         # Counts saves, for waiting.stamp.
         "save_seq": 0,
     }
@@ -2802,8 +2810,8 @@ def _housekeeping(
         session: seen for session, seen in state["extensions"].items()
         if stamp - _parse_time(seen).timestamp() <= EXTENSION_KEPT_S
     }
-    # A session's features and pane end with its extension's record.
-    for known in (state["extension_features"], state["extension_panes"]):
+    # A session's features, pane and activity end with its extension's record.
+    for known in (state["extension_features"], state["extension_panes"], state["extension_activity"]):
         for session in [session for session in known if session not in state["extensions"]]:
             del known[session]
     state["menu_requests"] = _fresh_menu_requests(state, now)
@@ -3511,7 +3519,9 @@ def _session_view(
         pane = _reported_pane(state, facts.agents, session, now)
     return {
         **target,
-        "close": _session_close(record, info["resumable"], pane, pinned),
+        "close": _session_close(
+            record, info["resumable"], pane, pinned, _activity(state, session, info["live"], now),
+        ),
         "session_id": session, "title": info["title"], "cwd": info["cwd"],
         "project": info["project"], "live": info["live"], "pane": pane,
         "tern_session": _text(live.get("ternSession")) or None,
@@ -3573,11 +3583,24 @@ def _comes_back_alone(wait: dict) -> bool:
     return bool(wait["prompt"] or wait.get("repeat")) and wait["kind"] != "later"
 
 
-def _session_close(record: dict | None, resumable: bool, pane: int | None, pinned: bool) -> dict | None:
+def _activity(state: dict, session: str, live: bool, now: datetime) -> dict:
+    """What runs in a live session, as its extension last said (`cmd_heartbeat`):
+    `busy`, a turn; `work`, a background job or command of omp's own. Only an
+    extension that reports each change is believed, and only while it is heard
+    from: anything else says nothing runs."""
+    if not live or not _extension_fresh(state, session, now):
+        return {}
+    return state["extension_activity"].get(session) or {}
+
+
+def _session_close(
+    record: dict | None, resumable: bool, pane: int | None, pinned: bool, activity: dict,
+) -> dict | None:
     """Whether closing the session now keeps its waits whole. `turn`: a
     delivered prompt's turn, a repeat's run included, was cut once already, and
     closing would cut it a second time (`_deliver`); `job`: the job runs in the
-    session's own pane."""
+    session's own pane; `work` and `busy`: closing would kill omp's own work, or
+    cut off a turn no wait sent again (`_activity`)."""
     waits = _open_waits(record) if record else []
     if not waits:
         return None
@@ -3589,10 +3612,16 @@ def _session_close(record: dict | None, resumable: bool, pane: int | None, pinne
     if not resumable:
         reasons.add("unresumable")
     queue = record["prompt_queue"]
-    if queue and queue[0]["state"] == "delivered" and _cut_before(queue[0]):
+    delivered = bool(queue) and queue[0]["state"] == "delivered"
+    if delivered and _cut_before(queue[0]):
         reasons.add("turn")
     if pane is not None and any(_watches_job(wait, pane) for wait in waits):
         reasons.add("job")
+    if activity.get("work"):
+        reasons.add("work")
+    # The turn of a delivered prompt is the prompt's, sent again on a close.
+    if activity.get("busy") and not delivered:
+        reasons.add("busy")
     return _close_view(reasons)
 
 
@@ -3890,10 +3919,16 @@ def _add_pr(record: dict, repo: str, number: int) -> None:
         record["prs"].append({"repo": repo, "number": number})
 
 
-def _park(state: dict, record: dict, agents: Agents, now: datetime, daemon: str | None = None) -> None:
-    session = record["session"]
-    pane = agents.pane_of(session) if session else record["pane"]
+def _park(
+    state: dict, agents: Agents, now: datetime, session: str | None, pane: int | None = None,
+    daemon: str | None = None,
+) -> int | None:
+    """Queue a park for a Tern window: the session's pane, or a shell `pane`,
+    leaves its tab and keeps running. A session without a Tern pane stays as it is."""
+    if session:
+        pane = agents.pane_of(session)
     _enqueue(state, now, {"type": "park", "session": session, "pane": pane}, daemon)
+    return pane
 
 
 def _attach_after(record: dict, wait: dict, after: str | None, now: datetime) -> None:
@@ -4055,10 +4090,12 @@ def cmd_add(args: argparse.Namespace) -> dict:
             record["size"] = args.size
         if kind == "pr":
             _add_pr(record, condition["repo"], condition["number"])
+        # The pane a Tern window parks; None: no window will, as the session has no pane.
+        parked = {}
         if args.park:
-            _park(state, record, agents, now, args.daemon)
+            parked["parked"] = _park(state, agents, now, record["session"], record["pane"], args.daemon)
         pin = _move_pin(state, session, True if kind == "later" else None, facts.omp, now)
-        return {"session": session, "pane": pane, "wait": _wait_view(wait, now), **pin}
+        return {"session": session, "pane": pane, "wait": _wait_view(wait, now), **pin, **parked}
 
     return _mutate(apply, agents=agents, omp=facts.omp)
 
@@ -4122,11 +4159,10 @@ def cmd_babysit_pr(args: argparse.Namespace) -> dict:
         _arm(waits[0], now)
         _apply_note(record, args.note, args.by)
         _add_pr(record, repo, number)
-        if args.park:
-            _park(state, record, agents, now)
+        parked = {"parked": _park(state, agents, now, args.session)} if args.park else {}
         return {
             "session": args.session, "pane": None, "wait": _wait_view(waits[0], now),
-            "waits": [_wait_view(wait, now) for wait in waits],
+            "waits": [_wait_view(wait, now) for wait in waits], **parked,
         }
 
     return _mutate(apply, agents=agents, omp=omp)
@@ -4182,10 +4218,21 @@ def cmd_what(args: argparse.Namespace) -> dict:
                 condition={"type": "something", "what": what}, by="user", label=what,
             )
         if args.park:
-            _park(state, record, agents, now)
+            _park(state, agents, now, record["session"], record["pane"])
         return {"wait": _wait_view(wait, now)}
 
     return _mutate(apply, agents=agents, omp=omp)
+
+
+def cmd_park(args: argparse.Namespace) -> dict:
+    """Park the session without a wait: the agent's own park. `parked` is None
+    when the session has no Tern pane, and then nothing happens."""
+    agents = _read_agents()
+
+    def apply(state: dict, now: datetime) -> dict:
+        return {"session": args.session, "parked": _park(state, agents, now, args.session)}
+
+    return _mutate(apply, agents=agents)
 
 
 def _target_wait(record: dict | None, wait_id: str) -> dict:
@@ -4195,14 +4242,34 @@ def _target_wait(record: dict | None, wait_id: str) -> dict:
     return wait
 
 
+def _stop_behind(record: dict, wait: dict, now: datetime) -> None:
+    """The steps chained behind a stopped `wait` that never started: nothing
+    can start them now, so they stop too. Steps already done are walked past,
+    as `_activate_next` does; one that started ends the walk, since its own end
+    moves the chain on."""
+    following_id = wait["next"]
+    while following_id:
+        following = _wait_in(record, following_id)
+        if following is None:
+            return
+        if following["state"] == "pending":
+            _log(record, now, following, f"Stopped: {following['label']}")
+            _finish(record, following, now, activate=False)
+        elif following["state"] != "done":
+            return
+        following_id = following["next"]
+
+
 def _end_by_hand(
     args: argparse.Namespace, word: str, pick: Callable[[dict | None], list[dict]],
-    clear_next: bool = False,
+    clear_next: bool = False, stop_chain: bool = False,
 ) -> dict:
     """Close the waits `pick` takes from the target's record, each logged as
-    `<word>: <label>`. `clear_next` ends their chains with them. Closing the
-    one wait `--wait` names unpins only for the last `later` wait; closing
-    many unpins once no wait is left, or when there was no record at all."""
+    `<word>: <label>`, each arming its chain's next step unless `stop_chain`
+    stops the steps behind it instead (`_stop_behind`). `clear_next` ends their
+    chains with them. Closing the one wait `--wait` names unpins only for the
+    last `later` wait; closing many unpins once no wait is left, or when there
+    was no record at all."""
     session, pane = _target(args)
     omp = Omp()
 
@@ -4216,7 +4283,9 @@ def _end_by_hand(
             _log(record, now, wait, f"{word}: {wait['label']}")
             if clear_next:
                 wait["next"] = None
-            _finish(record, wait, now)
+            if stop_chain:
+                _stop_behind(record, wait, now)
+            _finish(record, wait, now, activate=not stop_chain)
         if record:
             _settle(state, record, now)
         if args.wait:
@@ -4247,14 +4316,16 @@ def cmd_mark_seen(args: argparse.Namespace) -> dict:
 
 
 def cmd_stop(args: argparse.Namespace) -> dict:
-    """Stop waiting: end the open wait `--wait` names, whatever its state, or
-    with `--all` every open wait and the chains behind them."""
+    """Stop waiting: end the open wait `--wait` names, whatever its state, with
+    the steps chained behind it that never started, or with `--all` every open
+    wait and the chains behind them. A stopped wait never happened: it moves no
+    chain on, so a later step never runs without the one before it."""
     def pick(record: dict | None) -> list[dict]:
         if args.wait:
             return [_target_wait(record, args.wait)]
         return _open_waits(record) if record else []
 
-    return _end_by_hand(args, "Stopped", pick, clear_next=args.all)
+    return _end_by_hand(args, "Stopped", pick, clear_next=args.all, stop_chain=True)
 
 
 def _prompt_handed_over(record: dict, wait: dict) -> bool:
@@ -4550,7 +4621,7 @@ def _move_session(state: dict, old: str, new: str, omp: Omp, now: datetime) -> N
     if old in state["menu_requests"]:
         state["menu_requests"].setdefault(new, state["menu_requests"].pop(old))
     # This process ran `old`, and runs `new` now.
-    for heard in ("extensions", "extension_features", "extension_panes"):
+    for heard in ("extensions", "extension_features", "extension_panes", "extension_activity"):
         state[heard].pop(old, None)
     # The old pin goes only once the new one holds: a pin no wait asks for
     # (one the user set) has no retry, and would be lost.
@@ -4576,6 +4647,11 @@ def cmd_heartbeat(args: argparse.Namespace) -> dict:
             _move_session(state, args.moved_from, args.session, omp, now)
         state["extensions"][args.session] = _iso(now)
         state["extension_features"][args.session] = features
+        if FEATURE_ACTIVITY in features:
+            state["extension_activity"][args.session] = {"busy": not args.idle, "work": args.work}
+        else:
+            # An older extension heartbeats every 5 minutes: what it says may be long over.
+            state["extension_activity"].pop(args.session, None)
         if args.pane is not None:
             # A pane runs one session: a newer one there replaces the old mapping.
             panes = state["extension_panes"]
@@ -5162,6 +5238,9 @@ def _parser() -> argparse.ArgumentParser:
     what.add_argument("--text", required=True)
     what.add_argument("--park", action="store_true")
 
+    park = command("park", cmd_park)
+    park.add_argument("--session", type=_session_arg, required=True)
+
     mark_seen = command("mark-seen", cmd_mark_seen)
     _add_target(mark_seen)
     mark_seen.add_argument("--wait")
@@ -5195,6 +5274,8 @@ def _parser() -> argparse.ArgumentParser:
     heartbeat.add_argument("--features")
     # omp runs no turn and streams nothing (`_settle_idle`).
     heartbeat.add_argument("--idle", action="store_true")
+    # omp runs a background job or a command of its own (`_session_close`).
+    heartbeat.add_argument("--work", action="store_true")
     # omp moved the conversation to a new file: from which session, and why
     # (`replaced` and `contested` bring its waits along).
     heartbeat.add_argument("--moved-from", type=_session_arg)

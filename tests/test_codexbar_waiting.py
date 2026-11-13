@@ -825,7 +825,7 @@ class ConditionTests(Case):
         second = self.add("--kind", "time", "--at", "18:00", "--after", first)
         self.assertEqual((second["state"], second["summary"]), ("pending", "at 18:00"))
         self.clock = self.clock.replace(hour=19)
-        self.run_cli("stop", "--session", SID, "--wait", first)
+        self.run_cli("what", "--session", SID, "--text", "")
         tomorrow = (self.clock + timedelta(days=1)).replace(hour=18)
         self.assertEqual(self.wait_of(second["id"])["condition"]["at"], tomorrow.isoformat())
 
@@ -1584,7 +1584,7 @@ class MenuRequestTests(Case):
 
 
 class ChainTests(Case):
-    def test_stop_activates_after(self) -> None:
+    def test_clearing_the_status_activates_after(self) -> None:
         first = self.add("--kind", "something", "--what", "x")["id"]
         second = self.add("--kind", "time", "--in", "1h", "--after", first)
         self.assertEqual(second["state"], "pending")
@@ -1593,10 +1593,24 @@ class ChainTests(Case):
         self.advance(hours=2)
         self.tick()
         self.assertEqual(self.wait_of(second["id"])["state"], "pending")
-        self.run_cli("stop", "--session", SID, "--wait", first)
+        self.run_cli("what", "--session", SID, "--text", "")
         seen = self.wait_of(second["id"])
         self.assertEqual(seen["state"], "waiting")
         self.assertEqual(seen["condition"]["at"], (self.clock + timedelta(hours=1)).isoformat())
+
+    def test_stopping_a_prerequisite_stops_the_steps_behind_it(self) -> None:
+        first = self.add("--kind", "command", "--argv", '["true"]', "--label", "Archive sessions")["id"]
+        second = self.add("--kind", "time", "--in", "1h", "--after", first, "--label", "Forget chats")["id"]
+        third = self.add("--kind", "later", "--after", second, "--label", "Tidy up")["id"]
+        self.run_cli("stop", "--session", SID, "--wait", first)
+        self.assertEqual(self.session()["waits"], [])
+        steps = {wait["id"]: wait for wait in self.state()["sessions"][SID]["waits"]}
+        self.assertEqual([steps[wait]["state"] for wait in (first, second, third)], ["done"] * 3)
+        self.assertIsNone(steps[second]["armed_at"])
+        history = [entry["text"] for entry in self.state()["sessions"][SID]["history"]]
+        self.assertEqual(
+            history[-3:], ["Stopped: Archive sessions", "Stopped: Forget chats", "Stopped: Tidy up"],
+        )
 
     def test_firing_without_a_prompt_moves_the_chain_on(self) -> None:
         first = self.add("--kind", "time", "--in", "1h")["id"]
@@ -1622,14 +1636,29 @@ class ChainTests(Case):
         self.assertEqual(self.wait_of(first)["next"], second)
         self.assertEqual(self.wait_of(second)["next"], third)
 
-    def test_stopping_a_pending_step_keeps_the_chain_whole(self) -> None:
-        first = self.add("--kind", "later")["id"]
+    def test_stopping_a_step_mid_chain_leaves_the_steps_before_it(self) -> None:
+        first = self.add("--kind", "time", "--in", "1h")["id"]
         second = self.add("--kind", "later", "--after", first)["id"]
         third = self.add("--kind", "later", "--after", second)["id"]
         self.run_cli("stop", "--session", SID, "--wait", second)
-        self.assertEqual(self.wait_of(third)["state"], "pending")
+        self.assertEqual([wait["id"] for wait in self.session()["waits"]], [first])
+        self.assertEqual(self.wait_of(first)["state"], "waiting")
+        # The step before still runs; nothing is left behind it to start.
+        self.advance(hours=1)
+        self.tick()
+        self.assertEqual(self.wait_of(first)["state"], "fired")
+        self.assertEqual([wait["id"] for wait in self.session()["waits"]], [first])
+        self.assertEqual(self.state()["sessions"][SID]["waits"][2]["id"], third)
+        self.assertEqual(self.state()["sessions"][SID]["waits"][2]["state"], "done")
+
+    def test_stopping_a_step_that_started_leaves_it_running(self) -> None:
+        first = self.add("--kind", "time", "--in", "1h")["id"]
+        second = self.add("--kind", "later", "--after", first)["id"]
+        self.advance(hours=1)
+        self.tick()
+        self.assertEqual(self.wait_of(second)["state"], "waiting")
         self.run_cli("stop", "--session", SID, "--wait", first)
-        self.assertEqual(self.wait_of(third)["state"], "waiting")
+        self.assertEqual(self.wait_of(second)["state"], "waiting")
 
     def test_unknown_after(self) -> None:
         self.run_cli("add", "--session", SID, "--kind", "later", "--after", "w9", expect=2)
@@ -3126,7 +3155,7 @@ class OutcomeTests(Case):
         first = self.add("--kind", "something", "--what", "x")["id"]
         second = self.add("--kind", "time", "--in", "2d", "--after", first)["id"]
         self.advance(days=3)
-        self.run_cli("stop", "--session", SID, "--wait", first)
+        self.run_cli("what", "--session", SID, "--text", "")
         self.advance(days=2)
         self.tick()
         seen = self.wait_of(second)
@@ -4188,7 +4217,9 @@ class WhatTests(Case):
         self.assertNotEqual(now["id"], step["id"])
         self.assertEqual(self.session()["waiting_for"], "now")
         self.assertEqual(self.wait_of(step["id"])["label"], "later on")
-        self.run_cli("stop", "--session", SID, "--wait", timer)
+        self.advance(hours=1)
+        self.tick()
+        self.run_cli("mark-seen", "--session", SID, "--wait", timer)
         seen = self.session()
         self.assertEqual([wait["id"] for wait in seen["waits"]], [step["id"]])
         self.assertEqual(seen["waiting_for"], "later on")
@@ -4483,7 +4514,7 @@ class RepeatTests(Case):
         self.assertIsNone(self.wait_of(wait)["repeat"]["next_at"])
         self.at(hours=2)
         self.assertEqual(self.claim(), [])
-        self.run_cli("stop", "--session", SID, "--wait", first)
+        self.run_cli("what", "--session", SID, "--text", "")
         self.assertEqual(self.wait_of(wait)["repeat"]["next_at"], (T0 + timedelta(hours=3)).isoformat())
 
     def test_a_session_closed_during_a_run_sends_the_run_again_once(self) -> None:
@@ -4993,6 +5024,68 @@ class CloseTests(Case):
         for verdict, text in waiting.CLOSE_REASONS.values():
             self.assertIn(verdict, ("safe", "manual", "park"))
             self.assertLess(len(text), 40)
+
+    def activity(self, *argv: str) -> None:
+        """A heartbeat from an extension that reports each change of what runs."""
+        self.heartbeat(SID, "--features", "menu,activity", *argv)
+
+    def test_running_work_makes_it_park_only(self) -> None:
+        self.add("--kind", "time", "--in", "1h", "--prompt", "go")
+        self.activity("--idle", "--work")
+        self.assertEqual(self.close(), {
+            "verdict": "park", "reason": "work", "text": "park only: work runs in this session",
+        })
+        # Work goes on through a turn, and says more than it.
+        self.activity("--work")
+        self.assertEqual(self.close()["reason"], "work")
+        self.activity("--idle")
+        self.assertEqual(self.close(), {"verdict": "safe", "reason": "prompt", "text": "closable"})
+
+    def test_a_turn_no_wait_sent_makes_it_park_only(self) -> None:
+        self.add("--kind", "time", "--in", "1h")
+        self.activity()
+        self.assertEqual(self.close(), {
+            "verdict": "park", "reason": "busy", "text": "park only: the agent is working",
+        })
+
+    def test_idle_without_work_keeps_the_waits_verdict(self) -> None:
+        self.add("--kind", "time", "--in", "1h")
+        self.activity("--idle")
+        self.assertEqual(self.close()["reason"], "manual")
+
+    def test_a_delivered_prompts_turn_is_sent_again_so_it_stays_closable(self) -> None:
+        self.queued_prompt()
+        self.activity()
+        self.assertEqual(self.close()["verdict"], "safe")
+        self.activity("--work")
+        self.assertEqual(self.close()["reason"], "work")
+
+    def test_only_a_fresh_report_from_a_live_session_counts(self) -> None:
+        self.add("--kind", "time", "--in", "1h")
+        # An older extension heartbeats every 5 minutes: its word may be long over.
+        self.heartbeat(SID, "--features", "menu", "--work")
+        self.assertEqual(self.close()["reason"], "manual")
+        self.activity("--work")
+        self.assertEqual(self.close()["reason"], "work")
+        self.advance(seconds=waiting.EXTENSION_FRESH_S + 1)
+        self.assertEqual(self.close()["reason"], "manual")
+        self.activity("--work")
+        self.agents()  # closed: nothing of it runs
+        self.assertNotIn(self.close()["reason"], ("work", "busy"))
+
+    def test_a_moved_session_leaves_its_activity_behind(self) -> None:
+        self.add("--kind", "later")
+        self.activity("--work")
+        self.heartbeat(OTHER, "--moved-from", SID, "--move-reason", "replaced")
+        self.assertNotIn(SID, self.state()["extension_activity"])
+
+    def test_park_alone_queues_a_park_for_the_sessions_pane(self) -> None:
+        self.assertEqual(self.run_cli("park", "--session", SID)["parked"], 40)
+        added = self.run_cli("add", "--session", SID, "--kind", "time", "--in", "1h", "--by", "agent", "--park")
+        self.assertEqual(added["parked"], 40)
+        parks = [action for action in self.state()["actions"] if action["type"] == "park"]
+        self.assertEqual([(action["session"], action["pane"]) for action in parks], [(SID, 40), (SID, 40)])
+        self.assertIsNone(self.run_cli("park", "--session", OTHER)["parked"])
 
 
 class DescribedCheckTests(Case):
@@ -6029,14 +6122,20 @@ class PruneTests(Case):
         self.assertEqual(json.loads((self.state_dir / "pr_cache.json").read_text())["sessions"], {})
 
     def test_a_chain_runs_on_past_a_pruned_step(self) -> None:
-        first = self.add("--kind", "later")["id"]
-        skipped = self.add("--kind", "time", "--in", "1h", "--after", first)["id"]
+        first = self.add("--kind", "time", "--in", "9d")["id"]
+        skipped = self.add("--kind", "later", "--after", first)["id"]
         last = self.add("--kind", "later", "--label", "Last", "--after", skipped)["id"]
-        self.run_cli("stop", "--session", SID, "--wait", skipped)
+        # A step that ended before it started and left the steps behind it, as older state has them.
+        state = self.state()
+        for wait in state["sessions"][SID]["waits"]:
+            if wait["id"] == skipped:
+                wait.update(state="done", done_at=self.clock.isoformat())
+        (self.state_dir / "waiting.json").write_text(json.dumps(state))
         self.advance(days=8)
         self.tick()
         self.assertNotIn(skipped, [wait["id"] for wait in self.state()["sessions"][SID]["waits"]])
-        self.run_cli("stop", "--session", SID, "--wait", first)
+        self.advance(days=1)
+        self.tick()
         self.assertEqual(self.wait_of(last)["state"], "waiting")
 
 
@@ -6418,6 +6517,7 @@ const lines = ["1h", "", ""];
 let shutdown = false;
 const ctx = {
     hasUI: true, cwd: process.cwd(), isIdle: () => true, hasPendingMessages: () => false,
+    getAsyncJobSnapshot: () => ({ running: JSON.parse(process.env.JOBS || "[]") }),
     ui: {
         setWidget(name, factory) { widgets[name] = factory; },
         select: async () => choices.shift(), editor: async () => lines.shift(),
@@ -6442,7 +6542,7 @@ process.exit(0);
 
 @unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
 class ExtensionMenuCloseTests(unittest.TestCase):
-    def closed(self, strip_close: bool) -> dict:
+    def closed(self, strip_close: bool, jobs: str = "[]") -> dict:
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             (root / "omp").mkdir()
@@ -6467,7 +6567,7 @@ class ExtensionMenuCloseTests(unittest.TestCase):
             (root / "omp" / "sessions" / "-w").mkdir(parents=True)
             (root / "omp" / "sessions" / "-w" / f"2026-11-05_{SID}.jsonl").write_text("")
             return run_extension_driver(
-                self, MENU_CLOSE_DRIVER, SID=SID, PATH=path,
+                self, MENU_CLOSE_DRIVER, SID=SID, PATH=path, JOBS=jobs,
                 XDG_STATE_HOME=str(root / "state"), OMP_AGENT_DIR=str(root / "omp"), PI_CODING_AGENT_DIR="",
                 TERN_PANE="",
             )
@@ -6481,6 +6581,151 @@ class ExtensionMenuCloseTests(unittest.TestCase):
         self.assertEqual((answer["shutdown"], answer["left"]), (False, 0), answer)
         self.assertIn("Not closed: no close verdict came back for it", answer["panel"])
 
+    def test_a_running_job_keeps_close_off_the_menu(self) -> None:
+        answer = self.closed(strip_close=False, jobs='[{"id": "bg_1", "type": "bash", "label": "sleep 120"}]')
+        self.assertEqual((answer["shutdown"], answer["left"]), (False, 0), answer)
+
+
+# Loads the extension for SID and changes what runs in it: a background job, then a bash call. The
+# heartbeats tell the CLI each change (`extension_activity`).
+ACTIVITY_DRIVER = r"""
+import * as fs from "node:fs";
+const { default: install } = await import(process.env.EXTENSION);
+const SID = process.env.SID;
+const state = () => { try { return JSON.parse(fs.readFileSync(process.env.STATE_FILE, "utf8")); } catch { return {}; } };
+const activity = () => state().extension_activity?.[SID];
+async function until(busy, work) {
+    for (let i = 0; i < 200; i++) {
+        const seen = activity();
+        if (seen?.busy === busy && seen?.work === work) return true;
+        await Bun.sleep(50);
+    }
+    return false;
+}
+const chain = new Proxy(function () {}, { get: () => chain, apply: () => chain });
+const handlers = {};
+install({
+    zod: chain, logger: { debug() {} }, sendUserMessage() {},
+    pi: { Text: class { setText() {} render() { return []; } describe() { return {}; } } },
+    on: (name, fn) => { handlers[name] = fn; }, registerCommand() {}, registerShortcut() {}, registerTool() {},
+});
+let jobs = [{ id: "bg_1", type: "bash", label: "sleep 120" }];
+let idle = true;
+const ctx = {
+    hasUI: true, cwd: process.cwd(), isIdle: () => idle, hasPendingMessages: () => false, ui: { setWidget() {} },
+    getAsyncJobSnapshot: () => ({ running: jobs }),
+    sessionManager: {
+        getSessionId: () => SID, getHeader: () => ({ type: "session", id: SID }), getBranch: () => [],
+        onPersistenceNotice: () => () => {},
+    },
+    setTimeout: (fn, ms) => setTimeout(fn, ms), setInterval: (fn, ms) => setInterval(fn, ms),
+    clearTimer: (timer) => clearTimeout(timer),
+};
+const steps = [];
+handlers.session_start({}, ctx);
+steps.push(await until(false, true));
+jobs = [];
+steps.push(await until(false, false));
+idle = false;
+handlers.tool_execution_start({ toolName: "bash", toolCallId: "c1" }, ctx);
+steps.push(await until(true, true));
+handlers.tool_execution_end({ toolName: "bash", toolCallId: "c1" }, ctx);
+idle = true;
+steps.push(await until(false, false));
+handlers.session_shutdown();
+console.log(JSON.stringify(steps));
+process.exit(0);
+"""
+
+
+@unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
+class ExtensionActivityTests(unittest.TestCase):
+    def test_each_change_of_what_runs_reaches_the_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "omp").mkdir()
+            answer = run_extension_driver(
+                self, ACTIVITY_DRIVER, SID=SID,
+                STATE_FILE=str(root / "state" / "codexbar-agentview" / "waiting.json"),
+                XDG_STATE_HOME=str(root / "state"), OMP_AGENT_DIR=str(root / "omp"), PI_CODING_AGENT_DIR="",
+                TERN_PANE="",
+            )
+        # A job at the start, gone, a bash call in a turn, the turn over.
+        self.assertEqual(answer, [True, True, True, True])
+
+
+# Calls the waitingfor tool as the agent would, asking it to park, in Tern (TERN_PANE) or not.
+TOOL_PARK_DRIVER = r"""
+import * as fs from "node:fs";
+const { default: install } = await import(process.env.EXTENSION);
+const SID = process.env.SID;
+const chain = new Proxy(function () {}, { get: () => chain, apply: () => chain });
+const handlers = {};
+let tool;
+install({
+    zod: chain, logger: { debug() {} }, sendUserMessage() {},
+    pi: { Text: class { setText() {} render() { return []; } describe() { return {}; } } },
+    on: (name, fn) => { handlers[name] = fn; }, registerCommand() {}, registerShortcut() {}, registerTool: (spec) => { tool = spec; },
+});
+const ctx = {
+    hasUI: true, cwd: process.cwd(), isIdle: () => true, hasPendingMessages: () => false, ui: { setWidget() {} },
+    sessionManager: {
+        getSessionId: () => SID, getHeader: () => ({ type: "session", id: SID }), getBranch: () => [],
+        onPersistenceNotice: () => () => {},
+    },
+    setTimeout: (fn, ms) => setTimeout(fn, ms), setInterval: (fn, ms) => setInterval(fn, ms),
+    clearTimer: (timer) => clearTimeout(timer),
+};
+handlers.session_start({}, ctx);
+const notes = [];
+for (const params of [{ action: "add", kind: "later", park: true }, { action: "park" }]) {
+    const answer = await tool.execute("t", params, null, null, ctx);
+    notes.push(JSON.parse(answer.content[0].text).park);
+}
+handlers.session_shutdown();
+let actions = [];
+try { actions = JSON.parse(fs.readFileSync(process.env.STATE_FILE, "utf8")).actions; } catch {}
+const parks = actions.filter((action) => action.type === "park").map((action) => [action.session, action.pane]);
+console.log(JSON.stringify({ notes, parks }));
+process.exit(0);
+"""
+
+
+@unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
+class ExtensionToolParkTests(unittest.TestCase):
+    def parked(self, pane: str, listed: int | None = 52) -> dict:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "omp").mkdir()
+            state = root / "state" / "codexbar-agentview"
+            state.mkdir(parents=True)
+            (state / "agents.json").write_text(json.dumps({"bootId": "", "history": [], "agents": [{
+                "sessionId": SID, "provider": "omp", "cwd": folder, "state": "idle", "ternPane": listed,
+                "resumeCommand": f"omp --resume {SID}",
+            }]}))
+            return run_extension_driver(
+                self, TOOL_PARK_DRIVER, SID=SID, STATE_FILE=str(state / "waiting.json"),
+                XDG_STATE_HOME=str(root / "state"), OMP_AGENT_DIR=str(root / "omp"), PI_CODING_AGENT_DIR="",
+                TERN_PANE=pane,
+            )
+
+    def test_in_tern_the_park_reaches_the_cli(self) -> None:
+        answer = self.parked("52")
+        self.assertEqual(answer["parks"], [[SID, 52], [SID, 52]])
+        self.assertTrue(all(note.startswith("parked:") for note in answer["notes"]), answer)
+
+    def test_a_pane_tern_has_not_listed_yet_is_not_parked(self) -> None:
+        answer = self.parked("52", listed=None)
+        self.assertEqual(answer["notes"], [
+            "not parked: Tern has not listed this session's pane yet; try again in a few seconds",
+        ] * 2)
+
+    def test_outside_tern_nothing_is_parked_and_the_result_says_so(self) -> None:
+        answer = self.parked("")
+        self.assertEqual(answer["parks"], [])
+        self.assertEqual(answer["notes"], [
+            "not parked: this omp runs outside Tern, so there is no pane to park",
+        ] * 2)
 
 
 # Loads the extension with a wait under OLD, then omp moves the session once per REASONS entry (two:

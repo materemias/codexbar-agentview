@@ -33,6 +33,14 @@ const VIEW_DEBOUNCE_MS = 300;
 const SETTLE_IDLE_MS = 125_000;
 const REFRESH_MS = 60_000;
 const HEARTBEAT_MS = 5 * 60_000;
+/**
+ * How often what runs in the session is sampled. A change the next sample still sees goes to the CLI
+ * at once (heartbeat, `activity`), so its close verdict follows within seconds; a tool call shorter
+ * than a sample seldom makes a heartbeat.
+ */
+const ACTIVITY_MS = 1500;
+/** Tool calls that run commands or agents until they end: omp kills them when it closes. */
+const WORK_TOOLS = ["bash", "eval", "task"];
 /** How long a menu request from Tern stays worth answering. */
 const MENU_REQUEST_MS = 15_000;
 /** How many of the session's latest user messages a resend check looks through. */
@@ -612,6 +620,8 @@ export function healthWarning(health, now = Date.now(), uncheckedSince?: number)
 
 /** Closing loses the waits' checks while nothing runs them, whatever the session's own verdict says. */
 const UNCHECKED_CLOSE = { verdict: "park", reason: "unchecked", text: "park only: nothing checks waits" };
+/** omp's own background jobs and commands end with it; the CLI's `work` verdict says the same. */
+const WORK_CLOSE = { verdict: "park", reason: "work", text: "park only: work runs in this session" };
 
 /**
  * Whether the session may be closed: the CLI's `close` (undefined without waits), or park while the
@@ -812,7 +822,16 @@ const TOOL_FLAGS = {
 	times: "times",
 };
 
-/** The CLI options of an agent's own `add`; never `--park`, as only the user sets a session aside. */
+const NOT_PARKED_OUTSIDE_TERN = "not parked: this omp runs outside Tern, so there is no pane to park";
+
+/** What the tool's park did: `paneKnown` is false when the CLI knew no Tern pane of the session (`parked`). */
+function parkNote(inTern: boolean, paneKnown: boolean): string {
+	if (!inTern) return NOT_PARKED_OUTSIDE_TERN;
+	if (!paneKnown) return "not parked: Tern has not listed this session's pane yet; try again in a few seconds";
+	return "parked: a Tern window takes this pane off its tab shortly; the session keeps running";
+}
+
+/** The CLI options of an agent's own `add`, but its `--park`, which the tool adds only in Tern. */
 async function toolAddArgs(params, session: string, cwd: string): Promise<string[]> {
 	if (!params.kind) throw new Error("add needs a kind");
 	const args = ["add", "--session", session, "--kind", params.kind, "--by", "agent"];
@@ -1370,12 +1389,50 @@ export default function (pi) {
 	/** omp is idle: no turn running, recovering or queued to start. Closing the session needs it too. */
 	const idle = (c = ctx) => !retrying && !compacting && c?.isIdle() === true && c.hasPendingMessages?.() !== true;
 
+	const runningTools = new Set<string>(); // this session's WORK_TOOLS calls that have not ended
+	let reported: string | undefined; // the activity the CLI last took, as activityArgs joined
+	let sampled: string | undefined; // the activity the last sample saw
+	let reporting = false; // a heartbeat for a changed activity is on its way
+
+	/** omp runs work of its own that dies with it: a background job (bash, eval, task) or a WORK_TOOLS call. */
+	function hasWork(c = ctx): boolean {
+		if (runningTools.size > 0) return true;
+		try {
+			return (c?.getAsyncJobSnapshot?.()?.running?.length ?? 0) > 0;
+		} catch {
+			return false;
+		}
+	}
+
+	/** What runs, as the heartbeat tells it: a turn unless `--idle`, and omp's own work with `--work`. */
+	const activityArgs = () => [...(idle() ? ["--idle"] : []), ...(hasWork() ? ["--work"] : [])];
+
+	/** Heartbeats once the activity changed from what the CLI has and the next sample still sees it. */
+	function sampleActivity() {
+		const now = activityArgs().join(" ");
+		const held = now === sampled;
+		sampled = now;
+		if (!held || now === reported || reporting) return;
+		reporting = true;
+		inOrder(() =>
+			heartbeat().finally(() => {
+				reporting = false;
+			}),
+		);
+	}
+
 	function heartbeat() {
 		if (followSession()) return Promise.resolve(); // the activation heartbeats
 		const pane = process.env.TERN_PANE;
 		const move = moves[0];
 		const moveArgs = move ? ["--moved-from", move.from, "--move-reason", move.reason] : [];
-		const beat = cli(["heartbeat", "--session", sessionId, ...(pane ? ["--pane", pane] : []), "--features", "menu", ...(idle() ? ["--idle"] : []), ...moveArgs]);
+		const activity = activityArgs();
+		const beat = cli(["heartbeat", "--session", sessionId, ...(pane ? ["--pane", pane] : []), "--features", "menu,activity", ...activity, ...moveArgs]).then(
+			(answer) => {
+				reported = activity.join(" ");
+				return answer;
+			},
+		);
 		if (!move) return beat;
 		// Heartbeats carry the moves one at a time, each until one gets through: the CLI's re-key is idempotent.
 		return beat.then((answer) => {
@@ -1433,6 +1490,9 @@ export default function (pi) {
 			setPanel(c, undefined);
 		}
 		activatedAt = Date.now() - (Date.now() % 1000);
+		// The activation heartbeat tells this session's activity; a sample from before starts nothing.
+		reported = undefined;
+		sampled = undefined;
 		sessionId = c.sessionManager.getSessionId();
 		// A session switched away from took its delivered instruction with it.
 		for (const id of asked.keys()) if (id !== sessionId) asked.delete(id);
@@ -1447,6 +1507,7 @@ export default function (pi) {
 		timers = [
 			c.setInterval(() => quietly(refresh), REFRESH_MS),
 			c.setInterval(() => quietly(heartbeat), HEARTBEAT_MS),
+			c.setInterval(sampleActivity, ACTIVITY_MS),
 			// On resume or switch omp replaces the transcript after this hook returns; a prompt
 			// sent before that would be lost, so the first claim runs on the next tick.
 			c.setTimeout(() => {
@@ -1475,6 +1536,7 @@ export default function (pi) {
 		unwatchMoves = undefined;
 		watched = undefined;
 		ctx = undefined;
+		runningTools.clear();
 	});
 
 	// The main session's only: a subagent's retry or compaction leaves this one's idle as it is.
@@ -1494,6 +1556,8 @@ export default function (pi) {
 	// A non-final agent_end hands over to a queued follow-up, which may be the prompt being settled
 	// or the instruction for a described check.
 	pi.on("agent_end", (event, c) => {
+		// No tool call outlives its turn; one whose end never came would hold the session forever.
+		if (c?.agent?.kind !== "sub") runningTools.clear();
 		if (event?.willContinue) return;
 		report("turn_finished", (session) => session.waits?.length > 0, c);
 		if (c?.agent?.kind === "sub") return;
@@ -1507,6 +1571,10 @@ export default function (pi) {
 	pi.on("tool_approval_requested", (_event, c) => waitingInput(c));
 	pi.on("tool_execution_start", (event, c) => {
 		if (event.toolName === "ask") waitingInput(c);
+		if (c?.agent?.kind !== "sub" && WORK_TOOLS.includes(event.toolName)) runningTools.add(event.toolCallId);
+	});
+	pi.on("tool_execution_end", (event) => {
+		runningTools.delete(event.toolCallId);
 	});
 
 	/** Runs a user or agent command for `c`'s session and redraws the row from its answer. */
@@ -1583,12 +1651,14 @@ export default function (pi) {
 	}
 
 	/**
-	 * What keeps the session from closing now: nothing checking waits, or its close verdict (closeVerdict)
-	 * not saying it comes back. After a save (`saved`) the session has a wait, so a view without its
-	 * verdict blocks too. Undefined when closing loses nothing; the last applied view has the wait just saved.
+	 * What keeps the session from closing now: nothing checking waits, omp's own work (which the CLI
+	 * hears of only within seconds), or its close verdict (closeVerdict) not saying it comes back.
+	 * After a save (`saved`) the session has a wait, so a view without its verdict blocks too. Undefined
+	 * when closing loses nothing; the last applied view has the wait just saved.
 	 */
 	function closeBlocker(saved = false) {
 		if (healthState(health, Date.now(), uncheckedSince).unchecked) return UNCHECKED_CLOSE;
+		if (hasWork()) return WORK_CLOSE;
 		const close = ownSession?.close;
 		if (!close) return saved ? { text: "no close verdict came back for it" } : undefined;
 		return close.verdict === "safe" || close.verdict === "manual" ? undefined : { text: close.text || `verdict ${close.verdict}` };
@@ -1745,14 +1815,16 @@ export default function (pi) {
 			"Wait for an event and tell the user when it happens: a PR's review, comments, merge or release, CI, a command's output or a time. Code polls; no tokens until it fires.",
 			"Use this whenever the user says wait for X, notify me when, or tell me if, and right after you create a pull request (kind pr, or babysit_pr for review, ready and merged). The user is notified in Tern and on their phone: don't add your own ntfy call or polling loop.",
 			"The session can be parked or closed meanwhile; a closed one reopens in Tern by itself when a prompt is due, else it comes back to the user with a Resume button.",
-			"Kinds: pr for a known PR's review_on_head, ready, merged, released, or activity (the next comment, review, merge or close from someone other than the user); release for a repo's next release; command for anything else code can check; time to retry later; repeat to send prompt on a timer; something for what code can't watch, such as a person's reply, named by what: it never fires and the user stops it; later for when the user has time.",
+			"Kinds: pr for a known PR's review_on_head, ready, merged, released, or activity (the next comment, review, merge or close from someone other than the user); release for a repo's next release; command for anything else code can check; time to retry later; repeat to send prompt on a timer; something for what code can't watch, such as a person's reply, named by what: it never fires and the user stops it or clears its text; later for when the user has time.",
+			"after chains a step behind another wait: it starts when that one fires or completes. Stopping a wait never starts the steps behind it; it stops them too. So don't chain behind something or later, which never fire: a step behind a something starts only if the user clears its text, and one behind a later never does.",
 			"every sends prompt again and again instead of once: kind repeat runs until the user stops it; with kind command, pr or release it ends once that holds; for or times end it after a while or a number of runs; with kind repeat, until is a condition in words that you judge at each run, ending the repeat with end_repeat once it holds. A run due while the last run's turn still goes is skipped.",
 			"note is your suggested sentence for the user. The user's own sentence always stands: never try to overwrite it, and don't repeat a note the session already has.",
 			"prompt is sent into this session when the wait fires. list shows the open waits, stop ends one by its id.",
-			"This tool never parks the session on its own; setting it aside is the user's call. When the user's /wait check asked you for a command, call add with kind command and argv only: it becomes their check.",
+			"park (add, babysit_pr), or action park alone, parks this session in Tern: its pane only leaves its tab and keeps running until the user opens it again, so parking is always safe. Park when the user asks you to park the session or set it aside. Never close the session yourself. Outside Tern nothing can be parked, and the result says so.",
+			"When the user's /wait check asked you for a command, call add with kind command and argv only: it becomes their check.",
 		].join("\n"),
 		parameters: z.object({
-			action: z.enum(["add", "babysit_pr", "list", "stop", "end_repeat"]).describe("What to do"),
+			action: z.enum(["add", "babysit_pr", "list", "stop", "end_repeat", "park"]).describe("What to do"),
 			kind: z.enum(["time", "command", "pr", "release", "repeat", "something", "later"]).optional().describe("add: what to wait for"),
 			label: z.string().optional().describe("add: short label; derived when omitted"),
 			note: z.string().optional().describe("add, babysit_pr: suggested sentence for the user"),
@@ -1781,9 +1853,10 @@ export default function (pi) {
 			deadline_in: z.string().optional().describe("add: the same as a delay from now"),
 			prompt: z.string().optional().describe("add: text to send into this session when the wait fires; with every, at each run"),
 			verify: z.string().optional().describe("add: JSON condition that must hold after the prompt's turn"),
-			after: z.string().optional().describe("add: start only after this wait id completes"),
+			after: z.string().optional().describe("add: start only after this wait id fires or completes; never after a stop"),
 			no_fix: z.boolean().optional().describe("babysit_pr: skip the automatic review-fix prompt"),
 			released: z.boolean().optional().describe("babysit_pr: also wait for a release"),
+			park: z.boolean().optional().describe("add, babysit_pr: also park this session in Tern"),
 			wait: z.string().optional().describe("stop, end_repeat: the wait id"),
 			reason: z.string().optional().describe("end_repeat: why it ended"),
 		}),
@@ -1800,9 +1873,13 @@ export default function (pi) {
 			if (extra.length > 0) {
 				throw new Error(`This add writes the user's /wait check, which sets the rest: call it again with action, kind and argv only, without ${extra.join(", ")}. The command must exit 0 when it holds.`);
 			}
+			// Only a Tern pane can be parked: outside Tern the CLI isn't asked, and the result says so.
+			const inTern = Boolean(process.env.TERN_PANE);
+			const parking = params.action === "park" || (params.park === true && ["add", "babysit_pr"].includes(params.action));
+			const park = parking && inTern ? ["--park"] : [];
 			switch (params.action) {
 				case "add":
-					args = check ? ["write-check", "--session", session, `--argv=${JSON.stringify(params.argv)}`] : await toolAddArgs(params, session, c.cwd);
+					args = check ? ["write-check", "--session", session, `--argv=${JSON.stringify(params.argv)}`] : [...(await toolAddArgs(params, session, c.cwd)), ...park];
 					break;
 				case "babysit_pr":
 					args = [
@@ -1815,7 +1892,12 @@ export default function (pi) {
 						...(params.released ? ["--released"] : []),
 						"--by",
 						"agent",
+						...park,
 					];
+					break;
+				case "park":
+					if (!inTern) return { content: [{ type: "text", text: JSON.stringify({ park: NOT_PARKED_OUTSIDE_TERN }) }], details: {} };
+					args = ["park", "--session", session];
 					break;
 				case "stop":
 					if (!params.wait) throw new Error("stop needs a wait id; list shows them");
@@ -1840,6 +1922,7 @@ export default function (pi) {
 				if (ctx && session === sessionId) setPanel(ctx, () => `Check: ${params.argv.join(" ")} every ${seconds / size}${unit}`);
 			}
 			const result = params.action === "list" ? (answer.sessions?.[0] ?? { waits: [] }) : answer;
+			if (parking) result.park = parkNote(inTern, answer.parked != null);
 			return { content: [{ type: "text", text: JSON.stringify(result) }], details: {} };
 		},
 	});
