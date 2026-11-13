@@ -87,7 +87,7 @@ const FORMS = [
 	{
 		word: "every",
 		usage: "/wait every <dur> [for <dur>|N times] -- <prompt>",
-		what: "repeat the prompt until Done, for a while or N times; a sentence may go before the --",
+		what: "repeat the prompt until you stop it, for a while or N times; a sentence may go before the --",
 		example: "every 1d 5 times triage new issues -- Summarize the issues opened since the last run",
 	},
 	{
@@ -133,7 +133,7 @@ const FORMS = [
 	{
 		word: "for",
 		usage: "/wait for [what you wait for]",
-		what: "this session's free-text wait, in your words; you mark it done; alone, it clears",
+		what: "this session's free-text wait, in your words; you stop it when it's settled; alone, it clears",
 		example: "for Anna's answer on the contract",
 		featured: true,
 	},
@@ -145,7 +145,8 @@ const FORMS = [
 		featured: true,
 	},
 	{ word: "list", alone: true, usage: "/wait list", what: "this session's details" },
-	{ word: "done", usage: "/wait done [wait-id]", what: "close one wait, or what's on you (every wait when nothing is)", example: "done w1" },
+	{ word: "seen", usage: "/wait seen [wait-id]", what: "you've read what came: close the waits on you, or one of them", example: "seen w1" },
+	{ word: "stop", usage: "/wait stop <wait-id|all>", what: "stop waiting: end one wait, or all of them", example: "stop w1" },
 	{ word: "note", usage: "/wait note <text>", what: "set this session's sentence", example: "note on hold until Monday" },
 	{ word: "help", alone: true, usage: "/wait help", what: "this help" },
 ];
@@ -187,7 +188,7 @@ const UNTIL_CHOICES = [
 	{ label: "gh", description: "a PR state or a repo's next release: gh pr 42 merged" },
 ];
 /** Their text may hold a `--` of its own, as they never fire a prompt; list and help take no text at all. */
-const NO_PROMPT: Record<string, true> = { done: true, note: true, later: true, for: true, list: true, help: true };
+const NO_PROMPT: Record<string, true> = { seen: true, stop: true, note: true, later: true, for: true, list: true, help: true };
 
 const messageOf = (error) => (error instanceof Error ? error.message : String(error));
 
@@ -405,8 +406,11 @@ export function parseWait(input: string) {
 		case "list":
 		case "help":
 			return rest ? bad(`${key} takes nothing else.`) : { command: key, args: [] };
-		case "done":
-			return /\s/.test(rest) ? bad("done takes one wait id.") : { command: "done", args: rest ? [`--wait=${rest}`] : [] };
+		case "seen":
+			return /\s/.test(rest) ? bad("seen takes one wait id.") : { command: "mark-seen", args: rest ? [`--wait=${rest}`] : [] };
+		case "stop":
+			if (!rest || /\s/.test(rest)) return bad("stop takes one wait id, or all.");
+			return { command: "stop", args: rest === "all" ? ["--all"] : [`--wait=${rest}`] };
 		case "note":
 			return rest ? { command: "note", args: [`--text=${rest}`] } : bad("note needs the sentence.");
 		case "later": {
@@ -497,6 +501,11 @@ function everyChoices(words: string[]) {
 
 const SENTENCE_START = { label: ARGS_END, description: "the sentence starts here, even with a word that reads as a PR, state or repo" };
 
+/** A wait on the user: what Seen closes. */
+const onYou = (wait) => wait.ball === "on_me";
+/** A wait something still watches, which Stop ends; a fired one is Seen's. Stop all ends every wait. */
+const watched = (wait) => wait.outcome !== "fulfilled";
+
 /** What can follow the finished words of a /wait line. */
 function choicesAfter(words: string[], waits) {
 	const path = words.join(" ");
@@ -508,7 +517,9 @@ function choicesAfter(words: string[], waits) {
 	if (path === "later") return SIZES;
 	if (path === "check") return CHECK_CHOICES;
 	if (words.length === 3 && path.startsWith("check every ") && DURATION.test(words[2])) return [BANG];
-	if (path === "done") return waits.map((wait) => ({ label: wait.id, value: wait.id, description: wait.label }));
+	const ids = (list) => list.map((wait) => ({ label: wait.id, value: wait.id, description: wait.label }));
+	if (path === "seen") return ids(waits.filter(onYou));
+	if (path === "stop") return [...ids(waits.filter(watched)), ...(waits.length > 0 ? [{ label: "all", value: "all", description: `every wait of this session (${waits.length})` }] : [])];
 	return [];
 }
 
@@ -887,7 +898,7 @@ async function askPark(c, canClose: (c) => boolean, closeNote?: string, what?: s
  * check's text; undefined ends the flow (Esc, or a required line left empty).
  */
 const ENDS = [
-	{ label: "Keep going", description: "until you mark it done", ask: async () => ({ kind: "repeat", options: [] }) },
+	{ label: "Keep going", description: "until you stop it", ask: async () => ({ kind: "repeat", options: [] }) },
 	{
 		label: "Until the agent says so",
 		description: "you say what; each run asks the agent, and it ends the repeat once that holds",
@@ -1508,14 +1519,29 @@ export default function (pi) {
 
 	async function waitMenu(c, session: string, open) {
 		const items = open.map((wait) => ({ label: `${wait.id}  ${wait.label}`, description: waitFacts(wait), wait }));
+		// One wait has its own Stop; several also end at once, after a confirmation.
+		const stopAll = `Stop all ${open.length} waits`;
+		if (open.length > 1) items.push({ label: stopAll, description: "end every wait of this session" });
 		const chosen = await pick(c, "This session's waits", items);
 		if (!chosen) return;
+		if (!chosen.wait) {
+			const sure = await c.ui.confirm(`${stopAll}?`, "Each one ends now, whatever it was waiting for; none comes back to you.");
+			if (sure) await act(c, ["stop", "--session", session, "--all"]);
+			return;
+		}
 		const { id, retryable, snoozable } = chosen.wait;
 		// Retry comes first for a wait that check errors stopped: after fixing the cause it is the step to take.
-		const actions = [...(retryable ? ["Retry"] : []), "Done", ...(snoozable ? ["Snooze 1d"] : []), "Back"];
+		const actions = [
+			...(retryable ? ["Retry"] : []),
+			...(onYou(chosen.wait) ? ["Seen"] : []),
+			...(watched(chosen.wait) ? ["Stop"] : []),
+			...(snoozable ? ["Snooze 1d"] : []),
+			"Back",
+		];
 		const action = await c.ui.select(chosen.label, actions);
 		if (action === "Retry") await act(c, ["retry", "--session", session, `--wait=${id}`]);
-		else if (action === "Done") await act(c, ["done", "--session", session, `--wait=${id}`]);
+		else if (action === "Seen") await act(c, ["mark-seen", "--session", session, `--wait=${id}`]);
+		else if (action === "Stop") await act(c, ["stop", "--session", session, `--wait=${id}`]);
 		else if (action === "Snooze 1d") await act(c, ["snooze", "--session", session, `--wait=${id}`, "--for", "1d"]);
 	}
 
@@ -1657,7 +1683,12 @@ export default function (pi) {
 			const items = [
 				...first,
 				...(open.length > 0
-					? [{ label: `This session's waits (${open.length})`, description: open.some((wait) => wait.retryable) ? "retry, done or one more day" : "done or one more day" }]
+					? [
+							{
+								label: `This session's waits (${open.length})`,
+								description: `${[...(open.some(onYou) ? ["seen"] : []), "stop", ...(open.some((wait) => wait.retryable) ? ["retry"] : [])].join(", ")} or one more day`,
+							},
+						]
 					: []),
 				...MENU.items.filter((item) => first.length === 0 || item !== prItem),
 			];
@@ -1681,7 +1712,7 @@ export default function (pi) {
 	}
 
 	pi.registerCommand("wait", {
-		description: "Set this session aside: /wait opens the menu, or /wait 2d <sentence> [-- prompt] | every 2h -- <prompt> | gh pr|babysit|release | check | for | later | list | done | help",
+		description: "Set this session aside: /wait opens the menu, or /wait 2d <sentence> [-- prompt] | every 2h -- <prompt> | gh pr|babysit|release | check | for | later | list | seen | stop | help",
 		getArgumentCompletions: (prefix: string) => waitCompletions(prefix, waits),
 		handler: async (input: string, c) => {
 			followSession();
@@ -1714,14 +1745,14 @@ export default function (pi) {
 			"Wait for an event and tell the user when it happens: a PR's review, comments, merge or release, CI, a command's output or a time. Code polls; no tokens until it fires.",
 			"Use this whenever the user says wait for X, notify me when, or tell me if, and right after you create a pull request (kind pr, or babysit_pr for review, ready and merged). The user is notified in Tern and on their phone: don't add your own ntfy call or polling loop.",
 			"The session can be parked or closed meanwhile; a closed one reopens in Tern by itself when a prompt is due, else it comes back to the user with a Resume button.",
-			"Kinds: pr for a known PR's review_on_head, ready, merged, released, or activity (the next comment, review, merge or close from someone other than the user); release for a repo's next release; command for anything else code can check; time to retry later; repeat to send prompt on a timer; something for what code can't watch, such as a person's reply, named by what: it never fires and the user closes it; later for when the user has time.",
-			"every sends prompt again and again instead of once: kind repeat runs until the user's Done; with kind command, pr or release it ends once that holds; for or times end it after a while or a number of runs; with kind repeat, until is a condition in words that you judge at each run, ending the repeat with end_repeat once it holds. A run due while the last run's turn still goes is skipped.",
+			"Kinds: pr for a known PR's review_on_head, ready, merged, released, or activity (the next comment, review, merge or close from someone other than the user); release for a repo's next release; command for anything else code can check; time to retry later; repeat to send prompt on a timer; something for what code can't watch, such as a person's reply, named by what: it never fires and the user stops it; later for when the user has time.",
+			"every sends prompt again and again instead of once: kind repeat runs until the user stops it; with kind command, pr or release it ends once that holds; for or times end it after a while or a number of runs; with kind repeat, until is a condition in words that you judge at each run, ending the repeat with end_repeat once it holds. A run due while the last run's turn still goes is skipped.",
 			"note is your suggested sentence for the user. The user's own sentence always stands: never try to overwrite it, and don't repeat a note the session already has.",
-			"prompt is sent into this session when the wait fires. list shows the open waits, done closes one by its id.",
+			"prompt is sent into this session when the wait fires. list shows the open waits, stop ends one by its id.",
 			"This tool never parks the session on its own; setting it aside is the user's call. When the user's /wait check asked you for a command, call add with kind command and argv only: it becomes their check.",
 		].join("\n"),
 		parameters: z.object({
-			action: z.enum(["add", "babysit_pr", "list", "done", "end_repeat"]).describe("What to do"),
+			action: z.enum(["add", "babysit_pr", "list", "stop", "end_repeat"]).describe("What to do"),
 			kind: z.enum(["time", "command", "pr", "release", "repeat", "something", "later"]).optional().describe("add: what to wait for"),
 			label: z.string().optional().describe("add: short label; derived when omitted"),
 			note: z.string().optional().describe("add, babysit_pr: suggested sentence for the user"),
@@ -1753,7 +1784,7 @@ export default function (pi) {
 			after: z.string().optional().describe("add: start only after this wait id completes"),
 			no_fix: z.boolean().optional().describe("babysit_pr: skip the automatic review-fix prompt"),
 			released: z.boolean().optional().describe("babysit_pr: also wait for a release"),
-			wait: z.string().optional().describe("done, end_repeat: the wait id"),
+			wait: z.string().optional().describe("stop, end_repeat: the wait id"),
 			reason: z.string().optional().describe("end_repeat: why it ended"),
 		}),
 		approval: "write",
@@ -1786,9 +1817,9 @@ export default function (pi) {
 						"agent",
 					];
 					break;
-				case "done":
-					if (!params.wait) throw new Error("done needs a wait id; list shows them");
-					args = ["done", "--session", session, `--wait=${params.wait}`];
+				case "stop":
+					if (!params.wait) throw new Error("stop needs a wait id; list shows them");
+					args = ["stop", "--session", session, `--wait=${params.wait}`];
 					break;
 				case "end_repeat":
 					if (!params.wait) throw new Error("end_repeat needs the repeat's wait id; its prompt names it");
