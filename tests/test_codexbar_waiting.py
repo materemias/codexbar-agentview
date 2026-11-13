@@ -4807,12 +4807,16 @@ class CloseTests(Case):
         self.add("--kind", "time", "--in", "1h", "--prompt", "go")
         self.assertEqual(self.close()["verdict"], "manual")
 
-    def test_a_prompt_that_ran_waits_for_me(self) -> None:
+    def test_a_wait_already_on_me_doesnt_hold_the_session(self) -> None:
         wait, _ = self.queued_prompt()
         # Its turn runs: a close sends it again.
         self.assertEqual(self.close()["verdict"], "safe")
         self.run_cli("event", "--type", "turn_finished", "--session", SID)
         self.assertEqual(self.wait_of(wait)["state"], "review")
+        # "Ran, take a look" waits on the Waiting tab whether the session is open or not.
+        self.assertEqual(self.close(), {"verdict": "safe", "reason": "seen", "text": "closable"})
+        # Beside it, a wait still to come decides.
+        self.add("--kind", "something", "--what", "Anna's answer")
         self.assertEqual(self.close()["verdict"], "manual")
 
     def test_the_worst_wait_wins(self) -> None:

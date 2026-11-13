@@ -192,6 +192,8 @@ CLOSE_REASONS = {
     "unresumable": ("park", "park only: it can't be resumed"),
     "manual": ("manual", "closable · you reopen"),
     "prompt": ("safe", "closable"),
+    # Every open wait is already on me: closing loses nothing, and nothing is to come.
+    "seen": ("safe", "closable"),
 }
 REASON_NO_EXTENSION = "omp extension not loaded"
 REASON_QUESTION = "agent asks a question"
@@ -3459,14 +3461,16 @@ def _close_view(reasons: set[str]) -> dict | None:
     return {"verdict": verdict, "reason": reason, "text": text}
 
 
-def _comes_back_alone(wait: dict) -> bool:
-    """A closed session is reopened for this wait's prompt, or each repeat run,
-    and nothing about it waits for me first. A snoozed wait comes back as it was."""
+def _on_me_already(wait: dict) -> bool:
+    """The wait has already come to me (a snoozed one comes back as it was):
+    closing the session can't make me miss it, so it says nothing about closing."""
     state = wait["snoozed_from"] if wait["state"] == "snoozed" else wait["state"]
-    return (
-        bool(wait["prompt"] or wait.get("repeat")) and wait["kind"] != "later"
-        and not wait["on_me"] and state not in ("fired", "review", "needs_attention")
-    )
+    return bool(wait["on_me"]) or state in ("fired", "review", "needs_attention")
+
+
+def _comes_back_alone(wait: dict) -> bool:
+    """A closed session is reopened for this wait's prompt, or each repeat run."""
+    return bool(wait["prompt"] or wait.get("repeat")) and wait["kind"] != "later"
 
 
 def _session_close(record: dict | None, resumable: bool, pane: int | None, pinned: bool) -> dict | None:
@@ -3477,7 +3481,9 @@ def _session_close(record: dict | None, resumable: bool, pane: int | None, pinne
     waits = _open_waits(record) if record else []
     if not waits:
         return None
-    reasons = {"prompt" if _comes_back_alone(wait) else "manual" for wait in waits}
+    reasons = {
+        "prompt" if _comes_back_alone(wait) else "manual" for wait in waits if not _on_me_already(wait)
+    } or {"seen"}
     if pinned:
         reasons.add("manual")
     if not resumable:
