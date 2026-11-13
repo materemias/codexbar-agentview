@@ -5048,6 +5048,19 @@ class CloseTests(Case):
             "verdict": "park", "reason": "busy", "text": "park only: the agent is working",
         })
 
+    def test_outside_tern_a_park_reads_keep_open(self) -> None:
+        # Running in kitty, say: no Tern pane to park the session in.
+        payload = json.loads((self.state_dir / "agents.json").read_text())
+        del payload["agents"][0]["ternPane"]
+        (self.state_dir / "agents.json").write_text(json.dumps(payload))
+        self.add("--kind", "time", "--in", "1h", "--prompt", "go")
+        self.activity("--idle", "--work")
+        self.assertEqual(self.close(), {
+            "verdict": "park", "reason": "work", "text": "keep open: work runs in this session",
+        })
+        self.activity("--idle")
+        self.assertEqual(self.close()["text"], "closable")
+
     def test_idle_without_work_keeps_the_waits_verdict(self) -> None:
         self.add("--kind", "time", "--in", "1h")
         self.activity("--idle")
@@ -6393,8 +6406,8 @@ console.log(JSON.stringify([
             len("⚠ Last check: ") + 120,
         ])
 
-    def test_the_row_leads_with_whether_the_session_can_be_closed(self) -> None:
-        answer = run_extension_driver(self, r"""
+    def rows(self, pane: str) -> list:
+        return run_extension_driver(self, r"""
 const { closeVerdict, rowText } = await import(process.env.EXTENSION);
 const now = Date.parse("2026-11-12T12:00:00");
 const at = (minutes) => new Date(now - minutes * 60_000).toISOString();
@@ -6414,14 +6427,23 @@ console.log(JSON.stringify([
     row(safe, { checked_at: at(1), error: "boom", error_kind: "partial" }),
     row(null, { checked_at: at(20) }),
 ]));
-""")
-        self.assertEqual(answer, [
+""", TERN_PANE=pane)
+
+    def test_the_row_leads_with_whether_the_session_can_be_closed(self) -> None:
+        self.assertEqual(self.rows("52"), [
             "<muted>closable</> │ ⏲ Retry · in 2h",
             "<warning>park only: turn cut off once already</> │ ⏲ Retry · in 2h",
             "<warning>park only: nothing checks waits</> │ ⏲ Retry · in 2h",
             "<warning>park only: nothing checks waits</> │ ⏲ Retry · in 2h",
             "<muted>closable</> │ ⏲ Retry · in 2h",
             "⏲ Retry · in 2h",
+        ])
+
+    def test_outside_tern_nothing_says_park(self) -> None:
+        self.assertEqual(self.rows("")[1:4], [
+            "<warning>keep open: turn cut off once already</> │ ⏲ Retry · in 2h",
+            "<warning>keep open: nothing checks waits</> │ ⏲ Retry · in 2h",
+            "<warning>keep open: nothing checks waits</> │ ⏲ Retry · in 2h",
         ])
 
 
@@ -6583,7 +6605,8 @@ class ExtensionMenuCloseTests(unittest.TestCase):
 
     def test_a_running_job_keeps_close_off_the_menu(self) -> None:
         answer = self.closed(strip_close=False, jobs='[{"id": "bg_1", "type": "bash", "label": "sleep 120"}]')
-        self.assertEqual((answer["shutdown"], answer["left"]), (False, 0), answer)
+        # Outside Tern, with Close off the menu, nothing is left to ask: the wait is saved and the session stays.
+        self.assertEqual((answer["shutdown"], answer["left"]), (False, 1), answer)
 
 
 # Loads the extension for SID and changes what runs in it: a background job, then a bash call. The

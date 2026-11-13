@@ -3521,6 +3521,8 @@ def _session_view(
         **target,
         "close": _session_close(
             record, info["resumable"], pane, pinned, _activity(state, session, info["live"], now),
+            # A session running outside Tern (kitty, say) has no pane to park.
+            parkable=pane is not None or not info["live"],
         ),
         "session_id": session, "title": info["title"], "cwd": info["cwd"],
         "project": info["project"], "live": info["live"], "pane": pane,
@@ -3561,13 +3563,17 @@ def _pane_view(record: dict, now: datetime) -> dict:
     }
 
 
-def _close_view(reasons: set[str]) -> dict | None:
+def _close_view(reasons: set[str], parkable: bool = True) -> dict | None:
     """A target's `close`, from the reasons its waits give: the first one
-    `CLOSE_REASONS` lists, which has the worst verdict. None without a wait."""
+    `CLOSE_REASONS` lists, which has the worst verdict. None without a wait.
+    A session running outside Tern has no pane to park: its park reads
+    "keep open" instead."""
     reason = next((reason for reason in CLOSE_REASONS if reason in reasons), None)
     if reason is None:
         return None
     verdict, text = CLOSE_REASONS[reason]
+    if verdict == "park" and not parkable:
+        text = text.replace("park only", "keep open", 1)
     return {"verdict": verdict, "reason": reason, "text": text}
 
 
@@ -3595,6 +3601,7 @@ def _activity(state: dict, session: str, live: bool, now: datetime) -> dict:
 
 def _session_close(
     record: dict | None, resumable: bool, pane: int | None, pinned: bool, activity: dict,
+    parkable: bool = True,
 ) -> dict | None:
     """Whether closing the session now keeps its waits whole. `turn`: a
     delivered prompt's turn, a repeat's run included, was cut once already, and
@@ -3622,7 +3629,7 @@ def _session_close(
     # The turn of a delivered prompt is the prompt's, sent again on a close.
     if activity.get("busy") and not delivered:
         reasons.add("busy")
-    return _close_view(reasons)
+    return _close_view(reasons, parkable)
 
 
 def _sort_key(view: dict) -> tuple:

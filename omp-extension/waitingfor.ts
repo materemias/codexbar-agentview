@@ -618,18 +618,26 @@ export function healthWarning(health, now = Date.now(), uncheckedSince?: number)
 	return healthState(health, now, uncheckedSince).warning;
 }
 
+/** Only a Tern pane can be parked: an omp outside Tern has no pane to take off a tab. */
+const inTern = () => Boolean(process.env.TERN_PANE);
+
 /** Closing loses the waits' checks while nothing runs them, whatever the session's own verdict says. */
 const UNCHECKED_CLOSE = { verdict: "park", reason: "unchecked", text: "park only: nothing checks waits" };
 /** omp's own background jobs and commands end with it; the CLI's `work` verdict says the same. */
 const WORK_CLOSE = { verdict: "park", reason: "work", text: "park only: work runs in this session" };
 
+/** A `park` verdict as it reads where the session runs: outside Tern there is nothing to park, so it is kept open. */
+function closeHere<T extends { text?: string }>(close: T): T {
+	return close && !inTern() && close.text ? { ...close, text: close.text.replace(/^park only/, "keep open") } : close;
+}
+
 /**
  * Whether the session may be closed: the CLI's `close` (undefined without waits), or park while the
- * view's health says nothing checks the waits.
+ * view's health says nothing checks the waits; outside Tern a park reads "keep open".
  */
 export function closeVerdict(session, health, now = Date.now(), uncheckedSince?: number) {
 	const close = session?.close ?? undefined;
-	return close && healthState(health, now, uncheckedSince).unchecked ? UNCHECKED_CLOSE : close;
+	return closeHere(close && healthState(health, now, uncheckedSince).unchecked ? UNCHECKED_CLOSE : close);
 }
 
 /**
@@ -832,8 +840,8 @@ const TOOL_FLAGS = {
 const NOT_PARKED_OUTSIDE_TERN = "not parked: this omp runs outside Tern, so there is no pane to park";
 
 /** What the tool's park did: `paneKnown` is false when the CLI knew no Tern pane of the session (`parked`). */
-function parkNote(inTern: boolean, paneKnown: boolean): string {
-	if (!inTern) return NOT_PARKED_OUTSIDE_TERN;
+function parkNote(paneKnown: boolean): string {
+	if (!inTern()) return NOT_PARKED_OUTSIDE_TERN;
 	if (!paneKnown) return "not parked: Tern has not listed this session's pane yet; try again in a few seconds";
 	return "parked: a Tern window takes this pane off its tab shortly; the session keeps running";
 }
@@ -895,6 +903,7 @@ const PARK_CHOICES = [
 	{ label: "Park it", description: "off the screen until you open it", park: true },
 	{ label: "Keep it open", description: "stays where it is", park: false },
 ];
+const KEEP_OPEN = PARK_CHOICES[1];
 
 /** What Close the session says will bring the session back. */
 const CLOSE_NOTES = {
@@ -911,12 +920,16 @@ const CLOSE_NOTES = {
  * session back, closing is offered first, but only while `canClose(c)` holds: omp is idle (closing
  * mid-turn, or while omp retries, compacts or holds a queued message, would cut the turn off) and
  * closing would lose nothing. A check the agent is to write (`what`) closes once its turn wrote it.
+ * Outside Tern nothing can be parked: the step asks only Close or keep it open, and without Close it
+ * keeps the session open unasked.
  */
 async function askPark(c, canClose: (c) => boolean, closeNote?: string, what?: string) {
-	if (!closeNote || !canClose(c)) return pick(c, "Park the session?", PARK_CHOICES);
+	const closing = closeNote !== undefined && canClose(c);
+	if (!closing) return inTern() ? pick(c, "Park the session?", PARK_CHOICES) : KEEP_OPEN;
 	const described = what !== undefined && !LITERAL_CHECK.test(what);
 	const description = described ? `${closeNote}; it closes once the agent wrote the command` : closeNote;
-	return pick(c, "Close or park the session?", [{ label: "Close the session", description, park: false, close: true }, ...PARK_CHOICES]);
+	const close = { label: "Close the session", description, park: false, close: true };
+	return inTern() ? pick(c, "Close or park the session?", [close, ...PARK_CHOICES]) : pick(c, "Close the session?", [close, KEEP_OPEN]);
 }
 
 /**
@@ -1070,7 +1083,7 @@ const FLOWS = {
 		async request(c, record, _pr, canClose) {
 			const what = await ask(c, "What do you wait for? (empty: nothing any more)", record?.waiting_for ?? "");
 			if (what === undefined) return undefined;
-			const choice = what ? await askPark(c, canClose, CLOSE_NOTES.something) : PARK_CHOICES[1];
+			const choice = what ? await askPark(c, canClose, CLOSE_NOTES.something) : KEEP_OPEN;
 			return choice ? { ...whatRequest(what, choice.park), close: choice.close } : undefined;
 		},
 	},
@@ -1645,7 +1658,8 @@ export default function (pi) {
 	/** Carries out a request from a /wait line or the menu for `session`, the one open when it was asked; the CLI's answer. */
 	async function perform(c, request, session: string) {
 		const resolved = await confirmRepo(request, c.cwd);
-		const args = [...(await targetOptions(resolved, c)), ...resolved.args];
+		// A one-line /wait parks; outside Tern there is no pane to park.
+		const args = [...(await targetOptions(resolved, c)), ...resolved.args].filter((arg) => inTern() || arg !== "--park");
 		const answer = await act(c, [resolved.command, "--session", session, ...args]);
 		if (c.sessionManager.getSessionId() !== session) return answer;
 		if (resolved.gh) {
@@ -1664,11 +1678,11 @@ export default function (pi) {
 	 * when closing loses nothing; the last applied view has the wait just saved.
 	 */
 	function closeBlocker(saved = false) {
-		if (healthState(health, Date.now(), uncheckedSince).unchecked) return UNCHECKED_CLOSE;
-		if (hasWork()) return WORK_CLOSE;
+		if (healthState(health, Date.now(), uncheckedSince).unchecked) return closeHere(UNCHECKED_CLOSE);
+		if (hasWork()) return closeHere(WORK_CLOSE);
 		const close = ownSession?.close;
 		if (!close) return saved ? { text: "no close verdict came back for it" } : undefined;
-		return close.verdict === "safe" || close.verdict === "manual" ? undefined : { text: close.text || `verdict ${close.verdict}` };
+		return close.verdict === "safe" || close.verdict === "manual" ? undefined : closeHere({ text: close.text || `verdict ${close.verdict}` });
 	}
 
 	/** Close is offered while omp is idle and closing would lose nothing. */
@@ -1704,7 +1718,7 @@ export default function (pi) {
 		const blocker = closeBlocker(true);
 		if (blocker) {
 			const kept = pinned ? "The session stays pinned" : "The wait is saved";
-			setPanel(c, errorPanel(`Not closed: ${blocker.text}. ${kept}; park the session instead.`));
+			setPanel(c, errorPanel(`Not closed: ${blocker.text}. ${kept}${inTern() ? "; park the session instead" : ""}.`));
 			return;
 		}
 		await c.shutdown();
@@ -1881,9 +1895,8 @@ export default function (pi) {
 				throw new Error(`This add writes the user's /wait check, which sets the rest: call it again with action, kind and argv only, without ${extra.join(", ")}. The command must exit 0 when it holds.`);
 			}
 			// Only a Tern pane can be parked: outside Tern the CLI isn't asked, and the result says so.
-			const inTern = Boolean(process.env.TERN_PANE);
 			const parking = params.action === "park" || (params.park === true && ["add", "babysit_pr"].includes(params.action));
-			const park = parking && inTern ? ["--park"] : [];
+			const park = parking && inTern() ? ["--park"] : [];
 			switch (params.action) {
 				case "add":
 					args = check ? ["write-check", "--session", session, `--argv=${JSON.stringify(params.argv)}`] : [...(await toolAddArgs(params, session, c.cwd)), ...park];
@@ -1903,7 +1916,7 @@ export default function (pi) {
 					];
 					break;
 				case "park":
-					if (!inTern) return { content: [{ type: "text", text: JSON.stringify({ park: NOT_PARKED_OUTSIDE_TERN }) }], details: {} };
+					if (!inTern()) return { content: [{ type: "text", text: JSON.stringify({ park: NOT_PARKED_OUTSIDE_TERN }) }], details: {} };
 					args = ["park", "--session", session];
 					break;
 				case "stop":
@@ -1929,7 +1942,7 @@ export default function (pi) {
 				if (ctx && session === sessionId) setPanel(ctx, () => `Check: ${params.argv.join(" ")} every ${seconds / size}${unit}`);
 			}
 			const result = params.action === "list" ? (answer.sessions?.[0] ?? { waits: [] }) : answer;
-			if (parking) result.park = parkNote(inTern, answer.parked != null);
+			if (parking) result.park = parkNote(answer.parked != null);
 			return { content: [{ type: "text", text: JSON.stringify(result) }], details: {} };
 		},
 	});

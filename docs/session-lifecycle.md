@@ -28,7 +28,9 @@ Press `Ctrl+Alt+B` or type `/wait` in omp. Both open the same menu:
 4. Optionally, a prompt to send into the session when the wait fires; Repeat
    a prompt needs one.
 5. What to do with the session: **Close the session**, **Park it** or **Keep
-   it open**. Close is offered only while the agent is idle, and it ends omp
+   it open**. Outside Tern there is no pane to park: only Close or Keep it
+   open is offered, and when Close isn't either, the step is skipped and the
+   session stays open. Close is offered only while the agent is idle, and it ends omp
    once the wait is saved; for a check the agent writes, once that turn ends.
    A turn still going by then, retrying, compacting or with a message queued,
    keeps the session open, and the row says so.
@@ -37,7 +39,8 @@ Press `Ctrl+Alt+B` or type `/wait` in omp. Both open the same menu:
    where Resume reopens it. For **When I have time** the pin brings it back
    from that group.
 
-A one-line `/wait` command always parks. Parked cards stay as Tern draws them.
+A one-line `/wait` command always parks in Tern; outside Tern the session stays
+as it is. Parked cards stay as Tern draws them.
 
 In Tern, `Ctrl+Alt+B` on an omp pane asks that session's omp extension to open
 its menu above the composer, so there is one menu, not two. A session started
@@ -287,7 +290,9 @@ again the same way, counted once; cut twice, that run is over and the repeat
 goes on. A check the agent is to
 write goes through the same queue (above). The row above the composer starts
 with the answer, and `/wait list` shows it on a `Closing:` line. The menu's
-Close the session is offered only when the answer is not "park only".
+Close the session is offered only when the answer is not "park only". A
+session running outside Tern (kitty, say) has no pane to park, so there each
+`park only` reads `keep open`: same reason, and closing it would lose the same.
 
 ## Coming back
 
