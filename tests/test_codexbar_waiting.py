@@ -17,7 +17,7 @@ import threading
 import time
 import types
 import unittest
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -207,7 +207,11 @@ class CliShapeTests(Case):
             ["add", "--session", SID, "--kind", "time", "--at", "18:60"],
             ["add", "--session", SID, "--kind", "something"],
             ["add", "--session", SID, "--kind", "something", "--what", "  "],
-            ["done", "--session", SID, "--wait", "w99"],
+            ["stop", "--session", SID, "--wait", "w99"],
+            ["stop", "--session", SID],
+            ["stop", "--session", SID, "--wait", "w1", "--all"],
+            ["mark-seen", "--session", SID, "--wait", "w99"],
+            ["mark-seen", "--session", SID],
             ["nonsense"],
         ):
             with self.subTest(argv=argv):
@@ -220,6 +224,7 @@ class CliShapeTests(Case):
             ["add", "--session", SID, "--kind", "something", "--what", "x", "--who", "y"],
             ["add", "--session", SID, "--kind", "something", "--what", "x", "--remind-in", "1d"],
             ["chain-pr", "--session", SID, "--repo", "o/r", "--number", "7"],
+            ["done", "--session", SID],
         ):
             with self.subTest(argv=argv):
                 self.run_cli(*argv, expect=2)
@@ -616,15 +621,16 @@ class ConditionTests(Case):
         self.run_cli("event", "--type", "turn_finished", "--pane", "40")
         self.assertEqual(self.wait_of(wait)["state"], "review")
 
-    def test_done_ends_what_is_on_me_and_keeps_what_still_waits(self) -> None:
+    def test_seen_ends_what_is_on_me_and_stop_ends_the_rest(self) -> None:
         self.agents(SID)
         self.heartbeat()
         ran, _ = self.queued_prompt()
         self.run_cli("event", "--type", "turn_finished", "--pane", "40")
         later = self.add("--kind", "time", "--in", "1d")["id"]
-        self.run_cli("done", "--session", SID)
+        self.run_cli("mark-seen", "--session", SID)
         self.assertEqual([w["id"] for w in self.session()["waits"]], [later])
-        self.run_cli("done", "--session", SID)
+        self.run_cli("mark-seen", "--session", SID, expect=2)
+        self.run_cli("stop", "--session", SID, "--all")
         self.assertEqual({w["id"]: w["state"] for w in self.state()["sessions"][SID]["waits"]}, {ran: "done", later: "done"})
 
     def test_job_on_a_pane_record(self) -> None:
@@ -733,7 +739,7 @@ class ConditionTests(Case):
         self.assertEqual([action["type"] for action in actions], ["park"])
         self.assertEqual([pane["pane"] for pane in self.run_cli("list")["panes"]], [52])
 
-    def test_something_never_fires_and_ends_with_done(self) -> None:
+    def test_something_never_fires_and_ends_with_stop(self) -> None:
         answer = self.add("--kind", "something", "--what", "Reply from Dóra")
         wait = answer["id"]
         self.assertEqual((answer["label"], answer["summary"]), ("Reply from Dóra", "Reply from Dóra"))
@@ -743,7 +749,7 @@ class ConditionTests(Case):
         self.assertEqual((seen["state"], seen["ball"]), ("waiting", "on_someone"))
         self.assertIsNone(seen["due_at"])
         self.assertEqual(self.session()["status"], "⏳ Reply from Dóra · 2d")
-        self.run_cli("done", "--session", SID, "--wait", wait)
+        self.run_cli("stop", "--session", SID, "--wait", wait)
         self.assertEqual(self.run_cli("list")["sessions"], [])
 
     def test_something_past_its_deadline_comes_to_me_and_stays_open(self) -> None:
@@ -819,7 +825,7 @@ class ConditionTests(Case):
         second = self.add("--kind", "time", "--at", "18:00", "--after", first)
         self.assertEqual((second["state"], second["summary"]), ("pending", "at 18:00"))
         self.clock = self.clock.replace(hour=19)
-        self.run_cli("done", "--session", SID, "--wait", first)
+        self.run_cli("stop", "--session", SID, "--wait", first)
         tomorrow = (self.clock + timedelta(days=1)).replace(hour=18)
         self.assertEqual(self.wait_of(second["id"])["condition"]["at"], tomorrow.isoformat())
 
@@ -1333,7 +1339,7 @@ class NoteTests(Case):
         self.run_cli("note", "--pane", "51", "--text", "forgotten", expect=2)
         self.assertFalse((self.state_dir / "waiting.json").exists())
         wait = self.add("--kind", "time", "--in", "1h", "--note", "old")["id"]
-        self.run_cli("done", "--session", SID, "--wait", wait)
+        self.run_cli("stop", "--session", SID, "--wait", wait)
         self.run_cli("note", "--session", SID, "--text", "new", expect=2)
 
     def test_a_pinned_session_takes_a_note_without_a_wait(self) -> None:
@@ -1344,7 +1350,7 @@ class NoteTests(Case):
 
     def test_a_new_set_aside_does_not_inherit_the_old_sentence(self) -> None:
         wait = self.add("--kind", "later", "--note", "old")["id"]
-        self.run_cli("done", "--session", SID, "--wait", wait)
+        self.run_cli("stop", "--session", SID, "--wait", wait)
         self.add("--kind", "later")
         seen = self.session()
         self.assertIsNone(seen["note"])
@@ -1578,7 +1584,7 @@ class MenuRequestTests(Case):
 
 
 class ChainTests(Case):
-    def test_done_activates_after(self) -> None:
+    def test_stop_activates_after(self) -> None:
         first = self.add("--kind", "something", "--what", "x")["id"]
         second = self.add("--kind", "time", "--in", "1h", "--after", first)
         self.assertEqual(second["state"], "pending")
@@ -1587,7 +1593,7 @@ class ChainTests(Case):
         self.advance(hours=2)
         self.tick()
         self.assertEqual(self.wait_of(second["id"])["state"], "pending")
-        self.run_cli("done", "--session", SID, "--wait", first)
+        self.run_cli("stop", "--session", SID, "--wait", first)
         seen = self.wait_of(second["id"])
         self.assertEqual(seen["state"], "waiting")
         self.assertEqual(seen["condition"]["at"], (self.clock + timedelta(hours=1)).isoformat())
@@ -1599,7 +1605,7 @@ class ChainTests(Case):
         self.tick()
         self.assertEqual(self.wait_of(first)["state"], "fired")
         self.assertEqual(self.wait_of(second)["state"], "waiting")
-        self.run_cli("done", "--session", SID, "--wait", first)
+        self.run_cli("mark-seen", "--session", SID, "--wait", first)
         self.assertEqual(self.wait_of(second)["state"], "waiting")
 
     def test_after_a_fired_wait_starts_at_once(self) -> None:
@@ -1616,22 +1622,22 @@ class ChainTests(Case):
         self.assertEqual(self.wait_of(first)["next"], second)
         self.assertEqual(self.wait_of(second)["next"], third)
 
-    def test_done_on_a_pending_step_keeps_the_chain_whole(self) -> None:
+    def test_stopping_a_pending_step_keeps_the_chain_whole(self) -> None:
         first = self.add("--kind", "later")["id"]
         second = self.add("--kind", "later", "--after", first)["id"]
         third = self.add("--kind", "later", "--after", second)["id"]
-        self.run_cli("done", "--session", SID, "--wait", second)
+        self.run_cli("stop", "--session", SID, "--wait", second)
         self.assertEqual(self.wait_of(third)["state"], "pending")
-        self.run_cli("done", "--session", SID, "--wait", first)
+        self.run_cli("stop", "--session", SID, "--wait", first)
         self.assertEqual(self.wait_of(third)["state"], "waiting")
 
     def test_unknown_after(self) -> None:
         self.run_cli("add", "--session", SID, "--kind", "later", "--after", "w9", expect=2)
 
-    def test_done_all_leaves_the_view(self) -> None:
+    def test_stop_all_leaves_the_view(self) -> None:
         first = self.add("--kind", "later")["id"]
         self.add("--kind", "later", "--after", first)
-        view = self.run_cli("done", "--session", SID)["view"]
+        view = self.run_cli("stop", "--session", SID, "--all")["view"]
         self.assertEqual(view["sessions"], [])
 
     def test_remove(self) -> None:
@@ -1696,17 +1702,17 @@ class PromptTests(Case):
     def test_ack_is_idempotent_and_checks_the_result(self) -> None:
         wait, action = self.queued_prompt()
         self.run_cli("ack", "--action", action, "--result", "done", expect=2)
-        self.run_cli("done", "--session", SID, "--wait", wait)
+        self.run_cli("stop", "--session", SID, "--wait", wait)
         self.assertTrue(self.run_cli("ack", "--action", action, "--result", "delivered")["ignored"])
 
-    def test_turn_without_verify_goes_to_review_then_done_moves_on(self) -> None:
+    def test_turn_without_verify_goes_to_review_then_seen_moves_on(self) -> None:
         wait, _ = self.queued_prompt()
         following = self.add("--kind", "later", "--after", wait)["id"]
         self.run_cli("event", "--type", "turn_finished", "--session", SID)
         seen = self.wait_of(wait)
         self.assertEqual((seen["state"], seen["ball"], seen["reason"]), ("review", "on_me", "ran, take a look"))
         self.assertEqual(self.wait_of(following)["state"], "pending")
-        self.run_cli("done", "--session", SID, "--wait", wait)
+        self.run_cli("mark-seen", "--session", SID, "--wait", wait)
         self.assertEqual(self.wait_of(following)["state"], "waiting")
 
     def test_turn_with_verify_ok_finishes_and_moves_on(self) -> None:
@@ -1960,7 +1966,7 @@ class TickTests(Case):
         self.assertEqual(self.tick()["next_tick_s"], 300)
         self.add("--kind", "time", "--in", "2m")
         self.assertEqual(self.tick()["next_tick_s"], 120)
-        self.run_cli("done", "--session", SID)
+        self.run_cli("stop", "--session", SID, "--all")
         self.add("--kind", "time", "--in", "2s")
         self.assertEqual(self.tick()["next_tick_s"], 15)
 
@@ -2093,7 +2099,7 @@ class ViewTests(Case):
                 "status", "line", "composer_row",
                 "next_step", "threads", "still_waiting", "waiting_for", "recap", "recap_at", "recap_stale", "due_at", "prompts_queued", "waits",
                 "close",
-                "history", "prs",
+                "history", "prs", "on_you", "stoppable",
             },
         )
         self.assertEqual(seen["status"], "⏲ Retry · in 2h")
@@ -2215,10 +2221,10 @@ class ViewTests(Case):
         self.assertEqual(seen["line"], "📌 pinned")
         self.assertEqual(self.run_cli("list")["counts"]["on_my_time"], 1)
 
-    def test_pinned_keeps_its_sentence_after_done(self) -> None:
+    def test_pinned_keeps_its_sentence_after_stop(self) -> None:
         self.pin(SID)
         wait = self.add("--kind", "time", "--in", "1h", "--note", "mine")["id"]
-        self.run_cli("done", "--session", SID, "--wait", wait)
+        self.run_cli("stop", "--session", SID, "--wait", wait)
         self.assertEqual(self.session()["note"], "mine")
         self.add("--kind", "later")
         self.assertEqual(self.session()["note"], "mine")
@@ -2417,7 +2423,7 @@ class ClosedSessionTests(Case):
 
     def test_closed_record_is_pruned_after_a_week(self) -> None:
         wait = self.add("--kind", "later")["id"]
-        self.run_cli("done", "--session", SID, "--wait", wait)
+        self.run_cli("stop", "--session", SID, "--wait", wait)
         self.advance(days=6)
         self.tick()
         self.assertIn(SID, self.state()["sessions"])
@@ -2833,7 +2839,7 @@ class CardTests(SessionPrCase):
 
     def test_a_finished_record_still_shows_its_note(self) -> None:
         wait = self.add("--kind", "later", "--note", "why")["id"]
-        self.run_cli("done", "--session", SID, "--wait", wait)
+        self.run_cli("stop", "--session", SID, "--wait", wait)
         card = self.card()
         self.assertEqual((card["note"], card["waits"]), ("why", []))
         self.assertTrue(card["has_record"])
@@ -2959,6 +2965,130 @@ class CardTests(SessionPrCase):
         self.assertEqual(sorted(pr["number"] for pr in self.card()["prs"]), [1, 2])
 
 
+def stamped(record: dict, moment: datetime) -> dict:
+    """A transcript record with omp's UTC timestamp."""
+    utc = moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3]
+    return {**record, "timestamp": f"{utc}Z"}
+
+
+class SeenStopTests(SessionPrCase):
+    """Seen closes what is on me; Stop ends what is still watched."""
+
+    def fired(self, label: str = "Ping") -> str:
+        wait = self.add("--kind", "time", "--in", "1s", "--label", label)["id"]
+        self.advance(seconds=2)
+        self.tick()
+        return wait
+
+    def history(self) -> list[str]:
+        return [line["text"] for line in self.state()["sessions"][SID]["history"]]
+
+    def states(self) -> dict[str, str]:
+        return {wait["id"]: wait["state"] for wait in self.state()["sessions"][SID]["waits"]}
+
+    def test_seen_closes_only_what_is_on_me_and_logs_it(self) -> None:
+        ping = self.fired()
+        watched = self.add("--kind", "time", "--in", "1d", "--label", "Watched")["id"]
+        self.run_cli("mark-seen", "--session", SID)
+        self.assertEqual(self.states(), {ping: "done", watched: "waiting"})
+        self.assertIn("Seen: Ping", self.history())
+        self.assertFalse(any(text.endswith("Watched") for text in self.history()))
+        answer = self.run_cli("mark-seen", "--session", SID, expect=2)
+        self.assertEqual(answer["error"], "nothing is on you")
+        self.assertEqual(self.states()[watched], "waiting")
+
+    def test_seen_with_nothing_set_aside_is_refused(self) -> None:
+        self.assertEqual(self.run_cli("mark-seen", "--session", SID, expect=2)["error"], "nothing is on you")
+
+    def test_seen_refuses_a_wait_still_watched(self) -> None:
+        self.fired()
+        watched = self.add("--kind", "time", "--in", "1d")["id"]
+        self.run_cli("mark-seen", "--session", SID, "--wait", watched, expect=2)
+        self.assertEqual(self.states()[watched], "waiting")
+
+    def test_stop_one_ends_it_and_leaves_the_rest(self) -> None:
+        ping = self.fired()
+        watched = self.add("--kind", "time", "--in", "1d", "--label", "Watched")["id"]
+        self.run_cli("stop", "--session", SID, "--wait", watched)
+        self.assertEqual(self.states(), {ping: "fired", watched: "done"})
+        self.assertIn("Stopped: Watched", self.history())
+
+    def test_stop_all_ends_every_wait_and_its_chain(self) -> None:
+        ping = self.fired()
+        first = self.add("--kind", "something", "--what", "x", "--label", "First")["id"]
+        second = self.add("--kind", "later", "--label", "Second", "--after", first)["id"]
+        self.assertEqual(self.session()["stoppable"], 3)
+        view = self.run_cli("stop", "--session", SID, "--all")["view"]
+        self.assertEqual(view["sessions"], [])
+        self.assertEqual(self.states(), {ping: "done", first: "done", second: "done"})
+        self.assertEqual(
+            [wait["next"] for wait in self.state()["sessions"][SID]["waits"]], [None, None, None],
+        )
+        self.assertEqual(
+            [text for text in self.history() if text.startswith("Stopped: ")],
+            ["Stopped: Ping", "Stopped: First", "Stopped: Second"],
+        )
+        self.assertFalse(any(text.startswith("Next: ") for text in self.history()))
+
+    def test_on_you_lists_what_came_and_stoppable_counts_every_open_wait(self) -> None:
+        ping = self.fired()
+        self.add("--kind", "time", "--in", "1d")
+        seen = self.session()
+        fired = self.wait_of(ping)
+        self.assertEqual(seen["on_you"], [{
+            "id": ping, "label": "Ping", "mark": fired["mark"], "text": fired["fired_text"], "report": None,
+        }])
+        self.assertEqual(seen["stoppable"], 2)
+        self.run_cli("mark-seen", "--session", SID)
+        seen = self.session()
+        self.assertEqual((seen["on_you"], seen["stoppable"]), ([], 1))
+
+    def test_a_pane_has_on_you_and_stoppable_too(self) -> None:
+        self.run_cli("add", "--pane", "51", "--kind", "job")
+        pane = self.run_cli("list")["panes"][0]
+        self.assertEqual((pane["on_you"], pane["stoppable"]), ([], 1))
+
+    def test_seen_skips_a_status_the_chain_it_moved_on_replaced(self) -> None:
+        ran = self.add("--kind", "time", "--in", "1s", "--prompt", "go", "--label", "Ran")["id"]
+        status = self.add("--kind", "something", "--what", "status", "--label", "Status", "--deadline-in", "1s")["id"]
+        step = self.add("--kind", "something", "--what", "after", "--after", ran)["id"]
+        self.advance(seconds=2)
+        self.tick()
+        action = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]["action"]
+        self.run_cli("ack", "--action", action, "--result", "failed")
+        self.assertEqual([entry["id"] for entry in self.session()["on_you"]], [ran, status])
+        self.run_cli("mark-seen", "--session", SID)
+        self.assertEqual(self.states(), {status: "done", ran: "done", step: "waiting"})
+        self.assertIn("Done: Status", self.history())
+        self.assertNotIn("Seen: Status", self.history())
+
+    def test_a_review_wait_reports_the_agents_last_reply(self) -> None:
+        self.write(stamped(said("before the prompt"), self.clock - timedelta(minutes=1)))
+        wait, _ = self.queued_prompt()
+        delivered = self.clock
+        reply = "Done.  Merged\n the PR " + "and more " * 60
+        self.write(
+            stamped(user("go"), delivered),
+            stamped(said("first look"), delivered + timedelta(seconds=1)),
+            stamped(call("c1", "ls"), delivered + timedelta(seconds=2)),
+            stamped(said(reply), delivered + timedelta(seconds=3)),
+            stamped(call("c2", "ls"), delivered + timedelta(seconds=4)),
+        )
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        (entry,) = self.session()["on_you"]
+        self.assertEqual((entry["id"], entry["text"]), (wait, "ran, take a look"))
+        self.assertEqual(len(entry["report"]), waiting.REPORT_CHARS)
+        self.assertTrue(entry["report"].startswith("Done. Merged the PR and more"))
+        self.assertTrue(entry["report"].endswith("…"))
+        self.assertEqual(self.run_cli("card", "--session", SID, "--cached")["card"]["on_you"], [entry])
+
+    def test_a_review_wait_with_no_reply_since_reports_nothing(self) -> None:
+        self.write(stamped(said("before the prompt"), self.clock - timedelta(minutes=1)))
+        self.queued_prompt()
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.assertIsNone(self.session()["on_you"][0]["report"])
+
+
 class OutcomeTests(Case):
     """What a wait came to, and how every surface says it."""
 
@@ -2996,7 +3126,7 @@ class OutcomeTests(Case):
         first = self.add("--kind", "something", "--what", "x")["id"]
         second = self.add("--kind", "time", "--in", "2d", "--after", first)["id"]
         self.advance(days=3)
-        self.run_cli("done", "--session", SID, "--wait", first)
+        self.run_cli("stop", "--session", SID, "--wait", first)
         self.advance(days=2)
         self.tick()
         seen = self.wait_of(second)
@@ -3686,45 +3816,45 @@ class PinTests(Case):
         answer = self.run_cli("add", "--pane", "4", "--kind", "later")
         self.assertFalse(answer["pinned"])
         self.assertFalse(self.pins_path.exists())
-        self.assertFalse(self.run_cli("done", "--pane", "4")["pinned"])
+        self.assertFalse(self.run_cli("stop", "--pane", "4", "--all")["pinned"])
 
-    def test_done_on_the_later_wait_unpins_and_keeps_the_rest(self) -> None:
+    def test_stopping_the_later_wait_unpins_and_keeps_the_rest(self) -> None:
         self.seed("first", "second")
         wait = self.add_answer("--kind", "later")["wait"]["id"]
         self.seed("first", SID, "second")
-        answer = self.run_cli("done", "--session", SID, "--wait", wait)
+        answer = self.run_cli("stop", "--session", SID, "--wait", wait)
         self.assertFalse(answer["pinned"])
         self.assertEqual(self.pins(), ["first", "second"])
         self.assertEqual(answer["view"]["sessions"][0]["session_id"], "first")
         self.assertEqual(len(answer["view"]["sessions"]), 2)
 
-    def test_done_on_another_wait_keeps_the_pin(self) -> None:
+    def test_stopping_another_wait_keeps_the_pin(self) -> None:
         self.add_answer("--kind", "later")
         wait = self.add_answer("--kind", "time", "--in", "1h")["wait"]["id"]
-        answer = self.run_cli("done", "--session", SID, "--wait", wait)
+        answer = self.run_cli("stop", "--session", SID, "--wait", wait)
         self.assertTrue(answer["pinned"])
         self.assertEqual(self.pins(), [SID])
 
     def test_a_second_later_wait_keeps_the_pin(self) -> None:
         first = self.add_answer("--kind", "later")["wait"]["id"]
         second = self.add_answer("--kind", "later")["wait"]["id"]
-        self.assertTrue(self.run_cli("done", "--session", SID, "--wait", first)["pinned"])
-        self.assertFalse(self.run_cli("done", "--session", SID, "--wait", second)["pinned"])
+        self.assertTrue(self.run_cli("stop", "--session", SID, "--wait", first)["pinned"])
+        self.assertFalse(self.run_cli("stop", "--session", SID, "--wait", second)["pinned"])
         self.assertEqual(self.pins(), [])
 
-    def test_done_without_a_wait_unpins_a_pinned_session(self) -> None:
+    def test_stop_all_unpins_a_pinned_session(self) -> None:
         self.seed("first", SID)
         self.add_answer("--kind", "time", "--in", "1h")
-        self.assertFalse(self.run_cli("done", "--session", SID)["pinned"])
+        self.assertFalse(self.run_cli("stop", "--session", SID, "--all")["pinned"])
         self.assertEqual(self.pins(), ["first"])
 
-    def test_done_with_no_record_unpins_too(self) -> None:
+    def test_stop_all_with_no_record_unpins_too(self) -> None:
         self.seed(SID)
-        self.assertFalse(self.run_cli("done", "--session", SID)["pinned"])
+        self.assertFalse(self.run_cli("stop", "--session", SID, "--all")["pinned"])
         self.assertEqual(self.pins(), [])
 
-    def test_done_on_an_unpinned_session_writes_nothing(self) -> None:
-        self.assertFalse(self.run_cli("done", "--session", SID)["pinned"])
+    def test_stop_all_on_an_unpinned_session_writes_nothing(self) -> None:
+        self.assertFalse(self.run_cli("stop", "--session", SID, "--all")["pinned"])
         self.assertFalse(self.pins_path.exists())
 
     def test_a_held_lock_leaves_the_record_and_reports_the_pin(self) -> None:
@@ -3736,10 +3866,10 @@ class PinTests(Case):
         self.assertEqual(self.pins(), ["first"])
         self.assertEqual(self.session()["note"], "why")
 
-    def test_a_held_lock_only_postpones_the_unpin_on_done(self) -> None:
+    def test_a_held_lock_only_postpones_the_unpin_on_stop(self) -> None:
         wait = self.add_answer("--kind", "later")["wait"]["id"]
         self.hold_lock()
-        answer = self.run_cli("done", "--session", SID, "--wait", wait)
+        answer = self.run_cli("stop", "--session", SID, "--wait", wait)
         self.assertTrue(answer["pinned"])
         self.assertIn("pin_error", answer)
         self.assertEqual(self.state()["sessions"][SID]["waits"][0]["state"], "done")
@@ -3749,9 +3879,9 @@ class PinTests(Case):
         self.hold_lock()
         self.assertNotIn("pin_error", self.add_answer("--kind", "later"))
 
-    def test_a_held_lock_is_no_error_when_done_has_nothing_to_unpin(self) -> None:
+    def test_a_held_lock_is_no_error_when_stop_has_nothing_to_unpin(self) -> None:
         self.hold_lock()
-        answer = self.run_cli("done", "--session", SID)
+        answer = self.run_cli("stop", "--session", SID, "--all")
         self.assertFalse(answer["pinned"])
         self.assertNotIn("pin_error", answer)
 
@@ -3772,17 +3902,17 @@ class PinTests(Case):
 
         with mock.patch.object(waiting, "_replace_pins", write):
             wait = self.add_answer("--kind", "later")["wait"]["id"]
-            self.run_cli("done", "--session", SID, "--wait", wait)
+            self.run_cli("stop", "--session", SID, "--wait", wait)
         self.assertEqual(held, [True, True])
 
     def test_the_attempt_under_the_state_lock_stays_short(self) -> None:
         self.assertLessEqual(waiting.PIN_LOCK_TRIES * waiting.PIN_LOCK_DELAY_S, 1)
 
-    def test_done_after_a_failed_pin_stays_unpinned_for_good(self) -> None:
+    def test_stop_after_a_failed_pin_stays_unpinned_for_good(self) -> None:
         holder = self.hold_lock()
         wait = self.add_answer("--kind", "later")["wait"]["id"]
         self.assertTrue(self.pin_wanted())
-        self.assertNotIn("pin_error", self.run_cli("done", "--session", SID, "--wait", wait))
+        self.assertNotIn("pin_error", self.run_cli("stop", "--session", SID, "--wait", wait))
         self.assertIsNone(self.pin_wanted())
         holder.close()
         self.tick()
@@ -3804,16 +3934,16 @@ class PinTests(Case):
         self.seed("first", SID)
         wait = self.add_answer("--kind", "later")["wait"]["id"]
         holder = self.hold_lock()
-        self.run_cli("done", "--session", SID, "--wait", wait)
+        self.run_cli("stop", "--session", SID, "--wait", wait)
         self.assertIs(self.pin_wanted(), False)
         holder.close()
         self.tick()
         self.assertEqual(self.pins(), ["first"])
         self.assertIsNone(self.pin_wanted())
 
-    def test_tick_never_pins_a_session_whose_later_wait_is_done(self) -> None:
+    def test_tick_never_pins_a_session_whose_later_wait_is_stopped(self) -> None:
         wait = self.add_answer("--kind", "later")["wait"]["id"]
-        self.run_cli("done", "--session", SID, "--wait", wait)
+        self.run_cli("stop", "--session", SID, "--wait", wait)
         self.set_pin_wanted(True)
         self.tick()
         self.assertEqual(self.pins(), [])
@@ -3829,17 +3959,17 @@ class PinTests(Case):
     def test_a_new_later_wait_replaces_a_failed_unpin(self) -> None:
         wait = self.add_answer("--kind", "later")["wait"]["id"]
         holder = self.hold_lock()
-        self.run_cli("done", "--session", SID, "--wait", wait)
+        self.run_cli("stop", "--session", SID, "--wait", wait)
         holder.close()
         self.add_answer("--kind", "later")
         self.assertIsNone(self.pin_wanted())
         self.tick()
         self.assertEqual(self.pins(), [SID])
 
-    def test_done_with_no_record_keeps_a_failed_unpin(self) -> None:
+    def test_stop_all_with_no_record_keeps_a_failed_unpin(self) -> None:
         self.seed(SID)
         holder = self.hold_lock()
-        self.assertIn("pin_error", self.run_cli("done", "--session", SID))
+        self.assertIn("pin_error", self.run_cli("stop", "--session", SID, "--all"))
         self.assertIs(self.pin_wanted(), False)
         self.assertIsNotNone(self.state()["sessions"][SID]["closed_at"])
         holder.close()
@@ -4058,7 +4188,7 @@ class WhatTests(Case):
         self.assertNotEqual(now["id"], step["id"])
         self.assertEqual(self.session()["waiting_for"], "now")
         self.assertEqual(self.wait_of(step["id"])["label"], "later on")
-        self.run_cli("done", "--session", SID, "--wait", timer)
+        self.run_cli("stop", "--session", SID, "--wait", timer)
         seen = self.session()
         self.assertEqual([wait["id"] for wait in seen["waits"]], [step["id"]])
         self.assertEqual(seen["waiting_for"], "later on")
@@ -4353,7 +4483,7 @@ class RepeatTests(Case):
         self.assertIsNone(self.wait_of(wait)["repeat"]["next_at"])
         self.at(hours=2)
         self.assertEqual(self.claim(), [])
-        self.run_cli("done", "--session", SID, "--wait", first)
+        self.run_cli("stop", "--session", SID, "--wait", first)
         self.assertEqual(self.wait_of(wait)["repeat"]["next_at"], (T0 + timedelta(hours=3)).isoformat())
 
     def test_a_session_closed_during_a_run_sends_the_run_again_once(self) -> None:
@@ -4801,7 +4931,7 @@ class CloseTests(Case):
     def test_later_and_a_pin_come_back_to_me(self) -> None:
         self.add("--kind", "later")
         self.assertEqual(self.close()["verdict"], "manual")
-        self.run_cli("done", "--session", SID)
+        self.run_cli("stop", "--session", SID, "--all")
         (self.omp / "session-pins.json").write_text(json.dumps([SID]))
         self.assertIsNone(self.close())  # pinned, nothing to wait for
         self.add("--kind", "time", "--in", "1h", "--prompt", "go")
@@ -4938,9 +5068,9 @@ class DescribedCheckTests(Case):
         )
         self.assertIn(self.DESCRIPTION, answer["error"])
 
-    def test_done_takes_the_instruction_back(self) -> None:
+    def test_stop_takes_the_instruction_back(self) -> None:
         wait = self.describe()
-        self.run_cli("done", "--session", SID, "--wait", wait)
+        self.run_cli("stop", "--session", SID, "--wait", wait)
         self.assertEqual(self.run_cli("claim-prompts", "--session", SID)["prompts"], [])
 
     def test_closing_before_the_command_was_written_asks_once_more(self) -> None:
@@ -5860,7 +5990,7 @@ class PruneTests(Case):
         ended = self.add("--kind", "time", "--in", "1s", "--label", "Old")["id"]
         self.advance(seconds=2)
         self.tick()
-        self.run_cli("done", "--session", SID, "--wait", ended)
+        self.run_cli("mark-seen", "--session", SID, "--wait", ended)
         ids = lambda: [wait["id"] for wait in self.state()["sessions"][SID]["waits"]]
         self.advance(days=7)
         self.tick()
@@ -5868,7 +5998,7 @@ class PruneTests(Case):
         self.advance(seconds=1)
         self.tick()
         self.assertNotIn(ended, ids())
-        self.assertIn("Done: Old", [line["text"] for line in self.state()["sessions"][SID]["history"]])
+        self.assertIn("Seen: Old", [line["text"] for line in self.state()["sessions"][SID]["history"]])
 
     def test_pr_cache_rows_unused_for_a_week_go(self) -> None:
         old = (self.clock - timedelta(days=8)).isoformat()
@@ -5902,11 +6032,11 @@ class PruneTests(Case):
         first = self.add("--kind", "later")["id"]
         skipped = self.add("--kind", "time", "--in", "1h", "--after", first)["id"]
         last = self.add("--kind", "later", "--label", "Last", "--after", skipped)["id"]
-        self.run_cli("done", "--session", SID, "--wait", skipped)
+        self.run_cli("stop", "--session", SID, "--wait", skipped)
         self.advance(days=8)
         self.tick()
         self.assertNotIn(skipped, [wait["id"] for wait in self.state()["sessions"][SID]["waits"]])
-        self.run_cli("done", "--session", SID, "--wait", first)
+        self.run_cli("stop", "--session", SID, "--wait", first)
         self.assertEqual(self.wait_of(last)["state"], "waiting")
 
 

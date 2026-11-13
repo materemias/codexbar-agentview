@@ -8,7 +8,7 @@ Code watches the waits; `tick` runs one pass and exits, its caller schedules it.
 Every command prints one JSON object. State changes run under a flock on
 waiting.lock and replace waiting.json atomically. Commands and `gh` run outside
 the lock: a tick claims the due checks, runs them, and merges each result only
-if the wait's `rev` is unchanged, so a Done or a snooze during a slow check wins.
+if the wait's `rev` is unchanged, so a Seen, a Stop or a snooze during a slow check wins.
 """
 from __future__ import annotations
 
@@ -33,6 +33,7 @@ import tempfile
 import time
 import traceback
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO
@@ -90,6 +91,9 @@ TICKER_AHEAD_S = 60
 TICK_OUTBOX_S = 30
 OUTBOX_RECENT_S = 5 * 60
 RECAP_CHARS = 600
+# A "ran, take a look" wait's excerpt of the agent's reply (`Omp.last_reply`).
+REPORT_CHARS = 400
+REPLY_TAIL_BYTES = 64 * 1024
 NOTE_IN_LINE_CHARS = 80
 SHORT_LABEL_CHARS = 24
 COMMAND_LABEL_CHARS = 60
@@ -585,6 +589,7 @@ class Omp:
         self.pins_path = self.root / "session-pins.json"
         self._pins: list[str] | None = None
         self._transcripts: dict[str, Path] | None = None
+        self._replies: dict[tuple[str, float], str | None] = {}
 
     def pins(self) -> list[str]:
         if self._pins is None:
@@ -607,6 +612,17 @@ class Omp:
                 for path in (self.root / "sessions").glob("*/*_*.jsonl")
             }
         return self._transcripts.get(session)
+
+    def last_reply(self, session: str, since: float) -> str | None:
+        """The text of the session's last assistant message written at or after
+        `since` (seconds), clipped to `REPORT_CHARS`; None when there is none.
+        Read from the transcript's tail, back to the first older entry."""
+        key = (session, since)
+        if key not in self._replies:
+            path = self.transcript(session)
+            text = _last_reply(path, since) if path is not None else None
+            self._replies[key] = _clip(text, REPORT_CHARS) if text else None
+        return self._replies[key]
 
     def header(self, session: str) -> dict:
         """Title and folder from a transcript's first records."""
@@ -864,7 +880,7 @@ def _move_pin(
     state: dict, session: str | None, want: bool | None, omp: Omp, now: datetime,
 ) -> dict:
     """Move the session's pin to `want` (None leaves it) and return the answer's
-    `pinned`. Callers hold the state lock, so a Done that closes the wait also
+    `pinned`. Callers hold the state lock, so a Seen or Stop that closes the wait also
     unpins, and no pin can land after it. What can't be written stays in
     `pin_wanted` for tick; a later `want` replaces it."""
     if session is None:
@@ -917,6 +933,54 @@ def _message_text(content: object) -> str:
         block["text"] for block in content if isinstance(block, dict)
         and block.get("type") == "text" and isinstance(block.get("text"), str)
     )
+
+
+def _entry_stamp(entry: dict) -> float | None:
+    try:
+        return _stamp(entry["timestamp"]) if isinstance(entry.get("timestamp"), str) else None
+    except BadInput:
+        return None
+
+
+def _last_reply(path: Path, since: float) -> str | None:
+    """The text of the transcript's last assistant message at or after `since`.
+    Reads the tail in growing chunks and stops at the first older entry, so a
+    long transcript costs only what was written since."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as source:
+            chunk = REPLY_TAIL_BYTES
+            while True:
+                start = max(0, size - chunk)
+                source.seek(start)
+                rows = source.read(size - start).split(b"\n")
+                if start:
+                    rows = rows[1:]  # the first may be cut
+                for row in reversed(rows):
+                    if not row.startswith(b"{"):
+                        continue
+                    try:
+                        entry = json.loads(row)
+                    except ValueError:
+                        continue  # one still being written
+                    if not isinstance(entry, dict):
+                        continue
+                    stamp = _entry_stamp(entry)
+                    if stamp is not None and stamp < since:
+                        return None
+                    message = entry.get("message")
+                    if (
+                        entry.get("type") == "message" and isinstance(message, dict)
+                        and message.get("role") == "assistant"
+                    ):
+                        text = _message_text(message.get("content")).strip()
+                        if text:
+                            return text
+                if not start:
+                    return None
+                chunk *= 4
+    except OSError:
+        return None
 
 
 def _note_pr(prs: list[dict], repo: str, number: int, source: str) -> None:
@@ -1392,6 +1456,8 @@ def _new_wait(state: dict, now: datetime, daemon: str | None = None, **fields: o
         # What `retry` restores of a wait check errors put on me (`_attention`).
         "retry_as": None,
         "done_at": None, "snooze_s": None,
+        # When the prompt a "ran, take a look" wait ran was delivered (`_settle_turn`).
+        "review_since": None,
     }
     wait.update(fields)
     if wait.get("kind") == "job":
@@ -1590,7 +1656,7 @@ def _fire(
     ending: bool = False,
 ) -> None:
     """The condition held. With a prompt the wait stays with the machine; without
-    one the step is over, so the chain moves on while the wait waits for my Done.
+    one the step is over, so the chain moves on while the wait waits for my Seen.
     `text` is the history's and the toast's, `fired` the surfaces' "what happened"
     when that reads differently. A repeat stops here; `ending` says `text`
     already tells how (`_end_repeat`)."""
@@ -1682,7 +1748,10 @@ INTERNAL_ERROR = "internal error: "
 CHECK_RETRIES = ("check", "verify")
 # The time fields `_quarantine` clears when they don't parse, so the record can
 # still be shown.
-_WAIT_TIMES = ("deadline", "refire_at", "next_check_at", "verify_claim_until", "armed_at", "fired_at", "done_at")
+_WAIT_TIMES = (
+    "deadline", "refire_at", "next_check_at", "verify_claim_until", "armed_at", "fired_at", "done_at",
+    "review_since",
+)
 
 
 @contextlib.contextmanager
@@ -2331,7 +2400,7 @@ def _merge_fires(wait: dict) -> bool:
 
 
 def _revocable(wait: dict) -> bool:
-    """A fired `review_on_head` or `ready` that waits for my Done: it was true of
+    """A fired `review_on_head` or `ready` that waits for my Seen: it was true of
     one head, so it stays watched until then."""
     return (
         wait["state"] == "fired" and wait["kind"] == "pr" and bool(wait.get("fired_head"))
@@ -3374,12 +3443,25 @@ def _extension_panes(state: dict, agents: Agents, now: datetime) -> dict:
     return panes
 
 
-def _target_view(record: dict | None, now: datetime) -> dict:
-    """What a session row and a pane row both say about the target's waits."""
+def _on_you_text(view: dict) -> str:
+    """What came of an on_me wait, in a few words."""
+    if view["outcome"] == "attention":
+        return view["reason"] or view["label"]
+    if view["outcome"] == "overdue":
+        return view["reason"] or REASON_OVERDUE
+    return REASON_REVIEW if view["state"] == "review" else view["fired_text"]
+
+
+def _target_view(
+    record: dict | None, now: datetime, reply: Callable[[dict], str | None] | None = None,
+) -> dict:
+    """What a session row and a pane row both say about the target's waits.
+    `reply` gives a "ran, take a look" wait's excerpt of what the agent said."""
+    waits = _open_waits(record) if record else []
     views = [
         {**_wait_view(wait, now), "snoozable": _snooze_refusal(record, wait) is None}
-        for wait in _open_waits(record)
-    ] if record else []
+        for wait in waits
+    ]
     outcome, headline = _outcome_headline(views)
     dues = [view["due_at"] for view in _active(views) if view["due_at"]]
     return {
@@ -3389,7 +3471,25 @@ def _target_view(record: dict | None, now: datetime) -> dict:
         "waiting_for": _waiting_for(views),
         "due_at": min(dues, key=_stamp) if dues else None,
         "waits": views, "history": _history_view(record),
+        # What Seen (`mark-seen`) closes, and what Stop all (`stop --all`) ends.
+        "on_you": [
+            {
+                "id": view["id"], "label": view["label"], "mark": view["mark"],
+                "text": _on_you_text(view),
+                "report": reply(wait) if reply and wait["state"] == "review" else None,
+            }
+            for wait, view in zip(waits, views) if view["ball"] == "on_me"
+        ],
+        "stoppable": len(views),
     }
+
+
+def _review_reply(omp: Omp, session: str) -> Callable[[dict], str | None]:
+    """The agent's last message since the wait's prompt went out."""
+    def reply(wait: dict) -> str | None:
+        since = _stamp(wait.get("review_since") or wait.get("fired_at"))
+        return None if since is None else omp.last_reply(session, since)
+    return reply
 
 
 def _session_view(
@@ -3397,7 +3497,7 @@ def _session_view(
     state: dict, now: datetime, prs: PrCache,
 ) -> dict:
     info = facts.describe(session)
-    target = _target_view(record, now)
+    target = _target_view(record, now, _review_reply(facts.omp, session))
     views = target["waits"]
     live = facts.agents.live.get(session) or {}
     agent_state = live.get("state")
@@ -3847,7 +3947,7 @@ def _set_something(
 
 def _clear_something(state: dict, record: dict | None, now: datetime) -> None:
     for wait in _free_text_waits(record):
-        _log(record, now, wait, f"Done: {wait['label']}")
+        _log(record, now, wait, f"Stopped: {wait['label']}")
         _complete(state, record, wait, now)
 
 
@@ -4095,32 +4195,66 @@ def _target_wait(record: dict | None, wait_id: str) -> dict:
     return wait
 
 
-def cmd_done(args: argparse.Namespace) -> dict:
+def _end_by_hand(
+    args: argparse.Namespace, word: str, pick: Callable[[dict | None], list[dict]],
+    clear_next: bool = False,
+) -> dict:
+    """Close the waits `pick` takes from the target's record, each logged as
+    `<word>: <label>`. `clear_next` ends their chains with them. Closing the
+    one wait `--wait` names unpins only for the last `later` wait; closing
+    many unpins once no wait is left, or when there was no record at all."""
     session, pane = _target(args)
     omp = Omp()
 
     def apply(state: dict, now: datetime) -> dict:
         record = _lookup(state, session, pane)
-        unpin = True
-        if args.wait:
-            wait = _target_wait(record, args.wait)
-            _log(record, now, wait, f"Done: {wait['label']}")
-            _complete(state, record, wait, now)
-            # Another `later` wait still belongs in the inventory.
-            unpin = wait["kind"] == "later" and not _later_open(record)
-        elif record:
-            # What is on me, when something is: a wait still watched for me
-            # stays. With nothing on me, Done ends them all.
-            mine = [wait for wait in _open_waits(record) if _wait_ball(wait) == "on_me"]
-            for wait in mine or _open_waits(record):
-                if not mine:
-                    wait["next"] = None
-                _complete(state, record, wait, now)
+        waits = pick(record)
+        for wait in waits:
+            # A chain step this armed may have replaced a picked free-text status.
+            if wait["state"] == "done":
+                continue
+            _log(record, now, wait, f"{word}: {wait['label']}")
+            if clear_next:
+                wait["next"] = None
+            _finish(record, wait, now)
+        if record:
             _settle(state, record, now)
-            unpin = not _open_waits(record)
+        if args.wait:
+            # Another `later` wait still belongs in the inventory.
+            unpin = waits[0]["kind"] == "later" and not _later_open(record)
+        else:
+            unpin = not (record and _open_waits(record))
         return _move_pin(state, session, False if unpin else None, omp, now)
 
     return _mutate(apply, omp=omp)
+
+
+def cmd_mark_seen(args: argparse.Namespace) -> dict:
+    """Seen: I've read what came. Closes the waits on me, or the one `--wait`
+    names; a wait still watched for me is Stop's to end."""
+    def pick(record: dict | None) -> list[dict]:
+        if args.wait:
+            wait = _target_wait(record, args.wait)
+            if _wait_ball(wait) != "on_me":
+                raise BadInput(f"{args.wait} is not on you: stop it instead")
+            return [wait]
+        mine = [wait for wait in _open_waits(record) if _wait_ball(wait) == "on_me"] if record else []
+        if not mine:
+            raise BadInput("nothing is on you")
+        return mine
+
+    return _end_by_hand(args, "Seen", pick)
+
+
+def cmd_stop(args: argparse.Namespace) -> dict:
+    """Stop waiting: end the open wait `--wait` names, whatever its state, or
+    with `--all` every open wait and the chains behind them."""
+    def pick(record: dict | None) -> list[dict]:
+        if args.wait:
+            return [_target_wait(record, args.wait)]
+        return _open_waits(record) if record else []
+
+    return _end_by_hand(args, "Stopped", pick, clear_next=args.all)
 
 
 def _prompt_handed_over(record: dict, wait: dict) -> bool:
@@ -4321,7 +4455,10 @@ def _settle_turn(state: dict, record: dict, now: datetime) -> None:
             _log(record, now, wait, f"{wait['label']}: ran; superseded by {after['label']}")
             _complete(state, record, wait, now)
             return
-        wait.update(state="review", reason=REASON_REVIEW)
+        wait.update(
+            state="review", reason=REASON_REVIEW,
+            review_since=entry.get("delivered_at") or entry.get("claimed_at"),
+        )
         _touch(wait)
         _log(record, now, wait, f"{wait['label']}: {REASON_REVIEW}")
         record["unseen"] = True
@@ -5025,9 +5162,15 @@ def _parser() -> argparse.ArgumentParser:
     what.add_argument("--text", required=True)
     what.add_argument("--park", action="store_true")
 
-    done = command("done", cmd_done)
-    _add_target(done)
-    done.add_argument("--wait")
+    mark_seen = command("mark-seen", cmd_mark_seen)
+    _add_target(mark_seen)
+    mark_seen.add_argument("--wait")
+
+    stop = command("stop", cmd_stop)
+    _add_target(stop)
+    which = stop.add_mutually_exclusive_group(required=True)
+    which.add_argument("--wait")
+    which.add_argument("--all", action="store_true")
 
     snooze = command("snooze", cmd_snooze)
     _add_target(snooze)
