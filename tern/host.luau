@@ -94,6 +94,8 @@ local TAB_NAMES = { usage = "Usage", agents = "Agents", waiting = "Waiting", his
 -- `tern.kv` key `settings`, a table; only this host half writes settings.
 
 local DEFAULTS = {
+	-- Usage tracking: every usage fetch, cache read and usage view. Off starts no codexbar_fetch.py.
+	usage = true,
 	providers = { "claude", "codex", "zai", "opencodego", "openrouter", "kilo" },
 	cliPath = "",
 	refreshSeconds = 300,
@@ -358,6 +360,47 @@ local store = {
 	cachePaths = {} :: { string },
 	usageGeneration = 0,
 	usageError = nil :: string?,
+	-- The fetcher's setup steps while its CLI is missing (`fatal.code` "cli_missing"); nil otherwise.
+	usageSetup = nil :: { string }?,
+	-- Takes an answer's `fatal`: its message as `usageError` and, when the CLI is
+	-- missing, its setup steps as `usageSetup`. A cache answer (`cached`) without
+	-- one only ends a missing CLI's state; other errors wait for a fetch's answer.
+	noteFatal = function(self, data: any, cached: boolean?)
+		local fatal = val(data.fatal)
+		if cached and fatal == nil and not self.usageSetup then
+			return
+		end
+		self.usageError = if type(fatal) == "table" then str(fatal.message) elseif fatal then str(fatal) else nil
+		local setup = nil
+		if type(fatal) == "table" and val(fatal.code) == "cli_missing" then
+			setup = {}
+			for _, line in (if type(val(fatal.setup)) == "table" then fatal.setup else {}) do
+				if type(line) == "string" then
+					table.insert(setup, line)
+				end
+			end
+		end
+		self.usageSetup = setup
+	end,
+	-- Applies a changed `usage` setting; set beside readUsageCache.
+	usageSwitched = nil :: (() -> ())?,
+	-- Persists one setting (nil: its default); the caller applies what the change implies.
+	writeSetting = function(name: string, value: any)
+		local raw = tern.kv.get("settings")
+		local settings = if type(raw) == "table" then table.clone(raw) else {}
+		settings[name] = value
+		tern.kv.set("settings", settings)
+	end,
+	-- The dashboard's tabs: Usage only while usage tracking is on.
+	tabs = function(): { string }
+		local shown = {}
+		for _, id in TABS do
+			if id ~= "usage" or setting("usage") then
+				table.insert(shown, id)
+			end
+		end
+		return shown
+	end,
 	agents = nil :: any,
 	agentsRaw = "",
 	scanning = false,
@@ -1449,7 +1492,9 @@ local function publishSummary()
 	local summary = {
 		-- On the minute: the graphs and "resets in" lines move with the clock,
 		-- and a summary rebuilt within the minute stays the one published.
-		usage = if store.usage then usageWidgets(store.usage, os.time() // 60 * 60) else {},
+		usage = if store.usage and setting("usage") then usageWidgets(store.usage, os.time() // 60 * 60) else {},
+		-- Usage tracking is off: the window half's Usage command says so instead of opening the tab.
+		usageOff = if setting("usage") then nil else true,
 		counts = counts,
 		restore = restore,
 		-- While another daemon ticks, the view's pane ids are its panes: none of ours.
@@ -1879,6 +1924,7 @@ local function adoptCache(data: any)
 			end
 		end
 	end
+	store:noteFatal(data, true)
 	store.usage = data
 end
 
@@ -1886,10 +1932,10 @@ local function applyUsage(res: ProcessResult)
 	local okj, data = pcall(tern.json.decode, res.stdout)
 	if res.status == 0 and okj and type(data) == "table" then
 		store.usage = data
-		local fatal = val(data.fatal)
-		store.usageError = if type(fatal) == "table" then str(fatal.message) elseif fatal then str(fatal) else nil
+		store:noteFatal(data)
 	else
 		store.usageError = if res.timed_out then "CodexBar AgentView did not answer in time" else firstLine(res.stderr)
+		store.usageSetup = nil
 	end
 end
 
@@ -1898,7 +1944,7 @@ local function providerArgs(): { string }
 end
 
 local function fetchUsage(automatic: boolean?)
-	if store.fetching or #setting("providers") == 0 then
+	if store.fetching or not setting("usage") or #setting("providers") == 0 then
 		return
 	end
 	store.fetching = true
@@ -1957,7 +2003,7 @@ end
 -- A settings reread is cache-only, including when the cache is stale.
 -- `inputs` is a usageInputs() digest the caller already computed.
 local function readUsageCache(allowFetch: boolean?, reclassify: boolean?, inputs: string?)
-	if #setting("providers") == 0 then
+	if not setting("usage") or #setting("providers") == 0 then
 		return
 	end
 	store.cacheInputs = inputs or usageInputs()
@@ -1999,7 +2045,9 @@ local function readUsageCache(allowFetch: boolean?, reclassify: boolean?, inputs
 			adoptCache(data)
 		elseif usable and not store.fetching and type(store.usage) == "table" then
 			-- A newer fetch's reading stays, but omp's rotation is local and
-			-- current, and an account whose login changed since is gone.
+			-- current, an account whose login changed since is gone, and the CLI
+			-- is as missing or present as this answer found it.
+			store:noteFatal(data, true)
 			store.usage.claudeRotation = data.claudeRotation
 			store.usage.codexRotation = data.codexRotation
 			local scopes = val(data.scopes)
@@ -2027,6 +2075,30 @@ local function readUsageCache(allowFetch: boolean?, reclassify: boolean?, inputs
 	end)
 end
 
+-- Off drops what usage tracking showed and ignores the helpers still running. On
+-- starts over as a load does: a cache read now, which fetches when the cache is stale.
+-- While a dropped fetch still runs it blocks a new one: that read then only
+-- shows the cache, and a later tick fetches.
+store.usageSwitched = function()
+	store.usageGeneration += 1
+	store.usageError = nil
+	store.usageSetup = nil
+	store.usageAt = 0
+	if setting("usage") then
+		store.cacheReadAt = os.time()
+		readUsageCache(if store.fetching then false else nil)
+	else
+		store.usage = nil
+		for _, b in blocks do
+			if b.tab == "usage" then
+				b.tab, b.sel = "agents", nil
+			end
+		end
+	end
+	publishSummary()
+	renderAll()
+end
+
 local function prune()
 	local live: { [number]: boolean } = {}
 	for _, p in tern.pane.list() do
@@ -2051,7 +2123,15 @@ local function applyGoto()
 	end
 	store.lastGoto = g.seq
 	local target = tonumber(g.pane)
-	if not target or not table.find(TABS, g.tab) then
+	-- From the window half's openSettings: its open settings tab turns to a page and row.
+	local s = if target then settingsBlocks[target] else nil
+	if s and type(g.page) == "string" then
+		local focus = if type(g.focus) == "string" and g.focus ~= "" then g.focus else nil
+		s.page, s.query, s.cursor, s.focus, s.editing, s.searching = g.page, "", 0, focus, nil, focus == nil
+		s.cx:render()
+		return
+	end
+	if not target or not table.find(store.tabs(), g.tab) then
 		return
 	end
 	for pane, b in blocks do
@@ -2141,7 +2221,7 @@ local function tick()
 			renderAll()
 		end
 		local now = os.time()
-		if now - store.cacheReadAt >= CACHE_EVERY_S then
+		if setting("usage") and now - store.cacheReadAt >= CACHE_EVERY_S then
 			store.cacheReadAt = now
 			local inputs = if now - store.cacheSpawnAt >= CACHE_FORCE_S then nil else usageInputs()
 			if inputs == nil or inputs ~= store.cacheInputs then
@@ -3427,7 +3507,8 @@ local function dockView(b: Block, now: number): Node
 		elseif at > 0 then
 			table.insert(segs, seg("at", "Updated " .. absoluteTime(at, now), { icon = "clock", priority = 2 }))
 		end
-		if store.usageError and store.usage then -- without a snapshot the error fills the page instead
+		-- Without a snapshot, or with the CLI missing, the error fills the page instead.
+		if store.usageError and store.usage and not store.usageSetup then
 			table.insert(segs, seg("err", store.usageError, { icon = "warn", tone = "error", priority = 3, min = { w = "20ch" } }))
 		end
 		if type(snap) == "table" and str(snap.cliVersion) ~= "" then
@@ -3516,7 +3597,7 @@ local function tabsNode(b: Block): Node
 	local onMe = tonumber(val(waitingCounts().on_me)) or 0
 	local counts = { agents = #liveAgents(), waiting = onMe, history = #reboot + #exited }
 	local items = {}
-	for _, id in TABS do
+	for _, id in store.tabs() do
 		local label: { any } = { ui.span(TAB_NAMES[id]) }
 		if counts[id] then
 			local alert = (id == "history" and #reboot > 0) or (id == "waiting" and onMe > 0)
@@ -3802,11 +3883,19 @@ local function act(b: Block, name: string)
 		scanAgents(true)
 	elseif name == "settings" then
 		tern.kv.set("settingsRequest", { pane = b.cx.pane, seq = tern.now() })
+	elseif name == "setup_settings" then
+		-- The setup panel's: settings on the CLI path, in a new tab or the window's open one (applyGoto).
+		tern.kv.set("settingsRequest", { pane = b.cx.pane, seq = tern.now(), page = "general", focus = "cliPath" })
+	elseif name == "usage_off" then
+		if setting("usage") then -- a second press on a panel not yet redrawn changes nothing
+			store.writeSetting("usage", false)
+			if store.usageSwitched then
+				store.usageSwitched()
+			end
+			b.cx:toast("info", "Usage tracking is off", "Turn it back on in Settings › General.")
+		end
 	elseif name == "hide_old" then
-		local raw = tern.kv.get("settings")
-		local settings = if type(raw) == "table" then table.clone(raw) else {}
-		settings.hideOld = not setting("hideOld")
-		tern.kv.set("settings", settings)
+		store.writeSetting("hideOld", not setting("hideOld"))
 		renderAll()
 	elseif name == "restore_all" then
 		restoreAll(b)
@@ -3860,7 +3949,7 @@ tern.block.define("dashboard", {
 	init = function(cx: BlockCx, args: { string }, saved: any): Block
 		-- A restart (plugin reload, daemon restart) keeps the tab shown; a new block opens on its launch argument.
 		local tab = if type(saved) == "table" then saved.tab else args[1]
-		if not table.find(TABS, tab) then
+		if not table.find(store.tabs(), tab) then
 			tab = "agents"
 		end
 		local b: Block = { cx = cx, tab = tab, sel = nil, peek = false, filter = "", launched = {}, busy = nil }
@@ -3885,6 +3974,27 @@ tern.block.define("dashboard", {
 				table.insert(main, ui.node("empty", { key = "state", icon = "gauge", title = "Usage providers are off", text = "Turn providers on in Settings." }, {
 					button("Open settings", "settings", { size = "md", icon = "gear" }),
 				}))
+			elseif store.usageSetup then
+				-- The fetcher's setup steps, a line each: Markdown code marks dropped, URLs linked.
+				local kids: { Node } = { withp(ui.text({ ui.span(store.usageError or "", "muted") }), { key = "message" }) }
+				for i, raw in store.usageSetup do
+					local line = string.gsub(raw, "`", "")
+					local spans: { any } = { ui.span("•\u{a0}", "dim") }
+					local at = 1
+					for s, url in string.gmatch(line, "()(https?://%S+)") do
+						url = string.match(url, "^(.-)[%.,;:%)]*$") :: string
+						table.insert(spans, ui.span(string.sub(line, at, s - 1)))
+						table.insert(spans, ui.link(url, url))
+						at = s + #url
+					end
+					table.insert(spans, ui.span(string.sub(line, at)))
+					table.insert(kids, withp(ui.text(spans), { key = "step" .. i }))
+				end
+				table.insert(kids, withp(ui.row({
+					button("Open settings", "setup_settings", { size = "md", icon = "gear" }),
+					button("Turn off usage tracking", "usage_off", { size = "md" }),
+				}), { key = "actions", wrap = true }))
+				table.insert(main, withp(ui.card({ ui.span("Usage tracking isn't set up") }, kids, { icon = "gauge" }), { key = "state", tone = "warning" }))
 			elseif store.usage then
 				for _, card in providerCards(store.usage, now) do
 					table.insert(main, card)
@@ -3920,12 +4030,13 @@ tern.block.define("dashboard", {
 			return false
 		end
 		if name == "left" or name == "right" then
-			local i = table.find(TABS, b.tab) or 1
-			i = math.clamp(i + (if name == "left" then -1 else 1), 1, #TABS)
-			if TABS[i] == b.tab then
+			local tabs = store.tabs()
+			local i = table.find(tabs, b.tab) or 1
+			i = math.clamp(i + (if name == "left" then -1 else 1), 1, #tabs)
+			if tabs[i] == b.tab then
 				return false
 			end
-			b.tab = TABS[i]
+			b.tab = tabs[i]
 			b.sel = nil
 			return true
 		end
@@ -4001,7 +4112,7 @@ tern.block.define("dashboard", {
 	end,
 
 	event = function(b: Block, ev: UiEvent, cx: BlockCx)
-		if ev.ev == "select" and type(ev.item) == "string" and table.find(TABS, ev.item) then
+		if ev.ev == "select" and type(ev.item) == "string" and table.find(store.tabs(), ev.item) then
 			b.tab = ev.item
 			b.sel = nil
 		elseif (ev.ev == "select" or ev.ev == "activate") and type(ev.item) == "string" then
@@ -4035,7 +4146,7 @@ local SETTINGS_LEADS = {
 	usage = "Choose the details shown in the Usage tab. Changes save immediately.",
 	providers = "Choose which providers appear in usage and the widget bar. Credentials stay in ~/.codexbar/config.json.",
 	agents = "Choose which live agents and recently closed sessions appear.",
-	general = "The plugin reads the applet's usage cache. It fetches only after two refresh intervals without a measurement, each provider at most once per interval across Tern daemons and the applet. A live Claude fetch may start a probe session when rate-limited.",
+	general = "Usage tracking reads the applet's usage cache. It fetches only after two refresh intervals without a measurement, each provider at most once per interval across Tern daemons and the applet. A live Claude fetch may start a probe session when rate-limited.",
 	about = "CodexBar AgentView brings provider usage and coding-agent sessions to KDE Plasma and Tern. It uses the upstream CodexBar CLI for usage data.",
 }
 local SETTINGS_ROWS: { any } = {
@@ -4067,6 +4178,8 @@ for _, row in {
 		hint = "Show processes without a hook sentinel." },
 	{ id = "historyLimit", page = "agents", section = "History", label = "Recently closed sessions",
 		hint = "Keep 10 to 1000 same-boot exits. Sessions ended by a reboot are not limited.", kind = "number" },
+	{ id = "usage", page = "general", section = "Usage", label = "Usage tracking",
+		hint = "Fetch and show provider usage: the Usage tab and the usage widgets. Off runs no CodexBar fetch; Agents, Waiting and History stay." },
 	{ id = "refreshSeconds", page = "general", section = "Polling", label = "Usage refresh interval",
 		hint = "60 to 3600 seconds. Match the applet's interval; fallback waits twice this interval.", kind = "number", unit = "s" },
 	{ id = "cliPath", page = "general", section = "CLI", label = "CodexBar executable",
@@ -4175,25 +4288,30 @@ local function saveSetting(b: SettingsBlock, row: any, value: any): boolean
 		return false
 	end
 	local old = setting(name)
-	local raw = tern.kv.get("settings")
-	local settings = if type(raw) == "table" then table.clone(raw) else {}
-	settings[name] = if reset and not row.provider then nil else parsed
-	tern.kv.set("settings", settings)
+	store.writeSetting(name, if reset and not row.provider then nil else parsed)
 	if tern.json.encode(old) ~= tern.json.encode(parsed) then
 		if name == "providers" or name == "cliPath" then
+			-- A path entered for the setup panel is the user's retry: fetch with it now.
+			local retry = name == "cliPath" and store.usageSetup ~= nil
 			-- Pending helpers belong to the selection they started with.
 			store.usageGeneration += 1
 			store.usageError = nil
+			store.usageSetup = nil
 			if name == "cliPath" then
 				store.usage = nil
 			end
 			store.cacheReadAt = os.time()
 			readUsageCache(false)
+			if retry then
+				fetchUsage()
+			end
 		elseif name == "refreshSeconds" then
 			store.cacheReadAt = os.time()
 			-- Reuse equally recent measurements with the new stale threshold,
 			-- but don't replace a fresh result delivered while the cache was read.
 			readUsageCache(false, true)
+		elseif name == "usage" and store.usageSwitched then
+			store.usageSwitched()
 		end
 		publishSummary()
 	end
@@ -4290,12 +4408,16 @@ local function closeSettings(b: SettingsBlock)
 end
 
 tern.block.define("settings", {
-	init = function(cx: BlockCx, _args: { string }, saved: any): SettingsBlock
-		local page = if type(saved) == "table" then saved.page else nil
+	init = function(cx: BlockCx, args: { string }, saved: any): SettingsBlock
+		-- A new tab opens on its launch arguments, a page and a row to focus (the usage setup panel's).
+		args = args or {}
+		local page = if type(saved) == "table" then saved.page else args[1]
+		-- With usage tracking off, General holds its switch; the Usage page shows nothing it applies to.
 		if not SETTINGS_LEADS[page] then
-			page = "usage"
+			page = if setting("usage") then "usage" else "general"
 		end
-		local b: SettingsBlock = { cx = cx, page = page, query = "", cursor = 0, searching = true, focus = nil, editing = nil }
+		local focus = if type(saved) ~= "table" and SETTINGS_BY_ID[args[2]] then args[2] else nil
+		local b: SettingsBlock = { cx = cx, page = page, query = "", cursor = 0, searching = focus == nil, focus = focus, editing = nil }
 		settingsBlocks[cx.pane] = b
 		publishOpen()
 		return b

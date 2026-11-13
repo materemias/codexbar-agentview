@@ -3,8 +3,8 @@
 --
 -- The host half publishes `summary` (widget bar and status data) and `settingsRequest`
 -- (dashboard settings button) through `tern.kv`; this half answers with `goto`
--- (switch a dashboard tab) and `focus` (the last focused pane that is not a
--- CodexBar AgentView block).
+-- (switch a dashboard tab, or turn a settings tab to a page and row) and `focus`
+-- (the last focused pane that is not a CodexBar AgentView block).
 --
 -- For sessions set aside it adds the set-aside command, which on an omp pane asks
 -- the omp extension to open its menu and elsewhere shows Tern's own picker, and
@@ -318,15 +318,19 @@ local function toggle(cx: WindowCx, tab: string)
 	end
 end
 
--- Settings are a persistent tab, not a dashboard sidebar.
-local function openSettings(cx: WindowCx)
+-- Settings are a persistent tab, not a dashboard sidebar. `args` (a page and a row)
+-- opens a new one there, or turns this window's open one (the host's applyGoto).
+local function openSettings(cx: WindowCx, args: { string }?)
 	for _, p in cx.session:panes() do
 		if p.block == SETTINGS_KIND then
+			if args then
+				tern.kv.set("goto", { pane = p.pane, page = args[1], focus = args[2], seq = tern.now() })
+			end
 			cx.layout:focus(p.pane)
 			return
 		end
 	end
-	cx:new_block(SETTINGS_KIND, nil, "tab", { focus = true })
+	cx:new_block(SETTINGS_KIND, args, "tab", { focus = true })
 end
 
 tern.command({ id = "agents", title = "CodexBar AgentView: Agents", icon = "users", keys = { "ctrl+alt+a" }, run = function(cx)
@@ -336,6 +340,12 @@ tern.command({ id = "waiting", title = "CodexBar AgentView: Waiting", icon = "cl
 	toggle(cx, "waiting")
 end })
 tern.command({ id = "usage", title = "CodexBar AgentView: Usage", icon = "gauge", keys = { "ctrl+alt+u" }, run = function(cx)
+	-- With usage tracking off the dashboard has no Usage tab: say so rather than open another.
+	local s = tern.kv.get("summary")
+	if type(s) == "table" and s.usageOff == true then
+		cx:toast("info", "CodexBar AgentView: usage tracking is off", "Turn it on in Settings › General.")
+		return
+	end
 	toggle(cx, "usage")
 end })
 tern.command({ id = "history", title = "CodexBar AgentView: History", icon = "history", keys = { "ctrl+alt+h" }, run = function(cx)
@@ -2270,7 +2280,7 @@ local function poll(cx: WindowCx?)
 			local info = paneInfo(cx, request.pane)
 			if info and info.block == KIND then
 				lastSettingsRequest = request.seq
-				openSettings(cx)
+				openSettings(cx, if type(request.page) == "string" then { request.page, if type(request.focus) == "string" then request.focus else "" } else nil)
 			end
 		end
 		for _, step in { waitingRequest, dropOrphanCards, lead, publishPanes, refreshCards } do
