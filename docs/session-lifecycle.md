@@ -278,7 +278,9 @@ card, the Plasma Agents section and tern-awui.
 Closing a session while a prompt's turn runs is treated like a reboot: the
 prompt is sent again once, when Tern reopens the session, led by a note asking
 the agent to check what was already done; a reboot and a close count
-together, so a second cut of either kind comes to you. A check the agent is to
+together, so a second cut of either kind comes to you. A repeat's run is sent
+again the same way, counted once; cut twice, that run is over and the repeat
+goes on. A check the agent is to
 write goes through the same queue (above). The row above the composer starts
 with the answer, and `/wait list` shows it on a `Closing:` line. The menu's
 Close the session is offered only when the answer is not "park only".

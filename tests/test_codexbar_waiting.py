@@ -1878,17 +1878,6 @@ class PromptTests(Case):
         self.assertEqual((seen["state"], seen["reason"]), ("needs_attention", waiting.REASON_CUT_TWICE))
         self.assertEqual(self.session()["prompts_queued"], 0)
 
-    def test_a_repeat_run_cut_off_is_not_sent_again(self) -> None:
-        wait = self.add("--kind", "repeat", "--every", "1h", "--prompt", "p")["id"]
-        self.advance(hours=1)
-        self.tick()
-        action = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]["action"]
-        self.run_cli("ack", "--action", action, "--result", "delivered")
-        self.agents()
-        self.tick()
-        self.assertEqual(self.state()["sessions"][SID]["prompt_queue"], [])
-        self.assertEqual(self.wait_of(wait)["state"], "waiting")
-
     def test_snooze_cancels_the_queued_prompt(self) -> None:
         wait = self.add("--kind", "time", "--in", "1s", "--prompt", "go")["id"]
         self.advance(seconds=2)
@@ -4367,16 +4356,43 @@ class RepeatTests(Case):
         self.run_cli("done", "--session", SID, "--wait", first)
         self.assertEqual(self.wait_of(wait)["repeat"]["next_at"], (T0 + timedelta(hours=3)).isoformat())
 
-    def test_a_session_closed_during_a_run_keeps_repeating(self) -> None:
+    def test_a_session_closed_during_a_run_sends_the_run_again_once(self) -> None:
         wait = self.repeat()
         self.at(hours=1)
         self.deliver()
         self.agents()
         self.clock = T0 + timedelta(hours=1, minutes=5)
         self.tick()
+        record = self.state()["sessions"][SID]
+        self.assertEqual([entry["text"] for entry in record["prompt_queue"]], [f"{waiting.CLOSE_NOTE}\n\ncheck it"])
+        self.assertEqual(record["waits"][0]["repeat"]["runs"], 1)
+        # Reopened, the run goes in again, and a second close would cut it twice.
+        self.agents(SID)
+        self.at(hours=1, minutes=6)
+        self.deliver()
+        self.assertEqual(self.session()["close"]["reason"], "turn")
+        # Cut twice, that run is over and the repeat goes on.
+        self.agents()
+        self.clock = T0 + timedelta(hours=1, minutes=10)
+        self.tick()
         self.assertEqual(self.wait_of(wait)["state"], "waiting")
         self.assertEqual(self.session()["history"][-1]["text"], "The session closed during a run")
         self.assertEqual(self.state()["sessions"][SID]["prompt_queue"], [])
+
+    def test_the_last_run_cut_off_by_a_close_still_runs(self) -> None:
+        wait = self.repeat("--times", "1")
+        self.at(hours=1)
+        self.deliver()
+        self.agents()
+        self.clock = T0 + timedelta(hours=1, minutes=5)
+        self.tick()
+        self.assertEqual(self.wait_of(wait)["state"], "waiting")
+        self.agents(SID)
+        self.at(hours=1, minutes=6)
+        self.assertEqual(self.deliver()["text"], f"{waiting.CLOSE_NOTE}\n\ncheck it")
+        self.finish_turn()
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["outcome"]), ("fired", "fulfilled"))
 
     def test_the_next_run_sets_the_next_tick(self) -> None:
         self.repeat(every="2m")

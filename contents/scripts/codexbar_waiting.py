@@ -1916,15 +1916,16 @@ def _deliver(
     if not live and queue and queue[0]["state"] == "delivered":
         entry = queue[0]
         wait = _wait_in(record, entry["wait"])
-        if entry.get("repeat"):
+        if wait is not None and not _cut_before(entry):
+            # A repeat's run too: it already counts, and stays the running one.
+            _send_again(record, entry, CLOSE_NOTE, now)
+            _log(record, now, wait, f"Sending again after the session closed: {wait['label']}")
+        elif entry.get("repeat"):
             queue.pop(0)
-            # The repeat goes on: its next run resumes the session.
+            # Cut twice, the run is over; the repeat goes on and its next run resumes the session.
             if wait is not None:
                 _log(record, now, wait, "The session closed during a run")
             _run_over(state, record, entry, now)
-        elif wait is not None and not _cut_before(entry):
-            _send_again(record, entry, CLOSE_NOTE, now)
-            _log(record, now, wait, f"Sending again after the session closed: {wait['label']}")
         else:
             queue.pop(0)
             if wait is not None:
@@ -3470,8 +3471,9 @@ def _comes_back_alone(wait: dict) -> bool:
 
 def _session_close(record: dict | None, resumable: bool, pane: int | None, pinned: bool) -> dict | None:
     """Whether closing the session now keeps its waits whole. `turn`: a
-    delivered prompt's turn was cut once already, and closing would cut it a
-    second time (`_deliver`); `job`: the job runs in the session's own pane."""
+    delivered prompt's turn, a repeat's run included, was cut once already, and
+    closing would cut it a second time (`_deliver`); `job`: the job runs in the
+    session's own pane."""
     waits = _open_waits(record) if record else []
     if not waits:
         return None
@@ -3481,7 +3483,7 @@ def _session_close(record: dict | None, resumable: bool, pane: int | None, pinne
     if not resumable:
         reasons.add("unresumable")
     queue = record["prompt_queue"]
-    if queue and queue[0]["state"] == "delivered" and not queue[0].get("repeat") and _cut_before(queue[0]):
+    if queue and queue[0]["state"] == "delivered" and _cut_before(queue[0]):
         reasons.add("turn")
     if pane is not None and any(_watches_job(wait, pane) for wait in waits):
         reasons.add("job")
