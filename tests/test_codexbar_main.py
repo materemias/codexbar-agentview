@@ -639,7 +639,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
 
     def test_authoritative_empty_fatal_snapshot_does_not_resurrect_memory(self):
         calls, notifications = self.applet('''
-                if (app.cacheRestoring || app.loading) return
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
                 if (fixture.stage === 0) {
                     check(app.snapshot.providers.length === 1, "initial scoped usage")
                     app.refresh()
@@ -660,7 +660,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
         for failure in ("", "not json", '{"providers": [null]}'):
             with self.subTest(failure=failure):
                 calls, notifications = self.applet('''
-                if (app.cacheRestoring || app.loading) return
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
                 if (fixture.stage === 0) {
                     app.refresh()
                     fixture.stage = 1
@@ -683,7 +683,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
         current = {"id": "codex", "ok": True, "stale": True, "sourceScope": "b" * 64,
                    "primary": {"usedPercent": 83}, "cachedAt": "2026-09-29T12:00:00Z"}
         calls, notifications = self.applet('''
-                if (app.cacheRestoring || app.loading) return
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
                 if (fixture.stage === 0) {
                     app.refresh()
                     fixture.stage = 1
@@ -704,7 +704,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
 
     def test_failed_cache_recovery_clears_unverified_usage_without_retry_loop(self):
         calls, notifications = self.applet('''
-                if (app.cacheRestoring || app.loading) return
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
                 if (fixture.stage === 0) {
                     app.refresh()
                     fixture.stage = 1
@@ -724,7 +724,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
 
     def test_late_usage_delivery_cannot_settle_replacement_credential_scope(self):
         calls, notifications = self.applet('''
-                if (app.cacheRestoring || app.loading) return
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
                 if (fixture.stage === 0) {
                     Plasmoid.configuration.ompModeNotifications = false
                     fixture.oldCommand = Object.keys(app.pendingNotifications)[0]
@@ -750,7 +750,8 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
 
     def test_successful_fetch_does_not_clear_notification_service_failure(self):
         calls, notifications = self.applet('''
-                if (app.cacheRestoring || app.loading || Object.keys(app.pendingNotifications).length) return
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading
+                        || Object.keys(app.pendingNotifications).length) return
                 if (fixture.stage === 0) {
                     app.refresh()
                     fixture.stage = 1
@@ -797,7 +798,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
 
     def test_inflight_backend_round_trip_rejects_old_completion(self):
         calls, notifications = self.applet('''
-                if (fixture.stage === 0 && !app.cacheRestoring && !app.loading) {
+                if (fixture.stage === 0 && fixture.freshFetches >= 1 && !app.cacheRestoring && !app.loading) {
                     app.refresh()
                     check(app.loading, "start the old backend request")
                     Plasmoid.configuration.cliPath = "/missing"
@@ -820,7 +821,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
 
     def test_mode_dispatch_uses_fresh_status_and_clears_gaps(self):
         calls, notifications = self.applet('''
-                if (app.cacheRestoring || app.loading
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading
                         || Object.keys(app.pendingNotifications).length) return
                 if (fixture.stage === 0) {
                     check(app.ompModeNotificationState.mode === "auto · FILL",
@@ -853,7 +854,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
 
     def test_disabling_codex_clears_status_and_reenabling_is_silent(self):
         calls, notifications = self.applet('''
-                if (app.cacheRestoring || app.loading) return
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
                 if (fixture.stage === 0) {
                     Plasmoid.configuration.enableCodex = false
                     check(app.snapshot.codexRotation === null
@@ -879,7 +880,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
 
     def test_old_delivery_cannot_settle_new_backend_mode_transition(self):
         calls, notifications = self.applet('''
-                if (app.cacheRestoring || app.loading) return
+                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
                 if (fixture.stage === 0) {
                     app.refresh()
                     fixture.stage = 1
