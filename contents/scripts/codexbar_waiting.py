@@ -144,7 +144,8 @@ PR_UNTIL = {
 KINDS = ("time", "command", "job", "pr", "release", "something", "later", "repeat")
 KIND_OPTIONS = {
     "time": {"at", "in_"},
-    "command": {"argv", "interval", "predicate"},
+    # `describe`: the agent writes the argv from these words (`write-check`).
+    "command": {"argv", "describe", "interval", "predicate"},
     "job": {"close_on_success"},
     "pr": {"pr", "repo", "number", "until", "bots"},
     "release": {"repo", "interval"},
@@ -172,8 +173,26 @@ REASON_CLOSED = "session closed: resume it to deliver the prompt"
 REASON_RESUMING = "resuming the session in Tern"
 # A resume waits for a Tern window to carry it out.
 REASON_NO_WINDOW = "open a Tern window to reopen it"
-# Leads a prompt sent again because a reboot cut its turn off.
+# Lead a prompt sent again because its earlier turn was cut off. A prompt is
+# sent again once (`cut`); cut off a second time, it comes to me.
 REBOOT_NOTE = "(A reboot cut this prompt's earlier turn off. Check what was already done before you go on.)"
+CLOSE_NOTE = "(Closing the session cut this prompt's earlier turn off. Check what was already done before you go on.)"
+REASON_CUT_TWICE = "session closed before the prompt's turn ended"
+REASON_NO_CHECK = "the agent's turn ended without writing the check's command"
+# A described check's summary until the agent wrote its command.
+CHECK_UNWRITTEN = "the agent writes its command"
+# Whether a session or pane may be closed (`_close_view`): each reason's
+# verdict and what the surfaces say. `safe` comes back by itself, `manual`
+# comes back to me, `park` would lose something. The first reason a target has
+# wins, so the worst verdicts come first.
+CLOSE_REASONS = {
+    "job": ("park", "park only: job runs in this pane"),
+    "shell": ("park", "park only: its waits end with the pane"),
+    "turn": ("park", "park only: turn cut off once already"),
+    "unresumable": ("park", "park only: it can't be resumed"),
+    "manual": ("manual", "closable · you reopen"),
+    "prompt": ("safe", "closable"),
+}
 REASON_NO_EXTENSION = "omp extension not loaded"
 REASON_QUESTION = "agent asks a question"
 REASON_REVIEW = "ran, take a look"
@@ -709,6 +728,8 @@ class Facts:
             "live": live is not None,
             "pane": self.agents.pane_of(session),
             "resume_command": None if live is not None else command or None,
+            # Closed, it could be resumed: by its command, or omp's own transcript.
+            "resumable": bool(command) or self.omp.transcript(session) is not None,
         }
 
 
@@ -1240,6 +1261,22 @@ def _open_waits(record: dict) -> list[dict]:
     return [wait for wait in record["waits"] if wait["state"] != "done"]
 
 
+def _unwritten(wait: dict) -> bool:
+    """A check the user described whose command the agent hasn't written yet:
+    it waits, unarmed, for `write-check`."""
+    return wait["kind"] == "command" and wait["condition"].get("argv", ()) is None
+
+
+def _check_instruction(description: str) -> str:
+    """The prompt that asks the session's agent to write a described check."""
+    return "\n".join((
+        f'I want to wait until this holds: "{description}".',
+        "Write a command that exits 0 exactly when it holds and non-zero otherwise. It runs without a shell, as an argv; use sh -c '…' only when it needs pipes.",
+        "Run it once now and show me its exit code and output.",
+        "Then call the waitingfor tool with action add, kind command and argv, and nothing else: the label, the interval and the rest come from my /wait check.",
+    ))
+
+
 def _wait_in(record: dict, wait_id: str) -> dict | None:
     return next((wait for wait in record["waits"] if wait["id"] == wait_id), None)
 
@@ -1432,6 +1469,27 @@ def _queue_prompt(
     return action
 
 
+def _cut_before(entry: dict) -> bool:
+    """A reboot or a close cut the prompt's turn off once already. Entries from
+    before closes counted say `rebooted`."""
+    return bool(entry.get("cut") or entry.get("rebooted"))
+
+
+def _send_again(record: dict, entry: dict, note: str, now: datetime) -> None:
+    """A prompt whose turn was cut off is queued where it stood, once, led by
+    `note`, and gets an automatic resume of its own: the one that brought the
+    session up for it did its job."""
+    entry.update(
+        state="queued", claimed_at=None, cut=True, queued_at=_iso(now),
+        text=f"{note}\n\n{entry['text']}",
+    )
+    covered = record.get("resume_prompts") or []
+    record.update(
+        resume_prompts=[action for action in covered if action != entry["action"]],
+        resume_opened_at=None,
+    )
+
+
 def _queued(record: dict, action: str | None) -> bool:
     return action is not None and any(entry["action"] == action for entry in record["prompt_queue"])
 
@@ -1498,7 +1556,10 @@ def _finish(record: dict, wait: dict, now: datetime, activate: bool = True) -> N
 
 def _arm_step(record: dict, wait: dict, now: datetime) -> None:
     """Arm a chain step. A `something` step becomes the target's one free-text
-    status, so the one it replaces closes."""
+    status, so the one it replaces closes. A described check starts once the
+    agent wrote its command (`cmd_write_check`)."""
+    if _unwritten(wait):
+        return
     _arm(wait, now)
     if wait["kind"] != "something":
         return
@@ -1853,15 +1914,21 @@ def _deliver(
         # Back for good: a later close may be resumed again at once.
         record["resume_opened_at"] = None
     if not live and queue and queue[0]["state"] == "delivered":
-        entry = queue.pop(0)
+        entry = queue[0]
         wait = _wait_in(record, entry["wait"])
         if entry.get("repeat"):
+            queue.pop(0)
             # The repeat goes on: its next run resumes the session.
             if wait is not None:
                 _log(record, now, wait, "The session closed during a run")
             _run_over(state, record, entry, now)
-        elif wait is not None:
-            _attention(state, record, wait, now, "session closed before the prompt's turn ended")
+        elif wait is not None and not _cut_before(entry):
+            _send_again(record, entry, CLOSE_NOTE, now)
+            _log(record, now, wait, f"Sending again after the session closed: {wait['label']}")
+        else:
+            queue.pop(0)
+            if wait is not None:
+                _attention(state, record, wait, now, REASON_CUT_TWICE)
     # Cancelling prompts replaces the list.
     queue = record["prompt_queue"]
     if live or not queue:
@@ -2548,7 +2615,7 @@ def _after_reboot(state: dict, agents: Agents, now: datetime) -> None:
     """Nothing that ran before the reboot runs now. Each closed session gets one
     fresh automatic resume, an extension heard from before the reboot doesn't
     hold it back, and a prompt the reboot cut off is sent again, once, saying
-    so; cut off a second time it comes to me."""
+    so; cut off a second time, by a reboot or a close, it comes to me."""
     booted = _booted_at()
 
     def this_boots(session: str) -> bool:
@@ -2566,12 +2633,9 @@ def _after_reboot(state: dict, agents: Agents, now: datetime) -> None:
     for record in state["sessions"].values():
         record.update(resume_prompts=[], resume_opened_at=None)
         for entry in record["prompt_queue"]:
-            if entry["state"] == "queued" or entry.get("rebooted"):
+            if entry["state"] == "queued" or _cut_before(entry):
                 continue
-            entry.update(
-                state="queued", claimed_at=None, rebooted=True, queued_at=_iso(now),
-                text=f"{REBOOT_NOTE}\n\n{entry['text']}",
-            )
+            _send_again(record, entry, REBOOT_NOTE, now)
             wait = _wait_in(record, entry["wait"])
             if wait is not None:
                 _log(record, now, wait, f"Sending again after a reboot: {wait['label']}")
@@ -3007,6 +3071,8 @@ def _condition_summary(wait: dict, now: datetime) -> str:
     if kind == "command" and condition.get("repo"):
         baseline = condition.get("baseline")
         return f"after {baseline}" if baseline else f"next release of {condition['repo']}"
+    if kind == "command" and condition["argv"] is None:
+        return CHECK_UNWRITTEN
     if kind == "command":
         return _command_line(condition)
     if kind == "job":
@@ -3342,6 +3408,7 @@ def _session_view(
         pane = _reported_pane(state, facts.agents, session, now)
     return {
         **target,
+        "close": _session_close(record, info["resumable"], pane, pinned),
         "session_id": session, "title": info["title"], "cwd": info["cwd"],
         "project": info["project"], "live": info["live"], "pane": pane,
         "tern_session": _text(live.get("ternSession")) or None,
@@ -3364,9 +3431,14 @@ def _session_view(
 def _pane_view(record: dict, now: datetime) -> dict:
     target = _target_view(record, now)
     status, line = _status_lines(target["waits"], record["note"], False, now)
+    pane = record["pane"]
     return {
         **target,
-        "pane": record["pane"],
+        # Closing the pane ends its record (`_pane_closed`): only a job comes back, to me.
+        "close": _close_view({
+            "job" if _watches_job(wait, pane) else "shell" for wait in _open_waits(record)
+        }),
+        "pane": pane,
         "label": _primary(target["waits"])["label"],
         "note": record["note"],
         "status": status, "line": line,
@@ -3374,6 +3446,46 @@ def _pane_view(record: dict, now: datetime) -> dict:
         # The Tern daemon whose pane this is (`event --daemon`).
         "daemon": record.get("daemon"),
     }
+
+
+def _close_view(reasons: set[str]) -> dict | None:
+    """A target's `close`, from the reasons its waits give: the first one
+    `CLOSE_REASONS` lists, which has the worst verdict. None without a wait."""
+    reason = next((reason for reason in CLOSE_REASONS if reason in reasons), None)
+    if reason is None:
+        return None
+    verdict, text = CLOSE_REASONS[reason]
+    return {"verdict": verdict, "reason": reason, "text": text}
+
+
+def _comes_back_alone(wait: dict) -> bool:
+    """A closed session is reopened for this wait's prompt, or each repeat run,
+    and nothing about it waits for me first. A snoozed wait comes back as it was."""
+    state = wait["snoozed_from"] if wait["state"] == "snoozed" else wait["state"]
+    return (
+        bool(wait["prompt"] or wait.get("repeat")) and wait["kind"] != "later"
+        and not wait["on_me"] and state not in ("fired", "review", "needs_attention")
+    )
+
+
+def _session_close(record: dict | None, resumable: bool, pane: int | None, pinned: bool) -> dict | None:
+    """Whether closing the session now keeps its waits whole. `turn`: a
+    delivered prompt's turn was cut once already, and closing would cut it a
+    second time (`_deliver`); `job`: the job runs in the session's own pane."""
+    waits = _open_waits(record) if record else []
+    if not waits:
+        return None
+    reasons = {"prompt" if _comes_back_alone(wait) else "manual" for wait in waits}
+    if pinned:
+        reasons.add("manual")
+    if not resumable:
+        reasons.add("unresumable")
+    queue = record["prompt_queue"]
+    if queue and queue[0]["state"] == "delivered" and not queue[0].get("repeat") and _cut_before(queue[0]):
+        reasons.add("turn")
+    if pane is not None and any(_watches_job(wait, pane) for wait in waits):
+        reasons.add("job")
+    return _close_view(reasons)
 
 
 def _sort_key(view: dict) -> tuple:
@@ -3534,6 +3646,9 @@ def _parse_verify(text: str) -> dict:
 
 
 def _command_line(condition: dict) -> str:
+    """The command, or the words the agent is to write it from."""
+    if condition["argv"] is None:
+        return _clip(condition["describe"], COMMAND_LABEL_CHARS)
     return _clip(shlex.join(condition["argv"]), COMMAND_LABEL_CHARS)
 
 
@@ -3570,10 +3685,13 @@ def _condition(args: argparse.Namespace) -> dict:
             raise BadInput("time needs --at or --in")
         return {"type": "time", "at": at} if at else {"type": "time", "at": None, "in_s": in_s}
     if kind == "command":
-        if args.argv is None:
-            raise BadInput("command needs --argv")
+        describe = _text(args.describe)
+        if (args.argv is None) == (not describe):
+            raise BadInput("command needs --argv, or --describe for the agent to write it")
         return {
-            "type": "command", "argv": _parse_argv(args.argv),
+            # Described, it has no argv until the agent writes it (`write-check`).
+            "type": "command", "argv": None if describe else _parse_argv(args.argv),
+            **({"describe": describe} if describe else {}),
             "interval_s": _parse_duration(args.interval) if args.interval else DEFAULT_INTERVAL_S,
             "predicate": _validate_predicate(args.predicate or "exit0"),
         }
@@ -3770,6 +3888,11 @@ def cmd_add(args: argparse.Namespace) -> dict:
         raise BadInput("something takes no prompt: it never fires")
     if args.verify and not args.prompt:
         raise BadInput("--verify needs --prompt")
+    described = condition.get("describe")
+    if described and session is None:
+        raise BadInput("--describe needs --session: the session's agent writes the command")
+    if described and args.after:
+        raise BadInput("--describe takes no --after: the agent writes the command now")
     verify = _parse_verify(args.verify) if args.verify else None
     deadline, deadline_in_s = _time_or_in(args.deadline, args.deadline_in, "deadline")
     facts = Facts(agents)
@@ -3797,6 +3920,13 @@ def cmd_add(args: argparse.Namespace) -> dict:
             if deadline is not None or deadline_in_s is not None:
                 _move_deadline(record, wait, deadline, deadline_in_s, now)
         else:
+            pending = next((other for other in _open_waits(record) if _unwritten(other)), None) if described else None
+            if pending is not None:
+                # Its instruction can't be told apart from a second one's.
+                raise BadInput(
+                    f'The agent is still on the check "{pending["condition"]["describe"]}"; '
+                    "ask for the next one after its turn.",
+                )
             after = None if record["closed_at"] is not None else args.after
             wait = _start_wait(
                 state, record, facts.omp, now, after, kind=kind, condition=condition, by=args.by,
@@ -3809,6 +3939,9 @@ def cmd_add(args: argparse.Namespace) -> dict:
                 toast=not args.no_toast, repeat=repeat,
                 close_on_success=args.close_on_success, daemon=args.daemon,
             )
+            if described:
+                # A prompt like any other, so a closed session is reopened to write it.
+                _queue_prompt(state, record, wait, _check_instruction(described), now, check=True)
         _apply_note(record, args.note, args.by)
         if args.size:
             record["size"] = args.size
@@ -4155,6 +4288,12 @@ def _settle_turn(state: dict, record: dict, now: datetime) -> None:
         _run_over(state, record, entry, now)
         return
     wait = _wait_in(record, entry["wait"])
+    if entry.get("check"):
+        # Writing the command takes the instruction off the queue: still here,
+        # the turn ended without it. The check itself never ran.
+        if wait is not None and wait["state"] != "done" and _unwritten(wait):
+            _attention(state, record, wait, now, REASON_NO_CHECK)
+        return
     if wait is None or wait["state"] != "acting":
         return
     wait.update(on_me=False, reason=None)
@@ -4360,6 +4499,8 @@ def cmd_claim_prompts(args: argparse.Namespace) -> dict:
         return {"prompts": [{
             "action": head["action"], "wait": head["wait"], "text": head["text"],
             "resend_check": resend_check, "claimed_at": claimed_at,
+            # The instruction for a described check: the agent's next command add writes it.
+            "check": bool(head.get("check")),
         }]}
 
     return _mutate(apply, agents=agents)
@@ -4382,9 +4523,40 @@ def _ack_prompt(
     if wait is not None:
         wait.update(on_me=False, reason=None)
         # A run logged itself when it was queued.
-        if not entry.get("repeat"):
+        if entry.get("check"):
+            _log(record, now, wait, f"Asked the agent to write the check: {wait['label']}")
+        elif not entry.get("repeat"):
             _log(record, now, wait, f"Prompt delivered: {wait['label']}")
     return {}
+
+
+def cmd_write_check(args: argparse.Namespace) -> dict:
+    """The agent wrote the command of the check the user described: it becomes
+    that wait's argv, and the check starts. Only a check whose instruction the
+    agent has takes it; the instruction leaves the queue, so the turn's end
+    settles nothing for it."""
+    argv = _parse_argv(args.argv)
+
+    def apply(state: dict, now: datetime) -> dict:
+        record = state["sessions"].get(args.session)
+        found = next((
+            (entry, wait) for entry in (record["prompt_queue"] if record else [])
+            if entry.get("check") and entry["state"] != "queued"
+            for wait in [_wait_in(record, entry["wait"])]
+            if wait is not None and _unwritten(wait)
+        ), None)
+        if found is None:
+            raise BadInput("no check the user described is with the agent")
+        entry, wait = found
+        record["prompt_queue"].remove(entry)
+        wait["condition"]["argv"] = argv
+        wait.update(on_me=False, reason=None)
+        _arm_step(record, wait, now)
+        condition = wait["condition"]
+        _log(record, now, wait, f"Check: {_command_line(condition)} every {_interval_text(condition['interval_s'])}")
+        return {"session": args.session, "wait": _wait_view(wait, now)}
+
+    return _mutate(apply)
 
 
 def cmd_ack(args: argparse.Namespace) -> dict:
@@ -4785,6 +4957,8 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--at")
     add.add_argument("--in", dest="in_")
     add.add_argument("--argv")
+    # A check in words: its instruction is queued, and the agent's `write-check` gives the argv.
+    add.add_argument("--describe")
     add.add_argument("--cwd")
     add.add_argument("--interval")
     add.add_argument("--predicate")
@@ -4810,6 +4984,10 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--times", type=int)
     # The Tern daemon of the window that adds it: a pane wait or a park names its panes.
     add.add_argument("--daemon")
+
+    write_check = command("write-check", cmd_write_check)
+    write_check.add_argument("--session", type=_session_arg, required=True)
+    write_check.add_argument("--argv", required=True)
 
     retry = command("retry", cmd_retry)
     _add_target(retry)

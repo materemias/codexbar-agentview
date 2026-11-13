@@ -500,6 +500,34 @@ class WaitingRuntimeTests(unittest.TestCase):
         self.assertFalse((self.helper / "checked").exists())
         self.assertFalse((self.project / "checked").exists())
 
+    def test_described_check_runs_in_the_session_project_only_once_written(self) -> None:
+        self.project_statuses()
+        self.live_session()
+        wait = self.cli(
+            "add", "--session", SID, "--kind", "command", "--describe", "the status is ready",
+            "--interval", "1s", "--no-toast",
+        )["wait"]["id"]
+        self.tick()
+        self.assertEqual(self.saved_wait(wait)["state"], "pending")
+        self.assertEqual(self.saved_wait(wait)["condition"]["cwd"], str(self.project))
+        self.assertFalse((self.project / "checked").exists(), "the check ran before its command was written")
+        prompt = self.cli("claim-prompts", "--session", SID)["prompts"][0]
+        self.assertTrue(prompt["check"])
+        self.cli("ack", "--action", prompt["action"], "--result", "delivered")
+        argv = [sys.executable, "-c", (
+            "from pathlib import Path; Path('checked').write_text(str(Path.cwd())); "
+            "raise SystemExit(Path('status').read_text().strip() != 'ready')"
+        )]
+        self.cli("write-check", "--session", SID, "--argv", json.dumps(argv))
+        self.cli("event", "--type", "turn_finished", "--session", SID)
+        self.tick(seconds=1)
+        self.assertEqual(self.saved_wait(wait)["state"], "waiting")
+        self.assertEqual((self.project / "checked").read_text(), str(self.project))
+        self.assertFalse((self.helper / "checked").exists())
+        (self.project / "status").write_text("ready")
+        self.tick(seconds=2)
+        self.assertEqual(self.saved_wait(wait)["state"], "fired")
+
 
 if __name__ == "__main__":
     unittest.main()

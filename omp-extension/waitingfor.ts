@@ -41,8 +41,6 @@ const RESEND_WINDOW = 10;
 const PR_WINDOW = 4;
 /** How often a check runs when nothing says; the CLI's default too. */
 const CHECK_EVERY = "15m";
-/** How long the agent has to turn a described check into a command. */
-const CHECK_TTL_MS = 10 * 60_000;
 /** Why omp moved a session to a new id (its persistence notice); the CLI re-keys the old record on all but open-elsewhere. */
 const MOVE_REASONS = ["open-elsewhere", "replaced", "contested"];
 
@@ -254,24 +252,26 @@ function userArgs(sentence: string, prompt?: string, park = true): string[] {
 	return [...(sentence ? [`--note=${sentence}`] : []), ...(prompt ? [`--prompt=${prompt}`] : []), "--by", "user", ...(park ? ["--park"] : [])];
 }
 
-function checkOptions(argv: string, label: string, interval: string): string[] {
-	return ["--kind", "command", `--argv=${argv}`, "--predicate=exit0", `--label=${label}`, `--interval=${interval}`];
-}
-
 /** A check's own command line, `! command` (or `!command`), rather than a description for the agent. */
 const LITERAL_CHECK = /^!([\s\S]*)$/;
 
 /**
- * A check, or `{error}`: a LITERAL_CHECK runs as given; anything else is a description, and `check`
- * asks the agent for its command. `repeat`: the options of a prompt the check's wait repeats until it passes.
+ * A check's add, or `{error}`: a LITERAL_CHECK runs as given; anything else is a description, and its
+ * add (`described`) queues the instruction that asks the agent for the command. `repeat`: the options
+ * of a prompt the check's wait repeats until it passes.
  */
 function checkRequest(what: string, { interval = CHECK_EVERY, prompt = "", sentence = "", park = true, close = false, repeat = [] } = {}) {
 	if (!DURATION.test(interval)) return { error: `Check every takes a duration such as 10m, not ${interval}.` };
 	const literal = what.match(LITERAL_CHECK);
-	if (!literal) return { check: { description: what, interval, prompt: prompt || undefined, sentence, park, close, repeat } };
-	const command = literal[1]?.trim();
-	if (!command) return { error: "A command line must follow the !." };
-	return { command: "add", args: [...checkOptions(command, command, interval), ...repeat, ...userArgs(sentence, prompt, park)], close };
+	const command = literal?.[1]?.trim();
+	if (literal && !command) return { error: "A command line must follow the !." };
+	const check = literal ? [`--argv=${command}`] : [`--describe=${what}`];
+	return {
+		command: "add",
+		args: ["--kind", "command", ...check, "--predicate=exit0", `--label=${command ?? what}`, `--interval=${interval}`, ...repeat, ...userArgs(sentence, prompt, park)],
+		close,
+		...(literal ? {} : { described: what }),
+	};
 }
 
 const UNIT_SECONDS = { s: 1, m: 60, h: 3600, d: 86_400, w: 604_800 };
@@ -370,7 +370,7 @@ function whatRequest(text: string, park = true) {
 }
 
 /**
- * `{command, args}` for one /wait line, `{check}` for a check the agent is to write, `{error,
+ * `{command, args}` for one /wait line (`described`: a check the agent is to write), `{error,
  * forms}` for a bad line. `needs: "pr"|"repo"`: a target still to resolve, `pr` being the
  * reference the line gave. `gh`: a GitHub wait, whose reading is shown once it is saved.
  * `guessedRepo`: a first word taken for the repo that gh is to confirm, `withoutRepo` the request
@@ -530,8 +530,16 @@ const TONES: Record<string, string> = { fulfilled: "success", attention: "warnin
 /** theme.bold can come out plain, so the bold is written out. */
 const bold = (text: string) => `\x1b[1m${text}\x1b[22m`;
 
-/** The CLI's composer row: its prefix in the outcome's color, and what happened in bold when fulfilled. */
-function rowText(session, theme): string {
+/**
+ * The CLI's composer row: its prefix in the outcome's color, and what happened in bold when fulfilled;
+ * led by `close`, whether the session may be closed (closeVerdict).
+ */
+export function rowText(session, theme, close?): string {
+	const row = outcomeRow(session, theme);
+	return close ? `${theme.fg(close.verdict === "park" ? "warning" : "muted", close.text)} │ ${row}` : row;
+}
+
+function outcomeRow(session, theme): string {
 	const row: string = session.composer_row;
 	const tone = TONES[session.outcome];
 	const space = row.indexOf(" ");
@@ -560,14 +568,15 @@ function clockTime(ms: number, now: number): string {
 }
 
 /**
- * The warning a view's `health` gives at `now`; undefined while the waits are being checked. Before
- * the first tick (`checked_at` null) it warns only once this process has seen that since
- * `uncheckedSince` for 15 minutes, so a fresh install doesn't flash a warning. A recent tick whose
- * error came from one check (`error_kind` "partial") checked the rest: the waits count as checked,
- * and only the error shows. A CLI without `error_kind` means the tick failed.
+ * What a view's `health` says at `now`: its `warning`, undefined while the waits are being checked, and
+ * `unchecked` when that warning is that nothing checks them. Before the first tick (`checked_at` null)
+ * it warns only once this process has seen that since `uncheckedSince` for 15 minutes, so a fresh
+ * install doesn't flash a warning. A recent tick whose error came from one check (`error_kind`
+ * "partial") checked the rest: the waits count as checked, and only the error shows. A CLI without
+ * `error_kind` means the tick failed.
  */
-export function healthWarning(health, now = Date.now(), uncheckedSince?: number): string | undefined {
-	if (!health) return undefined;
+function healthState(health, now: number, uncheckedSince?: number): { warning?: string; unchecked: boolean } {
+	if (!health) return { unchecked: false };
 	const checked = Date.parse(health.checked_at ?? "");
 	const since = Number.isNaN(checked) ? "never" : clockTime(checked, now);
 	const stale = Date.parse(health.agents_stale_since ?? "");
@@ -577,11 +586,29 @@ export function healthWarning(health, now = Date.now(), uncheckedSince?: number)
 	const chars = Array.from(String(health.error ?? "").replace(/\s+/g, " ").trim());
 	const error = chars.length > 120 ? `${chars.slice(0, 119).join("")}…` : chars.join("");
 	const fresh = !Number.isNaN(checked) && now - checked <= TICK_STALE_MS;
-	if (error && fresh && health.error_kind === "partial") return `⚠ Last check: ${error}${scanSince ? ` · session scan stale since ${scanSince}` : ""}`;
-	if (error) return `⚠ Waits not checked since ${since}: ${error}`;
+	if (error && fresh && health.error_kind === "partial") {
+		return { warning: `⚠ Last check: ${error}${scanSince ? ` · session scan stale since ${scanSince}` : ""}`, unchecked: false };
+	}
+	if (error) return { warning: `⚠ Waits not checked since ${since}: ${error}`, unchecked: true };
 	const last = Number.isNaN(checked) ? uncheckedSince : checked;
-	if (last !== undefined && now - last > TICK_STALE_MS) return `⚠ Waits not checked since ${since}`;
-	return scanSince && `⚠ Session scan stale since ${scanSince}`;
+	if (last !== undefined && now - last > TICK_STALE_MS) return { warning: `⚠ Waits not checked since ${since}`, unchecked: true };
+	return { warning: scanSince && `⚠ Session scan stale since ${scanSince}`, unchecked: false };
+}
+
+export function healthWarning(health, now = Date.now(), uncheckedSince?: number): string | undefined {
+	return healthState(health, now, uncheckedSince).warning;
+}
+
+/** Closing loses the waits' checks while nothing runs them, whatever the session's own verdict says. */
+const UNCHECKED_CLOSE = { verdict: "park", reason: "unchecked", text: "park only: nothing checks waits" };
+
+/**
+ * Whether the session may be closed: the CLI's `close` (undefined without waits), or park while the
+ * view's health says nothing checks the waits.
+ */
+export function closeVerdict(session, health, now = Date.now(), uncheckedSince?: number) {
+	const close = session?.close ?? undefined;
+	return close && healthState(health, now, uncheckedSince).unchecked ? UNCHECKED_CLOSE : close;
 }
 
 /**
@@ -628,8 +655,11 @@ function errorPanel(message: string, forms = []) {
 	return (theme, width: number) => [theme.fg("error", message), ...(forms.length > 0 ? [columns(forms, theme, width)] : [])].join("\n");
 }
 
-/** The session details from `card`, the CLI's answer; the health warning has its own line above the row. */
-function detailsPanel(card) {
+/**
+ * The session details from `card`, the CLI's answer, and `close`, whether it may be closed
+ * (closeVerdict); the health warning has its own line above the row.
+ */
+function detailsPanel(card, close?) {
 	return (theme) => {
 		const muted = (text: string) => theme.fg("muted", text);
 		const waits = card.waits ?? [];
@@ -653,6 +683,7 @@ function detailsPanel(card) {
 			mentioned.length > 0 && muted("Mentioned"),
 			...mentioned.map((pr) => muted(prLine(pr))),
 			...waits.map((wait) => `${wait.id}  ${wait.mark ?? ""}${wait.summary || wait.label} (${waitFacts(wait)})`),
+			close && `${muted("Closing:")} ${theme.fg(close.verdict === "park" ? "warning" : "muted", close.text)}`,
 			history.length > 0 && muted("Since set aside"),
 			...history.map(({ at, text }) => `${when(at)}  ${text}`),
 			card.next_step && `Next: ${card.next_step}`,
@@ -840,12 +871,12 @@ const CLOSE_NOTES = {
 
 /**
  * The menu's last step: the chosen `{park, close?}`, undefined on Esc. With `closeNote`, what brings the
- * session back, closing is offered first, but only while `idle(c)` holds: closing mid-turn, or while omp
- * retries, compacts or holds a queued message, would cut the turn off.
- * A check the agent is to write (`what`) closes once its turn wrote it.
+ * session back, closing is offered first, but only while `canClose(c)` holds: omp is idle (closing
+ * mid-turn, or while omp retries, compacts or holds a queued message, would cut the turn off) and
+ * closing would lose nothing. A check the agent is to write (`what`) closes once its turn wrote it.
  */
-async function askPark(c, idle: (c) => boolean, closeNote?: string, what?: string) {
-	if (!closeNote || !idle(c)) return pick(c, "Park the session?", PARK_CHOICES);
+async function askPark(c, canClose: (c) => boolean, closeNote?: string, what?: string) {
+	if (!closeNote || !canClose(c)) return pick(c, "Park the session?", PARK_CHOICES);
 	const described = what !== undefined && !LITERAL_CHECK.test(what);
 	const description = described ? `${closeNote}; it closes once the agent wrote the command` : closeNote;
 	return pick(c, "Close or park the session?", [{ label: "Close the session", description, park: false, close: true }, ...PARK_CHOICES]);
@@ -919,9 +950,9 @@ const ENDS = [
  * The steps of the menu's items, keyed by the item ids of MENU_FILE, which holds their text.
  * `options` asks what the form needs and gives its CLI options; undefined ends the flow (Esc, or a
  * required line left empty). The sentence and the prompt come after it, unless the flow turns
- * them off; `closeNote` replaces the park step's own. `request(c, record, pr, idle)` instead asks
+ * them off; `closeNote` replaces the park step's own. `request(c, record, pr, canClose)` instead asks
  * everything, the park step included, and gives a request as parseWait does, with `close` when the
- * user chose to close; `idle` is the guard askPark offers Close under.
+ * user chose to close; `canClose` is the guard askPark offers Close under.
  * Shell panes get Tern's own picker from the same file.
  */
 const FLOWS = {
@@ -933,7 +964,7 @@ const FLOWS = {
 		},
 	},
 	every: {
-		async request(c, record, pr, idle) {
+		async request(c, record, pr, canClose) {
 			const typed = await ask(c, "Repeat every? 30m, 2h, 1d", "1h");
 			if (!typed) return undefined;
 			const every = durationOf(typed);
@@ -948,7 +979,7 @@ const FLOWS = {
 			if (!prompt) throw new Error("Repeat a prompt needs the prompt to repeat.");
 			const sentence = await ask(c, SENTENCE_TITLE, record?.note ?? "");
 			if (sentence === undefined) return undefined;
-			const choice = await askPark(c, idle, CLOSE_NOTES.repeat, ends.check);
+			const choice = await askPark(c, canClose, CLOSE_NOTES.repeat, ends.check);
 			if (!choice) return undefined;
 			const repeat = [`--every=${every}`];
 			if (ends.check === undefined) {
@@ -984,14 +1015,14 @@ const FLOWS = {
 		},
 	},
 	check: {
-		async request(c, _record, _pr, idle) {
+		async request(c, _record, _pr, canClose) {
 			const what = await ask(c, CHECK_TITLE);
 			if (!what) return undefined;
 			const every = await ask(c, "Check every", CHECK_EVERY);
 			if (every === undefined) return undefined;
 			const prompt = await ask(c, PROMPT_TITLE);
 			if (prompt === undefined) return undefined;
-			const choice = await askPark(c, idle, prompt ? CLOSE_NOTES.prompt : CLOSE_NOTES.quiet, what);
+			const choice = await askPark(c, canClose, prompt ? CLOSE_NOTES.prompt : CLOSE_NOTES.quiet, what);
 			if (!choice) return undefined;
 			const request = checkRequest(what, { interval: durationOf(every) || CHECK_EVERY, prompt, park: choice.park, close: choice.close });
 			if (request.error) throw new Error(request.error);
@@ -999,10 +1030,10 @@ const FLOWS = {
 		},
 	},
 	for: {
-		async request(c, record, _pr, idle) {
+		async request(c, record, _pr, canClose) {
 			const what = await ask(c, "What do you wait for? (empty: nothing any more)", record?.waiting_for ?? "");
 			if (what === undefined) return undefined;
-			const choice = what ? await askPark(c, idle, CLOSE_NOTES.something) : PARK_CHOICES[1];
+			const choice = what ? await askPark(c, canClose, CLOSE_NOTES.something) : PARK_CHOICES[1];
 			return choice ? { ...whatRequest(what, choice.park), close: choice.close } : undefined;
 		},
 	},
@@ -1038,16 +1069,6 @@ function readMenu() {
 }
 const MENU = readMenu();
 
-/** What the agent gets for a described check. */
-function checkInstruction(description: string): string {
-	return [
-		`I want to wait until this holds: "${description}".`,
-		"Write a command that exits 0 exactly when it holds and non-zero otherwise. It runs without a shell, as an argv; use sh -c '…' only when it needs pipes.",
-		"Run it once now and show me its exit code and output.",
-		"Then call the waitingfor tool with action add, kind command and argv, and nothing else: the label, the interval and the rest come from my /wait check.",
-	].join("\n");
-}
-
 export default function (pi) {
 	const z = pi.zod;
 	let ctx; // the main session with a UI; subagents and headless runs only get the tool and /wait
@@ -1063,6 +1084,7 @@ export default function (pi) {
 	let waits = []; // this session's open waits, as the last applied view had them
 	let menuOpen = false;
 	let closeAfterTurn: string | undefined; // the session to close once the turn writing its described check ends
+	let closeAfterCheck: { session: string; wait: string } | undefined; // the described check whose writing closes the session
 	let menuSeq = 0; // the last menu request seen
 	let activatedAt = 0; // in whole seconds, as a request's time has no finer ones
 	let unwatchMoves; // ends the subscription to omp's notices of a session moved to a new file
@@ -1080,21 +1102,9 @@ export default function (pi) {
 	// Prompts this process sent and the CLI has yet to hear about: a follow-up stays out of the
 	// transcript until the turn ends.
 	const sent = new Set<string>();
-	// Checks the user described and the agent is to write, by session, with the instruction it got.
-	const checks = new Map<
-		string,
-		{
-			description: string;
-			interval: string;
-			prompt?: string;
-			sentence: string;
-			park: boolean;
-			close: boolean;
-			repeat: string[];
-			instruction: string;
-			at: number;
-		}
-	>();
+	// Described checks whose instruction this process sent, by session: the agent's next command add
+	// writes it (checkWritten). The CLI holds the check itself.
+	const asked = new Map<string, { wait: string; text: string; at: number }>();
 
 	const log = (error) => pi.logger?.debug("waitingfor", { error: messageOf(error) });
 	const quietly = (task) => {
@@ -1102,12 +1112,13 @@ export default function (pi) {
 	};
 	const inOrder = (step) => (tail = tail.then(step).catch(log));
 
-	/** Draws the health warning, when there is one, over the session's row, when it has one. */
+	/** Draws the health warning, when there is one, over the session's row, when it has one, led by its close verdict. */
 	function drawRow() {
 		const session = ownSession;
 		const line = session?.composer_row || undefined;
 		const warning = healthWarning(health, Date.now(), uncheckedSince);
-		const shown = JSON.stringify([session?.outcome, session?.headline, line, warning]);
+		const verdict = closeVerdict(session, health, Date.now(), uncheckedSince);
+		const shown = JSON.stringify([session?.outcome, session?.headline, line, warning, verdict]);
 		if (!ctx || shown === shownLine) return;
 		shownLine = shown;
 		// omp draws widgets in the order they were set: the warning, the row, then the panel.
@@ -1120,13 +1131,13 @@ export default function (pi) {
 			let plain;
 			let linked;
 			return {
-				...panelComponent((t) => open + rowText(session, t) + close, theme),
+				...panelComponent((t) => open + rowText(session, t, verdict) + close, theme),
 				// Tern's native view paints an undescribed widget as terminal cells, where the link
 				// shows no pointer and no hover. Described, the row opens its card on a plain click
 				// (a span link would want Ctrl), and codexbar.css underlines it on hover. The same
 				// node object while the text holds lets omp skip it.
 				describe(cx) {
-					text.setText(rowText(session, theme));
+					text.setText(rowText(session, theme, verdict));
 					const node = text.describe(cx);
 					if (!href) return node;
 					if (node !== plain) {
@@ -1174,7 +1185,8 @@ export default function (pi) {
 		setPanel(c, loading);
 		let details;
 		try {
-			details = detailsPanel((await cli(["card", "--session", c.sessionManager.getSessionId()])).card);
+			const { card } = await cli(["card", "--session", c.sessionManager.getSessionId()]);
+			details = detailsPanel(card, closeVerdict(card, health, Date.now(), uncheckedSince));
 		} catch (error) {
 			const message = messageOf(error);
 			// A session with no message yet has nothing for the card to read; an unreadable state
@@ -1270,6 +1282,8 @@ export default function (pi) {
 					continue;
 				}
 			}
+			// The instruction for a described check: the agent's command add writes it (checkWritten).
+			if (prompt.check) asked.set(session, { wait: prompt.wait, text: prompt.text, at: resent ? Date.parse(prompt.claimed_at) : claimedAt });
 			applyView((await cli(["ack", "--action", prompt.action, "--result", "delivered"])).view);
 			sent.delete(prompt.action);
 			delivered = true;
@@ -1373,9 +1387,10 @@ export default function (pi) {
 		if (!change) return false;
 		if (change.moved) {
 			formerIds.add(sessionId);
-			const check = checks.get(sessionId);
-			if (check) checks.set(change.id, check);
+			const check = asked.get(sessionId);
+			if (check) asked.set(change.id, check);
 			if (closeAfterTurn === sessionId) closeAfterTurn = change.id;
+			if (closeAfterCheck?.session === sessionId) closeAfterCheck = { ...closeAfterCheck, session: change.id };
 			const reason = MOVE_REASONS.includes(notice?.reason) ? notice.reason : "open-elsewhere";
 			// Back-to-back moves all go to the newest id, but none across an open-elsewhere: the id moved
 			// from there is another process's, and so is the record an earlier move would have handed it.
@@ -1401,14 +1416,15 @@ export default function (pi) {
 			formerIds.clear();
 			moves = [];
 			closeAfterTurn = undefined; // chosen for the session switched away from
+			closeAfterCheck = undefined;
 			retrying = false;
 			compacting = false;
 			setPanel(c, undefined);
 		}
 		activatedAt = Date.now() - (Date.now() % 1000);
 		sessionId = c.sessionManager.getSessionId();
-		// A session switched away from took its queued instruction with it.
-		for (const id of checks.keys()) if (id !== sessionId) checks.delete(id);
+		// A session switched away from took its delivered instruction with it.
+		for (const id of asked.keys()) if (id !== sessionId) asked.delete(id);
 		watchView();
 		// omp tells of each move here, inside the write that made it, so a tool call or claim in the same
 		// tick already sees the new id; it replays the earlier moves at once, which name this id already.
@@ -1469,8 +1485,10 @@ export default function (pi) {
 	pi.on("agent_end", (event, c) => {
 		if (event?.willContinue) return;
 		report("turn_finished", (session) => session.waits?.length > 0, c);
-		dropUnwrittenCheck(c);
-		if (c?.agent?.kind !== "sub" && closeAfterTurn !== undefined && closeAfterTurn === sessionId) closeOnceSettled(c);
+		if (c?.agent?.kind === "sub") return;
+		// A check its turn didn't write is the CLI's to report; a later command add is the agent's own.
+		asked.delete(sessionId);
+		if (closeAfterTurn !== undefined && closeAfterTurn === sessionId) closeOnceSettled(c);
 	});
 	pi.on("input", (_event, c) => {
 		if (panel) setPanel(c, undefined);
@@ -1501,97 +1519,62 @@ export default function (pi) {
 		else if (action === "Snooze 1d") await act(c, ["snooze", "--session", session, `--wait=${id}`, "--for", "1d"]);
 	}
 
-	/** A described check whose turn ended without the tool call is dropped, and the user told. */
-	function dropUnwrittenCheck(c) {
-		if (!ctx || c?.agent?.kind === "sub" || !checks.delete(sessionId)) return;
-		setPanel(ctx, errorPanel("The agent didn't register a check."));
-	}
-
-	/** When `check`'s instruction reached the agent, as its user message has it; undefined while still queued. */
-	function checkStarted(c, check): number | undefined {
-		const entry = c.sessionManager
-			.getBranch()
-			.findLast(
-				(item) =>
-					item.type === "message" &&
-					item.message?.role === "user" &&
-					!(Number(item.message.timestamp) < check.at) && // not the same words from an earlier check
-					messageText(item.message) === check.instruction,
-			);
-		return entry && (Number(entry.message.timestamp) || check.at);
-	}
-
-	/** `c`'s session's described check; 10 minutes after its instruction reached the agent it has expired. */
-	function pendingCheck(c) {
-		const session = c.sessionManager.getSessionId();
-		const check = checks.get(session);
-		const started = check && checkStarted(c, check);
-		if (started === undefined || Date.now() - started <= CHECK_TTL_MS) return check;
-		checks.delete(session);
-		if (ctx && session === sessionId) setPanel(ctx, errorPanel("The check expired: the agent took over 10 minutes to write it."));
-		return undefined;
-	}
-
 	/**
 	 * The described check an agent call writes: an add of a command once the check's instruction
-	 * reached the agent, steering messages after it or not. While it is still queued, the running
+	 * reached the agent, steering messages after it or not. While it is still on its way, the running
 	 * turn's command waits are the agent's own.
 	 */
 	function checkWritten(c, params) {
 		if (params.action !== "add" || params.kind !== "command" || !params.argv) return undefined;
-		const check = pendingCheck(c);
-		return check && checkStarted(c, check) !== undefined ? check : undefined;
-	}
-
-	/**
-	 * Leaves a described check to the agent; its waitingfor call adds it as the user's (see the tool).
-	 * One at a time: a queued instruction can't be taken back, so a second one would get the first's command.
-	 */
-	function requestCheck(c, check) {
-		const session = c.sessionManager.getSessionId();
-		const pending = pendingCheck(c);
-		if (pending) throw new Error(`The agent is still on the check "${pending.description}"; ask for the next one after its turn.`);
-		const instruction = checkInstruction(check.description);
-		const entry = { ...check, instruction, at: Date.now() };
-		checks.set(session, entry);
-		let sending;
-		try {
-			sending = pi.sendUserMessage(instruction, c.isIdle() ? undefined : { deliverAs: "followUp" });
-		} catch (error) {
-			checks.delete(session);
-			throw error;
-		}
-		setPanel(c, (theme) => theme.fg("muted", `Asked the agent for a command that checks: ${check.description}`));
-		// A dropped instruction rejects later; the agent never got it.
-		Promise.resolve(sending).catch((error) => {
-			if (error?.name !== "PromptDroppedError" && (!ours(session) || checkStarted(c, entry) !== undefined)) return;
-			// A move carried the check over to the new id (followSession).
-			if (checks.get(sessionId) === entry) checks.delete(sessionId);
-			if (ctx && ours(session)) setPanel(ctx, errorPanel(`The check didn't reach the agent: ${messageOf(error)}`));
-		});
+		const check = asked.get(c.sessionManager.getSessionId());
+		const reached =
+			check &&
+			c.sessionManager
+				.getBranch()
+				.some(
+					(item) =>
+						item.type === "message" &&
+						item.message?.role === "user" &&
+						!(Number(item.message.timestamp) < check.at) && // not the same words from an earlier check
+						messageText(item.message) === check.text,
+				);
+		return reached ? check : undefined;
 	}
 
 	/** Carries out a request from a /wait line or the menu for `session`, the one open when it was asked; the CLI's answer. */
 	async function perform(c, request, session: string) {
-		if (request.check) {
-			// The instruction goes to whichever session is open now.
-			if (c.sessionManager.getSessionId() !== session) throw new Error("The session changed: ask for the check again.");
-			return requestCheck(c, request.check);
-		}
 		const resolved = await confirmRepo(request, c.cwd);
 		const args = [...(await targetOptions(resolved, c)), ...resolved.args];
 		const answer = await act(c, [resolved.command, "--session", session, ...args]);
-		if (resolved.gh && c.sessionManager.getSessionId() === session) {
+		if (c.sessionManager.getSessionId() !== session) return answer;
+		if (resolved.gh) {
 			const reading = ghReading(resolved.command, args, resolved === request ? undefined : request.guessedRepo);
 			setPanel(c, (theme) => theme.fg("muted", reading));
+		} else if (resolved.described) {
+			setPanel(c, (theme) => theme.fg("muted", `Asked the agent for a command that checks: ${resolved.described}`));
 		}
 		return answer;
 	}
 
 	/**
+	 * What keeps the session from closing now: nothing checking waits, or its close verdict (closeVerdict)
+	 * not saying it comes back. After a save (`saved`) the session has a wait, so a view without its
+	 * verdict blocks too. Undefined when closing loses nothing; the last applied view has the wait just saved.
+	 */
+	function closeBlocker(saved = false) {
+		if (healthState(health, Date.now(), uncheckedSince).unchecked) return UNCHECKED_CLOSE;
+		const close = ownSession?.close;
+		if (!close) return saved ? { text: "no close verdict came back for it" } : undefined;
+		return close.verdict === "safe" || close.verdict === "manual" ? undefined : { text: close.text || `verdict ${close.verdict}` };
+	}
+
+	/** Close is offered while omp is idle and closing would lose nothing. */
+	const canClose = (c) => idle(c) && closeBlocker() === undefined;
+
+	/**
 	 * Closes `session`, the one whose wait the CLI saved (`answer`), and with `pinned` its pin, which
-	 * is what brings a When I have time session back. Without it, with a turn running, or with
-	 * another session open by then, it stays open and says why.
+	 * is what brings a When I have time session back. Without it, with a turn running, with closing
+	 * losing something (closeBlocker), or with another session open by then, it stays open and says why.
 	 */
 	async function closeSession(c, session: string, answer, pinned = false) {
 		if (pinned && answer?.pinned !== true) {
@@ -1613,6 +1596,12 @@ export default function (pi) {
 		if (!idle(c)) {
 			const kept = pinned ? "The session stays pinned" : "The wait is saved";
 			setPanel(c, errorPanel(`Not closed: the agent is still working. ${kept}; close it once the turn ends.`));
+			return;
+		}
+		const blocker = closeBlocker(true);
+		if (blocker) {
+			const kept = pinned ? "The session stays pinned" : "The wait is saved";
+			setPanel(c, errorPanel(`Not closed: ${blocker.text}. ${kept}; park the session instead.`));
 			return;
 		}
 		await c.shutdown();
@@ -1644,7 +1633,7 @@ export default function (pi) {
 		if (sentence === undefined) return;
 		const prompt = flow.prompt === false ? "" : await ask(c, PROMPT_TITLE);
 		if (prompt === undefined) return;
-		const choice = await askPark(c, idle, flow.closeNote ?? (prompt ? CLOSE_NOTES.prompt : CLOSE_NOTES.quiet));
+		const choice = await askPark(c, canClose, flow.closeNote ?? (prompt ? CLOSE_NOTES.prompt : CLOSE_NOTES.quiet));
 		if (!choice) return;
 		const kind = flow.kind ? ["--kind", flow.kind] : [];
 		const answer = await act(c, [flow.command ?? "add", "--session", session, ...kind, ...options, ...userArgs(sentence, prompt, choice.park)]);
@@ -1677,10 +1666,12 @@ export default function (pi) {
 			if (!chosen.flow) await waitMenu(c, session, open);
 			else if (!chosen.flow.request) await setAside(c, session, chosen.flow, pr, record);
 			else {
-				const request = await chosen.flow.request(c, record, pr, idle);
+				const request = await chosen.flow.request(c, record, pr, canClose);
 				if (!request) return;
 				const answer = await perform(c, request, session);
-				if (request.close) await closeSession(c, session, answer);
+				// A described check closes once the agent wrote its command (the tool).
+				if (request.close && request.described) closeAfterCheck = { session, wait: answer.wait?.id };
+				else if (request.close) await closeSession(c, session, answer);
 			}
 		} catch (error) {
 			setPanel(c, errorPanel(messageOf(error)));
@@ -1772,7 +1763,7 @@ export default function (pi) {
 			followSession(); // the check the user described may still sit under the id omp moved from
 			const session = c.sessionManager.getSessionId();
 			let args;
-			// The user's described check this call writes; a failed add keeps it for the agent's retry.
+			// The user's described check this call writes; a failed write keeps it for the agent's retry.
 			const check = checkWritten(c, params);
 			const extra = check ? Object.keys(params).filter((name) => params[name] !== undefined && !["action", "kind", "argv"].includes(name)) : [];
 			if (extra.length > 0) {
@@ -1780,16 +1771,7 @@ export default function (pi) {
 			}
 			switch (params.action) {
 				case "add":
-					args = check
-						? [
-								"add",
-								"--session",
-								session,
-								...checkOptions(JSON.stringify(params.argv), check.description, check.interval),
-								...check.repeat,
-								...userArgs(check.sentence, check.prompt, check.park),
-							]
-						: await toolAddArgs(params, session, c.cwd);
+					args = check ? ["write-check", "--session", session, `--argv=${JSON.stringify(params.argv)}`] : await toolAddArgs(params, session, c.cwd);
 					break;
 				case "babysit_pr":
 					args = [
@@ -1817,9 +1799,14 @@ export default function (pi) {
 			}
 			const { view, ...answer } = await act(c, args);
 			if (check) {
-				if (checks.get(session) === check) checks.delete(session);
-				if (check.close && session === sessionId) closeAfterTurn = session;
-				if (ctx && session === sessionId) setPanel(ctx, () => `Check: ${params.argv.join(" ")} every ${check.interval}`);
+				if (asked.get(session) === check) asked.delete(session);
+				if (closeAfterCheck?.session === session && closeAfterCheck.wait === check.wait && session === sessionId) {
+					closeAfterCheck = undefined;
+					closeAfterTurn = session;
+				}
+				const seconds = answer.wait.condition.interval_s;
+				const [unit, size] = Object.entries(UNIT_SECONDS).findLast(([, length]) => seconds % length === 0);
+				if (ctx && session === sessionId) setPanel(ctx, () => `Check: ${params.argv.join(" ")} every ${seconds / size}${unit}`);
 			}
 			const result = params.action === "list" ? (answer.sessions?.[0] ?? { waits: [] }) : answer;
 			return { content: [{ type: "text", text: JSON.stringify(result) }], details: {} };

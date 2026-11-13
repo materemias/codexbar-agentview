@@ -1836,7 +1836,9 @@ class PromptTests(Case):
         self.advance(minutes=1)
         self.stale_agents(self.clock)
         self.tick()
-        self.assertEqual(self.wait_of(wait)["state"], "needs_attention")
+        # Closed during its turn: sent again, once.
+        self.assertEqual(self.wait_of(wait)["state"], "acting")
+        self.assertEqual(self.state()["sessions"][SID]["prompt_queue"][0]["state"], "queued")
 
     def test_liveness_is_read_again_after_slow_checks(self) -> None:
         wait = self.add("--kind", "time", "--in", "1s", "--prompt", "go")["id"]
@@ -1855,12 +1857,37 @@ class PromptTests(Case):
             self.tick()
         self.assertEqual(self.wait_of(wait)["state"], "acting")
 
-    def test_session_closing_during_the_turn_needs_attention(self) -> None:
+    def test_a_session_closed_during_the_turn_sends_the_prompt_again_once(self) -> None:
         wait, _ = self.queued_prompt()
         self.agents()
         self.tick()
-        self.assertEqual(self.wait_of(wait)["state"], "needs_attention")
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["outcome"]), ("acting", "attention"))
+        self.assertEqual(seen["reason"], waiting.REASON_CLOSED)  # nothing here can resume it
+        self.assertIn("Sending again after the session closed: Timer", [h["text"] for h in self.session()["history"]])
+        self.agents(SID)
+        self.heartbeat()
+        prompt = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]
+        self.assertEqual(prompt["text"], f"{waiting.CLOSE_NOTE}\n\ngo")
+        self.assertFalse(prompt["resend_check"])
+        self.run_cli("ack", "--action", prompt["action"], "--result", "delivered")
+        # Cut off a second time, it comes to me.
+        self.agents()
+        self.tick()
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["reason"]), ("needs_attention", waiting.REASON_CUT_TWICE))
         self.assertEqual(self.session()["prompts_queued"], 0)
+
+    def test_a_repeat_run_cut_off_is_not_sent_again(self) -> None:
+        wait = self.add("--kind", "repeat", "--every", "1h", "--prompt", "p")["id"]
+        self.advance(hours=1)
+        self.tick()
+        action = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]["action"]
+        self.run_cli("ack", "--action", action, "--result", "delivered")
+        self.agents()
+        self.tick()
+        self.assertEqual(self.state()["sessions"][SID]["prompt_queue"], [])
+        self.assertEqual(self.wait_of(wait)["state"], "waiting")
 
     def test_snooze_cancels_the_queued_prompt(self) -> None:
         wait = self.add("--kind", "time", "--in", "1s", "--prompt", "go")["id"]
@@ -2076,6 +2103,7 @@ class ViewTests(Case):
                 "size", "set_aside_at", "pinned", "ball", "unseen", "outcome", "headline",
                 "status", "line", "composer_row",
                 "next_step", "threads", "still_waiting", "waiting_for", "recap", "recap_at", "recap_stale", "due_at", "prompts_queued", "waits",
+                "close",
                 "history", "prs",
             },
         )
@@ -4481,6 +4509,72 @@ class ResumeTests(Case):
         self.tick("--window")
         self.assertEqual(self.wait_of(wait)["state"], "needs_attention")
 
+    def closed_mid_turn(self) -> None:
+        """The session closes while the prompt's turn runs, and its extension has gone quiet."""
+        self.closed()
+        self.advance(seconds=waiting.RESUME_QUIET_S)
+
+    def back_with_the_prompt(self) -> dict:
+        """Tern reopens the session and its extension takes the prompt."""
+        resumes = self.resumes()
+        self.assertEqual([action["session"] for action in resumes], [SID])
+        self.run_cli("ack", "--action", resumes[0]["id"], "--result", "done")
+        self.live()
+        self.heartbeat(SID)
+        prompt = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]
+        self.run_cli("ack", "--action", prompt["action"], "--result", "delivered")
+        return prompt
+
+    def test_a_close_mid_turn_resumes_and_sends_the_prompt_again_once(self) -> None:
+        wait = self.fired_prompt()
+        self.resumed_and_delivered()
+        self.assertEqual(self.session()["close"]["verdict"], "safe")
+        self.closed_mid_turn()
+        prompt = self.back_with_the_prompt()
+        self.assertEqual(prompt["text"], f"{waiting.CLOSE_NOTE}\n\ngo")
+        self.assertIn("Sending again after the session closed: Retry", [h["text"] for h in self.session()["history"]])
+        # A second close would cut it off again: that one comes to me.
+        self.assertEqual(self.session()["close"], {
+            "verdict": "park", "reason": "turn", "text": "park only: turn cut off once already",
+        })
+        self.closed_mid_turn()
+        self.assertEqual(self.resumes(), [])
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["reason"]), ("needs_attention", waiting.REASON_CUT_TWICE))
+
+    def test_a_reboot_and_then_a_close_cut_the_turn_twice(self) -> None:
+        wait = self.fired_prompt()
+        self.resumed_and_delivered()
+        self.rebooted()
+        prompt = self.back_with_the_prompt()
+        self.assertEqual(prompt["text"], f"{waiting.REBOOT_NOTE}\n\ngo")
+        self.assertEqual(self.session()["close"]["reason"], "turn")
+        self.closed_mid_turn()
+        self.assertEqual(self.resumes(), [])
+        self.assertEqual(self.wait_of(wait)["state"], "needs_attention")
+
+    def test_a_close_and_then_a_reboot_cut_the_turn_twice(self) -> None:
+        wait = self.fired_prompt()
+        self.resumed_and_delivered()
+        self.closed_mid_turn()
+        self.back_with_the_prompt()
+        self.rebooted()
+        self.tick("--window")
+        self.assertEqual(self.wait_of(wait)["state"], "needs_attention")
+
+    def test_a_described_check_closed_before_its_command_is_reopened_to_write_it(self) -> None:
+        self.closed()
+        wait = self.add(
+            "--kind", "command", "--describe", "the deploy is green", "--prompt", "tell me",
+        )["id"]
+        self.assertEqual(self.session()["close"]["verdict"], "safe")
+        prompt = self.back_with_the_prompt()
+        self.assertTrue(prompt["check"])
+        self.assertEqual(prompt["text"], waiting._check_instruction("the deploy is green"))
+        self.assertEqual(self.wait_of(wait)["state"], "pending")
+        written = self.run_cli("write-check", "--session", SID, "--argv", '["true"]')["wait"]
+        self.assertEqual((written["state"], written["condition"]["argv"]), ("waiting", ["true"]))
+
     def test_a_reboot_gives_a_session_that_never_came_up_a_fresh_resume(self) -> None:
         wait = self.fired_prompt()
         self.run_cli("ack", "--action", self.resumes()[0]["id"], "--result", "done")
@@ -4661,6 +4755,191 @@ class ResumeTests(Case):
         self.closed()
         self.advance(seconds=2)
         self.assertEqual([action["tern_session"] for action in self.resumes()], [None])
+
+
+class CloseTests(Case):
+    """Whether a session or pane can be closed now, and how it comes back (`close`)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.agents(SID)
+        self.heartbeat()
+
+    def close(self) -> dict | None:
+        return self.session()["close"]
+
+    def test_a_prompt_reopens_it_by_itself(self) -> None:
+        self.add("--kind", "time", "--in", "1h", "--prompt", "go")
+        self.assertEqual(self.close(), {"verdict": "safe", "reason": "prompt", "text": "closable"})
+
+    def test_a_repeat_reopens_it_for_each_run(self) -> None:
+        self.add("--kind", "repeat", "--every", "1h", "--prompt", "p")
+        self.assertEqual(self.close()["verdict"], "safe")
+
+    def test_a_wait_without_a_prompt_comes_back_to_me(self) -> None:
+        self.add("--kind", "time", "--in", "1h")
+        self.assertEqual(
+            self.close(), {"verdict": "manual", "reason": "manual", "text": "closable · you reopen"},
+        )
+
+    def test_later_and_a_pin_come_back_to_me(self) -> None:
+        self.add("--kind", "later")
+        self.assertEqual(self.close()["verdict"], "manual")
+        self.run_cli("done", "--session", SID)
+        (self.omp / "session-pins.json").write_text(json.dumps([SID]))
+        self.assertIsNone(self.close())  # pinned, nothing to wait for
+        self.add("--kind", "time", "--in", "1h", "--prompt", "go")
+        self.assertEqual(self.close()["verdict"], "manual")
+
+    def test_a_prompt_that_ran_waits_for_me(self) -> None:
+        wait, _ = self.queued_prompt()
+        # Its turn runs: a close sends it again.
+        self.assertEqual(self.close()["verdict"], "safe")
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.assertEqual(self.wait_of(wait)["state"], "review")
+        self.assertEqual(self.close()["verdict"], "manual")
+
+    def test_the_worst_wait_wins(self) -> None:
+        self.add("--kind", "time", "--in", "1h", "--prompt", "go")
+        self.add("--kind", "something", "--what", "Anna's answer")
+        self.assertEqual(self.close()["verdict"], "manual")
+        self.add("--kind", "job")  # the job that runs in the session's own pane
+        self.assertEqual(
+            self.close(), {"verdict": "park", "reason": "job", "text": "park only: job runs in this pane"},
+        )
+
+    def test_a_job_in_another_pane_comes_back_by_its_prompt(self) -> None:
+        self.add("--kind", "job", "--pane", "51", "--prompt", "look at the build")
+        self.assertEqual(self.close()["verdict"], "safe")
+
+    def test_without_a_transcript_or_resume_command_it_can_not_come_back(self) -> None:
+        payload = json.loads((self.state_dir / "agents.json").read_text())
+        del payload["agents"][0]["resumeCommand"]
+        (self.state_dir / "agents.json").write_text(json.dumps(payload))
+        self.add("--kind", "time", "--in", "1h", "--prompt", "go")
+        self.assertEqual(self.close(), {
+            "verdict": "park", "reason": "unresumable", "text": "park only: it can't be resumed",
+        })
+        folder = self.omp / "sessions" / "-w"
+        folder.mkdir(parents=True)
+        (folder / f"2026-11-05_{SID}.jsonl").write_text("")
+        self.assertEqual(self.close()["verdict"], "safe")
+
+    def test_a_panes_waits_end_with_it(self) -> None:
+        self.run_cli("add", "--pane", "51", "--kind", "job")
+        self.run_cli("add", "--pane", "52", "--kind", "time", "--in", "1h")
+        closes = {view["pane"]: view["close"] for view in self.run_cli("list")["panes"]}
+        self.assertEqual(closes, {
+            51: {"verdict": "park", "reason": "job", "text": "park only: job runs in this pane"},
+            52: {"verdict": "park", "reason": "shell", "text": "park only: its waits end with the pane"},
+        })
+
+    def test_the_card_says_it_too(self) -> None:
+        self.add("--kind", "time", "--in", "1h")
+        card = self.run_cli("card", "--session", SID, "--cached")["card"]
+        self.assertEqual(card["close"]["verdict"], "manual")
+
+    def test_every_text_is_short(self) -> None:
+        for verdict, text in waiting.CLOSE_REASONS.values():
+            self.assertIn(verdict, ("safe", "manual", "park"))
+            self.assertLess(len(text), 40)
+
+
+class DescribedCheckTests(Case):
+    """/wait check <words>: the session's agent writes the command, asked by a queued prompt."""
+
+    DESCRIPTION = "the deploy is green"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.agents(SID)
+        self.heartbeat()
+
+    def describe(self, *argv: str) -> str:
+        return self.add("--kind", "command", "--describe", self.DESCRIPTION, "--interval", "10m", *argv)["id"]
+
+    def asked(self) -> dict:
+        """The agent got the instruction."""
+        prompt = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]
+        self.run_cli("ack", "--action", prompt["action"], "--result", "delivered")
+        return prompt
+
+    def write(self, argv: list[str], expect: int = 0) -> dict:
+        return self.run_cli("write-check", "--session", SID, "--argv", json.dumps(argv), expect=expect)
+
+    def test_it_waits_unchecked_until_the_agent_writes_the_command(self) -> None:
+        wait = self.describe("--prompt", "tell me")
+        seen = self.wait_of(wait)
+        self.assertEqual(
+            (seen["state"], seen["label"], seen["summary"], seen["condition"]["argv"]),
+            ("pending", self.DESCRIPTION, waiting.CHECK_UNWRITTEN, None),
+        )
+        self.assertEqual(self.session()["close"]["verdict"], "safe")
+        prompt = self.asked()
+        self.assertEqual(prompt["text"], waiting._check_instruction(self.DESCRIPTION))
+        self.assertTrue(prompt["check"])
+        self.assertIn(
+            f"Asked the agent to write the check: {self.DESCRIPTION}",
+            [entry["text"] for entry in self.session()["history"]],
+        )
+        # Nothing runs, and nothing fires, before the command is there.
+        self.advance(hours=1)
+        self.tick()
+        self.assertEqual(self.wait_of(wait)["state"], "pending")
+        written = self.write([sys.executable, "-c", "raise SystemExit(1)"])["wait"]
+        self.assertEqual((written["id"], written["state"]), (wait, "waiting"))
+        self.assertEqual(self.state()["sessions"][SID]["prompt_queue"], [])
+        logged = self.session()["history"][-1]["text"]
+        self.assertTrue(logged.startswith("Check: ") and logged.endswith(" every 10m"), logged)
+        # The turn that wrote it ends; the check runs and doesn't hold.
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.tick()
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["outcome"], seen["fired_at"]), ("waiting", None, None))
+        self.assertEqual(self.run_cli("claim-prompts", "--session", SID)["prompts"], [])
+
+    def test_a_turn_that_wrote_no_command_puts_it_on_me(self) -> None:
+        wait = self.describe()
+        self.asked()
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        seen = self.wait_of(wait)
+        self.assertEqual((seen["state"], seen["reason"]), ("needs_attention", waiting.REASON_NO_CHECK))
+        self.assertIsNone(self.state()["sessions"][SID]["waits"][0]["fired_at"])
+        self.write(["true"], expect=2)
+
+    def test_only_an_instruction_the_agent_has_takes_the_command(self) -> None:
+        self.describe()
+        self.write(["true"], expect=2)
+
+    def test_one_described_check_at_a_time(self) -> None:
+        self.describe()
+        answer = self.run_cli(
+            "add", "--session", SID, "--kind", "command", "--describe", "another", expect=2,
+        )
+        self.assertIn(self.DESCRIPTION, answer["error"])
+
+    def test_done_takes_the_instruction_back(self) -> None:
+        wait = self.describe()
+        self.run_cli("done", "--session", SID, "--wait", wait)
+        self.assertEqual(self.run_cli("claim-prompts", "--session", SID)["prompts"], [])
+
+    def test_closing_before_the_command_was_written_asks_once_more(self) -> None:
+        self.describe()
+        self.asked()
+        self.agents()
+        self.tick()
+        prompt = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]
+        self.assertEqual(prompt["text"], f"{waiting.CLOSE_NOTE}\n\n{waiting._check_instruction(self.DESCRIPTION)}")
+        self.assertTrue(prompt["check"])
+
+    def test_describe_takes_no_argv_and_needs_a_session(self) -> None:
+        for argv in (
+            ["add", "--session", SID, "--kind", "command", "--describe", "x", "--argv", '["true"]'],
+            ["add", "--pane", "51", "--kind", "command", "--describe", "x"],
+            ["add", "--session", SID, "--kind", "time", "--in", "1h", "--describe", "x"],
+        ):
+            with self.subTest(argv=argv):
+                self.run_cli(*argv, expect=2)
 
 
 class HealthTests(Case):
@@ -5864,6 +6143,194 @@ console.log(JSON.stringify([
             None,
             len("⚠ Last check: ") + 120,
         ])
+
+    def test_the_row_leads_with_whether_the_session_can_be_closed(self) -> None:
+        answer = run_extension_driver(self, r"""
+const { closeVerdict, rowText } = await import(process.env.EXTENSION);
+const now = Date.parse("2026-11-12T12:00:00");
+const at = (minutes) => new Date(now - minutes * 60_000).toISOString();
+const theme = { fg: (tone, text) => `<${tone}>${text}</>` };
+const session = (close) => ({ composer_row: "⏲ Retry · in 2h", outcome: null, close });
+const safe = { verdict: "safe", reason: "prompt", text: "closable" };
+const park = { verdict: "park", reason: "turn", text: "park only: turn cut off once already" };
+const checked = { checked_at: at(1) };
+const row = (close, health) => rowText(session(close), theme, closeVerdict(session(close), health, now));
+console.log(JSON.stringify([
+    row(safe, checked),
+    row(park, checked),
+    // Nothing checks waits: whatever the session's verdict, it is park.
+    row(safe, { checked_at: at(20) }),
+    row(safe, { checked_at: at(1), error: "boom", error_kind: "failed" }),
+    // One check failed in a recent tick: the others were checked.
+    row(safe, { checked_at: at(1), error: "boom", error_kind: "partial" }),
+    row(null, { checked_at: at(20) }),
+]));
+""")
+        self.assertEqual(answer, [
+            "<muted>closable</> │ ⏲ Retry · in 2h",
+            "<warning>park only: turn cut off once already</> │ ⏲ Retry · in 2h",
+            "<warning>park only: nothing checks waits</> │ ⏲ Retry · in 2h",
+            "<warning>park only: nothing checks waits</> │ ⏲ Retry · in 2h",
+            "<muted>closable</> │ ⏲ Retry · in 2h",
+            "⏲ Retry · in 2h",
+        ])
+
+
+# Loads the extension for SID, asks for a described check with /wait check, and lets the agent write
+# it with its waitingfor tool once the queued instruction reached it.
+DESCRIBED_CHECK_DRIVER = r"""
+import * as fs from "node:fs";
+const { default: install } = await import(process.env.EXTENSION);
+const SID = process.env.SID;
+const state = () => { try { return JSON.parse(fs.readFileSync(process.env.STATE_FILE, "utf8")); } catch { return {}; } };
+async function until(test) {
+    for (let i = 0; i < 300; i++) { if (test()) return true; await Bun.sleep(50); }
+    return false;
+}
+const chain = new Proxy(function () {}, { get: () => chain, apply: () => chain });
+const handlers = {};
+const commands = {};
+let tool;
+const branch = [];
+install({
+    zod: chain, logger: { debug() {} },
+    sendUserMessage(text) {
+        branch.push({ type: "message", message: { role: "user", content: text, timestamp: Date.now() } });
+        return Promise.resolve();
+    },
+    pi: { Text: class { setText() {} render() { return []; } describe() { return {}; } } },
+    on: (name, fn) => { handlers[name] = fn; }, registerCommand: (name, spec) => { commands[name] = spec; },
+    registerShortcut() {}, registerTool: (spec) => { tool = spec; },
+});
+const ctx = {
+    hasUI: true, cwd: process.cwd(), isIdle: () => true, hasPendingMessages: () => false, ui: { setWidget() {} },
+    sessionManager: {
+        getSessionId: () => SID, getHeader: () => ({ type: "session", id: SID }), getBranch: () => branch,
+        onPersistenceNotice: () => () => {},
+    },
+    setTimeout: (fn, ms) => setTimeout(fn, ms), setInterval: (fn, ms) => setInterval(fn, ms),
+    clearTimer: (timer) => clearTimeout(timer),
+};
+handlers.session_start({}, ctx);
+await commands.wait.handler("check every 10m the deploy is green -- tell me", ctx);
+const queue = () => state().sessions?.[SID]?.prompt_queue ?? [];
+await until(() => queue()[0]?.state === "delivered");
+const sent = branch.map((entry) => entry.message.content);
+const extra = await tool.execute("t1", { action: "add", kind: "command", argv: ["true"], label: "x" }, null, null, ctx).catch((error) => error.message);
+await tool.execute("t2", { action: "add", kind: "command", argv: ["true"] }, null, null, ctx);
+handlers.session_shutdown();
+const waits = state().sessions[SID].waits.map((wait) => ({
+    state: wait.state, argv: wait.condition.argv, label: wait.label, interval: wait.condition.interval_s, prompt: wait.prompt,
+}));
+console.log(JSON.stringify({ sent, extra, waits, queue: queue().length }));
+process.exit(0);
+"""
+
+
+@unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
+class ExtensionDescribedCheckTests(unittest.TestCase):
+    def test_the_instruction_goes_through_the_queue_and_the_tool_writes_the_check(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "omp").mkdir()
+            answer = run_extension_driver(
+                self, DESCRIBED_CHECK_DRIVER, SID=SID,
+                STATE_FILE=str(root / "state" / "codexbar-agentview" / "waiting.json"),
+                XDG_STATE_HOME=str(root / "state"), OMP_AGENT_DIR=str(root / "omp"), PI_CODING_AGENT_DIR="",
+                TERN_PANE="",
+            )
+        self.assertEqual(answer["sent"], [waiting._check_instruction("the deploy is green")])
+        self.assertIn("call it again with action, kind and argv only, without label", answer["extra"])
+        self.assertEqual(answer["waits"], [{
+            "state": "waiting", "argv": ["true"], "label": "the deploy is green", "interval": 600,
+            "prompt": "tell me",
+        }])
+        self.assertEqual(answer["queue"], 0)
+
+
+# Sets a session aside from the menu with Close the session, as a user would, and reports whether
+# omp was shut down and what the panel says.
+MENU_CLOSE_DRIVER = r"""
+const { default: install } = await import(process.env.EXTENSION);
+const SID = process.env.SID;
+const chain = new Proxy(function () {}, { get: () => chain, apply: () => chain });
+const handlers = {};
+const commands = {};
+class Text { constructor(text = "") { this.text = text; } setText(text) { this.text = text; } render() { return [this.text]; } describe() { return {}; } }
+install({
+    zod: chain, logger: { debug() {} }, sendUserMessage() {}, pi: { Text },
+    on: (name, fn) => { handlers[name] = fn; }, registerCommand: (name, spec) => { commands[name] = spec; },
+    registerShortcut() {}, registerTool() {},
+});
+const widgets = {};
+const choices = ["Retry later", "Close the session"];
+const lines = ["1h", "", ""];
+let shutdown = false;
+const ctx = {
+    hasUI: true, cwd: process.cwd(), isIdle: () => true, hasPendingMessages: () => false,
+    ui: {
+        setWidget(name, factory) { widgets[name] = factory; },
+        select: async () => choices.shift(), editor: async () => lines.shift(),
+    },
+    sessionManager: {
+        getSessionId: () => SID, getHeader: () => ({ type: "session", id: SID }), getBranch: () => [],
+        onPersistenceNotice: () => () => {},
+    },
+    setTimeout: (fn, ms) => setTimeout(fn, ms), setInterval: (fn, ms) => setInterval(fn, ms),
+    clearTimer: (timer) => clearTimeout(timer),
+    shutdown: async () => { shutdown = true; },
+};
+handlers.session_start({}, ctx);
+await Bun.sleep(300);
+await commands.wait.handler("", ctx);
+const panel = widgets["waitingfor-panel"]?.(null, { fg: (_tone, text) => text })?.render(200).join("\n") ?? null;
+handlers.session_shutdown();
+console.log(JSON.stringify({ shutdown, panel, left: choices.length }));
+process.exit(0);
+"""
+
+
+@unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
+class ExtensionMenuCloseTests(unittest.TestCase):
+    def closed(self, strip_close: bool) -> dict:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            (root / "omp").mkdir()
+            folder_bin = root / "bin"
+            folder_bin.mkdir()
+            # The CLI as an older or broken one would answer: views without `close`.
+            python = folder_bin / "python3"
+            python.write_text(
+                f"#!/bin/sh\n{shlex.quote(sys.executable)} \"$@\" | {shlex.quote(sys.executable)} -c "
+                + shlex.quote(
+                    "import json, sys\n"
+                    "answer = json.load(sys.stdin)\n"
+                    "for row in (answer.get('view') or answer).get('sessions') or []:\n"
+                    "    row.pop('close', None)\n"
+                    "print(json.dumps(answer))\n"
+                )
+                + "\n"
+            )
+            python.chmod(0o755)
+            path = f"{folder_bin}{os.pathsep}{os.environ['PATH']}" if strip_close else os.environ["PATH"]
+            # A transcript makes the session resumable, as one with messages is.
+            (root / "omp" / "sessions" / "-w").mkdir(parents=True)
+            (root / "omp" / "sessions" / "-w" / f"2026-11-05_{SID}.jsonl").write_text("")
+            return run_extension_driver(
+                self, MENU_CLOSE_DRIVER, SID=SID, PATH=path,
+                XDG_STATE_HOME=str(root / "state"), OMP_AGENT_DIR=str(root / "omp"), PI_CODING_AGENT_DIR="",
+                TERN_PANE="",
+            )
+
+    def test_a_saved_wait_with_a_verdict_closes_the_session(self) -> None:
+        answer = self.closed(strip_close=False)
+        self.assertEqual((answer["shutdown"], answer["left"]), (True, 0), answer)
+
+    def test_without_a_verdict_for_the_saved_wait_it_stays_open(self) -> None:
+        answer = self.closed(strip_close=True)
+        self.assertEqual((answer["shutdown"], answer["left"]), (False, 0), answer)
+        self.assertIn("Not closed: no close verdict came back for it", answer["panel"])
+
 
 
 # Loads the extension with a wait under OLD, then omp moves the session once per REASONS entry (two:
