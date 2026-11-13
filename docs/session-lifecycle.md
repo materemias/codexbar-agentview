@@ -19,7 +19,8 @@ list.
 
 Press `Ctrl+Alt+B` or type `/wait` in omp. Both open the same menu:
 
-1. **This session's waits**, when it has some: Done or Snooze 1d for each.
+1. **This session's waits**, when it has some: Seen (when it's on you), Stop
+   or Snooze 1d for each, and Stop all at the end.
 2. What the session waits for. Every item shows the `/wait` command that does
    the same in one line.
 3. Your sentence: why you left it, what comes next. It starts with the
@@ -61,10 +62,11 @@ Type `/wait ` for completions. `/wait help` lists them above the composer.
 | `/wait gh release [owner/repo] [--] <sentence> [-- prompt]` | a repo's next GitHub release |
 | `/wait check [every 10m] <what to check> [-- prompt]` | a condition you describe; the agent writes the command once, code runs it |
 | `/wait check [every 10m] ! <command> [-- prompt]` | a command you give, until it exits 0 |
-| `/wait for <what>` | anything else, in your words; you mark it done. One per session: it replaces the previous text, and `/wait for` alone removes it |
+| `/wait for <what>` | anything else, in your words; you stop it when it's settled. One per session: it replaces the previous text, and `/wait for` alone removes it |
 | `/wait later [S\|M\|L] <sentence>` | the time you have for it; pins the session |
 | `/wait list` | this session's details |
-| `/wait done [w1]` | close one wait, or all of them |
+| `/wait seen [w1]` | you've read what came: close the waits on you, or one of them |
+| `/wait stop <w1\|all>` | stop waiting: end one wait, or all of them |
 | `/wait note <text>` | replace your sentence (on a session with waits or pinned) |
 
 The text after a standalone `--` is the prompt sent into the session when the
@@ -79,7 +81,7 @@ with gh and stays in the sentence if GitHub has no such repo. After saving,
 the area above the composer shows what the line was read as.
 
 **Repeating a prompt.** `/wait every 2h -- <prompt>` sends the prompt every
-2 hours, the first time 2 hours from now, until you press Done. It can stop by
+2 hours, the first time 2 hours from now, until you stop it. It can stop by
 itself:
 
 | Ends | Form |
@@ -188,7 +190,7 @@ A session's group is its most urgent wait's. A repeating prompt shows as
 
 ## When a wait is fulfilled
 
-A wait that happened stays in On me until you mark it Done, and everything
+A wait that happened stays in On me until you mark it Seen, and everything
 shows it the same way:
 
 | Mark | Means | Color |
@@ -297,7 +299,7 @@ Close the session is offered only when the answer is not "park only".
 | `+` | Snooze 1d (below) |
 | `F2` | Manual wait…: edit the free-text wait |
 | `F5` | Retry a wait its failing checks stopped (when shown) |
-| `Delete` | Done |
+| `Delete` | Seen: you've read what's on you (only when something is) |
 
 Beside its time, each row says where the session is in Tern:
 
@@ -333,9 +335,18 @@ had queued is cancelled until it fires again.
 | Anything overdue | moves the deadline to 24 hours from now |
 | When I have time, a chain step not started yet, a job still running, a wait whose prompt the agent has | not offered |
 
-**Done** on a row or card closes what's on you and leaves the waits still
-watched; with nothing on you, it closes every wait. On a session set aside for
-later, closing the last wait also unpins it.
+**Seen** and **Stop** are the two ways a wait ends by hand, and neither changes
+its meaning:
+
+- **Seen** says you've read what came. It is offered only when something is on
+  you, and closes exactly those waits. The card lists them under **On you**,
+  each with what came and, for "ran, take a look", the start of the agent's
+  last message, so you can read it before pressing Seen.
+- **Stop** ends waits still watched: `×` beside one wait on the card ends that
+  one, and **Stop N waits…** ends all of them after a second press.
+
+Each shows in "Since set aside" as `Seen: …` or `Stopped: …`. On a session set
+aside for later, closing the last wait also unpins it.
 
 **The session card** floats over the pane. It opens by itself the first time
 you focus a session whose wait fired, and on demand with `Ctrl+Alt+I`, a click
@@ -361,7 +372,7 @@ their own, and only removes the colors it set.
 
 Every session pinned with omp's `/pin` is listed here, closed ones too, sorted
 by the size you gave it (S, M, L). Setting a session aside for later pins it;
-Done unpins it. This group never notifies; open it when you have time.
+stopping its last wait unpins it. This group never notifies; open it when you have time.
 
 ## The agent's tool
 
@@ -383,7 +394,7 @@ session's own wait saw merged reads merged at once.
 - **Plasma** shows the waits only with Settings → Agents → **Tern
   integration** on: an hourglass on waiting rows, `●` when one is back on you,
   and an amber count beside the panel dots.
-- **tern-awui** shows the same groups on the phone, with Snooze 1d, Done and a
+- **tern-awui** shows the same groups on the phone, with Snooze 1d, Seen, Stop and a
   push notification when a session comes back to you.
 
 ## When waits can't be checked
