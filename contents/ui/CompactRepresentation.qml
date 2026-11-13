@@ -34,7 +34,8 @@ Item {
     readonly property var _canonicalOrder: ["claude", "codex", "zai", "opencodego", "openrouter", "kilo"]
 
     readonly property var groups: {
-        var keys = compact.configured || []
+        // Usage tracking off: no meters; the fallback icon keeps the applet visible.
+        var keys = root.usageEnabled ? compact.configured || [] : []
         if (keys.length === 0) return []
         var providers = root.snapshot.providers || []
         var byId = {}

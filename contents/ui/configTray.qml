@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
+import org.kde.plasma.plasmoid
 import "process" as Process
 import "Command.js" as Command
 
@@ -13,6 +14,10 @@ Item {
     property int cfg_compactStyle: 0
     property int cfg_trayIconSize: 22
     property string cfg_cliPath: "/usr/bin/codexbar"
+    // Read, not declared as cfg_enableUsage: Plasma writes back every
+    // cfg_ key a page declares, which would undo the popup's switch.
+    readonly property bool usageEnabled: Plasmoid.configuration.enableUsage !== false
+    onUsageEnabledChanged: if (initialized) loadAccounts()
 
     // Accounts with an email, per provider, from the last saved usage.
     property var accounts: ({ claude: [], codex: [] })
@@ -64,6 +69,7 @@ Item {
         property bool isOn: root._has(key)
         property var setOn: function (on) { root._toggle(meter.key, on) }
         spacing: Kirigami.Units.smallSpacing
+        enabled: root.usageEnabled
 
         QQC2.CheckBox {
             text: meter.text
@@ -307,7 +313,12 @@ Item {
         }
     }
 
+    // Off, usage tracking starts no fetch helper, not even a cache read.
     function loadAccounts() {
+        if (!root.usageEnabled) {
+            root.accountsLoading = false
+            return
+        }
         if (root.activeCommand) return
         root.accountsLoading = true
         root.activeCliPath = root.cliPath
@@ -332,7 +343,9 @@ Item {
             width: scroller.availableWidth
 
             QQC2.Label {
-                text: "Pick which (provider, window) meters to render as separate tray indicators. "
+                text: !root.usageEnabled
+                    ? "Usage tracking is off, so the panel shows no meters. Turn it on under Backend."
+                    : "Pick which (provider, window) meters to render as separate tray indicators. "
                     + "\"only if proj > 100%\" keeps a meter hidden while it is on pace to last until reset."
                 wrapMode: Text.WordWrap
                 Layout.fillWidth: true
@@ -389,6 +402,7 @@ Item {
                     { text: "Percent only",   value: 2 }
                 ]
                 textRole: "text"
+                enabled: root.usageEnabled
                 currentIndex: {
                     var v = cfg_compactStyle
                     for (var i = 0; i < model.length; i++) if (model[i].value === v) return i

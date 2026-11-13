@@ -148,6 +148,7 @@ Window {
         property string requestedTab: "usage"
         property bool expanded: true
         property bool loading: false
+        property bool usageEnabled: true
         property bool codexForecastEnabled: false
         property bool showRecentUsage: true
         property string lastError: ""

@@ -35,14 +35,18 @@ class MainLifecycleTest(unittest.TestCase):
                              root / "ui" / ("Main.qml" if name == "main.qml" else name))
             (root / "ui/process").symlink_to(PLUGIN, target_is_directory=True)
             if views:
-                # The real panel item and Agents rows, hosted in a bare popup.
+                # The real panel item and Agents rows, hosted in a bare popup,
+                # or with views="popup" the real popup.
                 (root / "icons").symlink_to(ROOT / "contents/icons", target_is_directory=True)
+                popup = ("FullRepresentation.qml", "ProviderSection.qml", "HistorySection.qml",
+                         "UsageSetup.qml") if views == "popup" else ()
                 for name in ("CompactRepresentation.qml", "AgentsSection.qml", "SectionCard.qml",
-                             "AgentTitle.qml", "TurnBubble.qml"):
+                             "AgentTitle.qml", "TurnBubble.qml") + popup:
                     shutil.copy2(ROOT / "contents/ui" / name, root / "ui" / name)
-                put("ui/FullRepresentation.qml", "import QtQuick\nItem {\n"
-                    "property bool tooltipHovered: false\n"
-                    "AgentsSection { objectName: 'agentsSection'; width: 600 }\n}\n")
+                if not popup:
+                    put("ui/FullRepresentation.qml", "import QtQuick\nItem {\n"
+                        "property bool tooltipHovered: false\n"
+                        "AgentsSection { objectName: 'agentsSection'; width: 600 }\n}\n")
             else:
                 for name in ("FullRepresentation", "CompactRepresentation"):
                     put(f"ui/{name}.qml", "import QtQuick\nItem { property bool tooltipHovered: false }\n")
@@ -59,7 +63,7 @@ class MainLifecycleTest(unittest.TestCase):
                 name, kind = entry.attrib["name"], entry.attrib["type"]
                 default = entry.findtext("{*}default", "")
                 if kind == "Bool":
-                    value = name in ("enableCodex", "ompModeNotifications") or (
+                    value = name in ("enableUsage", "enableCodex", "ompModeNotifications") or (
                         name == "usageNotifications" and bool((helper_case or {}).get("usageNotifications")))
                 elif kind == "Int":
                     value = int(default or 0)
@@ -69,7 +73,7 @@ class MainLifecycleTest(unittest.TestCase):
                     value = "/backend-a" if name == "cliPath" else default
                 if real_fetch:
                     if kind == "Bool":
-                        value = name == "enableKilo" or (
+                        value = name in ("enableUsage", "enableKilo") or (
                             name == "usageNotifications"
                             and bool((helper_case or {}).get("usageNotifications")))
                     elif name == "cliPath":
@@ -80,6 +84,9 @@ class MainLifecycleTest(unittest.TestCase):
                 configuration.append(f"property var {name}: {json.dumps(value)}")
             put(module + "Plasmoid.qml", "pragma Singleton\nimport QtQuick\nQtObject {\n"
                 "signal activated()\nproperty int formFactor: 2\nproperty string globalShortcut: ''\n"
+                "property QtObject configureAction: QtObject {\n"
+                "property int triggered: 0\nfunction trigger() { triggered++ }\n}\n"
+                "function internalAction(name) { return name === 'configure' ? configureAction : null }\n"
                 "property QtObject configuration: QtObject {\n"
                 + "\n".join(configuration) + "\n}\n}\n")
             put(module + "PlasmoidItem.qml", """import QtQuick
@@ -122,6 +129,11 @@ test = json.loads((root / "scenario.json").read_text())
 snapshots = (test or {}).get("freshSnapshots", {}).get(backend, [])
 if snapshots and not cache:
     print(json.dumps(snapshots[min(normal - 1, len(snapshots) - 1)]))
+    sys.exit(0)
+cached = (test or {}).get("cacheSnapshots", {}).get(backend, [])
+if cached and cache:
+    reads = sum(call["backend"] == backend and call["cache"] for call in history)
+    print(json.dumps(cached[min(reads - 1, len(cached) - 1)]))
     sys.exit(0)
 if test and test.get("failure") is not None and normal >= 2:
     if cache:
@@ -1198,6 +1210,205 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 console.log("PASS actual main waiting empty read")
                 Qt.exit(0)
 ''')
+
+    def test_usage_tracking_off_starts_no_fetch_and_shows_no_meters(self):
+        calls, notifications = self.applet('''
+                if (fixture.stage === 0) {
+                    fixture.compact = app.compactRepresentation.createObject(fixture, { width: 400, height: 24 })
+                    app.refresh()
+                    app.refresh(true)
+                    fixture.since = fixture.ticks
+                    fixture.stage = 1
+                } else if (fixture.stage === 1) {
+                    // The stub helper answers in 0.15 s; wait well past it.
+                    if (fixture.ticks - fixture.since < 25) return
+                    check(!app.loading && !app.cacheRestoring && app.snapshot.providers.length === 0,
+                        "off: neither startup, a manual nor an automatic refresh may fetch")
+                    check(fixture.compact.groups.length === 0, "off: no tray meters")
+                    check(app.toolTipSubText === "", "off: no usage tooltip: " + app.toolTipSubText)
+                    Plasmoid.configuration.enableUsage = true
+                    fixture.stage = 2
+                } else if (fixture.stage === 2) {
+                    // On: saved usage first, as at startup, then a fresh fetch.
+                    if (fixture.freshFetches < 1 || app.loading) return
+                    check(app.snapshot.providers.length === 1 && fixture.compact.groups.some(function(g) {
+                        return g.windows.some(function(w) { return w.hasData })
+                    }), "on: the fresh reading reaches the panel")
+                    Plasmoid.configuration.enableUsage = false
+                    check(app.snapshot.providers.length === 0 && fixture.compact.groups.length === 0,
+                        "off: usage leaves the panel at once")
+                    Plasmoid.configuration.enableUsage = true
+                    fixture.stage = 3
+                } else if (fixture.stage === 3) {
+                    // Off again while that cache read runs: its late completion
+                    // must not publish usage or start a refresh.
+                    if (!app.loading) return
+                    Plasmoid.configuration.enableUsage = false
+                    fixture.stage = 4
+                } else if (fixture.stage === 4) {
+                    if (app.loading) return
+                    fixture.since = fixture.ticks
+                    fixture.stage = 5
+                } else if (fixture.ticks - fixture.since >= 25) {
+                    check(!app.loading && app.snapshot.providers.length === 0
+                        && fixture.compact.groups.length === 0,
+                        "a fetch that outlived the switch stays unpublished")
+                    console.log("PASS actual main usage tracking off")
+                    Qt.exit(0)
+                }
+''', {"configuration": {"enableUsage": False}}, views=True)
+        self.assertEqual(calls, [{"backend": "/backend-a", "cache": True},
+                                 {"backend": "/backend-a", "cache": False},
+                                 {"backend": "/backend-a", "cache": True}])
+        self.assertEqual(notifications, [])
+
+    def test_missing_cli_shows_setup_card_that_turns_usage_off(self):
+        fatal = {"code": "cli_missing",
+                 "message": "codexbar CLI not found or not executable: /backend-a",
+                 "setup": ["Install the CodexBar CLI: `brew install steipete/tap/codexbar`, "
+                           "or a tarball from https://github.com/steipete/CodexBar/releases.",
+                           "Installed somewhere else? Set the CodexBar executable path in Settings.",
+                           "Sign in to each provider."]}
+        missing = {"updatedAt": None, "cacheOnly": False, "fatal": fatal, "codexRotation": None,
+                   "providers": [{"id": "codex", "ok": False, "accountEmail": "a@example.com",
+                                  "error": {"code": "cli_missing", "message": "CLI not found"}},
+                                 {"id": "codex", "ok": True, "stale": True, "accountEmail": "b@example.com",
+                                  "cachedAt": "2026-11-13T08:00:00Z", "primary": {"usedPercent": 30}}]}
+        calls, notifications = self.applet('''
+                function find(item, name, out) {
+                    out = out || []
+                    if (item.objectName === name) out.push(item)
+                    var kids = item.children || []
+                    for (var i = 0; i < kids.length; i++) find(kids[i], name, out)
+                    return out
+                }
+                function shown(item, test, out) {
+                    out = out || []
+                    if (!item.visible) return out
+                    if (test(item)) out.push(item)
+                    var kids = item.children || []
+                    for (var i = 0; i < kids.length; i++) shown(kids[i], test, out)
+                    return out
+                }
+                function tab(label) {
+                    return shown(fixture.popup, function(i) {
+                        return i.iconName !== undefined && typeof i.text === "string"
+                            && i.text.indexOf(label) === 0
+                    })[0]
+                }
+                if (fixture.stage === 0) {
+                    if (fixture.freshFetches < 1 || app.loading) return
+                    fixture.popup = app.fullRepresentation.createObject(fixture, { width: 500, height: 460 })
+                    fixture.stage = 1
+                } else if (fixture.stage === 1) {
+                    var fatal = ''' + json.dumps(fatal) + '''
+                    var card = find(fixture.popup, "usageSetup")[0]
+                    check(card && card.visible, "the setup card is shown: " + !!card + " "
+                        + JSON.stringify(app.snapshot.fatal) + " " + app.lastError)
+                    check(tab("Usage") && tab("Usage").checked, "on the Usage tab")
+                    check(find(card, "usageSetupTitle")[0].text === "Usage tracking isn't set up", "title")
+                    check(find(card, "usageSetupMessage")[0].text === fatal.message, "the helper's message")
+                    var steps = find(card, "usageSetupStep")
+                    check(steps.length === 3, "one row per setup line")
+                    check(steps[0].text.indexOf("<code>brew install steipete/tap/codexbar</code>") >= 0
+                        && steps[0].text.indexOf('<a href="https://github.com/steipete/CodexBar/releases">'
+                            + "https://github.com/steipete/CodexBar/releases</a>.") >= 0,
+                        "the release URL is a link without the closing period: " + steps[0].text)
+                    var sections = shown(fixture.popup, function(i) {
+                        return i.subheading !== undefined && i.record !== undefined
+                    })
+                    check(sections.length === 1 && sections[0].record.accountEmail === "b@example.com",
+                        "beside the setup card only the last-known reading stays, not the error card")
+                    check(!find(fixture.popup, "headerError")[0].visible,
+                        "the header does not repeat the card's message")
+                    app.requestedTab = "agents"
+                    check(find(fixture.popup, "headerError")[0].text === fatal.message,
+                        "on Agents the header still names the missing CLI")
+                    find(card, "usageSetupSettings")[0].clicked()
+                    check(Plasmoid.configureAction.triggered === 1, "Open settings opens the settings")
+                    find(card, "usageSetupTurnOff")[0].clicked()
+                    check(Plasmoid.configuration.enableUsage === false && !app.usageEnabled,
+                        "Turn off usage tracking switches the setting off")
+                    check(!card.visible, "the card leaves with usage")
+                    fixture.since = fixture.ticks
+                    fixture.stage = 2
+                } else if (fixture.ticks - fixture.since >= 25) {
+                    check(!tab("Usage") && tab("Agents") && tab("Agents").checked,
+                        "the popup moves to Agents and hides the Usage tab")
+                    check(!app.loading, "no fetch after usage turned off")
+                    console.log("PASS actual main missing CLI setup card")
+                    Qt.exit(0)
+                }
+''', {"freshSnapshots": {"/backend-a": [missing]}, "configuration": {"showAgents": True}},
+            views="popup")
+        self.assertEqual(calls, [{"backend": "/backend-a", "cache": True},
+                                 {"backend": "/backend-a", "cache": False}])
+        self.assertEqual(notifications, [])
+
+    def test_cache_read_reporting_missing_cli_shows_the_card_until_an_answer_without_it(self):
+        fatal = {"code": "cli_missing", "message": "codexbar CLI not found or not executable: /backend-a",
+                 "setup": ["Install the CodexBar CLI."]}
+        missing = {"updatedAt": None, "cacheOnly": True, "fatal": fatal, "codexRotation": None,
+                   "providers": []}
+        now = dt.datetime.now(dt.timezone.utc).isoformat()
+        measured = {"updatedAt": now, "cacheOnly": False, "fatal": None, "codexRotation": None,
+                    "providers": [{"id": "codex", "ok": True, "primary": {"usedPercent": 40},
+                                   "updatedAt": now}]}
+        calls, notifications = self.applet('''
+                function find(item, name, out) {
+                    out = out || []
+                    if (item.objectName === name) out.push(item)
+                    var kids = item.children || []
+                    for (var i = 0; i < kids.length; i++) find(kids[i], name, out)
+                    return out
+                }
+                if (fixture.stage === 0) {
+                    fixture.popup = app.fullRepresentation.createObject(fixture, { width: 500, height: 460 })
+                    fixture.stage = 1
+                } else if (fixture.stage === 1) {
+                    // The cache read has answered; the fresh fetch is still running.
+                    if (fixture.freshFetches < 1) return
+                    check(app.loading && app.snapshot.cacheOnly === true,
+                        "the fresh fetch must still be running")
+                    check(find(fixture.popup, "usageSetup")[0].visible
+                        && find(fixture.popup, "usageSetupMessage")[0].text === ''' + json.dumps(fatal["message"]) + ''',
+                        "a cache read reporting the missing CLI shows the setup card")
+                    fixture.stage = 2
+                } else if (!app.loading) {
+                    check(!find(fixture.popup, "usageSetup")[0].visible && app.snapshot.providers.length === 1,
+                        "an answer without the fatal replaces the card with usage")
+                    console.log("PASS actual main cache read setup card")
+                    Qt.exit(0)
+                }
+''', {"cacheSnapshots": {"/backend-a": [missing]}, "freshSnapshots": {"/backend-a": [measured]},
+      "configuration": {"showAgents": True}}, views="popup")
+        self.assertEqual(calls, [{"backend": "/backend-a", "cache": True},
+                                 {"backend": "/backend-a", "cache": False}])
+        self.assertEqual(notifications, [])
+
+    def test_turning_usage_back_on_during_an_old_fetch_reads_the_cache_first(self):
+        calls, notifications = self.applet('''
+                if (fixture.stage === 0) {
+                    if (!(app.loading && app.fetchKind === "fresh")) return
+                    Plasmoid.configuration.enableUsage = false
+                    Plasmoid.configuration.enableUsage = true
+                    fixture.stage = 1
+                } else if (fixture.stage === 1) {
+                    // The old fetch ends as an old generation; what follows
+                    // must be the startup cache read, not a claim-free refresh.
+                    if (app.loading && app.fetchKind === "fresh") return
+                    if (!app.loading) return
+                    check(app.fetchKind === "startup-cache",
+                        "re-enabling must restart as at startup, got " + app.fetchKind)
+                    fixture.stage = 2
+                } else if (!app.loading && fixture.freshFetches >= 2) {
+                    check(app.snapshot.providers.length === 1, "usage is back")
+                    console.log("PASS actual main re-enable during old fetch")
+                    Qt.exit(0)
+                }
+''')
+        self.assertEqual([call["cache"] for call in calls], [True, False, True, False])
+        self.assertEqual(notifications, [])
 
 
 if __name__ == "__main__":

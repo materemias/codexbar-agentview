@@ -3,8 +3,12 @@ import QtQuick.Controls as QQC2
 import QtQuick.Layouts
 import org.kde.kirigami as Kirigami
 import org.kde.kcmutils as KCM
+import org.kde.plasma.plasmoid
 
 KCM.SimpleKCM {
+    // Read, not declared as cfg_enableUsage: Plasma writes back every
+    // cfg_ key a page declares, which would undo the popup's switch.
+    readonly property bool usageEnabled: Plasmoid.configuration.enableUsage !== false
     property bool cfg_enableClaude: true
     property bool cfg_enableCodex: true
     property bool cfg_showCodexResetForecast: true
@@ -21,7 +25,13 @@ KCM.SimpleKCM {
     property bool cfg_usageNotifications: true
     property bool cfg_ompModeNotifications: true
 
+    header: Kirigami.InlineMessage {
+        visible: !usageEnabled
+        text: "Usage tracking is off. Turn it on under Backend to use these options."
+    }
+
     Kirigami.FormLayout {
+        enabled: usageEnabled
         QQC2.CheckBox {
             Kirigami.FormData.label: "Notifications:"
             text: "Warn about usage limits"

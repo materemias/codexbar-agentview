@@ -60,7 +60,8 @@ PlasmoidItem {
     property bool agentsLoading: false
     property bool aggregatorLoading: false
     property var agentsRequest: null
-    property string fetchKind: "startup-cache"
+    // "startup-cache" while the first cache read runs; set when it starts.
+    property string fetchKind: ""
     readonly property bool cacheRestoring: root.fetchKind === "startup-cache"
     property int backendGeneration: 0
     property int fetchGeneration: 0
@@ -130,18 +131,50 @@ PlasmoidItem {
         if (xhr) xhr.abort()
         root.applyWaitingView(null)
     }
+    // Usage tracking: every codexbar_fetch.py run and all usage UI. Off,
+    // no fetch starts and the views show no usage; Agents keep working.
+    readonly property bool usageEnabled: Plasmoid.configuration.enableUsage !== false
+    onUsageEnabledChanged: {
+        if (root.usageEnabled) {
+            // As at startup, deferred: a change that settles while the
+            // applet is created must leave the first cache read to
+            // Component.onCompleted.
+            Qt.callLater(function() {
+                if (!root.usageEnabled) return
+                if (!root.loading) root.fetchProviders("startup-cache")
+                // A fetch from before the switch is still running: its
+                // completion starts the cache read instead.
+                else if (root.fetchGeneration !== root.backendGeneration) root.cacheReadPending = true
+            })
+            return
+        }
+        // A fetch in flight runs to its end (the runner cannot stop it);
+        // the generation bump below drops its result. The poll timer
+        // stops through its `running` binding.
+        root.cacheReadPending = false
+        root.resetUsage()
+    }
+    // Set while usage is back on but an old fetch still runs; see runner.
+    property bool cacheReadPending: false
     readonly property string cliPath: Command.cliPath(Plasmoid.configuration.cliPath)
     onCliPathChanged: {
-        // A generation also rejects an old request after A → B → A.
-        root.backendGeneration++
-        root.snapshot = {
-            updatedAt: "", providers: [], fatal: null, forecast: null,
+        root.resetUsage()
+        if (!root.cacheRestoring && !root.loading) Qt.callLater(root.refresh)
+    }
+    function emptySnapshot(updatedAt) {
+        return {
+            updatedAt: updatedAt, providers: [], fatal: null, forecast: null,
             claudeRotation: null, codexRotation: null, cliVersion: null
         }
+    }
+    // Drops every reading and alert state, and rejects the fetch in flight.
+    function resetUsage() {
+        // A generation also rejects an old request after A → B → A.
+        root.backendGeneration++
+        root.snapshot = root.emptySnapshot("")
         root.usageNotificationState = {}
         root.ompModeNotificationState = null
         root.lastError = ""
-        if (!root.cacheRestoring && !root.loading) Qt.callLater(root.refresh)
     }
     readonly property bool codexForecastEnabled:
         Plasmoid.configuration.enableCodex !== false
@@ -218,6 +251,7 @@ PlasmoidItem {
         var arr = root.snapshot.providers || []
         // The waitingfor health line rides along under the usage rows.
         var waitingWarning = Filter.escape(root.waitingWarning)
+        if (!root.usageEnabled) return waitingWarning
         if (arr.length === 0)
             return Filter.escape(root.lastError || (root.loading ? "Loading…" : "No providers enabled"))
                 + (waitingWarning ? "<br>" + waitingWarning : "")
@@ -361,11 +395,17 @@ PlasmoidItem {
 
         onFinished: function(command, exitCode, standardOutput, standardError) {
             // Anchor the next poll to completion, not the previous timer tick.
-            poll.restart()
+            if (root.usageEnabled) poll.restart()
             if (root.fetchGeneration !== root.backendGeneration) {
                 root.loading = false
                 root.fetchKind = ""
-                Qt.callLater(root.refresh)
+                if (root.cacheReadPending) {
+                    // Usage tracking came back on: start as at startup.
+                    root.cacheReadPending = false
+                    root.fetchProviders("startup-cache")
+                } else {
+                    Qt.callLater(root.refresh)
+                }
                 return
             }
             var kind = root.fetchKind
@@ -413,10 +453,7 @@ PlasmoidItem {
                 root.dispatchNotifications(modeResult.events)
             } catch (err) {
                 if (kind !== "recovery-cache") root.lastError = err.message
-                root.snapshot = {
-                    updatedAt: "", providers: [], fatal: null, forecast: null,
-                    claudeRotation: null, codexRotation: null, cliVersion: null
-                }
+                root.snapshot = root.emptySnapshot("")
                 root.ompModeNotificationState = Notifications.ompMode(
                     root.ompModeNotificationState, null, false).state
                 if (kind === "fresh" && root.enabledProviders.length > 0) {
@@ -1011,17 +1048,9 @@ PlasmoidItem {
     }
 
     function refresh(automatic = false) {
-        if (root.cacheRestoring || root.loading) return
+        if (!root.usageEnabled || root.cacheRestoring || root.loading) return
         if (root.enabledProviders.length === 0) {
-            root.snapshot = {
-                updatedAt: new Date().toISOString(),
-                providers: [],
-                fatal: null,
-                forecast: null,
-                claudeRotation: null,
-                codexRotation: null,
-                cliVersion: null
-            }
+            root.snapshot = root.emptySnapshot(new Date().toISOString())
             root.usageNotificationState = {}
             root.ompModeNotificationState = Notifications.ompMode(
                 root.ompModeNotificationState, null, false).state
@@ -1031,6 +1060,7 @@ PlasmoidItem {
     }
 
     function fetchProviders(kind, automatic) {
+        if (!root.usageEnabled) return
         poll.stop()
         root.loading = true
         root.fetchKind = kind
@@ -1052,12 +1082,12 @@ PlasmoidItem {
     Timer {
         id: poll
         interval: root.refreshMs
-        running: true; repeat: true
+        running: root.usageEnabled; repeat: true
         onTriggered: root.refresh(true)
     }
     onRefreshMsChanged: {
         poll.interval = root.refreshMs
-        if (!root.loading) poll.restart()
+        if (!root.loading && root.usageEnabled) poll.restart()
     }
 
     // One scan timer; completion triggers the file read.

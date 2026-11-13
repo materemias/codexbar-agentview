@@ -35,6 +35,13 @@ Item {
     readonly property bool hasStaleUsage: (root.snapshot.providers || []).some(function(record) {
         return !!record.stale
     })
+    // The Usage tab shows only while usage tracking is on; off, the bar's
+    // first visible tab is Agents (index 1).
+    readonly property int firstTab: root.usageEnabled ? 0 : 1
+    // The helper's missing-CLI report, shown as the Usage tab's setup card
+    // (its `setup` steps may be absent: the card then has none).
+    readonly property var setupFatal: root.snapshot.fatal
+        && root.snapshot.fatal.code === "cli_missing" ? root.snapshot.fatal : null
 
     readonly property color panelColor: Qt.tint(Kirigami.Theme.backgroundColor,
         Qt.rgba(Kirigami.Theme.textColor.r, Kirigami.Theme.textColor.g,
@@ -44,7 +51,7 @@ Item {
         id: control
         property string iconName
         property string compactText: text
-        width: tabBar.width / tabBar.count
+        width: visible ? tabBar.width / (tabBar.count - full.firstTab) : 0
         implicitHeight: Kirigami.Units.gridUnit * 2
         padding: Kirigami.Units.smallSpacing
         hoverEnabled: true
@@ -125,7 +132,7 @@ Item {
                     var v = root.snapshot ? root.snapshot.cliVersion : null
                     return typeof v === "string" && v.length > 0 ? "v" + v : ""
                 }
-                visible: text.length > 0
+                visible: root.usageEnabled && text.length > 0
                 font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                 opacity: 0.55
                 Layout.alignment: Qt.AlignBaseline
@@ -134,6 +141,7 @@ Item {
                 Layout.fillWidth: true
             }
             PC3.Label {
+                visible: root.usageEnabled
                 font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                 opacity: 0.7
                 text: {
@@ -157,11 +165,14 @@ Item {
         }
 
         PC3.Label {
+            objectName: "headerError"
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
             color: Kirigami.Theme.negativeTextColor
             visible: text.length > 0
             text: {
+                // On the Usage tab the setup card carries the missing CLI.
+                if (full.setupFatal && tabHost.activeTab === 0) return root.notificationError
                 if (root.snapshot.fatal) return root.snapshot.fatal.message
                 if (root.lastError) return root.lastError
                 if (root.notificationError) return root.notificationError
@@ -175,9 +186,9 @@ Item {
             background: Item {}
             visible: full.agentsTabVisible
             currentIndex: root.requestedTab === "agents" ? 1
-                : root.requestedTab === "usage" ? 0
+                : root.requestedTab === "usage" ? full.firstTab
                 : full.blockedCount > 0 ? 1
-                : full.rebootCount > 0 ? 2 : 0
+                : full.rebootCount > 0 ? 2 : full.firstTab
 
             // A manual user click on a TabButton breaks the binding above.
             // Re-establish it explicitly whenever requestedTab changes (e.g.
@@ -186,11 +197,19 @@ Item {
                 target: root
                 function onRequestedTabChanged() {
                     if (root.requestedTab === "agents") tabBar.currentIndex = 1
-                    else if (root.requestedTab === "usage") tabBar.currentIndex = 0
+                    else if (root.requestedTab === "usage") tabBar.currentIndex = full.firstTab
+                }
+                function onUsageEnabledChanged() {
+                    // After the binding above settles: a binding the user broke
+                    // by clicking may still point at the hidden Usage tab.
+                    Qt.callLater(function() {
+                        if (tabBar.currentIndex < full.firstTab) tabBar.currentIndex = full.firstTab
+                    })
                 }
             }
 
             PanelTab {
+                visible: root.usageEnabled
                 iconName: "office-chart-bar"
                 text: "Usage"
             }
@@ -236,11 +255,21 @@ Item {
             color: full.panelColor
             radius: Kirigami.Units.largeSpacing
         }
+        PC3.Label {
+            anchors.fill: parent
+            anchors.margins: Kirigami.Units.largeSpacing
+            visible: !root.usageEnabled && !full.agentsTabVisible
+            text: "Usage tracking and the Agents view are both off. Turn either on in Settings."
+            wrapMode: Text.WordWrap
+            horizontalAlignment: Text.AlignHCenter
+            verticalAlignment: Text.AlignVCenter
+            opacity: 0.7
+        }
         // --- Usage tab ---
         QQC2.ScrollView {
             anchors.fill: parent
             anchors.margins: Kirigami.Units.largeSpacing
-            visible: tabHost.activeTab === 0
+            visible: tabHost.activeTab === 0 && root.usageEnabled
             contentWidth: availableWidth
             clip: true
 
@@ -248,6 +277,10 @@ Item {
                 width: parent.width
                 spacing: Kirigami.Units.smallSpacing
 
+                UsageSetup {
+                    visible: !!full.setupFatal
+                    fatal: full.setupFatal
+                }
                 PC3.Label {
                     Layout.fillWidth: true
                     wrapMode: Text.WordWrap
@@ -264,7 +297,11 @@ Item {
                 Repeater {
                     model: {
                         var out = []
-                        var providers = root.snapshot.providers || []
+                        // Beside the setup card only last-known readings stay:
+                        // it explains the failed ones.
+                        var providers = (root.snapshot.providers || []).filter(function(p) {
+                            return !full.setupFatal || (p && p.ok)
+                        })
                         for (var i = 0; i < providers.length; i++) {
                             var p = providers[i]
                             var last = out[out.length - 1]
@@ -494,7 +531,7 @@ Item {
             tabBar.currentIndex++
             event.accepted = true
         } else if (event.key === Qt.Key_Left
-            && tabBar.currentIndex > 0) {
+            && tabBar.currentIndex > full.firstTab) {
             tabBar.currentIndex--
             event.accepted = true
         } else if (event.key === Qt.Key_R

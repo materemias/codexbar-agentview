@@ -261,6 +261,7 @@ Window {
         property string requestedTab: ""
         property bool expanded: false
         property bool loading: false
+        property bool usageEnabled: true
         property bool codexForecastEnabled: false
         property bool showRecentUsage: true
         property string lastError: ""

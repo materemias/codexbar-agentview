@@ -5,6 +5,10 @@
                           http://www.kde.org/standards/kcfg/1.0/kcfg.xsd">
     <kcfgfile name=""/>
     <group name="General">
+        <entry name="enableUsage" type="Bool">
+            <label>Track provider usage: run the codexbar fetch helper and show usage in the popup, panel and tooltip</label>
+            <default>true</default>
+        </entry>
         <entry name="cliPath" type="String">
             <label>Path to the codexbar CLI binary</label>
             <default>/usr/bin/codexbar</default>
