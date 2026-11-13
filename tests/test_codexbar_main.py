@@ -935,7 +935,8 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                     {"session_id": "back", "ball": "on_me", "status": "● ⏳ PR#7 · 2d",
                      "line": "● ⏳ PR#7 · Q&A <b>on</b> head · 2 days"},
                     {"session_id": "away", "ball": "on_machine", "status": "⏳ 16:00",
-                     "line": "⏳ 16:00 · \"check the deploy\""}],
+                     "line": "⏳ 16:00 · \"check the deploy\"",
+                     "close": {"verdict": "park", "reason": "job", "text": "park only: job runs in this pane"}}],
                 "panes": []}
         self.applet('''
                 if (app.cacheRestoring || app.loading) return
@@ -992,6 +993,12 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                         && tip.text === line.replace("&", "&\\u200a") + "\\n/w/back"
                             + "\\nclick to focus · peek button or Space for recent messages",
                         "row tooltip leads with the line, as plain text with its ampersand: " + tip.text)
+                    var away = rows.filter(function(r) { return r.waiting && !r.waiting.onMe })[0]
+                    check(away.closeText === "park only: job runs in this pane"
+                        && away.waitingHoverText.indexOf("deploy\\"\\npark only: job runs in this pane\\n") >= 0,
+                        "a park verdict follows the line: " + away.waitingHoverText)
+                    check(rows.filter(function(r) { return r.waiting && r.waiting.onMe })[0].closeText === "",
+                        "no close field: no verdict line")
                     section.hoveredRow = rows.filter(function(r) { return !r.waiting })[0]
                     check(section.hoveredRow && tip.text === "",
                         "a row without a wait keeps its attached cwd tooltip")
@@ -1021,7 +1028,8 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 "health": {"checked_at": checked.isoformat(),
                            "error": "waiting.json:\n unknown version 9",
                            "error_since": checked.isoformat(), "agents_stale_since": None},
-                "sessions": [{"session_id": "back", "ball": "on_me", "line": "● PR#7 merged"}]}
+                "sessions": [{"session_id": "back", "ball": "on_me", "line": "● PR#7 merged",
+                              "close": {"verdict": "safe", "reason": "prompt", "text": "closable"}}]}
         self.applet('''
                 if (app.cacheRestoring || app.loading) return
                 function find(item, name, out) {
@@ -1054,9 +1062,10 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 check(label.visible && label.text === expected, "Agents section shows the warning")
                 check(count.visible && countText.text === "2?" && count.opacity < 1,
                     "stale panel count reads as uncertain")
-                check(row.waitingHoverText === "● PR#7 merged\\n" + expected + "\\n/w/back"
+                check(row.waitingHoverText === "● PR#7 merged\\npark only: nothing checks waits\\n"
+                    + expected + "\\n/w/back"
                     + "\\nclick to focus · peek button or Space for recent messages",
-                    "row tooltip follows the line with the warning: " + row.waitingHoverText)
+                    "unchecked waits override the close verdict with park: " + row.waitingHoverText)
                 check(app.toolTipSubText.indexOf("unknown version 9") >= 0, "panel tooltip carries the warning")
 
                 var fresh = ''' + json.dumps(view) + '''
@@ -1066,6 +1075,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 check(app.waitingWarning === "" && !label.visible, "a successful tick clears the warning")
                 check(countText.text === "2" && count.opacity === 1, "fresh count is plain")
                 check(row.waitingHoverText.indexOf("⚠") < 0, "fresh row tooltip has no warning")
+                check(row.closeText === "closable", "fresh: the view's own close verdict: " + row.closeText)
                 check(app.toolTipSubText.indexOf("⚠") < 0, "fresh panel tooltip has no warning")
                 var partial = JSON.parse(JSON.stringify(fresh))
                 partial.health.error = "session abcd can't be shown:\\n gone"
@@ -1079,6 +1089,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 check(row.waitingHoverText.indexOf(lastCheck) >= 0
                     && app.toolTipSubText.indexOf("⚠ Last check: session abcd") >= 0,
                     "both tooltips carry the last check's error")
+                check(row.closeText === "closable", "a last check's error does not override the verdict")
                 var failed = JSON.parse(JSON.stringify(partial))
                 failed.health.error = "tern: no daemon"
                 failed.health.error_kind = "failed"

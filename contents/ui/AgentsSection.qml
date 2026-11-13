@@ -938,8 +938,11 @@ ColumnLayout {
                 + (record.host ? "  (" + record.host + ")" : "")
                 + "\nclick to focus · peek button or Space for recent messages"
             // A stale view's line may be out of date: the health warning follows it.
+            // With nothing checking the waits, no session is safe to close.
+            readonly property string closeText: !waiting ? ""
+                : root.waitingUnchecked ? "park only: nothing checks waits" : waiting.close || ""
             readonly property string waitingHoverText: waiting
-                ? [waiting.line, root.waitingWarning || "",
+                ? [waiting.line, closeText, root.waitingWarning || "",
                    record.cwd ? cwdHoverText : ""].filter(Boolean).join("\n") : ""
             PC3.ToolTip.visible: rowMouse.containsMouse && !waiting
                 && (record.cwd || "").length > 0

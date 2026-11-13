@@ -111,13 +111,17 @@ PlasmoidItem {
         Command.stateFileUrl(root.stateLocation, "waiting_view.json")
     property var waitingRequest: null
     property string _waitingViewKey: ""
-    // sessionId → { line, onMe } for every session the view lists.
+    // sessionId → { line, onMe, close } for every session the view lists;
+    // `close` is the view's close verdict text ("" with no open waits).
     property var waitingBySession: ({})
     property int waitingOnMeCount: 0
     // The view's `health` as waitingHealth reads it: one "⚠ …" line, and
     // whether the panel count reads as uncertain.
     property string waitingWarning: ""
     property bool waitingUncertain: false
+    // Nothing checks the waits (the "Waits not checked since" warning): no
+    // session is safe to close, whatever its own verdict says.
+    property bool waitingUnchecked: false
     readonly property int waitingTickStaleMs: 15 * 60 * 1000
     onTernIntegrationChanged: {
         if (root.ternIntegration) return
@@ -939,7 +943,8 @@ PlasmoidItem {
             if (!s || !s.session_id) continue
             sessions[String(s.session_id)] = {
                 line: String(s.line || s.status || ""),
-                onMe: s.ball === "on_me"
+                onMe: s.ball === "on_me",
+                close: s.close && typeof s.close === "object" ? String(s.close.text || "") : ""
             }
         }
         var onMe = view && view.counts ? Math.max(0, Math.floor(Number(view.counts.on_me) || 0)) : 0
@@ -957,14 +962,15 @@ PlasmoidItem {
         root.waitingOnMeCount = onMe
         root.waitingWarning = state.text
         root.waitingUncertain = state.uncertain
+        root.waitingUnchecked = !!state.unchecked
     }
 
     // When this applet first saw a view no tick had checked yet, in ms; 0
     // once one has (or with no view).
     property real _waitingUncheckedSince: 0
     // waiting_view.json `health` → { text, uncertain }: the warning every
-    // waitingfor surface shows ("" while ticks are current), and whether the
-    // waits may be out of date. A check that ran within 15 minutes and
+    // waitingfor surface shows ("" while ticks are current), whether the
+    // waits may be out of date, and whether nothing checks them (`unchecked`). A check that ran within 15 minutes and
     // reported a partial problem (`error_kind` "partial": a session it can't
     // show, PR checks) is the last check's error, with the count certain
     // unless the session scan is stale; a failed tick (`error_kind`
@@ -996,9 +1002,9 @@ PlasmoidItem {
             return { text: "⚠ Last check: " + error + (scan ? " · session scan stale since " + scanSince : ""),
                      uncertain: !!scan }
         if (error)
-            return { text: "⚠ Waits not checked since " + since + ": " + error, uncertain: true }
+            return { text: "⚠ Waits not checked since " + since + ": " + error, uncertain: true, unchecked: true }
         if (stale)
-            return { text: "⚠ Waits not checked since " + since, uncertain: true }
+            return { text: "⚠ Waits not checked since " + since, uncertain: true, unchecked: true }
         return scan
             ? { text: "⚠ Session scan stale since " + scanSince, uncertain: true }
             : { text: "", uncertain: false }
