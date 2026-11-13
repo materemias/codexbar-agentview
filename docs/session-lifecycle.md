@@ -275,6 +275,8 @@ card, the Plasma Agents section and tern-awui.
 | `park only: its waits end with the pane` | another wait on a shell pane: a shell can't be reopened, so closing the pane ends its waits |
 | `park only: turn cut off once already` | the prompt's turn was cut off before; a second cut would come to you |
 | `park only: it can't be resumed` | omp has no transcript to resume the session from |
+| `park only: work runs in this session` | a command the agent started still runs (a background job, say): closing omp would kill it |
+| `park only: the agent is working` | the agent is mid-turn on your own request: nothing would send it again |
 | `park only: nothing checks waits` | no check ran for 15 minutes (Tern isn't running, say): nothing would notice the wait fire |
 
 Closing a session while a prompt's turn runs is treated like a reboot: the
@@ -343,7 +345,8 @@ its meaning:
   each with what came and, for "ran, take a look", the start of the agent's
   last message, so you can read it before pressing Seen.
 - **Stop** ends waits still watched: `×` beside one wait on the card ends that
-  one, and **Stop N waits…** ends all of them after a second press.
+  one, and **Stop N waits…** ends all of them after a second press. Stopping a
+  step never starts the step chained after it: the steps behind it stop too.
 
 Each shows in "Since set aside" as `Seen: …` or `Stopped: …`. On a session set
 aside for later, closing the last wait also unpins it.
@@ -377,8 +380,10 @@ stopping its last wait unpins it. This group never notifies; open it when you ha
 ## The agent's tool
 
 The agent can add waits through the `waitingfor` tool, for example right after
-it opens a pull request. It never parks the session and never overwrites your
-sentence; its suggestion waits for you to accept it.
+it opens a pull request. It can park the session when you ask it to set it
+aside (parking only takes the pane out of its tab, so it is always safe; it
+does nothing outside Tern). It never closes the session and never overwrites
+your sentence; its suggestion waits for you to accept it.
 
 ## Pull requests of a session
 
