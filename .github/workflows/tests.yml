@@ -26,7 +26,7 @@ jobs:
           QT_QPA_PLATFORM: offscreen
         run: |
           python -m py_compile contents/scripts/*.py
-          python -m unittest discover -s tests -v
+          python tests/run.py -v
 
   macos:
     runs-on: macos-latest
@@ -38,4 +38,4 @@ jobs:
       - name: Python and Darwin bridge tests
         run: |
           python -m py_compile contents/scripts/*.py
-          python -m unittest discover -s tests -v
+          python tests/run.py -v
