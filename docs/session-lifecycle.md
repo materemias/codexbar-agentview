@@ -146,14 +146,16 @@ move onto the new one; a wait of its own on that PR, such as one for its
 release, stays.
 
 **Command check from a description.** `/wait check the nightly job passed`
-sends one prompt to the session's agent: write a command that exits 0 exactly
-when that holds, run it once, and register it. The extension then adds the
-check with your description as its label and parks the session; the command
-shows above the composer (`Check: <command> every 15m`) so you can read what
-will run. From then on only the command runs. If the agent's turn ends without
-registering a check, the area above the composer says so. One described check
-can be pending at a time. With `!` you give the command yourself and no agent
-is asked.
+saves the wait with your description as its label, parks the session and
+queues one prompt for its agent: write a command that exits 0 exactly when
+that holds, run it once, and register it. It goes through the same queue as
+other prompts, so a session closed before the agent wrote the command is
+reopened for it. Until then the wait is pending and nothing runs; once
+registered, the command shows above the composer (`Check: <command> every
+15m`) so you can read what will run, and from then on only the command runs.
+If the agent's turn ends without registering a command, the wait comes back
+to you. One described check can be pending at a time. With `!` you give the
+command yourself and no agent is asked.
 
 Command checks capture their directory when the wait is added: an explicit
 `add --cwd` overrides the known session project directory; otherwise, the
@@ -256,6 +258,30 @@ and an extension heard from just before it doesn't hold the reopen back. A
 prompt whose turn the reboot cut off is sent again once, led by a note asking
 the agent to check what was already done; cut off a second time, it comes to
 you. A job wait on a shell pane comes back to you, since the pane is gone.
+
+### Can I close it?
+
+Every surface that shows a session's waits also says whether closing it is
+safe: the row above the omp composer, `/wait list`, each Waiting row and its
+card, the Plasma Agents section and tern-awui.
+
+| Says | Means |
+|---|---|
+| `closable` | every open wait has a prompt: Tern reopens the session when one fires |
+| `closable · you reopen` | some wait has no prompt or is `later`: it comes back to you, and you resume it |
+| `park only: job runs in this pane` | closing the shell pane ends the job the wait watches |
+| `park only: its waits end with the pane` | another wait on a shell pane: a shell can't be reopened, so closing the pane ends its waits |
+| `park only: turn cut off once already` | the prompt's turn was cut off before; a second cut would come to you |
+| `park only: it can't be resumed` | omp has no transcript to resume the session from |
+| `park only: nothing checks waits` | no check ran for 15 minutes (Tern isn't running, say): nothing would notice the wait fire |
+
+Closing a session while a prompt's turn runs is treated like a reboot: the
+prompt is sent again once, when Tern reopens the session, led by a note asking
+the agent to check what was already done; a reboot and a close count
+together, so a second cut of either kind comes to you. A check the agent is to
+write goes through the same queue (above). The row above the composer starts
+with the answer, and `/wait list` shows it on a `Closing:` line. The menu's
+Close the session is offered only when the answer is not "park only".
 
 ## Coming back
 

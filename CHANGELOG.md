@@ -23,6 +23,8 @@
 - Waits say when they can't be checked: the Waiting tab, the row above the omp composer, `/wait list` and the Plasma Agents section show "⚠ Waits not checked since HH:MM" (with the error when a check failed) or "⚠ Session scan stale since HH:MM", and the panel's back-on-you count reads `N?`. A recent check that couldn't do part of its work shows "⚠ Last check: …" and leaves the count plain. A GitHub or check outage of an hour shows "GitHub unreachable since HH:MM" on the wait.
 - Retry (`F5` on the Waiting tab, on the card, in the omp menu, `retry --wait`) watches a wait its failing checks or an internal error stopped; such waits are also retried every hour.
 - Each Waiting tab row says whether its session is running, parked or closed in Tern (or runs elsewhere), beside its time; typing `parked` in the filter lists the parked ones.
+- Every place that shows a set-aside session says whether it is safe to close: `closable` (a prompt reopens it), `closable · you reopen` (it comes back to you) or `park only: …` with the reason (a job running in the pane, a turn already cut off once, nothing to resume from, or nothing checking the waits). It leads the row above the omp composer, marks each Waiting row (`✓`, `↺`, `⏸`) and its card, and shows in `/wait list`, the Plasma tooltip and tern-awui; the menu offers Close the session only when it isn't park only.
+- Closing a session while a prompt's turn runs no longer loses the prompt: like after a reboot, Tern reopens the session and sends it again once, asking the agent to check what was already done. A check the agent is to write is sent the same way, so the session can be closed before the agent wrote it.
 
 ### Fixes
 
