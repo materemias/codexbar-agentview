@@ -2943,16 +2943,16 @@ local function peekNode(b: Block, r: any, history: boolean): Node
 	if history then
 		if LAUNCH_HOSTS[str(r.host)] and str(r.resumeCommand) ~= "" then
 			local busy = b.launched[key] ~= nil and os.clock() - b.launched[key] < 60
-			table.insert(buttons, button("Launch", "launch", { variant = "primary", keys = { "enter" }, busy = busy }))
+			table.insert(buttons, button("Launch", "launch", { variant = "primary", busy = busy }))
 		end
 		if str(r.resumeCommand) ~= "" then
 			table.insert(buttons, button("Copy resume command", "copy_resume", { icon = "copy" }))
 		end
-		table.insert(buttons, button("Dismiss", "dismiss", { keys = { "del" } }))
+		table.insert(buttons, button("Dismiss", "dismiss"))
 	else
-		table.insert(buttons, button("Focus", "focus", { variant = "primary", keys = { "enter" } }))
+		table.insert(buttons, button("Focus", "focus", { variant = "primary" }))
 		if cardPane(r, false) then
-			table.insert(buttons, button("Card", "card", { keys = { "shift", "enter" } }))
+			table.insert(buttons, button("Card", "card"))
 		end
 		local ternInstalled = type(store.agents) == "table" and val(store.agents.ternInstalled) == true
 		if ternInstalled and r.host == "kitty" and str(r.resumeCommand) ~= "" then
@@ -2966,9 +2966,7 @@ local function peekNode(b: Block, r: any, history: boolean): Node
 			table.insert(buttons, button("Copy resume command", "copy_resume", { icon = "copy" }))
 		end
 	end
-	-- Once a filter is being typed, space is a filter character, not the peek key.
-	local peekKeys = if b.filter == "" then { "space" } else nil
-	table.insert(buttons, button(if b.peek then "Hide conversation" else "Conversation", "peek", { icon = "message", keys = peekKeys, on = b.peek }))
+	table.insert(buttons, button(if b.peek then "Hide conversation" else "Conversation", "peek", { icon = "message", on = b.peek }))
 	table.insert(kids, withp(ui.row(buttons), { key = "actions", wrap = true }))
 	if b.peek then
 		local turns = turnNodes(r)
@@ -3090,13 +3088,13 @@ end
 local function emptyNode(icon: string, title: string, text: string?, act: { [string]: any }?): Node
 	local kids: { Node } = {}
 	if act then
-		table.insert(kids, button(act.text, act.act, { variant = "quiet", keys = act.keys }))
+		table.insert(kids, button(act.text, act.act, { variant = "quiet" }))
 	end
 	return ui.node("empty", { variant = "inline", frame = true, icon = icon, title = title, text = text }, kids)
 end
 
 local function noMatch(b: Block, what: string): Node
-	return emptyNode("search", "No " .. what .. " matches “" .. b.filter .. "”", nil, { text = "Clear", act = "clear", keys = { "esc" } })
+	return emptyNode("search", "No " .. what .. " matches “" .. b.filter .. "”", nil, { text = "Clear", act = "clear" })
 end
 
 local function agentsView(b: Block, now: number): Node
@@ -3117,7 +3115,7 @@ local function agentsView(b: Block, now: number): Node
 	end
 	local hidden = if b.filter == "" and setting("hideOld") then oldCount() else 0
 	local empty = if b.filter ~= "" then noMatch(b, "session")
-		elseif hidden > 0 then emptyNode("eye-off", "All " .. hidden .. " sessions are older than a day", nil, { text = "Show them", act = "hide_old", keys = { "tab" } })
+		elseif hidden > 0 then emptyNode("eye-off", "All " .. hidden .. " sessions are older than a day", nil, { text = "Show them", act = "hide_old" })
 		else emptyNode("terminal", "No coding agents are running", "Sessions show up here as they start.")
 	return listView(b, kids, empty)
 end
@@ -3300,26 +3298,24 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	local live = waitLive(r)
 	local buttons: { Node } = {}
 	if live then
-		table.insert(buttons, button("Open", "wait_open", { variant = "primary", keys = { "enter" } }))
+		table.insert(buttons, button("Open", "wait_open", { variant = "primary" }))
 	else
 		local busy = b.busy == rowKey or (b.launched[rowKey] ~= nil and os.clock() - b.launched[rowKey] < 60)
-		table.insert(buttons, button("Resume", "wait_open", { variant = "primary", keys = { "enter" }, busy = busy }))
+		table.insert(buttons, button("Resume", "wait_open", { variant = "primary", busy = busy }))
 	end
 	local due, retry = firstDue(r)
 	if retry then -- any of the row's waits, not only the one its headline tells: each is a dead end without it
-		table.insert(buttons, button("Retry", "wait_retry", { icon = "repeat", keys = { "f5" }, title = "Check “" .. oneLine(retry.label) .. "” again now" }))
+		table.insert(buttons, button("Retry", "wait_retry", { icon = "repeat", title = "Check “" .. oneLine(retry.label) .. "” again now" }))
 	end
 	table.insert(buttons, button("Snooze 1d", "wait_snooze", {
-		keys = if b.filter == "" then { "+" } else nil,
 		disabled = if due then false else "Nothing to snooze",
 	}))
-	table.insert(buttons, button("Done", "wait_done", { keys = { "del" } }))
+	table.insert(buttons, button("Done", "wait_done"))
 	if cardPane(r, true) then
-		table.insert(buttons, button("Card", "wait_card", { keys = { "shift", "enter" } }))
+		table.insert(buttons, button("Card", "wait_card"))
 	end
-	table.insert(buttons, button("Manual wait…", "wait_what", { keys = { "f2" } }))
-	local peekKeys = if b.filter == "" then { "space" } else nil
-	table.insert(buttons, button(if b.peek then "Hide details" else "Details", "peek", { icon = "message", keys = peekKeys, on = b.peek }))
+	table.insert(buttons, button("Manual wait…", "wait_what"))
+	table.insert(buttons, button(if b.peek then "Hide details" else "Details", "peek", { icon = "message", on = b.peek }))
 	table.insert(kids, withp(ui.row(buttons), { key = "actions", wrap = true }))
 	if b.peek then
 		local waitingFor = oneLine(r.waiting_for)
@@ -3867,7 +3863,7 @@ tern.block.define("dashboard", {
 				end
 			elseif store.usageError then
 				table.insert(main, ui.node("empty", { key = "state", tone = "error", title = "Usage unavailable", text = store.usageError }, {
-					button("Retry", "refresh", { size = "md", icon = "repeat", keys = { "r" } }),
+					button("Retry", "refresh", { size = "md", icon = "repeat" }),
 				}))
 			else
 				table.insert(main, ui.node("skeleton", { key = "state", shape = "rows", rows = 4, aria = "Reading usage" }))
