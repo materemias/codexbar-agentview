@@ -719,9 +719,15 @@ class UsageCacheTests(IsolatedUsageTestCase):
         missing = fetch._result_error("codex", "cli_missing", f"CLI not found at {cli}")
         failed = self.snapshot([missing], cli=cli)
         self.assertEqual(failed["fatal"]["code"], "cli_missing")
+        # What to install comes with it, for this platform.
+        self.assertIn("CodexBar CLI", failed["fatal"]["setup"][0])
+        self.assertIn("macOS tarball", fetch._cli_setup("darwin")[0])
+        self.assertIn("codexbar-cli", fetch._cli_setup("linux")[0])
         [kept] = failed["providers"]
         self.assertEqual((kept["stale"], kept["primary"]["usedPercent"]), (True, 42))
         self.assertEqual(failed["updatedAt"], self.measured.isoformat())
+        # A cache answer (another poller's claim, startup) says so as well, once the reading failed.
+        self.assertEqual(self.snapshot(cache_only=True, cli=cli)["fatal"]["code"], "cli_missing")
 
     def test_missing_cli_is_not_fatal_while_meridian_serves_a_provider(self) -> None:
         cli = str(self.home / "removed-cli")
@@ -731,6 +737,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
         self.assertIsNone(result["fatal"])
         self.assertEqual([(r["id"], r["ok"]) for r in result["providers"]],
                          [("claude", True), ("codex", False)])
+        self.assertIsNone(self.snapshot(cache_only=True, providers="claude,codex", cli=cli)["fatal"])
 
     def test_provider_failure_retains_only_that_provider_and_does_not_renew_age(self) -> None:
         self.snapshot([self.record(), self.record("kilo", None, 12)], providers="codex,kilo")

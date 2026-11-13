@@ -2096,6 +2096,33 @@ def _adopt_shared(records: list[dict], now: _dt.datetime, min_interval: float) -
             record["stale"] = False
 
 
+CLI_RELEASES = "https://github.com/steipete/CodexBar/releases"
+
+
+def _cli_setup(platform: str = sys.platform) -> list[str]:
+    """What sets usage up when the CLI is missing, one step a line, for the
+    surfaces to show beside their own switch that turns usage tracking off."""
+    if platform == "darwin":
+        install = f"Install the CodexBar CLI: a CodexBarCLI macOS tarball from {CLI_RELEASES}."
+    else:
+        install = (
+            "Install the CodexBar CLI: the AUR package codexbar-cli on Arch, "
+            f"`brew install steipete/tap/codexbar`, or a CodexBarCLI tarball from {CLI_RELEASES}."
+        )
+    return [
+        install,
+        "Installed somewhere else? Set its path in Settings (the codexbar CLI or CodexBar executable field).",
+        "Sign in to each provider as the CodexBar docs describe (Claude and Codex use their own CLIs' logins).",
+    ]
+
+
+def _cli_missing_fatal(cli: str, no_meridian: bool = False) -> dict:
+    message = f"codexbar CLI not found or not executable: {cli}"
+    if no_meridian:
+        message += "; Meridian is not running either"
+    return {"code": "cli_missing", "message": message, "setup": _cli_setup()}
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--cli-path", required=True)
@@ -2149,6 +2176,10 @@ def main(argv: list[str]) -> int:
             if args.forecast_url:
                 out["forecast"] = _fetch_forecast(args.forecast_url, FORECAST_TIMEOUT)
         _attach_recent_usage(restored, _usage_history_entries(_usage_cache_payload(), now), now)
+        # Another poller's claim must not hide a missing CLI: without one, only a
+        # reading some source served without error (Meridian's) keeps it from fatal.
+        if cli_missing and not any(r.get("ok") and not r.get("refreshError") for r in restored):
+            out["fatal"] = _cli_missing_fatal(cli)
         out["cacheOnly"] = True
         out["inputs"] = _cache_inputs(providers)
         # The login fingerprints records carry as `sourceScope`, so a poller
@@ -2232,10 +2263,9 @@ def main(argv: list[str]) -> int:
         "cliVersion": _cli_version(cli),
     }
     if cli_missing and not served:
-        message = f"codexbar CLI not found or not executable: {cli}"
-        if {"claude", "codex"} & set(providers) and meridian.snapshot() is None:
-            message += "; Meridian is not running either"
-        out["fatal"] = {"code": "cli_missing", "message": message}
+        out["fatal"] = _cli_missing_fatal(
+            cli, bool({"claude", "codex"} & set(providers)) and meridian.snapshot() is None,
+        )
     json.dump(out, sys.stdout)
     sys.stdout.write("\n")
     return 0
