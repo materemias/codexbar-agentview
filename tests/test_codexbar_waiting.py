@@ -6970,6 +6970,176 @@ class ExtensionMenuCloseTests(unittest.TestCase):
         self.assertEqual((answer["shutdown"], answer["left"]), (False, 1), answer)
 
 
+# Stands in for codexbar_waiting.py where a copy of the extension looks for it: logs each argv to
+# CLI_LOG and answers as the snooze contract says. FAKE_CLOSE: the session's close verdict before the
+# snooze; FAKE_WAITS: its open waits; FAKE_HIDDEN/FAKE_FALLBACK: what an add or snooze did to hide it
+# (else what --hide asked for).
+SNOOZE_FAKE_CLI = r"""
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["CLI_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(args) + "\n")
+value = lambda name: args[args.index(name) + 1] if name in args else None
+close = json.loads(os.environ.get("FAKE_CLOSE") or "null")
+waits = json.loads(os.environ.get("FAKE_WAITS") or "[]")
+row = {"session_id": value("--session"), "close": close, "waits": waits}
+view = {"sessions": [row] if close or waits else []}
+answer = {"ok": True, "prompts": [], "view": view}
+if args[0] == "list":
+    answer = {"ok": True, **view}
+elif args[0] in ("add", "snooze"):
+    saved = {**row, "close": {"verdict": "safe", "reason": "prompt", "text": "closable"}, "waits": [{"id": "w1", "label": "Snoozed"}]}
+    answer = {
+        "ok": True, "wait": {"id": "w1"}, "view": {"sessions": [saved]},
+        "hidden": os.environ.get("FAKE_HIDDEN", value("--hide") or "") or None,
+        "fallback": os.environ.get("FAKE_FALLBACK") or None,
+    }
+print(json.dumps(answer))
+"""
+
+# Runs one /wait line (CALL.line) or one waitingfor tool call (CALL.tool) for SID, answering the
+# dialogs from CHOICES and LINES; reports the snooze-related CLI calls, the panel and whether omp closed.
+SNOOZE_DRIVER = r"""
+import * as fs from "node:fs";
+const { default: install } = await import(process.env.EXTENSION);
+const SID = process.env.SID;
+const chain = new Proxy(function () {}, { get: () => chain, apply: () => chain });
+const handlers = {};
+const commands = {};
+let tool;
+class Text { constructor(text = "") { this.text = text; } setText(text) { this.text = text; } render() { return [this.text]; } describe() { return {}; } }
+install({
+    zod: chain, logger: { debug() {} }, sendUserMessage() {}, pi: { Text },
+    on: (name, fn) => { handlers[name] = fn; }, registerCommand: (name, spec) => { commands[name] = spec; },
+    registerShortcut() {}, registerTool: (spec) => { tool = spec; },
+});
+const widgets = {};
+const choices = JSON.parse(process.env.CHOICES);
+const lines = JSON.parse(process.env.LINES);
+const titles = [];
+let shutdown = false;
+const ctx = {
+    hasUI: true, cwd: process.cwd(), isIdle: () => true, hasPendingMessages: () => false,
+    ui: {
+        setWidget(name, factory) { widgets[name] = factory; },
+        select: async (title) => { titles.push(title); return choices.shift(); }, editor: async () => lines.shift(),
+    },
+    sessionManager: {
+        getSessionId: () => SID, getHeader: () => ({ type: "session", id: SID }), getBranch: () => [],
+        onPersistenceNotice: () => () => {},
+    },
+    setTimeout: (fn, ms) => setTimeout(fn, ms), setInterval: (fn, ms) => setInterval(fn, ms),
+    clearTimer: (timer) => clearTimeout(timer),
+    shutdown: async () => { shutdown = true; },
+};
+handlers.session_start({}, ctx);
+await Bun.sleep(300);
+const call = JSON.parse(process.env.CALL);
+const result = call.tool ? JSON.parse((await tool.execute("t", call.tool, null, null, ctx)).content[0].text) : null;
+if (!call.tool) await commands.wait.handler(call.line, ctx);
+const panel = widgets["waitingfor-panel"]?.(null, { fg: (_tone, text) => text })?.render(200).join("\n") ?? null;
+handlers.session_shutdown();
+const calls = fs.readFileSync(process.env.CLI_LOG, "utf8").trim().split("\n").map((line) => JSON.parse(line))
+    .filter((args) => ["add", "stop", "snooze"].includes(args[0]));
+console.log(JSON.stringify({ shutdown, panel, calls, titles, left: choices.length + lines.length, result }));
+process.exit(0);
+"""
+
+PARK_ONLY = {"verdict": "park", "reason": "turn", "text": "park only: turn cut off once already"}
+
+
+@unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
+class ExtensionSnoozeTests(unittest.TestCase):
+    """The session snooze: /wait snooze hides the session until a time; in Tern a park (or a close
+    Tern carries out), outside Tern a close this omp does itself, refused while it would lose something."""
+
+    def snooze(self, call: dict, pane: str = "", choices: tuple = (), lines: tuple = (), **fake) -> dict:
+        with extension_folder() as folder:
+            root = Path(folder)
+            package = root / "package"
+            extension = package / "omp-extension" / EXTENSION_PATH.name
+            scripts = package / "contents" / "scripts"
+            extension.parent.mkdir(parents=True)
+            scripts.mkdir(parents=True)
+            shutil.copy(EXTENSION_PATH, extension)
+            menu = json.loads((SCRIPT_PATH.parent / "waiting_menu.json").read_text(encoding="utf-8"))
+            if not any(item["id"] == "snooze" for item in menu["items"]):
+                menu["items"].insert(-1, {
+                    "id": "snooze", "label": "Snooze session…", "command": "/wait snooze",
+                    "detail": "hide this session until then; it comes back by itself", "targets": ["session", "pane"],
+                })
+            (scripts / "waiting_menu.json").write_text(json.dumps(menu), encoding="utf-8")
+            (scripts / SCRIPT_PATH.name).write_text(SNOOZE_FAKE_CLI, encoding="utf-8")
+            env = {f"FAKE_{name.upper()}": value if isinstance(value, str) else json.dumps(value) for name, value in fake.items()}
+            return run_extension_driver(
+                self, SNOOZE_DRIVER, SID=SID, EXTENSION=str(extension), CALL=json.dumps(call),
+                CHOICES=json.dumps(choices), LINES=json.dumps(lines), CLI_LOG=str(root / "cli.log"),
+                XDG_STATE_HOME=str(root / "state"), OMP_AGENT_DIR=str(root / "omp"), PI_CODING_AGENT_DIR="",
+                TERN_PANE=pane, **env,
+            )
+
+    def add(self, *time: str, hide: str, by: str = "user") -> list:
+        return ["add", "--session", SID, "--kind", "snooze", *time, "--by", by, "--hide", hide]
+
+    def test_outside_tern_the_line_saves_the_snooze_and_closes_the_session(self) -> None:
+        answer = self.snooze({"line": "snooze 2d waiting on Anna"})
+        self.assertEqual(answer["calls"], [self.add("--in=2d", "--note=waiting on Anna", hide="close")])
+        self.assertTrue(answer["shutdown"], answer)
+
+    def test_in_tern_the_line_parks(self) -> None:
+        answer = self.snooze({"line": "snooze 18:00"}, pane="52")
+        self.assertEqual(answer["calls"], [self.add("--at=18:00", hide="park")])
+        self.assertEqual((answer["shutdown"], answer["panel"]), (False, None))
+
+    def test_in_tern_a_pane_tern_has_not_listed_stays_on_screen_and_says_so(self) -> None:
+        answer = self.snooze({"line": "snooze 2d"}, pane="52", hidden="")
+        self.assertIn("Snoozed, but not hidden", answer["panel"])
+
+    def test_outside_tern_a_park_only_session_is_refused_with_its_verdict(self) -> None:
+        answer = self.snooze({"line": "snooze 2d"}, close=PARK_ONLY)
+        self.assertEqual((answer["calls"], answer["shutdown"]), ([], False))
+        self.assertEqual(answer["panel"], "Not snoozed: keep open: turn cut off once already. Outside Tern a snooze closes the session.")
+
+    def test_outside_tern_a_close_the_cli_fell_back_from_ends_the_snooze(self) -> None:
+        answer = self.snooze({"line": "snooze 2d"}, hidden="park", fallback="keep open: it can't be resumed")
+        self.assertEqual(answer["calls"], [self.add("--in=2d", hide="close"), ["stop", "--session", SID, "--wait=w1"]])
+        self.assertFalse(answer["shutdown"])
+        self.assertEqual(answer["panel"], "Not snoozed: keep open: it can't be resumed. Outside Tern a snooze closes the session.")
+
+    def test_the_picker_in_tern_offers_close_while_closing_loses_nothing(self) -> None:
+        answer = self.snooze({"line": "snooze"}, pane="52", choices=("Tomorrow 09:00", "Close the session"))
+        tomorrow = (datetime.now() + timedelta(days=1)).date().isoformat()
+        self.assertEqual(answer["calls"], [self.add(f"--at={tomorrow}T09:00", hide="close")])
+        # Tern's window closes the pane; this omp doesn't shut itself down.
+        self.assertEqual((answer["shutdown"], answer["left"]), (False, 0))
+
+    def test_the_picker_in_tern_parks_a_park_only_session_unasked(self) -> None:
+        answer = self.snooze({"line": "snooze"}, pane="52", choices=("Custom…",), lines=("1h 30m",), close=PARK_ONLY)
+        self.assertEqual(answer["calls"], [self.add("--in=1h30m", hide="park")])
+        self.assertEqual((answer["titles"], answer["left"]), (["Snooze the session until?"], 0))
+
+    def test_the_menu_item_opens_the_picker(self) -> None:
+        answer = self.snooze({"line": ""}, choices=("Snooze session…", "1w"))
+        self.assertEqual(answer["calls"], [self.add("--in=1w", hide="close")])
+        self.assertTrue(answer["shutdown"], answer)
+
+    def test_snooze_1d_on_a_session_back_from_its_snooze_closes_it_again_outside_tern(self) -> None:
+        waits = [{"id": "w1", "label": "Snoozed", "ball": "on_me", "outcome": "fulfilled", "snoozable": True}]
+        answer = self.snooze({"line": ""}, choices=("This session's waits (1)", "w1  Snoozed", "Snooze 1d"), waits=waits, hidden="close")
+        self.assertEqual(answer["calls"], [["snooze", "--session", SID, "--wait=w1", "--for", "1d"]])
+        self.assertTrue(answer["shutdown"], answer)
+
+    def test_the_tool_parks_in_tern_and_refuses_outside(self) -> None:
+        call = {"tool": {"action": "snooze", "in": "2h", "note": "after lunch"}}
+        parked = self.snooze(call, pane="52")
+        self.assertEqual(parked["calls"], [self.add("--in=2h", "--note=after lunch", hide="park", by="agent")])
+        self.assertTrue(parked["result"]["park"].startswith("parked:"), parked)
+        outside = self.snooze(call)
+        self.assertEqual(outside["calls"], [])
+        self.assertIn("ask the user to run /wait snooze", outside["result"]["snooze"])
+        self.assertFalse(outside["shutdown"])
+
+
 # Loads the extension for SID and changes what runs in it: a background job, then a bash call. The
 # heartbeats tell the CLI each change (`extension_activity`).
 ACTIVITY_DRIVER = r"""

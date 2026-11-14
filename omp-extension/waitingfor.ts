@@ -162,6 +162,14 @@ const FORMS = [
 		example: "later M untangle the config",
 		featured: true,
 	},
+	{
+		word: "snooze",
+		usage: "/wait snooze <time> [sentence]",
+		what: "hide this session until then; it comes back by itself",
+		example: "snooze 2d waiting on Anna",
+		featured: true,
+	},
+	{ usage: "/wait snooze", what: "pick the time, then park or close it; <time>: 2d, 18:00, 2026-11-07 09:00" },
 	{ word: "list", alone: true, usage: "/wait list", what: "this session's details" },
 	{ word: "seen", usage: "/wait seen [wait-id]", what: "you've read what came: close the waits on you, or one of them", example: "seen w1" },
 	{ word: "stop", usage: "/wait stop <wait-id|all>", what: "stop waiting: end one wait, or all of them", example: "stop w1" },
@@ -206,7 +214,15 @@ const UNTIL_CHOICES = [
 	{ label: "gh", description: "a PR state or a repo's next release: gh pr 42 merged" },
 ];
 /** Their text may hold a `--` of its own, as they never fire a prompt; list and help take no text at all. */
-const NO_PROMPT: Record<string, true> = { seen: true, stop: true, note: true, later: true, for: true, list: true, help: true };
+const NO_PROMPT: Record<string, true> = { seen: true, stop: true, note: true, later: true, for: true, snooze: true, list: true, help: true };
+/** What can follow `/wait snooze `: the picker's times a line can say. */
+const SNOOZE_CHOICES = [
+	{ label: "1h", description: "for an hour" },
+	{ label: "3h", description: "for three hours" },
+	{ label: "09:00", description: "until the next 09:00" },
+	{ label: "2d", description: "for two days" },
+	{ label: "1w", description: "for a week" },
+];
 
 const messageOf = (error) => (error instanceof Error ? error.message : String(error));
 
@@ -437,6 +453,16 @@ export function parseWait(input: string) {
 			const sentence = sized ? tail : rest;
 			return sentence ? add("later", sized ? [`--size=${size}`] : [], sentence) : bad("later needs a sentence.");
 		}
+		case "snooze": {
+			// Bare, it opens the picker; the hide is where the session runs (snoozeSession).
+			if (!rest) return { command: "snooze-session", args: [], ask: true };
+			const [time, tail] = cut(rest);
+			const inline = DURATION.test(time);
+			const at = inline ? undefined : rest.match(AT);
+			if (!inline && !at) return bad(`snooze takes a time first, such as 2d, 3h, 18:00 or 2026-11-07 09:00, not ${time}.`);
+			const sentence = at ? at[4] : tail;
+			return { command: "snooze-session", args: [at ? `--at=${atValue(at)}` : `--in=${time}`, ...(sentence ? [`--note=${sentence}`] : [])] };
+		}
 		case "for":
 			return whatRequest(rest);
 		case "check": {
@@ -533,6 +559,7 @@ function choicesAfter(words: string[], waits) {
 	if (path === "gh pr" || (words.length === 3 && path.startsWith("gh pr ") && PR_REF.test(words[2]))) return [...UNTILS, SENTENCE_START];
 	if (path === "gh babysit" || path === "gh release" || (words.length === 3 && path.startsWith("gh release ") && REPO.test(words[2]))) return [SENTENCE_START];
 	if (path === "later") return SIZES;
+	if (path === "snooze") return SNOOZE_CHOICES;
 	if (path === "check") return CHECK_CHOICES;
 	if (words.length === 3 && path.startsWith("check every ") && DURATION.test(words[2])) return [BANG];
 	const ids = (list) => list.map((wait) => ({ label: wait.id, value: wait.id, description: wait.label }));
@@ -635,6 +662,8 @@ const inTern = () => Boolean(process.env.TERN_PANE);
 const UNCHECKED_CLOSE = { verdict: "park", reason: "unchecked", text: "park only: nothing checks waits" };
 /** omp's own background jobs and commands end with it; the CLI's `work` verdict says the same. */
 const WORK_CLOSE = { verdict: "park", reason: "work", text: "park only: work runs in this session" };
+/** A turn that runs: closing would cut it off; the CLI's `busy` verdict says the same. */
+const BUSY_CLOSE = { verdict: "park", reason: "busy", text: "park only: the agent is working" };
 
 /** A `park` verdict as it reads where the session runs: outside Tern there is nothing to park, so it is kept open. */
 function closeHere<T extends { text?: string }>(close: T): T {
@@ -848,6 +877,10 @@ const TOOL_FLAGS = {
 };
 
 const NOT_PARKED_OUTSIDE_TERN = "not parked: this omp runs outside Tern, so there is no pane to park";
+/** Why a session snooze outside Tern needs closing to be safe. */
+const SNOOZE_CLOSES = "Outside Tern a snooze closes the session.";
+/** The agent never closes a session: outside Tern, where a snooze would, the user snoozes it. */
+const TOOL_SNOOZE_OUTSIDE_TERN = "not snoozed: this omp runs outside Tern, so there is no pane to park, and you never close the session; ask the user to run /wait snooze";
 
 /** What the tool's park did: `paneKnown` is false when the CLI knew no Tern pane of the session (`parked`). */
 function parkNote(paneKnown: boolean): string {
@@ -924,6 +957,37 @@ const CLOSE_NOTES = {
 	// "When I have time" sessions stay away a long while; the pin brings them back.
 	later: "it stays pinned; resume it from When I have time",
 };
+
+/** The session snooze's times; `options` gives its `--in`/`--at`, undefined on Esc or an empty line. */
+const SNOOZE_TIMES = [
+	{ label: "1h", description: "for an hour", options: () => ["--in=1h"] },
+	{ label: "3h", description: "for three hours", options: () => ["--in=3h"] },
+	{
+		label: "Tomorrow 09:00",
+		description: "back in the morning",
+		options() {
+			const day = new Date();
+			day.setDate(day.getDate() + 1);
+			const date = [day.getFullYear(), day.getMonth() + 1, day.getDate()].map((part) => String(part).padStart(2, "0")).join("-");
+			return [`--at=${date}T09:00`];
+		},
+	},
+	{ label: "2d", description: "for two days", options: () => ["--in=2d"] },
+	{ label: "1w", description: "for a week", options: () => ["--in=1w"] },
+	{
+		label: "Custom…",
+		description: "a duration or a time: 1h30m, 18:00, 2026-11-07 09:00",
+		async options(c) {
+			const due = await ask(c, "Snooze until? 1h30m, 18:00 or 2026-11-07 09:00");
+			return due ? timeOptions(due) : undefined;
+		},
+	},
+];
+/** How a snoozed session leaves the screen in Tern; Close only while closing loses nothing (canClose). */
+const SNOOZE_HIDES = [
+	{ label: "Park it", description: "off the screen; it comes back in a tab of its own", hide: "park" },
+	{ label: "Close the session", description: "it reopens by itself then", hide: "close" },
+];
 
 /**
  * The menu's last step: the chosen `{park, close?}`, undefined on Esc. With `closeNote`, what brings the
@@ -1108,6 +1172,8 @@ const FLOWS = {
 			return size ? [`--size=${size.label}`] : undefined;
 		},
 	},
+	// The session snooze has a picker of its own (snoozeMenu).
+	snooze: {},
 };
 
 /** The menu's items for an omp session, in file order: `{label, description, flow}`, or the reason there are none. */
@@ -1640,7 +1706,11 @@ export default function (pi) {
 		if (action === "Retry") await act(c, ["retry", "--session", session, `--wait=${id}`]);
 		else if (action === "Seen") await act(c, ["mark-seen", "--session", session, `--wait=${id}`]);
 		else if (action === "Stop") await act(c, ["stop", "--session", session, `--wait=${id}`]);
-		else if (action === "Snooze 1d") await act(c, ["snooze", "--session", session, `--wait=${id}`, "--for", "1d"]);
+		else if (action === "Snooze 1d") {
+			const answer = await act(c, ["snooze", "--session", session, `--wait=${id}`, "--for", "1d"]);
+			// A session back from its own snooze is snoozed again; outside Tern its close is this process's.
+			if (!inTern() && answer.hidden === "close") await closeSession(c, session, answer);
+		}
 	}
 
 	/**
@@ -1749,6 +1819,42 @@ export default function (pi) {
 		closeSession(c, session, undefined).catch((error) => setPanel(c, errorPanel(messageOf(error))));
 	}
 
+	/** Outside Tern a snooze closes the session: refused, with the close verdict's text, while closing would lose something. */
+	function refuseSnoozeClose(c) {
+		if (inTern()) return;
+		const blocker = idle(c) ? closeBlocker() : closeHere(BUSY_CLOSE);
+		if (blocker) throw new Error(`Not snoozed: ${blocker.text}. ${SNOOZE_CLOSES}`);
+	}
+
+	/**
+	 * Snoozes `session` until `time`, its `--in` or `--at` and the user's `--note`: `hide` park or close
+	 * in Tern, whose window carries it out. Outside Tern it closes: refused while closing would lose
+	 * something, and the CLI hands the close to this process (`hidden: "close"`); one it fell back to
+	 * park (`fallback`) parks nothing here, so the snooze ends again and the refusal shows.
+	 */
+	async function snoozeSession(c, session: string, time: string[], hide: "park" | "close") {
+		refuseSnoozeClose(c);
+		const answer = await act(c, ["add", "--session", session, "--kind", "snooze", ...time, "--by", "user", "--hide", hide]);
+		if (!inTern()) {
+			if (answer.hidden === "close") return closeSession(c, session, answer);
+			await act(c, ["stop", "--session", session, `--wait=${answer.wait.id}`]);
+			throw new Error(`Not snoozed: ${answer.fallback ?? "the session can't be closed"}. ${SNOOZE_CLOSES}`);
+		}
+		if (c.sessionManager.getSessionId() !== session) return;
+		if (!answer.hidden) setPanel(c, errorPanel("Snoozed, but not hidden: Tern has not listed this session's pane yet; park it yourself."));
+		else if (answer.hidden !== hide) setPanel(c, (theme) => theme.fg("warning", `Parked instead of closed: ${answer.fallback}`));
+	}
+
+	/** The snooze picker: the time, then in Tern Park it or, while closing loses nothing, Close the session. */
+	async function snoozeMenu(c, session: string) {
+		refuseSnoozeClose(c);
+		const chosen = await pick(c, "Snooze the session until?", SNOOZE_TIMES);
+		const time = chosen && (await chosen.options(c));
+		if (!time) return;
+		const hide = !inTern() ? "close" : canClose(c) ? (await pick(c, "Park or close it until then?", SNOOZE_HIDES))?.hide : "park";
+		if (hide) await snoozeSession(c, session, time, hide);
+	}
+
 	/**
 	 * The steps of an `options` flow, then its command and, if chosen, the park or closing the session
 	 * once the command succeeded. Nothing happens before the command.
@@ -1787,7 +1893,7 @@ export default function (pi) {
 					? [
 							{
 								label: `This session's waits (${open.length})`,
-								description: `${[...(open.some(onYou) ? ["seen"] : []), "stop", ...(open.some((wait) => wait.retryable) ? ["retry"] : [])].join(", ")} or one more day`,
+								description: `${[...(open.some(onYou) ? ["seen"] : []), "stop", ...(open.some((wait) => wait.retryable) ? ["retry"] : [])].join(", ")}${open.some((wait) => wait.snoozable) ? " or one more day" : ""}`,
 							},
 						]
 					: []),
@@ -1796,6 +1902,7 @@ export default function (pi) {
 			const chosen = await pick(c, "What does this wait for?", items);
 			if (!chosen) return;
 			if (!chosen.flow) await waitMenu(c, session, open);
+			else if (chosen.flow === FLOWS.snooze) await snoozeMenu(c, session);
 			else if (!chosen.flow.request) await setAside(c, session, chosen.flow, pr, record);
 			else {
 				const request = await chosen.flow.request(c, record, pr, canClose);
@@ -1813,7 +1920,7 @@ export default function (pi) {
 	}
 
 	pi.registerCommand("wait", {
-		description: "Set this session aside: /wait opens the menu, or /wait 2d <sentence> [-- prompt] | every 2h -- <prompt> | gh pr|babysit|release | check | for | later | list | seen | stop | help",
+		description: "Set this session aside: /wait opens the menu, or /wait 2d <sentence> [-- prompt] | every 2h -- <prompt> | gh pr|babysit|release | check | for | later | snooze | list | seen | stop | help",
 		getArgumentCompletions: (prefix: string) => waitCompletions(prefix, waits),
 		handler: async (input: string, c) => {
 			followSession();
@@ -1824,8 +1931,11 @@ export default function (pi) {
 			else if (parsed.command === "help") setPanel(c, helpPanel);
 			else if (parsed.command === "list") await showDetails(c);
 			else {
+				const session = c.sessionManager.getSessionId();
 				try {
-					await perform(c, parsed, c.sessionManager.getSessionId());
+					if (parsed.command !== "snooze-session") await perform(c, parsed, session);
+					else if (parsed.ask) await snoozeMenu(c, session);
+					else await snoozeSession(c, session, parsed.args, inTern() ? "park" : "close");
 				} catch (error) {
 					setPanel(c, errorPanel(messageOf(error)));
 				}
@@ -1852,15 +1962,16 @@ export default function (pi) {
 			"note is your suggested sentence for the user. The user's own sentence always stands: never try to overwrite it, and don't repeat a note the session already has.",
 			"prompt is sent into this session when the wait fires. list shows the open waits, stop ends one by its id.",
 			"park (add, babysit_pr), or action park alone, parks this session in Tern: its pane only leaves its tab and keeps running until the user opens it again, so parking is always safe. Park when the user asks you to park the session or set it aside. Never close the session yourself. Outside Tern nothing can be parked, and the result says so.",
+			"snooze parks this session until in or at, then brings it back to a tab by itself; use it only when the user asks to snooze the session. Outside Tern it does nothing, and the result says to ask the user for /wait snooze.",
 			"When the user's /wait check asked you for a command, call add with kind command and argv only: it becomes their check.",
 		].join("\n"),
 		parameters: z.object({
-			action: z.enum(["add", "babysit_pr", "list", "stop", "end_repeat", "park"]).describe("What to do"),
+			action: z.enum(["add", "babysit_pr", "list", "stop", "end_repeat", "park", "snooze"]).describe("What to do"),
 			kind: z.enum(["time", "command", "pr", "release", "repeat", "something", "later"]).optional().describe("add: what to wait for"),
 			label: z.string().optional().describe("add: short label; derived when omitted"),
-			note: z.string().optional().describe("add, babysit_pr: suggested sentence for the user"),
-			in: z.string().optional().describe("time: delay such as 30m, 2h, 1d, 1h30m"),
-			at: z.string().optional().describe("time: ISO 8601, local time without an offset"),
+			note: z.string().optional().describe("add, babysit_pr, snooze: suggested sentence for the user"),
+			in: z.string().optional().describe("time, snooze: delay such as 30m, 2h, 1d, 1h30m"),
+			at: z.string().optional().describe("time, snooze: ISO 8601, local time without an offset"),
 			argv: z.array(z.string()).optional().describe("command: argv, run without a shell"),
 			interval: z.string().optional().describe("command, release: how often to check (default 15m, release 1h)"),
 			predicate: z
@@ -1929,6 +2040,23 @@ export default function (pi) {
 					if (!inTern()) return { content: [{ type: "text", text: JSON.stringify({ park: NOT_PARKED_OUTSIDE_TERN }) }], details: {} };
 					args = ["park", "--session", session];
 					break;
+				case "snooze":
+					if (!inTern()) return { content: [{ type: "text", text: JSON.stringify({ snooze: TOOL_SNOOZE_OUTSIDE_TERN }) }], details: {} };
+					args = [
+						"add",
+						"--session",
+						session,
+						"--kind",
+						"snooze",
+						...(params.in !== undefined ? [`--in=${params.in}`] : []),
+						...(params.at !== undefined ? [`--at=${params.at}`] : []),
+						...(params.note ? [`--note=${params.note}`] : []),
+						"--by",
+						"agent",
+						"--hide",
+						"park",
+					];
+					break;
 				case "stop":
 					if (!params.wait) throw new Error("stop needs a wait id; list shows them");
 					args = ["stop", "--session", session, `--wait=${params.wait}`];
@@ -1953,6 +2081,7 @@ export default function (pi) {
 			}
 			const result = params.action === "list" ? (answer.sessions?.[0] ?? { waits: [] }) : answer;
 			if (parking) result.park = parkNote(answer.parked != null);
+			else if (params.action === "snooze") result.park = parkNote(answer.hidden != null);
 			return { content: [{ type: "text", text: JSON.stringify(result) }], details: {} };
 		},
 	});
