@@ -34,6 +34,7 @@
 
 ### Fixes
 
+- The Tern window works with the helpers again on Tern 0.9.20: wait cards, Seen, Stop, Snooze and Retry, the `Ctrl+Alt+B` menu, pane-closed and agent events, focusing a session and Install omp extension no longer fail with "table has a protected metatable".
 - An omp session running outside Tern is no longer offered parking: the `/wait` menu asks only Close the session or Keep it open, and skips the step when Close isn't possible; a one-line `/wait` doesn't queue a park, and every `park only` reason reads `keep open` for such a session.
 - Usage alerts no longer pile up: a reset the provider reports a few seconds or minutes apart no longer counts as a new period and repeats the alert, alerts from one refresh arrive as one notification so Plasma doesn't refuse them as too many, a failed one is retried after 10 minutes instead of on every refresh, and a pace projection warns only once a quarter of the window has passed.
 - Waits keep going unattended: one broken session no longer stops the others' checks; a prompt that landed without a turn settles after 2 minutes instead of staying "agent on it"; sleep, a reboot or a stale session scan no longer bring false "omp extension not loaded" flags or reopen a running session; a reopen with no Tern window comes to you after 3 minutes and unseen toasts fold into one; job waits whose pane vanished without an event end; a second Tern daemon on the same state stands aside; clock jumps no longer push checks far out; ended waits, PR cache rows, a PR's event memory and startup locks no longer pile up.

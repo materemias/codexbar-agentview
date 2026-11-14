@@ -599,11 +599,16 @@ end
 
 local function python(script: string, args: { string }, done: (ProcessResult, WindowCx?) -> ())
 	-- The host half's interpreter, an argv prefix (a string from older builds).
+	-- The window half gets kv tables protected, which table.clone refuses: copy by iterating.
 	local prefix = tern.kv.get("python")
-	local argv = if type(prefix) == "table" then table.clone(prefix)
-		elseif type(prefix) == "string" then { prefix }
-		elseif WINDOWS then { "python" }
-		else { "python3" }
+	local argv: { string } = {}
+	if type(prefix) == "table" then
+		for i, a in prefix do
+			argv[i] = a
+		end
+	else
+		table.insert(argv, if type(prefix) == "string" then prefix elseif WINDOWS then "python" else "python3")
+	end
 	table.insert(argv, SCRIPTS .. "/" .. script)
 	for _, a in args do
 		table.insert(argv, a)
