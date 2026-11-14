@@ -19,6 +19,9 @@ from unittest import mock
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "contents/scripts/install_integration.py"
 sys.path.insert(0, str(SCRIPT_PATH.parent))
 
+# What the Linux desktop alone has: Plasma's env files, systemd-user, mimeapps.list.
+LINUX_DESKTOP = "Plasma integration (env files, mimeapps.list) exists only on Linux"
+
 
 class IntegrationPlatformTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -103,6 +106,7 @@ class IntegrationPlatformTests(unittest.TestCase):
         self.assertEqual(self.snapshot(), before)
         self.commands.assert_not_called()
 
+    @unittest.skipIf(sys.platform == "win32", LINUX_DESKTOP)
     def test_linux_install_and_uninstall_keep_plasma_paths(self) -> None:
         self.seed_artifacts()
         state = self.home / "state"
@@ -137,6 +141,11 @@ class IntegrationPlatformTests(unittest.TestCase):
         self.assertIn(["systemctl", "--user", "set-environment", "QML_XHR_ALLOW_FILE_READ=1"], commands)
         self.assertIn(["systemctl", "--user", "unset-environment", "QML_XHR_ALLOW_FILE_READ"], commands)
 
+    def assert_ours(self, entry: Path) -> None:
+        """Our current entry: a symlink, a loader file on Windows."""
+        self.assertTrue(self.installer._omp_extension_current(entry), entry)
+        self.assertEqual(entry.is_symlink(), sys.platform != "win32")
+
     def run_main(self, *arguments: str) -> tuple[int, str]:
         output = io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
@@ -161,14 +170,14 @@ class IntegrationPlatformTests(unittest.TestCase):
         agent_dir = self.home / "elsewhere"
         with mock.patch.dict(os.environ, {"OMP_AGENT_DIR": str(agent_dir)}):
             self.assertEqual(self.run_main("--omp-extension")[0], 0)
-        self.assertTrue((agent_dir / "extensions/codexbar-waitingfor.ts").is_symlink())
-        self.assertFalse(self.omp_link.is_symlink())
+        self.assert_ours(agent_dir / "extensions/codexbar-waitingfor.ts")
+        self.assertFalse(self.omp_link.exists())
 
     def test_omp_extension_prefers_omps_own_agent_dir(self) -> None:
         ours, omps = self.home / "ours", self.home / "omps"
         with mock.patch.dict(os.environ, {"OMP_AGENT_DIR": str(ours), "PI_CODING_AGENT_DIR": str(omps)}):
             self.assertEqual(self.run_main("--omp-extension")[0], 0)
-        self.assertTrue((omps / "extensions/codexbar-waitingfor.ts").is_symlink())
+        self.assert_ours(omps / "extensions/codexbar-waitingfor.ts")
         self.assertFalse((ours / "extensions/codexbar-waitingfor.ts").exists())
 
     def test_omp_extension_replaces_a_moved_checkouts_dangling_link(self) -> None:
@@ -176,7 +185,7 @@ class IntegrationPlatformTests(unittest.TestCase):
         self.omp_link.symlink_to("/gone/repo/omp-extension/waitingfor.ts")
         self.assertIn("broken link", self.run_main("--status")[1])
         self.assertEqual(self.run_main("--omp-extension")[0], 0)
-        self.assertEqual(self.omp_link.resolve(), self.installer.OMP_EXTENSION_SOURCE)
+        self.assert_ours(self.omp_link)
 
     def test_omp_extension_leaves_what_is_not_ours(self) -> None:
         self.omp_link.parent.mkdir(parents=True)
@@ -194,6 +203,15 @@ class IntegrationPlatformTests(unittest.TestCase):
             self.assertEqual(after, before)
             self.omp_link.unlink()
 
+    def test_omp_extension_without_its_source_fails(self) -> None:
+        missing = self.home / "package/omp-extension/waitingfor.ts"
+        with mock.patch.object(self.installer, "OMP_EXTENSION_SOURCE", missing):
+            code, output = self.run_main("--omp-extension")
+        self.assertEqual(code, 1)
+        self.assertIn("not in this copy", output)
+        self.assertFalse(self.omp_link.exists())
+
+    @unittest.skipIf(sys.platform == "win32", LINUX_DESKTOP)
     def test_omp_extension_without_its_source_fails_alone(self) -> None:
         missing = self.home / "package/omp-extension/waitingfor.ts"
         state = self.home / "state"
@@ -204,13 +222,13 @@ class IntegrationPlatformTests(unittest.TestCase):
                 mock.patch.object(self.installer.sys, "platform", "linux"), \
                 mock.patch.object(self.installer.state_paths, "migrate", return_value=state), \
                 mock.patch.object(self.installer.os, "chmod"):
-            self.assertEqual(self.run_main("--omp-extension")[0], 1)
             code, output = self.run_main()
             self.assertEqual(code, 0)
             self.assertIn("omp extension: not in this copy", output)
         self.assertFalse(self.omp_link.is_symlink())
         self.assertTrue(self.installer.PLASMA_ENV_FILE.is_file())
 
+    @unittest.skipIf(sys.platform == "win32", LINUX_DESKTOP)
     def test_linux_install_and_uninstall_cover_the_omp_extension(self) -> None:
         state = self.home / "state"
         state.mkdir()
@@ -244,7 +262,59 @@ class IntegrationPlatformTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("can't link", output)
 
+    def test_omp_extension_on_windows_is_a_loader_file(self) -> None:
+        """A Windows symlink needs Developer Mode or an elevated token: there the entry
+        is a file that re-exports the checkout's extension, and only ours counts."""
+        with mock.patch.object(self.installer.sys, "platform", "win32"):
+            self.assertEqual(self.run_main("--omp-extension")[0], 0)
+            self.assertFalse(self.omp_link.is_symlink())
+            self.assertEqual(self.omp_link.read_text(encoding="utf-8"),
+                             self.installer._omp_loader(self.installer.OMP_EXTENSION_SOURCE))
+            self.assertIn(json.dumps(self.installer.OMP_EXTENSION_SOURCE.as_uri()), self.omp_link.read_text(encoding="utf-8"))
+            self.assertEqual(list(self.omp_link.parent.iterdir()), [self.omp_link])
+            self.assertIn("already current", self.run_main("--omp-extension")[1])
+            self.assertIn("omp extension:               yes", self.run_main("--status")[1])
+            # A moved checkout's loader is still ours: broken, then replaced.
+            self.omp_link.write_text(self.installer._omp_loader(self.home / "gone/repo/omp-extension/waitingfor.ts"), encoding="utf-8")
+            self.assertIn("broken link", self.run_main("--status")[1])
+            self.assertEqual(self.run_main("--omp-extension")[0], 0)
+            self.assertTrue(self.installer._omp_extension_current(self.omp_link))
+            # One edited by hand, or loading another file, isn't.
+            for text in (
+                self.installer._omp_loader(self.installer.OMP_EXTENSION_SOURCE) + "export const mine = 1;\n",
+                self.installer._omp_loader(self.home / "foreign.ts"),
+            ):
+                self.omp_link.write_text(text, encoding="utf-8")
+                self.assertIn("isn't ours", self.run_main("--omp-extension")[1])
+                self.assertIn("not ours", self.run_main("--status")[1])
+                self.assertIn("isn't ours", self.run_main("--omp-extension", "--uninstall")[1])
+                self.assertEqual(self.omp_link.read_text(encoding="utf-8"), text)
+            self.omp_link.write_text(self.installer._omp_loader(self.installer.OMP_EXTENSION_SOURCE), encoding="utf-8")
+            self.assertEqual(self.run_main("--omp-extension", "--uninstall")[0], 0)
+            self.assertFalse(self.omp_link.exists())
+            self.assertIn("omp extension:               no", self.run_main("--status")[1])
+        self.commands.assert_not_called()
 
+    @unittest.skipUnless(shutil.which("bun"), "needs bun, the runtime omp loads extensions in")
+    def test_the_loader_file_exports_the_extension(self) -> None:
+        with mock.patch.object(self.installer.sys, "platform", "win32"):
+            self.assertEqual(self.run_main("--omp-extension")[0], 0)
+        driver = self.home / "driver.mjs"
+        driver.write_text(
+            "const loaded = await import(process.env.LOADER);\n"
+            "console.log(JSON.stringify([typeof loaded.default, typeof loaded.parseWait]));\n"
+        )
+        # setUp mocks subprocess.run; Popen is the real one.
+        with subprocess.Popen(
+            ["bun", "run", str(driver)], cwd=self.home, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env={**os.environ, "LOADER": str(self.omp_link)},
+        ) as done:
+            stdout, stderr = done.communicate(timeout=60)
+        self.assertEqual(done.returncode, 0, stderr)
+        self.assertEqual(json.loads(stdout.strip().splitlines()[-1]), ["function", "function"])
+
+
+@unittest.skipIf(sys.platform == "win32", LINUX_DESKTOP)
 class MimeappsReplacementTests(unittest.TestCase):
     setUp = IntegrationPlatformTests.setUp
 
@@ -305,6 +375,7 @@ def _isolated_environment(home: Path) -> dict[str, str]:
     }
 
 
+@unittest.skipIf(sys.platform == "win32", LINUX_DESKTOP)
 class MimeappsEncodingTests(unittest.TestCase):
     def assert_utf8_associations_survive_ascii_locale(self, operation: str) -> None:
         with tempfile.TemporaryDirectory() as directory:

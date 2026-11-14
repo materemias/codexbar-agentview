@@ -24,6 +24,7 @@ local KIND = "codexbar-agentview.dashboard"
 local SETTINGS_KIND = "codexbar-agentview.settings"
 local CANVAS_KIND = "tern.canvas"
 local SCRIPTS = tern.plugin.dir .. "/../contents/scripts"
+local WINDOWS = tern.runtime.os == "windows"
 -- The leader lease runs on os.clock(), Luau's seconds on the system's monotonic
 -- clock (not CPU time), as do the waits here: every VM on the machine, the host
 -- half's included, reads the same one, and the wall clock can't move it. Both
@@ -512,6 +513,45 @@ local function shellQuote(text: string): string
 	return "'" .. string.gsub(text, "'", "'\\''") .. "'"
 end
 
+-- An absolute path (a drive or UNC path on Windows), as a pane's folder must be.
+local function absolute(path: string?): boolean
+	if not path then
+		return false
+	end
+	if WINDOWS then
+		return string.match(path, "^%a:[\\/]") ~= nil or string.match(path, "^[\\/][\\/]") ~= nil
+	end
+	return string.sub(path, 1, 1) == "/"
+end
+
+local BASE64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+-- `text` as PowerShell's -EncodedCommand takes it: base64 of its UTF-16LE.
+local function encodedCommand(text: string): string
+	local bytes = {}
+	local function unit(u: number)
+		table.insert(bytes, bit32.band(u, 0xFF))
+		table.insert(bytes, bit32.rshift(u, 8))
+	end
+	for _, code in utf8.codes(text) do
+		if code >= 0x10000 then
+			unit(0xD800 + bit32.rshift(code - 0x10000, 10))
+			unit(0xDC00 + bit32.band(code - 0x10000, 0x3FF))
+		else
+			unit(code)
+		end
+	end
+	local out = {}
+	for i = 1, #bytes, 3 do
+		local n = bytes[i] * 65536 + (bytes[i + 1] or 0) * 256 + (bytes[i + 2] or 0)
+		for k = 0, 3 do
+			local six = bit32.band(bit32.rshift(n, 18 - 6 * k), 0x3F)
+			table.insert(out, if i + k - 1 <= #bytes then string.sub(BASE64, six + 1, six + 1) else "=")
+		end
+	end
+	return table.concat(out)
+end
+
 -- Resume commands this machine started lately, by when (`waitingLaunches` in
 -- `tern.kv`, which every window here shares). One started again before
 -- agents.json lists it would be a second writer of its session file: Resume
@@ -535,8 +575,17 @@ local function launchTab(cx: WindowCx, command: string, cwd: string?, reveal: Re
 	if launches[command] then
 		return nil, true
 	end
-	local shell = shellQuote(tern.getenv("SHELL") or "/bin/sh")
-	local pane = cx.layout:new_tab({ cwd = cwd, command = shell .. " -ic " .. shellQuote(command .. "; exec " .. shell .. " -i") }, reveal)
+	-- Windows: Tern runs the line in the shell from Settings (PowerShell, cmd, Git
+	-- Bash…), so PowerShell gets the resume line, in its syntax, encoded where no
+	-- shell can misquote it; with the profile that sets PATH, staying as `-NoExit`.
+	local line
+	if WINDOWS then
+		line = "powershell -NoExit -EncodedCommand " .. encodedCommand(command)
+	else
+		local shell = shellQuote(tern.getenv("SHELL") or "/bin/sh")
+		line = shell .. " -ic " .. shellQuote(command .. "; exec " .. shell .. " -i")
+	end
+	local pane = cx.layout:new_tab({ cwd = cwd, command = line }, reveal)
 	if pane then
 		launches[command] = now
 		tern.kv.set("waitingLaunches", launches)
@@ -549,7 +598,13 @@ local function trim(text: string): string
 end
 
 local function python(script: string, args: { string }, done: (ProcessResult, WindowCx?) -> ())
-	local argv = { tern.kv.get("python") or "python3", SCRIPTS .. "/" .. script }
+	-- The host half's interpreter, an argv prefix (a string from older builds).
+	local prefix = tern.kv.get("python")
+	local argv = if type(prefix) == "table" then table.clone(prefix)
+		elseif type(prefix) == "string" then { prefix }
+		elseif WINDOWS then { "python" }
+		else { "python3" }
+	table.insert(argv, SCRIPTS .. "/" .. script)
 	for _, a in args do
 		table.insert(argv, a)
 	end
@@ -1840,7 +1895,7 @@ end
 
 -- The last steps: my sentence, whether to park, then `add` and the park.
 local function finishSetAside(cx: WindowCx, t: SetAside, kind: string, args: { string })
-	local cwd = if t.cwd and string.sub(t.cwd, 1, 1) == "/" then t.cwd else nil
+	local cwd = if absolute(t.cwd) then t.cwd else nil
 	if kind == "command" and not cwd then
 		waitingFailed("set aside", "the pane's folder is unknown", cx)
 		return
@@ -1882,7 +1937,7 @@ end
 
 -- The pane's repository as owner/repo; nil and the reason when `gh` can't tell.
 local function paneRepo(t: SetAside, timeoutMs: number, done: (string?, string?, WindowCx?) -> ())
-	if not t.cwd or string.sub(t.cwd, 1, 1) ~= "/" then -- `gh` would answer for the plugin's own folder
+	if not absolute(t.cwd) then -- `gh` would answer for the plugin's own folder
 		done(nil, "the pane's folder is unknown", nil)
 		return
 	end

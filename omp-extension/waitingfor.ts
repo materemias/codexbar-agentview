@@ -16,8 +16,18 @@ const SCRIPTS = path.join(path.dirname(fs.realpathSync(import.meta.path)), "..",
 const CLI = path.join(SCRIPTS, "codexbar_waiting.py");
 /** The set-aside items, shared with Tern's picker. */
 const MENU_FILE = path.join(SCRIPTS, "waiting_menu.json");
+const WINDOWS = process.platform === "win32";
+/** The helpers' interpreter, an argv prefix: on Windows `python3` is the Microsoft Store's stub. */
+const PYTHON = WINDOWS ? (Bun.which("py") ? ["py", "-3"] : ["python"]) : ["python3"];
+/** As state_paths.state_dir(): an absolute XDG_STATE_HOME, else %LOCALAPPDATA% on Windows, else ~/.local/state. */
 const STATE_BASE = process.env.XDG_STATE_HOME ?? "";
-const STATE_DIR = path.join(path.isAbsolute(STATE_BASE) ? STATE_BASE : path.join(os.homedir(), ".local", "state"), "codexbar-agentview");
+const LOCAL_APP_DATA = WINDOWS ? (process.env.LOCALAPPDATA ?? "") : "";
+const STATE_ROOT = path.isAbsolute(STATE_BASE)
+	? STATE_BASE
+	: path.isAbsolute(LOCAL_APP_DATA)
+		? LOCAL_APP_DATA
+		: path.join(os.homedir(), ".local", "state");
+const STATE_DIR = path.join(STATE_ROOT, "codexbar-agentview");
 const VIEW_NAME = "waiting_view.json";
 const VIEW_FILE = path.join(STATE_DIR, VIEW_NAME);
 
@@ -211,7 +221,7 @@ function run(file: string, args: string[], options: { timeout: number; cwd?: str
 
 /** One CLI command: its JSON answer, or an Error with the CLI's own message. */
 async function cli(args: string[]) {
-	const { stdout, stderr, message } = await run("python3", [CLI, ...args], { timeout: CLI_TIMEOUT_MS });
+	const { stdout, stderr, message } = await run(PYTHON[0], [...PYTHON.slice(1), CLI, ...args], { timeout: CLI_TIMEOUT_MS });
 	let answer;
 	try {
 		answer = JSON.parse(stdout);

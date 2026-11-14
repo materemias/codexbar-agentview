@@ -13,8 +13,9 @@ script handles the bits the widget can't:
   * Legacy identity cleanup: removes the codexbar:// handler and
     codexbar-xhr env files earlier versions installed.
   * omp extension: symlinks omp-extension/waitingfor.ts into omp's
-    extensions directory. This part also runs on macOS, on its own, with
-    --omp-extension.
+    extensions directory (on Windows, where a symlink needs extra rights, a
+    one-line loader file that imports it). This part also runs on macOS and
+    Windows, on its own, with --omp-extension.
 
 Usage:
   install_integration.py                  install everything
@@ -28,11 +29,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 import state_paths
@@ -92,9 +96,11 @@ LEGACY_ENV_FILES = (PLASMA_ENV_DIR / "codexbar-xhr.sh", SYSTEMD_ENV_DIR / "codex
 LEGACY_SYSTEMD_FILE = Path.home() / ".config" / "systemd" / "user" / "codexbar-agents.service"
 LEGACY_SYSTEMD_NAME = "codexbar-agents.service"
 
-# Symlinked into omp's extensions directory from a checkout or applet package.
+# Symlinked into omp's extensions directory from a checkout or applet package;
+# on Windows a loader file (OMP_LOADER_MARKER, then re-exports of its file URL).
 OMP_EXTENSION_SOURCE = SCRIPT_DIR.parents[1] / "omp-extension" / "waitingfor.ts"
 OMP_EXTENSION_NAME = "codexbar-waitingfor.ts"
+OMP_LOADER_MARKER = "// codexbar-agentview: loads its omp extension from the checkout (a Windows symlink needs extra rights).\n"
 DEFAULT_OMP_AGENT_DIR = Path.home() / ".omp" / "agent"
 
 
@@ -372,26 +378,65 @@ def _omp_extension_link() -> Path:
     return (Path(agent_dir) if agent_dir else DEFAULT_OMP_AGENT_DIR) / "extensions" / OMP_EXTENSION_NAME
 
 
-def _is_our_omp_link(link: Path) -> bool:
-    """Any checkout's link counts, so a moved repo's dangling one is still ours."""
-    return link.is_symlink() and Path(os.readlink(link)).parts[-2:] == OMP_EXTENSION_SOURCE.parts[-2:]
+def _omp_loader(source: Path) -> str:
+    url = json.dumps(source.as_uri())
+    return f'{OMP_LOADER_MARKER}export * from {url};\nexport {{ default }} from {url};\n'
+
+
+def _omp_extension_target(link: Path) -> Path | None:
+    """Where our link or loader file points, any checkout's (a moved repo's
+    dangling one is still ours); None when the entry isn't ours."""
+    if link.is_symlink():
+        target = link.parent / os.readlink(link)
+    elif link.is_file():
+        try:
+            text = link.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        loader = re.fullmatch(
+            re.escape(OMP_LOADER_MARKER) + r'export \* from ("file:[^"\n]*");\nexport \{ default \} from \1;\n', text,
+        )
+        if loader is None:
+            return None
+        try:
+            url = json.loads(loader[1])
+        except ValueError:
+            return None
+        target = Path(urllib.request.url2pathname(urllib.parse.urlparse(url).path))
+    else:
+        return None
+    return target if target.parts[-2:] == OMP_EXTENSION_SOURCE.parts[-2:] else None
+
+
+def _omp_extension_destination(link: Path) -> Path | None:
+    """The file our link or loader loads, resolved; None when it isn't ours.
+    A symlink resolves through the link: Windows' readlink adds a \\\\?\\ prefix."""
+    target = _omp_extension_target(link)
+    return None if target is None else (link if link.is_symlink() else target).resolve()
+
+
+def _omp_extension_current(link: Path) -> bool:
+    return _omp_extension_destination(link) == OMP_EXTENSION_SOURCE
 
 
 def install_omp_extension() -> str:
     if not OMP_EXTENSION_SOURCE.is_file():
         raise RuntimeError("not in this copy; use a complete checkout or applet package")
     link = _omp_extension_link()
-    if (link.exists() or link.is_symlink()) and not _is_our_omp_link(link):
+    if (link.exists() or link.is_symlink()) and _omp_extension_target(link) is None:
         raise RuntimeError(f"{link} exists and isn't ours; left alone")
-    if link.resolve() == OMP_EXTENSION_SOURCE:
+    if _omp_extension_current(link):
         return "omp extension: already current"
     # The name ends outside .ts, so a starting omp can't discover it half-made.
     temporary = link.with_name(f"{link.name}.{os.getpid()}.tmp")
     try:
         link.parent.mkdir(parents=True, exist_ok=True)
         temporary.unlink(missing_ok=True)
-        temporary.symlink_to(OMP_EXTENSION_SOURCE)
-        os.replace(temporary, link)
+        if sys.platform == "win32":
+            temporary.write_text(_omp_loader(OMP_EXTENSION_SOURCE), encoding="utf-8")
+        else:
+            temporary.symlink_to(OMP_EXTENSION_SOURCE)
+        state_paths.replace(temporary, link)
     except OSError as exc:
         raise RuntimeError(f"can't link {link}: {exc}") from exc
     return f"omp extension: linked {link}"
@@ -401,7 +446,7 @@ def remove_omp_extension() -> str:
     link = _omp_extension_link()
     if not link.exists() and not link.is_symlink():
         return "omp extension: removed nothing"
-    if not _is_our_omp_link(link):
+    if _omp_extension_target(link) is None:
         return f"omp extension: left {link}, it isn't ours"
     try:
         link.unlink()
@@ -412,11 +457,13 @@ def remove_omp_extension() -> str:
 
 def _omp_extension_status() -> str:
     link = _omp_extension_link()
-    if _is_our_omp_link(link):
-        if not link.exists():
+    target = _omp_extension_target(link)
+    if target is not None:
+        if not target.exists():
             return "broken link"
-        current = link.resolve() == OMP_EXTENSION_SOURCE or not OMP_EXTENSION_SOURCE.is_file()
-        return "yes" if current else f"other copy: {link.resolve()}"
+        destination = _omp_extension_destination(link)
+        current = destination == OMP_EXTENSION_SOURCE or not OMP_EXTENSION_SOURCE.is_file()
+        return "yes" if current else f"other copy: {destination}"
     return "not ours" if link.exists() or link.is_symlink() else "no"
 
 
@@ -499,7 +546,7 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--uninstall", action="store_true")
     parser.add_argument("--status", action="store_true")
     parser.add_argument("--omp-extension", action="store_true",
-                        help="install or remove only the omp extension (Linux and macOS)")
+                        help="install or remove only the omp extension (Linux, macOS and Windows)")
     args = parser.parse_args(argv)
     if args.status:
         print(status_all())

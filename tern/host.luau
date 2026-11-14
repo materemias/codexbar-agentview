@@ -3,7 +3,7 @@
 -- Data comes from the KDE applet's helpers next to this folder
 -- (../contents/scripts): codexbar_fetch.py is the provider normalization path
 -- and codexbar_agents.py writes agents.json under $XDG_STATE_HOME/codexbar-agentview
--- (default ~/.local/state/codexbar-agentview). While the applet runs,
+-- (default ~/.local/state/codexbar-agentview, %LOCALAPPDATA%\codexbar-agentview on Windows). While the applet runs,
 -- its data is fresh and reused; the plugin only runs a helper when the data it
 -- would read is older than the applet's own cadence.
 --
@@ -15,12 +15,25 @@
 
 local ui = tern.ui
 
-local HOME = tern.getenv("HOME") or ""
+-- Windows has no HOME of its own (Git Bash's would point elsewhere): the
+-- profile folder is the home the helpers' Path.home() reads.
+local HOME = (if tern.runtime.os == "windows" then tern.getenv("USERPROFILE") else tern.getenv("HOME")) or ""
 local MACOS = tern.runtime.os == "macos"
 
-local function pythonPath(): string
+-- The interpreter's argv prefix.
+local function pythonPath(): { string }
+	if tern.runtime.os == "windows" then
+		-- `python3` is the Microsoft Store's stub there; the py launcher picks the
+		-- newest Python 3 installed, else `python` is the one on PATH.
+		for dir in string.gmatch(tern.getenv("PATH") or "", "[^;]+") do
+			if tern.fs.exists(dir .. "\\py.exe") then
+				return { "py", "-3" }
+			end
+		end
+		return { "python" }
+	end
 	if not MACOS then
-		return "python3"
+		return { "python3" }
 	end
 	-- Honour a shell's Python, but Apple's /usr/bin/python3 can be an older
 	-- developer-tools shim. GUI launches should use Homebrew before that.
@@ -28,22 +41,29 @@ local function pythonPath(): string
 		if dir ~= "/usr/bin" and dir ~= "/usr/bin/" then
 			local p = dir .. "/python3"
 			if tern.fs.exists(p) then
-				return p
+				return { p }
 			end
 		end
 	end
 	for _, p in { "/opt/homebrew/bin/python3", "/usr/local/bin/python3" } do
 		if tern.fs.exists(p) then
-			return p
+			return { p }
 		end
 	end
-	return "python3"
+	return { "python3" }
 end
 
 local PYTHON = pythonPath()
 local SCRIPTS = tern.plugin.dir .. "/../contents/scripts"
+-- As the helpers' state_paths.state_dir(): an absolute XDG_STATE_HOME, else
+-- %LOCALAPPDATA% on Windows, else ~/.local/state.
 local XDG_STATE = tern.getenv("XDG_STATE_HOME") or ""
-local STATE_DIR = (if string.sub(XDG_STATE, 1, 1) == "/" then XDG_STATE else HOME .. "/.local/state") .. "/codexbar-agentview"
+local STATE_DIR = (
+	if tern.runtime.os ~= "windows" and string.sub(XDG_STATE, 1, 1) == "/" then XDG_STATE
+	elseif tern.runtime.os == "windows" and (string.match(XDG_STATE, "^%a:[\\/]") or string.match(XDG_STATE, "^[\\/]")) then XDG_STATE
+	elseif tern.runtime.os == "windows" and string.match(tern.getenv("LOCALAPPDATA") or "", "^%a:[\\/]") then tern.getenv("LOCALAPPDATA") :: string
+	else HOME .. "/.local/state"
+) .. "/codexbar-agentview"
 local AGENTS_FILE = STATE_DIR .. "/agents.json"
 local WAITING_FILE = STATE_DIR .. "/waiting.json"
 local WAITING_VIEW_FILE = STATE_DIR .. "/waiting_view.json"
@@ -53,7 +73,7 @@ local WAITING_CLI = "codexbar_waiting.py"
 local WAITING_TIMEOUT_MS = 600000
 local WAITING_RETRY_S = 60
 
--- The window half runs the helpers too, with the same interpreter.
+-- The window half runs the helpers too, with the same interpreter (argv prefix).
 tern.kv.set("python", PYTHON)
 
 -- One-shot: carry settings over from the plugin's former id `codexbar`.
@@ -166,7 +186,9 @@ local function cliPath(): string
 	if type(configured) == "string" and configured ~= "" then
 		return (string.gsub(configured, "^~", HOME))
 	end
-	for _, p in {
+	-- No codexbar build exists for Windows: its usage comes from Meridian, and
+	-- codexbar_fetch.py says so when this name isn't found.
+	for _, p in if tern.runtime.os == "windows" then {} else {
 		HOME .. "/.local/bin/codexbar",
 		"/usr/bin/codexbar",
 		if MACOS then "/opt/homebrew/bin/codexbar" else "/usr/local/bin/codexbar",
@@ -293,7 +315,7 @@ end
 
 local function cwdLabel(path: any): string
 	local p = str(path)
-	return string.match(p, "([^/]+)/*$") or p
+	return string.match(p, "([^/\\]+)[/\\]*$") or p
 end
 
 local function shortPath(path: any): string
@@ -481,7 +503,8 @@ local function renderAll()
 end
 
 local function python(script: string, args: { string }, timeout: number, done: (ProcessResult) -> ())
-	local argv = { PYTHON, SCRIPTS .. "/" .. script }
+	local argv = table.clone(PYTHON)
+	table.insert(argv, SCRIPTS .. "/" .. script)
 	for _, a in args do
 		table.insert(argv, a)
 	end
@@ -4386,8 +4409,11 @@ local function activateSetting(b: SettingsBlock, row: any)
 	b.focus = row.id
 	b.searching = false
 	if row.kind == "action" then
-		local opener = if MACOS then "/usr/bin/open" else "xdg-open"
-		local ok, err = pcall(tern.process.run, { opener, row.hint }, { timeout_ms = 10000 }, function(res: ProcessResult)
+		-- Windows: explorer.exe exits 1 even when it opened the page.
+		local argv = if MACOS then { "/usr/bin/open", row.hint }
+			elseif tern.runtime.os == "windows" then { "rundll32", "url.dll,FileProtocolHandler", row.hint }
+			else { "xdg-open", row.hint }
+		local ok, err = pcall(tern.process.run, argv, { timeout_ms = 10000 }, function(res: ProcessResult)
 			report(b.cx, "open GitHub", res)
 		end)
 		if not ok then
@@ -4543,8 +4569,8 @@ store.lastPoke = tern.kv.get("waitingPoke")
 -- is the process's pid and start time. A plugin reload keeps them, and so does an
 -- update (the daemon becomes the new build in place, its programs running on); a
 -- daemon restart changes them. Linux reads them in /proc, as the CLI does for the
--- daemon that runs a command; elsewhere `ps` reads them for a shell's parent, this
--- process. Without either, ticks go without `--daemon`.
+-- daemon that runs a command; elsewhere `ps` (PowerShell on Windows) reads them for
+-- a child's parent, this process. Without either, ticks go without `--daemon`.
 -- The timed tick waits for the answer (`daemonKnown`). In a callback of its own:
 -- the main chunk is at Luau's 200-local limit.
 tern.timer(0, function()
@@ -4557,7 +4583,12 @@ tern.timer(0, function()
 	if pid and fields[20] then -- the fields after the name start at the third; the start time is the 22nd
 		store.daemonId, store.daemonKnown = pid .. "-" .. fields[20], true
 	elseif tern.runtime.os ~= "linux" then -- on Linux, only /proc's form: a second one would read as another daemon
-		local started = pcall(tern.process.run, { "/bin/sh", "-c", 'echo "$PPID" $(ps -o lstart= -p "$PPID")' }, { timeout_ms = 10000 }, function(res: ProcessResult)
+		-- Windows' form is `<pid>-<UTC start yyyyMMddTHHmmss.fffffff>`; the CLI checks it
+		-- against the process's start time to tell whether that daemon still runs.
+		local argv = if tern.runtime.os == "windows"
+			then { "powershell", "-NoProfile", "-NonInteractive", "-Command", "$p=(Get-CimInstance Win32_Process -Filter ('ProcessId='+$PID)).ParentProcessId; [string]$p+' '+(Get-Process -Id $p).StartTime.ToUniversalTime().ToString('yyyyMMddTHHmmss.fffffff')" }
+			else { "/bin/sh", "-c", 'echo "$PPID" $(ps -o lstart= -p "$PPID")' }
+		local started = pcall(tern.process.run, argv, { timeout_ms = 10000 }, function(res: ProcessResult)
 			local id = (string.gsub(string.match(res.stdout, "^%s*(.-)%s*$") or "", "%s+", "-"))
 			store.daemonId = if res.status == 0 and string.match(id, "^%d+%-%S") then id else nil
 			store.daemonKnown = true
