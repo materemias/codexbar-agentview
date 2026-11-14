@@ -74,6 +74,10 @@
 - Plasma and Tern share usage refreshes within the configured interval.
 - The installed Plasma package includes the omp extension.
 
+### Docs
+
+- The README leads with the Tern extension; the Plasma widget is the optional extra. A new page, [Set sessions aside](docs/waiting.md), starts with examples and walks through what waits can do: babysitting a PR, waiting for a merge or release, coming back later, waiting on a check, repeating on a schedule, asking the agent to set them up, and where you see them again.
+
 ## 0.3.0 (2026-11-02)
 
 ### Features

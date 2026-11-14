@@ -1,63 +1,48 @@
 # CodexBar AgentView
 
-AI provider usage and your running coding agents, in one place. It comes in two
-interfaces:
+A [Tern](https://stencil.so/tern) extension for working with coding agents. It
+lists every Claude Code, Codex, OpenCode, pi and omp session you have running,
+lets you set a session aside with a sentence about what it waits for, and puts
+your AI provider usage in Tern's widget bar. It runs on Linux, macOS and
+Windows.
 
-- A **KDE Plasma 6 widget** puts usage rings and agent counts in your panel,
-  with a popup for Usage, Agents and History and a global shortcut.
-- A **Tern extension** runs on Linux, macOS and Windows. It puts usage and agent
-  counts in Tern's widget bar and opens the same three tabs as a temporary sidebar.
+A KDE Plasma 6 widget shows the same usage and agents in your panel. It's
+optional: use it beside Tern, or on its own if you work in other terminals.
 
 What you get:
 
-- **No surprise limits.** Every account's usage in one place, with pace
-  ticks and projections that warn you before a limit hits, not after.
-- **Who needs you, at a glance.** Panel dots or Tern's widget bar count
-  working, blocked and idle agents, so a session waiting for input finds you.
+- **Set sessions aside without losing why.** Write one sentence about why you
+  stopped and say what the session waits for: a pull request, a release, a
+  time, a check, a person, or "when I have time". Code watches the wait and
+  sends the session its follow-up prompt when it fires. Ask the agent in plain
+  words and it sets these up for you, repeating ones included.
+  [See how](docs/waiting.md).
+- **Who needs you, at a glance.** Tern's widget bar counts working, blocked
+  and idle agents and the set-aside sessions back on you.
 - **Find any session by typing.** Every Claude Code, Codex, OpenCode, pi
-  and omp session in a terminal or T3 Code, filtered as you type, with a peek
-  at its last messages.
-- **Jump straight to it.** In Plasma, one click switches to the right desktop
-  and raises the session's terminal. In Tern, `Enter` shows its pane.
-- **Never leave the keyboard.** `Super+A` in Plasma or `Ctrl+Alt+A` in Tern
+  and omp session in Tern, another terminal or T3 Code, filtered as you type,
+  with a peek at its last messages.
+- **Jump straight to it.** In Tern, `Enter` shows its pane. In Plasma, one
+  click switches to the right desktop and raises the session's terminal.
+- **Never leave the keyboard.** `Ctrl+Alt+A` in Tern or `Super+A` in Plasma
   opens the agent list. Type to filter, `↑`/`↓` to select, `Space` to peek,
   `Enter` to jump.
 - **Get it all back.** After a reboot or crash, **Restore all** reopens your
-  kitty sessions in their own windows and your Tern sessions as tabs. Closed
+  Tern sessions as tabs and your kitty sessions in their own windows. Closed
   one by mistake? Bring it back from History with one click.
-- **Set sessions aside without losing why.** Park a session with one
-  sentence about what it waits for: a time, a GitHub pull request or release,
-  a check, a job, anything else you name, or "when I have time". Code watches
-  the wait, sends the session its follow-up prompt when it fires, and tells
-  you what happened while you were away.
-
-Use either interface, or both. 
+- **No surprise limits.** Every account's usage in one place, with pace
+  ticks and projections that warn you before a limit hits, not after.
 
 It started as a Linux port of the macOS
 [CodexBar](https://github.com/steipete/CodexBar) menu-bar app and uses its
 `codexbar` CLI for usage data. It is an independent project, not an official
 CodexBar module.
 
-[Plasma widget](#kde-plasma-widget) · [Tern extension](#tern-extension) ·
+[Tern extension](#tern-extension) · [Set sessions aside](#set-sessions-aside) ·
 [Install](#install) · [Shortcuts](#keyboard-shortcuts) ·
-[Features](#features) · [Providers](#supported-providers) ·
-[Agents](#supported-agent-sessions) · [Credentials](#provider-credentials) ·
-[Update](#update)
-
-## KDE Plasma widget
-
-![The Plasma widget: the panel's usage rings and agent dots, the Usage tab, filtering the Agents tab by typing, a peek at a session, jumping to its terminal, Restore all after a reboot and one closed session brought back](docs/kde.gif)
-
-<details>
-<summary>Screenshots</summary>
-
-[![Panel indicators](docs/panel.png)](docs/panel.png)
-
-| Usage | Agents | History |
-| :---: | :---: | :---: |
-| [![Usage tab](docs/plasma-usage.png)](docs/plasma-usage.png) | [![Agents tab](docs/plasma-agents.png)](docs/plasma-agents.png) | [![History tab](docs/plasma-history.png)](docs/plasma-history.png) |
-
-</details>
+[Features](#features) · [Plasma widget](#kde-plasma-widget) ·
+[Providers](#supported-providers) · [Agents](#supported-agent-sessions) ·
+[Credentials](#provider-credentials) · [Update](#update)
 
 ## Tern extension
 
@@ -76,61 +61,61 @@ CodexBar module.
 
 The films and screenshots use made-up accounts and sessions.
 
+## Set sessions aside
+
+For sessions you leave and come back to later. Set one aside with
+`Ctrl+Alt+B`, or a one-line `/wait` in omp:
+
+```text
+/wait gh babysit
+/wait 2d upstream fix should be out by then -- retry the migration
+/wait check the nightly backup finished -- summarise its log
+/wait every 1d for 1w -- run the e2e suite and list the flaky tests
+```
+
+Or ask the agent: "babysit the PR you just opened", "check every Saturday
+whether the restore test still passes". Code watches each wait without
+spending tokens. When one fires, the session gets its prompt, Tern reopens it
+if you closed it, and a card over the pane tells you what happened while you
+were away. The Waiting tab (`Ctrl+Alt+W`) lists every set-aside session by who
+has the next step, and [tern-awui](https://github.com/materemias/tern-awui)
+shows the same list on your phone.
+
+[Set sessions aside](docs/waiting.md) walks through what you can do with it:
+babysit a pull request, wait for a merge or a release, come back in two days,
+wait until a command passes, repeat a check on a schedule, and keep big work
+for when you have time.
+
 ## Requirements
 
-The Plasma widget needs Linux and KDE Plasma 6. The Tern extension and the omp
-extension run on Linux, macOS and Windows. The `codexbar` CLI has no Windows
+The Tern extension and the omp extension run on Linux, macOS and Windows. The
+Plasma widget needs Linux and KDE Plasma 6. The `codexbar` CLI has no Windows
 build, so there usage comes from Meridian only, or you turn it off.
 
-| Requirement | Plasma | Tern | Enables |
+| Requirement | Tern | Plasma | Enables |
 | --- | :---: | :---: | --- |
-| KDE Plasma 6 with KWin | Required | | The widget |
-| [Tern](https://stencil.so/tern) 0.9.18 or later | | Required | The extension |
+| [Tern](https://stencil.so/tern) 0.9.18 or later | Required | | The extension |
 | Python 3.10+ | Required | Required | The shared helpers |
+| [omp](https://github.com/can1357/oh-my-pi) | Optional | Optional | `/wait`, the agent's `waitingfor` tool, the row above the composer and prompt delivery for set-aside sessions |
+| [`gh`](https://cli.github.com), logged in | Optional | Optional | Pull request and release waits |
 | [`codexbar`](https://github.com/steipete/CodexBar) CLI | Optional | Optional | Usage, which you can turn off. Agents, History and Waiting work without it; with Meridian, so do Claude and Codex seats |
 | [Meridian](https://github.com/rynfar/meridian) | Optional | Optional | Claude accounts and ChatGPT seats read from its usage poll |
-| CMake 3.21+, C++17 compiler, Qt 6 QML headers | Required | | Building the widget (Arch: `base-devel cmake qt6-declarative`) |
-| `qdbus6` | Optional | | Click to focus and desktop switching |
-| kitty or Tern | Optional | Optional | Launch and Restore all; with both, Teleport to Tern |
+| kitty | Optional | Optional | Launch and Restore all for kitty sessions; with Tern, Teleport to Tern |
 | kitty remote control | Optional | Optional | Exact focus of kitty windows |
-| `notify-send` | Optional | | Usage and waiting-for-input alerts |
-| [`gh`](https://cli.github.com), logged in | Optional | Optional | Pull request waits |
-| [omp](https://github.com/can1357/oh-my-pi) | Optional | Optional | `/wait`, the row above the composer and prompt delivery for set-aside sessions |
+| KDE Plasma 6 with KWin | | Required | The widget |
+| CMake 3.21+, C++17 compiler, Qt 6 QML headers | | Required | Building the widget (Arch: `base-devel cmake qt6-declarative`) |
+| `qdbus6` | | Optional | Click to focus and desktop switching |
+| `notify-send` | | Optional | Usage and waiting-for-input alerts |
 
 ## Install
 
-### Plasma widget
-
-1. Build and install. The package has a small native QML plugin, so build it
-   on the machine that runs it:
-
-   ```sh
-   git clone https://github.com/materemias/codexbar-agentview
-   cd codexbar-agentview
-   cmake -S . -B build
-   cmake --build build
-   kpackagetool6 -t Plasma/Applet -i build/package
-   ```
-
-2. Right-click the panel → **Enter Edit Mode** → **Add Widgets…**, search for
-   **CodexBar AgentView** and drag it onto the panel.
-3. In the widget's settings, open **Agents** and click **Install**, then run
-   `systemctl --user restart plasma-plasmashell.service` once. Agents and
-   History stay empty until you do.
-4. [Add credentials](#provider-credentials) for providers beyond Claude and
-   Codex.
-
-The `codexbar` path defaults to `/usr/bin/codexbar`, where Arch's
-`codexbar-cli` package puts it. Change it in Settings → Backend.
-
-Updating file associations preserves existing settings, including symlinked
-configuration. A failed write leaves the original configuration intact.
-
 ### Tern extension
 
-From the repository root:
+Clone the repository and link the extension:
 
 ```sh
+git clone https://github.com/materemias/codexbar-agentview
+cd codexbar-agentview
 tern plugin link tern
 ```
 
@@ -168,10 +153,9 @@ On Windows:
 ### omp extension (set-aside sessions)
 
 The extension gives omp the `/wait` command and the `waitingfor` agent tool,
-draws the row above the composer and delivers wait prompts. On Linux the
-Plasma **Install** button links it when omp's agent directory exists;
-anywhere else, run the Tern palette
-command `CodexBar AgentView: Install omp extension` or:
+draws the row above the composer and delivers wait prompts. Run the Tern
+palette command `CodexBar AgentView: Install omp extension`, or from the
+checkout:
 
 ```sh
 python3 contents/scripts/install_integration.py --omp-extension
@@ -185,6 +169,35 @@ writes a one-line loader file there instead. Keep that source in place. omp
 loads extensions at start, so run `/restart` in sessions that were already
 open. `--omp-extension --uninstall` removes the link or loader. What it does:
 [Session lifecycle](docs/session-lifecycle.md).
+
+### Plasma widget (optional)
+
+Skip this unless you want usage and agents in a KDE panel too.
+
+1. Build and install. The package has a small native QML plugin, so build it
+   on the machine that runs it:
+
+   ```sh
+   git clone https://github.com/materemias/codexbar-agentview
+   cd codexbar-agentview
+   cmake -S . -B build
+   cmake --build build
+   kpackagetool6 -t Plasma/Applet -i build/package
+   ```
+
+2. Right-click the panel → **Enter Edit Mode** → **Add Widgets…**, search for
+   **CodexBar AgentView** and drag it onto the panel.
+3. In the widget's settings, open **Agents** and click **Install**, then run
+   `systemctl --user restart plasma-plasmashell.service` once. Agents and
+   History stay empty until you do.
+4. [Add credentials](#provider-credentials) for providers beyond Claude and
+   Codex.
+
+The `codexbar` path defaults to `/usr/bin/codexbar`, where Arch's
+`codexbar-cli` package puts it. Change it in Settings → Backend.
+
+Updating file associations preserves existing settings, including symlinked
+configuration. A failed write leaves the original configuration intact.
 
 ## Keyboard shortcuts
 
@@ -200,7 +213,7 @@ open. `--omp-extension --uninstall` removes the link or loader. What it does:
 | `Enter` | Agents: jump to the session. History: launch it. Waiting: open or resume it | Both |
 | `Shift+Enter` | Agents and Waiting: open the selected session's card | Tern |
 | `Tab` | Hide or show sessions idle for over a day | Both |
-| `Delete` | Dismiss the selected History row; Waiting: mark it done | Tern |
+| `Delete` | Dismiss the selected History row; Waiting: Seen, you've read what's on you | Tern |
 | `F2` | Waiting: edit what the selected session waits for, in your words | Tern |
 | `+` | Waiting: snooze the selected wait by a day | Tern |
 | `R` | Refresh (Usage tab) | Both |
@@ -211,6 +224,55 @@ KDE binds `Ctrl+Alt+A` to Activate Window Demanding Attention. Clear it in
 System Settings → Shortcuts → KWin, or Tern never sees the key.
 
 ## Features
+
+### Waiting (set-aside sessions)
+
+`Ctrl+Alt+B` or `/wait` sets a session aside with your sentence and what it
+waits for. The Waiting tab (`Ctrl+Alt+W`) groups the set-aside sessions by who
+has the next step, and the session card (`Ctrl+Alt+I`) shows one session's
+waits, what happened since and what's next. [Set sessions aside](docs/waiting.md)
+shows what you can do with it. [Session lifecycle](docs/session-lifecycle.md)
+is the full reference: the commands, what each wait watches, the groups,
+Snooze 1d, Seen and Stop, follow-up prompts, and how it works.
+
+### Agents
+
+- **Live sessions,** grouped by project folder, newest first, with model,
+  terminal and time in the current state. Working is a pulsing green dot,
+  blocked on your input a red diamond, idle a grey ring.
+- **Filter by typing.** Title, prompt, folder, provider, model and recent
+  messages. Separate words with spaces: each must match somewhere, in any
+  order, and each match is highlighted. Word starts work too: `fmh` finds
+  "Fix MCP history" and `autor` finds "Auto-Research", but only across
+  neighbouring words.
+- **Peek** at the last eight turns, laid out like a chat, and the agent's
+  latest recap (omp and Claude Code write them).
+- **Focus.** Plasma switches desktop and raises the terminal. Tern shows the
+  pane, a kitty window or a T3 Code thread.
+- **Teleport to Tern.** Moves an idle kitty session into a new Tern tab.
+- **Hide old sessions** idle for over a day with `Tab` or the eye switch
+  (in Tern, the eye at the end of the filter field).
+  Working and blocked sessions always stay.
+- **Desktop badges** and a ring on the session in the window you last focused.
+
+### History
+
+- **Interrupted by restart.** Every session that was running before the last
+  reboot, in desktop order, until it runs again. **Restore all** brings them
+  back one by one: kitty sessions on their saved desktop, Tern sessions as
+  tabs.
+- **Recently closed.** The last 100 sessions that exited since boot, each with
+  **Launch** and a copyable resume command. omp and Claude Code sessions that
+  closed while nothing watched, or before you installed this, come from their
+  prompt history (`~/.omp/agent/history.db`, `~/.claude/history.jsonl`) while
+  their transcript and folder exist and no process runs them; they launch in
+  Tern when it is installed, else kitty. Claude Code deletes transcripts after
+  30 days by default (`cleanupPeriodDays`), so older sessions don't come back.
+  A dismissed session stays gone until you use it again.
+
+Launch and Teleport share a startup guard for each session. A second request
+while it starts asks you to retry; the startup reservation lasts up to
+60 seconds. A session that is already running cannot be resumed again.
 
 ### Usage
 
@@ -258,78 +320,6 @@ System Settings → Shortcuts → KWin, or Tern never sees the key.
   When it's on but the CLI is missing, the usage area says what to install
   and offers to turn tracking off.
 
-### Agents
-
-- **Live sessions,** grouped by project folder, newest first, with model,
-  terminal and time in the current state. Working is a pulsing green dot,
-  blocked on your input a red diamond, idle a grey ring.
-- **Filter by typing.** Title, prompt, folder, provider, model and recent
-  messages. Separate words with spaces: each must match somewhere, in any
-  order, and each match is highlighted. Word starts work too: `fmh` finds
-  "Fix MCP history" and `autor` finds "Auto-Research", but only across
-  neighbouring words.
-- **Peek** at the last eight turns, laid out like a chat, and the agent's
-  latest recap (omp and Claude Code write them).
-- **Focus.** Plasma switches desktop and raises the terminal. Tern shows the
-  pane, a kitty window or a T3 Code thread.
-- **Teleport to Tern.** Moves an idle kitty session into a new Tern tab.
-- **Hide old sessions** idle for over a day with `Tab` or the eye switch
-  (in Tern, the eye at the end of the filter field).
-  Working and blocked sessions always stay.
-- **Desktop badges** and a ring on the session in the window you last focused.
-
-### History
-
-- **Interrupted by restart.** Every session that was running before the last
-  reboot, in desktop order, until it runs again. **Restore all** brings them
-  back one by one: kitty sessions on their saved desktop, Tern sessions as
-  tabs.
-- **Recently closed.** The last 100 sessions that exited since boot, each with
-  **Launch** and a copyable resume command. omp and Claude Code sessions that
-  closed while nothing watched, or before you installed this, come from their
-  prompt history (`~/.omp/agent/history.db`, `~/.claude/history.jsonl`) while
-  their transcript and folder exist and no process runs them; they launch in
-  Tern when it is installed, else kitty. Claude Code deletes transcripts after
-  30 days by default (`cleanupPeriodDays`), so older sessions don't come back.
-  A dismissed session stays gone until you use it again.
-
-Launch and Teleport share a startup guard for each session. A second request
-while it starts asks you to retry; the startup reservation lasts up to
-60 seconds. A session that is already running cannot be resumed again.
-
-### Waiting (set-aside sessions)
-
-For sessions you leave and come back to later. `Ctrl+Alt+B` or `/wait` sets
-one aside with your own sentence and what it waits for: a while or a date, a
-GitHub pull request or release, a check the agent writes for you, anything
-else in your words, or the time you have for it. `/wait every 2h` repeats a
-prompt, for a while or until the agent, a command or a PR says it's done.
-Code watches the wait, sends the session your follow-up prompt when it fires,
-reopening it in Tern if you closed it, and the Waiting tab (`Ctrl+Alt+W`), the
-row above the omp composer and the session card (`Ctrl+Alt+I`) tell you what
-happened since and what's next.
-
-Command checks run in the captured project or Tern pane directory. If that
-directory disappears, the check reports failure rather than running elsewhere.
-Checks saved by older versions without a working directory must be recreated.
-After a follow-up turn ends, the next background tick runs its verification.
-
-[Session lifecycle](docs/session-lifecycle.md) covers the commands, what each
-wait watches, the groups, Snooze 1d, Seen and Stop, follow-up prompts, and how it works.
-
-### Panel (Plasma)
-
-Usage rings per provider and window, coloured by pace, which you can set to
-appear only once a window is projected to run out. Coloured dots count
-working, blocked and idle agents. The popup opens on Agents when one is
-blocked and on History when sessions wait to be restored.
-
-With several Claude or Codex accounts, the tray settings list each account
-with its own windows. A meter picked before the accounts were known (saved as
-`claude:primary`) shows every account's window until you change one account,
-which turns it into one meter per account
-(`claude:<email>:primary`).
-
 ### Widget bar (Tern)
 
 Place any of these through palette › **Edit widgets…**; each hides itself
@@ -361,6 +351,38 @@ keys do not. Settings, also at the right of the dashboard's status bar,
 opens a native tab with search; **Include non-Tern agents** (off by default)
 adds kitty, VS Code and other hosts. Desktop notifications and the panel are
 Plasma-only.
+
+## KDE Plasma widget
+
+The optional panel widget: usage rings and agent dots in the panel, and a
+popup with the Agents, History and Usage tabs. With **Tern integration** on
+(Settings → Agents), its Agents list also marks set-aside sessions.
+
+![The Plasma widget: the panel's usage rings and agent dots, the Usage tab, filtering the Agents tab by typing, a peek at a session, jumping to its terminal, Restore all after a reboot and one closed session brought back](docs/kde.gif)
+
+<details>
+<summary>Screenshots</summary>
+
+[![Panel indicators](docs/panel.png)](docs/panel.png)
+
+| Usage | Agents | History |
+| :---: | :---: | :---: |
+| [![Usage tab](docs/plasma-usage.png)](docs/plasma-usage.png) | [![Agents tab](docs/plasma-agents.png)](docs/plasma-agents.png) | [![History tab](docs/plasma-history.png)](docs/plasma-history.png) |
+
+</details>
+
+### Panel
+
+Usage rings per provider and window, coloured by pace, which you can set to
+appear only once a window is projected to run out. Coloured dots count
+working, blocked and idle agents. The popup opens on Agents when one is
+blocked and on History when sessions wait to be restored.
+
+With several Claude or Codex accounts, the tray settings list each account
+with its own windows. A meter picked before the accounts were known (saved as
+`claude:primary`) shows every account's window until you change one account,
+which turns it into one meter per account
+(`claude:<email>:primary`).
 
 ## Supported providers
 
@@ -470,6 +492,13 @@ warnings are on by default and waiting-for-input alerts off.
 
 ## Update
 
+Tern extension. Close any open dashboard first so it can restore your layout:
+
+```sh
+git pull
+tern plugin reload
+```
+
 Plasma widget. Stop Plasma before replacing the native plugin;
 `systemctl --user stop` waits for plasmashell to exit, `kquitapp6` does not:
 
@@ -484,13 +513,6 @@ systemctl --user start plasma-plasmashell.service
 If an update deleted files, replace the `-u` line with
 `kpackagetool6 -t Plasma/Applet -r io.github.materemias.codexbaragentview`
 followed by `kpackagetool6 -t Plasma/Applet -i build/package`.
-
-Tern extension. Close any open dashboard first so it can restore your layout:
-
-```sh
-git pull
-tern plugin reload
-```
 
 <details>
 <summary>Upgrading from codexbar-kde</summary>
@@ -526,11 +548,16 @@ tern plugin link tern
 
 ## Uninstall
 
-Click Settings → Agents → **Remove** if you installed the integration, then:
+```sh
+tern plugin unlink codexbar-agentview
+python3 contents/scripts/install_integration.py --omp-extension --uninstall
+```
+
+For the Plasma widget, click Settings → Agents → **Remove** if you installed
+the integration, then:
 
 ```sh
 kpackagetool6 -t Plasma/Applet -r io.github.materemias.codexbaragentview
-tern plugin unlink codexbar-agentview
 ```
 
 ## Development
