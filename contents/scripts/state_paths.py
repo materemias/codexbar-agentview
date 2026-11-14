@@ -1,17 +1,94 @@
-"""CodexBar AgentView's own state directory.
+"""CodexBar AgentView's own state directory, and the file lock its helpers share.
 
 The upstream CodexBar CLI owns ~/.codexbar/ (config.json and its caches). Our
-files live in $XDG_STATE_HOME/codexbar-agentview, or
-~/.local/state/codexbar-agentview when XDG_STATE_HOME is unset or relative.
-`migrate()` moves the files earlier versions kept in ~/.codexbar/ the first
-time a helper runs after the rename.
+files live in $XDG_STATE_HOME/codexbar-agentview, or by default
+~/.local/state/codexbar-agentview (%LOCALAPPDATA%\\codexbar-agentview on
+Windows) when XDG_STATE_HOME is unset or relative. `migrate()` moves the files
+earlier versions kept in ~/.codexbar/ the first time a helper runs after the
+rename.
 """
 from __future__ import annotations
 
-import fcntl
+import errno
 import os
 import shutil
+import time
 from pathlib import Path
+from typing import IO
+
+WINDOWS = os.name == "nt"
+
+if WINDOWS:
+    import msvcrt
+
+    # Windows byte-range locks are mandatory: a lock on a file's data would
+    # block other processes reading it. Lock one byte far past any data.
+    _LOCK_OFFSET = 1 << 30
+
+    def lock(file: int | IO, blocking: bool = True) -> bool:
+        """An exclusive lock on `file` (a file object or descriptor) until it
+        is closed; False when `blocking` is off and another process holds it."""
+        fd = file if isinstance(file, int) else file.fileno()
+        position = os.lseek(fd, 0, os.SEEK_CUR)
+        try:
+            while True:
+                os.lseek(fd, _LOCK_OFFSET, os.SEEK_SET)
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                    return True
+                except OSError as error:
+                    # Only a conflict means another holder; anything else is a failure.
+                    if error.errno not in (errno.EACCES, errno.EDEADLOCK):
+                        raise
+                    if not blocking:
+                        return False
+                    time.sleep(0.05)
+        finally:
+            os.lseek(fd, position, os.SEEK_SET)
+
+    def make_private(fd: int) -> None:
+        """Owner-only permissions; on Windows the profile's ACL already is."""
+else:
+    import fcntl
+
+    def lock(file: int | IO, blocking: bool = True) -> bool:
+        """An exclusive lock on `file` (a file object or descriptor) until it
+        is closed; False when `blocking` is off and another process holds it."""
+        try:
+            fcntl.flock(file, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        except BlockingIOError:
+            return False
+        return True
+
+    def make_private(fd: int) -> None:
+        """Owner-only permissions (0600)."""
+        os.fchmod(fd, 0o600)
+
+
+def replace(source: str | os.PathLike, target: str | os.PathLike) -> None:
+    """`os.replace`. Windows refuses to replace a file another process has
+    open without delete sharing, as Python's readers do for a moment: retry
+    for about a second before giving up."""
+    for _ in range(20 if WINDOWS else 0):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            time.sleep(0.05)
+    os.replace(source, target)
+
+
+def fsync_dir(path: str | os.PathLike) -> None:
+    """Make a rename in folder `path` durable. Windows can't open a folder to
+    fsync it, and NTFS journals the rename itself: a no-op there."""
+    if WINDOWS:
+        return
+    directory = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
 
 # Earlier versions kept these in ~/.codexbar/ next to the CLI's own files.
 _LEGACY_MOVED = (
@@ -24,7 +101,12 @@ _LEGACY_DELETED = ("agents.lock", "usage_cache.json.lock", "tern_fetch_claim")
 def state_dir() -> Path:
     """The state directory for the current environment; never touches disk."""
     base = os.environ.get("XDG_STATE_HOME", "")
-    root = Path(base) if os.path.isabs(base) else Path.home() / ".local" / "state"
+    if os.path.isabs(base):
+        root = Path(base)
+    elif WINDOWS and os.path.isabs(os.environ.get("LOCALAPPDATA", "")):
+        root = Path(os.environ["LOCALAPPDATA"])
+    else:
+        root = Path.home() / ".local" / "state"
     return root / "codexbar-agentview"
 
 
@@ -40,9 +122,9 @@ def migrate() -> Path:
     target = state_dir()
     target.parent.mkdir(parents=True, exist_ok=True)
     lock_path = target.parent / "codexbar-agentview.migrate.lock"
-    with open(lock_path, "a") as lock:
-        os.fchmod(lock.fileno(), 0o600)
-        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    with open(lock_path, "a") as held:
+        make_private(held.fileno())
+        lock(held)
         target.mkdir(mode=0o700, exist_ok=True)
         os.chmod(target, 0o700)
         legacy = Path.home() / ".codexbar"

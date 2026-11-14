@@ -14,6 +14,11 @@ process keeps open:
   * opencode: SQLite at ~/.local/share/opencode/opencode.db (session.title)
   * pi/omp  : the JSONL the pid keeps open via /proc/<pid>/fd
 
+Windows lists no process's open files, and lists only agents in Tern panes
+(TERN_PANE in their environment). There codex and omp sessions come from
+argv, the session folders by cwd and start time, and for omp the pane its
+CodexBar extension reports in waiting.json; what stays unknown is untracked.
+
 Usage:
   codexbar_agents.py                  one-shot, prints aggregate to stdout
   codexbar_agents.py --once           one-shot, writes agents.json
@@ -26,7 +31,7 @@ import argparse
 import hashlib
 import contextlib
 import math
-import fcntl
+import functools
 import heapq
 import json
 import os
@@ -38,7 +43,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, NamedTuple
 from urllib.parse import unquote
@@ -57,6 +62,8 @@ KNOWN_HOSTS = {
     "yakuake", "tilix", "ptyhost", "t3code", "tern",
     # macOS
     "Terminal", "iTerm2", "wezterm-gui",
+    # Windows: a tab opened from a Tern pane inherits its TERN_PANE.
+    "windowsterminal",
 }
 
 _MAC_APP_HOSTS = {
@@ -221,19 +228,62 @@ def _linux_boot_id() -> str:
 _read_boot_id = _linux_boot_id
 
 
-if sys.platform == "darwin":
-    import proc_darwin
+# Agents an npm or bun install runs as a script, by the package folder in the
+# script's path. Linux lists them by the name their process title sets;
+# Windows keeps no process titles. npm's Codex and OpenCode start a native
+# binary, which is listed under its own name instead.
+_SCRIPT_RUNTIMES = {"node", "bun"}
+_SCRIPT_AGENTS = (
+    ("/node_modules/@anthropic-ai/claude-code/", "claude"),
+    ("/node_modules/@mariozechner/pi-coding-agent/", "pi"),
+    ("/node_modules/@oh-my-pi/pi-coding-agent/", "omp"),
+)
 
-    _ppid_of = proc_darwin.ppid_of
-    _cwd_of = proc_darwin.cwd_of
-    _comm_of = proc_darwin.comm_of
-    _argv_of = proc_darwin.argv_of
-    _environ_value = proc_darwin.environ_value
-    _start_ms = proc_darwin.start_ms
-    _all_pids = proc_darwin.all_pids
-    _exe_of = proc_darwin.exe_of
-    _open_paths = proc_darwin.open_paths
-    _read_boot_id = proc_darwin.boot_id
+
+def _script_argv(argv: list[str]) -> list[str]:
+    """`argv` as the agent a runtime runs would show it, else unchanged:
+    `node …/@anthropic-ai/claude-code/cli.js --resume x` is
+    `claude --resume x`, the shape a native install's argv has."""
+    runtime = re.split(r"[\\/]", argv[0])[-1].lower().removesuffix(".exe") if argv else ""
+    if runtime not in _SCRIPT_RUNTIMES:
+        return argv
+    # Runtime options, and bun's `run`, come before the script.
+    i = next((i for i, a in enumerate(argv[1:], 1) if not a.startswith("-") and a != "run"), 0)
+    script = argv[i].replace("\\", "/").lower() if i else ""
+    for package, name in _SCRIPT_AGENTS:
+        if package in script:
+            return [name, *argv[i + 1:]]
+    return argv
+
+
+if sys.platform in ("darwin", "win32"):
+    if sys.platform == "darwin":
+        import proc_darwin as _native
+    else:
+        import proc_windows as _native
+
+    _ppid_of = _native.ppid_of
+    _cwd_of = _native.cwd_of
+    _comm_of = _native.comm_of
+    _argv_of = _native.argv_of
+    _environ_value = _native.environ_value
+    _start_ms = _native.start_ms
+    _all_pids = _native.all_pids
+    _exe_of = _native.exe_of
+    _open_paths = _native.open_paths
+    _read_boot_id = _native.boot_id
+
+if sys.platform == "win32":
+    def _argv_of(pid: int) -> list[str]:
+        return _script_argv(_native.argv_of(pid))
+
+    def _comm_of(pid: int) -> str:
+        comm = _native.comm_of(pid)
+        if comm in _SCRIPT_RUNTIMES:
+            name = (_argv_of(pid) or [""])[0]
+            if any(name == agent for _package, agent in _SCRIPT_AGENTS):
+                return name
+        return comm
 
 
 def _host_identity(comm: str, executable: str) -> str:
@@ -822,6 +872,9 @@ def _transcript_info(path: str, provider: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _claude_slug(cwd: str) -> str:
+    if state_paths.WINDOWS:
+        # Claude Code's projects folder for C:\Users\me\app is C--Users-me-app.
+        return re.sub(r"[^A-Za-z0-9]", "-", cwd)
     return "".join(("-" if c in "/_." else c) for c in cwd) if cwd else ""
 
 
@@ -869,8 +922,10 @@ def _claude_info(pid: int) -> dict:
 
 def _codex_home(pid: int) -> str:
     """The CODEX_HOME a codex process runs with; ~/.codex by default."""
-    home = _environ_value(pid, "CODEX_HOME").rstrip("/")
-    return home if home.startswith("/") else str(Path.home() / ".codex")
+    home = _environ_value(pid, "CODEX_HOME").rstrip("/" + os.sep)
+    if state_paths.WINDOWS and home.endswith(":"):
+        home += "\\"  # a drive root such as C:\
+    return home if os.path.isabs(home) else str(Path.home() / ".codex")
 
 
 def _codex_thread_name(home: str, session_id: str) -> str:
@@ -920,6 +975,26 @@ def _codex_rollout_named(home: str, session_id: str) -> str:
     return ""
 
 
+def _codex_recent_rollouts(home: str, since_ms: int) -> set[str]:
+    """Rollouts written since `since_ms`. Windows lists no process's open
+    files, so this stands in for the threads a process holds. Codex files
+    them under their creation day; a day's margin covers the time zone."""
+    found: set[str] = set()
+    if not since_ms:
+        return found
+    day = date.fromtimestamp(since_ms / 1000) - timedelta(days=1)
+    last = date.today() + timedelta(days=1)
+    while day <= last:
+        for path in Path(home, "sessions", day.strftime("%Y/%m/%d")).glob("rollout-*.jsonl"):
+            try:
+                if path.stat().st_mtime * 1000 >= since_ms - 2000:
+                    found.add(str(path))
+            except OSError:
+                continue
+        day += timedelta(days=1)
+    return found
+
+
 def _codex_fresh_rollout(pid: int, home: str, pool: set[str]) -> tuple[str, bool]:
     """The loaded thread a fresh TUI started, and whether that is certain.
 
@@ -934,7 +1009,7 @@ def _codex_fresh_rollout(pid: int, home: str, pool: set[str]) -> tuple[str, bool
     mine = []
     for path in pool:
         _sid, thread_cwd, created = _codex_meta(path)
-        if thread_cwd == cwd and created >= start - 2000:
+        if os.path.normcase(thread_cwd) == os.path.normcase(cwd) and created >= start - 2000:
             mine.append(path)
     if not mine:
         return "", False
@@ -945,7 +1020,8 @@ def _codex_fresh_rollout(pid: int, home: str, pool: set[str]) -> tuple[str, bool
     peers = [
         other for other in _pgrep("codex")
         if other != pid and _codex_home(other) == home
-        and _cwd_of(other) == cwd and not _resume_arg(other, "resume")
+        and os.path.normcase(_cwd_of(other)) == os.path.normcase(cwd)
+        and not _resume_arg(other, "resume")
         and not _under_t3(other)
     ]
     return newest, len(mine) == 1 and not peers
@@ -974,6 +1050,11 @@ def _codex_info(pid: int) -> dict:
                 (p for p in pool if p.endswith(f"-{resume_id}.jsonl")), ""
             ) or _codex_rollout_named(home, resume_id)
             exact = bool(rollout)
+        elif state_paths.WINDOWS:
+            # Files written since the TUI started only suggest its thread: a
+            # `codex exec` or another TUI that has exited may have written one.
+            pool |= _codex_recent_rollouts(home, _start_ms(pid))
+            rollout, _exact = _codex_fresh_rollout(pid, home, pool)
         else:
             rollout, exact = _codex_fresh_rollout(pid, home, pool)
     if not rollout:
@@ -1081,23 +1162,53 @@ def _opencode_info(pid: int) -> dict:
 
 def _pi_slug(cwd: str) -> str:
     """pi/omp slug for the session dir: `--` + cwd-without-leading-slash with
-    `/` → `-` + `--`. e.g. /home/user/projects/myapp → --home-user-projects-myapp--"""
+    `/` → `-` + `--`. e.g. /home/user/projects/myapp → --home-user-projects-myapp--
+    On Windows `\\` and `:` become `-` too: C:\\work → --C--work--."""
     if not cwd:
         return ""
+    if state_paths.WINDOWS:
+        return "--" + re.sub(r"[/\\:]", "-", cwd.lstrip("/\\")) + "--"
     return "--" + cwd.lstrip("/").replace("/", "-") + "--"
 
 
-def _find_pi_rollout(cwd: str) -> str:
+def _omp_dir_name(cwd: str) -> str:
+    """omp's session folder name for `cwd`, as its session-paths.ts names it:
+    relative to the temp folder (`-tmp-<rel>`), which on Windows sits inside
+    home, else to home (`-<rel>`), else the absolute `_pi_slug`."""
+    for root, prefix in ((tempfile.gettempdir(), "-tmp"), (str(Path.home()), "-")):
+        try:
+            relative = os.path.relpath(cwd, root)
+        except ValueError:  # another drive
+            continue
+        if relative == ".":
+            relative = ""
+        if relative.startswith("..") or os.path.isabs(relative):
+            continue
+        encoded = re.sub(r"[/\\:]", "-", relative)
+        if not encoded:
+            return prefix
+        return prefix + encoded if prefix.endswith("-") else f"{prefix}-{encoded}"
+    return _pi_slug(cwd)
+
+
+def _find_pi_rollout(cwd: str, tool: str = "omp") -> str:
     """Find the latest-modified JSONL under ~/.{pi,omp}/agent/sessions/<slug>/
     matching the agent's cwd. pi doesn't keep the file open as an fd so the
-    /proc/<pid>/fd trick we use for codex/omp doesn't apply."""
+    /proc/<pid>/fd trick we use for codex/omp doesn't apply, nor does it on
+    Windows. There each tool looks only in its own folders, omp's own name
+    first: a fresh omp would otherwise take a pi session in that folder."""
     slug = _pi_slug(cwd)
     if not slug:
         return ""
-    for base in (
-        Path.home() / ".pi" / "agent" / "sessions" / slug,
-        Path.home() / ".omp" / "agent" / "sessions" / slug,
-    ):
+    sessions = Path.home() / ".pi" / "agent" / "sessions"
+    omp_sessions = Path.home() / ".omp" / "agent" / "sessions"
+    if not state_paths.WINDOWS:
+        folders = [sessions / slug, omp_sessions / slug]
+    elif tool == "pi":
+        folders = [sessions / slug]
+    else:
+        folders = [omp_sessions / _omp_dir_name(cwd), omp_sessions / slug]
+    for base in folders:
         if not base.is_dir():
             continue
         try:
@@ -1165,6 +1276,14 @@ def _session_dir_of(pid: int) -> str:
     return ""
 
 
+def _safe_session_id(value: str) -> bool:
+    """A session id fit for argv and file names: letters, digits and `-`."""
+    return (
+        bool(value) and len(value) <= 256 and not value.startswith("-")
+        and all(c.isalnum() or c == "-" for c in value)
+    )
+
+
 def _flag_value(argv: list[str], flag: str) -> str:
     """The session id given to `flag` in `argv`, or "". omp's --resume
     also takes a transcript path, `<time>_<id>.jsonl`."""
@@ -1176,11 +1295,7 @@ def _flag_value(argv: list[str], flag: str) -> str:
             value = a.split("=", 1)[1]
     if value.endswith(".jsonl"):
         value = Path(value).stem.rpartition("_")[2]
-    ok = (
-        value and len(value) <= 256 and not value.startswith("-")
-        and all(c.isalnum() or c == "-" for c in value)
-    )
-    return value if ok else ""
+    return value if _safe_session_id(value) else ""
 
 
 def _resume_arg(pid: int, flag: str) -> str:
@@ -1224,6 +1339,55 @@ def _rollout_named(session_id: str) -> str:
                  Path.home() / ".omp" / "agent" / "sessions"):
         for path in base.glob(f"*/*_{session_id}.jsonl"):
             return str(path)
+    return ""
+
+
+def _tern_pane(pid: int) -> int | None:
+    """The Tern pane `pid` runs in, from the TERN_PANE it inherited."""
+    pane = _environ_value(pid, "TERN_PANE")
+    return int(pane) if re.fullmatch(r"[0-9]{1,18}", pane) else None
+
+
+@functools.lru_cache(maxsize=1)
+def _reported_panes(path: str, _mtime_ns: int, _size: int) -> tuple[tuple[str, int, int], ...]:
+    """(session, pane, report ms) for each pane waiting.json maps, parsed
+    once per version of the file."""
+    try:
+        state = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        return ()
+    panes = state.get("extension_panes") if isinstance(state, dict) else None
+    heard = state.get("extensions") if isinstance(state, dict) else None
+    if not isinstance(panes, dict) or not isinstance(heard, dict):
+        return ()
+    return tuple(
+        (session, pane, _ts_ms(heard.get(session)))
+        for session, pane in panes.items()
+        if type(pane) is int and _safe_session_id(session)
+    )
+
+
+def _extension_session(pid: int) -> str:
+    """The session omp's CodexBar extension last reported from the Tern pane
+    `pid` runs in, or "". Used on Windows, where no open file names it.
+
+    The extension reports the session omp writes and its TERN_PANE to
+    codexbar_waiting.py, which keeps the newest session per pane in
+    waiting.json. A report from before the process started came from an
+    earlier one in that pane; reports carry whole seconds."""
+    if not state_paths.WINDOWS:
+        return ""
+    pane, start = _tern_pane(pid), _start_ms(pid)
+    if pane is None or not start:
+        return ""
+    path = state_paths.state_dir() / "waiting.json"
+    try:
+        stat = path.stat()
+    except OSError:
+        return ""
+    for session, reported, heard in _reported_panes(str(path), stat.st_mtime_ns, stat.st_size):
+        if reported == pane and heard >= start - start % 1000:
+            return session
     return ""
 
 
@@ -1431,10 +1595,15 @@ def _created_by(pid: int, rollout: str) -> bool:
     return not any(fresh(p) for p in siblings)
 
 
-def _pi_info(pid: int, resume_flags: tuple[str, ...] = ("--resume", "--restore")) -> dict:
+def _pi_info(
+    pid: int, resume_flags: tuple[str, ...] = ("--resume", "--restore"), reported: str = "",
+    tool: str = "omp",
+) -> dict:
     """pi and omp share the same JSONL layout. omp keeps the active file open
     on an fd (so we can see it via /proc/<pid>/fd); pi closes it between
-    writes, so we fall back to the cwd → slug lookup.
+    writes, so we fall back to the cwd → slug lookup. `reported` is the
+    session omp's extension says the process runs, which stands in for the
+    open file where none can be seen.
 
     State follows the last transcript message: a terminal assistant response
     is idle; a user message, tool request or tool result is still working."""
@@ -1443,6 +1612,8 @@ def _pi_info(pid: int, resume_flags: tuple[str, ...] = ("--resume", "--restore")
         "state": "working", "identityExact": False, "model": "",
     }
     rollout, direct = _open_jsonl_under(pid, "/.pi/agent/sessions/", "/.omp/agent/sessions/")
+    if not direct and reported and (named := _rollout_named(reported)):
+        rollout, direct = named, True
     resume_id = next(
         (value for value in (_resume_arg(pid, flag) for flag in resume_flags) if value),
         "",
@@ -1464,7 +1635,7 @@ def _pi_info(pid: int, resume_flags: tuple[str, ...] = ("--resume", "--restore")
         # cwd slug, and the slug lookup would hand it a *different* session's
         # rollout — duplicating that session's row under a wrong pid.
         sess_dir = _session_dir_of(pid)
-        rollout = _newest_jsonl(Path(sess_dir)) if sess_dir else _find_pi_rollout(_cwd_of(pid))
+        rollout = _newest_jsonl(Path(sess_dir)) if sess_dir else _find_pi_rollout(_cwd_of(pid), tool)
         direct = False
     if not rollout:
         info["cwd"] = _cwd_of(pid)
@@ -1519,8 +1690,8 @@ _INFO_FN = {
     "claude": _claude_info,
     "codex": _codex_info,
     "opencode": _opencode_info,
-    "pi": lambda pid: _pi_info(pid, ("--session", "--session-id")),
-    "omp": _pi_info,
+    "pi": lambda pid: _pi_info(pid, ("--session", "--session-id"), tool="pi"),
+    "omp": lambda pid: _pi_info(pid, reported=_extension_session(pid)),
 }
 
 _RESUME_PREFIXES = {
@@ -1540,7 +1711,7 @@ def _codex_home_value(value: object) -> str:
     """A saved non-default CODEX_HOME, or "" when absent or unusable."""
     if (
         not isinstance(value, str)
-        or not value.startswith("/")
+        or not os.path.isabs(value)
         or len(value) > 4096
         or any(c in value for c in "\0\n")
     ):
@@ -1568,13 +1739,53 @@ def _resume_command(
         or "\0" in cwd
     ):
         return ""
-    command = shlex.join([*_RESUME_PREFIXES[provider], session_id])
+    program, flag = _RESUME_PREFIXES[provider]
     home = _codex_home_value(codex_home) if provider == "codex" else ""
+    if state_paths.WINDOWS:
+        # Windows PowerShell 5.1 has neither `&&` nor POSIX quoting; a folder
+        # that is gone stops the line as `&&` would.
+        command = f"{program} {flag} {_powershell_quote(session_id)}"
+        if home:
+            # Scoped to the one command, as the POSIX prefix is.
+            command = (
+                f"& {{ $saved = $env:CODEX_HOME; $env:CODEX_HOME = {_powershell_quote(home)}; "
+                f"try {{ {command} }} finally {{ $env:CODEX_HOME = $saved }} }}"
+            )
+        parts = [command]
+        if cwd:
+            parts.insert(0, f"Set-Location -LiteralPath {_powershell_quote(cwd)} -ErrorAction Stop")
+        return "; ".join(parts)
+    command = shlex.join([program, flag, session_id])
     if home:
         command = f"CODEX_HOME={shlex.quote(home)} {command}"
     if cwd:
         command = f"{shlex.join(['cd', '--', cwd])} && {command}"
     return command
+
+
+def _powershell_quote(text: str) -> str:
+    """A PowerShell single-quoted literal. PowerShell also ends one at the
+    typographic single quotes, so each of those is doubled too."""
+    return "'" + re.sub("(['\u2018\u2019\u201a\u201b])", r"\1\1", text) + "'"
+
+
+def _session_host(pid: int, windows: dict[str, list[int]]) -> tuple[str, list[int]]:
+    """`_parent_walk_for_host`, but on Windows only Tern panes count: a
+    process with TERN_PANE runs in one even when its parents can't be read
+    or have exited, which Windows does not reparent."""
+    if not state_paths.WINDOWS:
+        return _parent_walk_for_host(pid, windows)
+    if _tern_pane(pid) is None:
+        return "", []
+    host, chain = _parent_walk_for_host(pid, windows)
+    if host == "tern":
+        return host, chain
+    if host:
+        # A terminal started from a Tern pane inherited its TERN_PANE.
+        return "", []
+    if "tern" not in windows:
+        windows["tern"] = tern_window_pids()
+    return "tern", [pid, *(p for p in windows["tern"] if p != pid)]
 
 
 def _build_records() -> list[dict]:
@@ -1585,7 +1796,7 @@ def _build_records() -> list[dict]:
     windows: dict[str, list[int]] = {}
     for provider, info_fn in _INFO_FN.items():
         for pid in _pgrep(provider):
-            host, ancestors = _parent_walk_for_host(pid, windows)
+            host, ancestors = _session_host(pid, windows)
             # No terminal ancestor means there is no focusable session row.
             if not host:
                 continue
@@ -1725,11 +1936,11 @@ def _mark_tern_panes(records: list[dict]) -> None:
     for record in records:
         if record["host"] != "tern":
             continue
-        pane = _environ_value(record["pid"], "TERN_PANE")
-        if pane.isdigit():
-            record["ternPane"] = int(pane)
+        pane = _tern_pane(record["pid"])
+        if pane is not None:
+            record["ternPane"] = pane
             socket = _environ_value(record["pid"], "TERN_PANE_SOCKET")
-            by_socket.setdefault(socket, []).append((record, int(pane)))
+            by_socket.setdefault(socket, []).append((record, pane))
     for socket, rows in by_socket.items():
         visible, home = _tern_panes(socket)
         for record, pane in rows:
@@ -2422,9 +2633,11 @@ def _backfill_history(payload: dict, history_limit: int = HISTORY_LIMIT) -> None
             state["skip"][provider][sid] = bound
             continue
         if provider not in live:
-            live[provider] = source.live()
+            held, unresolved = source.live()
+            # Windows spells one folder in several cases and slashes.
+            live[provider] = held, {os.path.normcase(c) for c in unresolved}
         # Still running: it reaches history when a sweep sees it end.
-        if sid in live[provider][0] or cwd in live[provider][1]:
+        if sid in live[provider][0] or os.path.normcase(cwd) in live[provider][1]:
             continue
         state_name = info["state"]
         added[(provider, sid)] = (_history_record({
@@ -2479,20 +2692,14 @@ def _write_file(path: Path, text: str, durable: bool) -> None:
             delete=False,
         ) as output:
             temporary = Path(output.name)
-            os.fchmod(output.fileno(), 0o600)
+            state_paths.make_private(output.fileno())
             output.write(text)
             if durable:
                 output.flush()
                 os.fsync(output.fileno())
-        os.replace(temporary, path)
+        state_paths.replace(temporary, path)
         if durable:
-            directory_fd = os.open(
-                path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
-            )
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            state_paths.fsync_dir(path.parent)
     finally:
         if temporary is not None:
             try:
@@ -2539,13 +2746,13 @@ def _aggregate_lock(aggregate_path: Path, lock_path: Path | None = None):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        os.fchmod(lock_fd, 0o600)
+        state_paths.make_private(lock_fd)
         lock_file = os.fdopen(lock_fd, "a+")
     except Exception:
         os.close(lock_fd)
         raise
     with lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        state_paths.lock(lock_file)
         yield
 
 

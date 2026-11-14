@@ -8,8 +8,11 @@ from __future__ import annotations
 import ctypes
 import ctypes.util
 import struct
+import sys
 
-_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+# Only macOS has libproc. Elsewhere the module still imports, so its tests
+# can run against a mocked library; Windows has no C library to find.
+_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True) if sys.platform == "darwin" else None
 
 _PROC_PIDLISTFDS = 1
 _PROC_PIDTBSDINFO = 3

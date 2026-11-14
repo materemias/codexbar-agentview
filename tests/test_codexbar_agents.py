@@ -9,6 +9,7 @@ import shlex
 import sqlite3
 import stat
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from datetime import datetime, timezone
@@ -104,6 +105,24 @@ def history(provider: str, session_id: str, **changes: object) -> dict:
     }
     record.update(changes)
     return record
+
+
+def resume_line(cwd: str, program: str, flag: str, session_id: str, home: str = "") -> str:
+    """The resume command this platform's shell runs, spelled out apart from
+    _resume_command: PowerShell on Windows, a POSIX shell elsewhere."""
+    if agents.state_paths.WINDOWS:
+        def literal(text: str) -> str:
+            return "'" + text.replace("'", "''") + "'"
+        command = f"{program} {flag} {literal(session_id)}"
+        if home:
+            command = (f"& {{ $saved = $env:CODEX_HOME; $env:CODEX_HOME = {literal(home)}; "
+                       f"try {{ {command} }} finally {{ $env:CODEX_HOME = $saved }} }}")
+        location = [f"Set-Location -LiteralPath {literal(cwd)} -ErrorAction Stop"] if cwd else []
+        return "; ".join(location + [command])
+    command = shlex.join([program, flag, session_id])
+    if home:
+        command = f"CODEX_HOME={shlex.quote(home)} {command}"
+    return f"{shlex.join(['cd', '--', cwd])} && {command}" if cwd else command
 
 
 class ModelExtractionTests(unittest.TestCase):
@@ -261,8 +280,7 @@ class SnapshotMergeTests(unittest.TestCase):
         self.assertEqual(restored["lastSeenAt"], 100)
         self.assertEqual(
             restored["resumeCommand"],
-            f"{shlex.join(['cd', '--', old['cwd']])} && "
-            f"{shlex.join(['omp', '--resume', old['sessionId']])}",
+            resume_line(old["cwd"], "omp", "--resume", old["sessionId"]),
         )
         self.assertTrue(
             {"pid", "ancestorPids", "identityExact"}
@@ -584,11 +602,31 @@ class ResumeAndIdentityTests(unittest.TestCase):
             "omp": ["omp", "--resume", session_id],
         }
         for provider, command in expected_args.items():
-            with self.subTest(provider=provider):
+            with self.subTest(provider=provider), mock.patch.object(agents.state_paths, "WINDOWS", False):
                 self.assertEqual(
                     agents._resume_command(provider, session_id, cwd, True),
                     f"{shlex.join(['cd', '--', cwd])} && {shlex.join(command)}",
                 )
+
+    def test_windows_resume_commands_are_powershell_lines(self) -> None:
+        with mock.patch.object(agents.state_paths, "WINDOWS", True):
+            self.assertEqual(
+                agents._resume_command("omp", "session id's", "C:\\work\\O'Brien project", True),
+                "Set-Location -LiteralPath 'C:\\work\\O''Brien project' -ErrorAction Stop; "
+                "omp --resume 'session id''s'",
+            )
+            # The home lasts for the one command, and PowerShell ends a
+            # literal at typographic quotes too. The home must be absolute
+            # where the test runs: C:\h’s or /h’s.
+            home = os.path.join(os.path.abspath(os.sep), "h\u2019s")
+            self.assertEqual(
+                agents._resume_command("codex", "s", "C:\\w", True, home),
+                "Set-Location -LiteralPath 'C:\\w' -ErrorAction Stop; & { $saved = $env:CODEX_HOME; "
+                f"$env:CODEX_HOME = '{home.replace(chr(0x2019), chr(0x2019) * 2)}'; "
+                "try { codex resume 's' } finally { $env:CODEX_HOME = $saved } }",
+            )
+            self.assertEqual(agents._resume_command("claude", "s", "", True), "claude --resume 's'")
+            self.assertEqual(agents._resume_command("claude", "s", "C:\\w", False), "")
 
     def test_heuristic_untracked_and_invalid_identities_have_no_command(self) -> None:
         self.assertEqual(agents._resume_command("omp", "heuristic", "/tmp", False), "")
@@ -623,7 +661,7 @@ class ResumeAndIdentityTests(unittest.TestCase):
             "omp",
             "safe-session",
             cwd="/work/project",
-            resumeCommand="cd -- /work/project && omp --resume safe-session",
+            resumeCommand=resume_line("/work/project", "omp", "--resume", "safe-session"),
         )
         tampered = history(
             "omp",
@@ -647,10 +685,11 @@ class ResumeAndIdentityTests(unittest.TestCase):
         }
         self.assertEqual(
             commands["safe-session"],
-            "cd -- /work/project && omp --resume safe-session",
+            resume_line("/work/project", "omp", "--resume", "safe-session"),
         )
         self.assertEqual(commands["tampered-session"], "")
 
+    @unittest.skipIf(sys.platform == "win32", "Windows lists no process's open files")
     def test_open_rollout_reports_direct_and_sidecar_provenance(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             base = Path(directory) / ".omp" / "agent" / "sessions" / "project"
@@ -927,6 +966,8 @@ class ResumeAndIdentityTests(unittest.TestCase):
 
             def run(pid: int) -> dict:
                 with (
+                    # The app server's held threads; Windows lists no open files.
+                    mock.patch.object(agents.state_paths, "WINDOWS", False),
                     mock.patch.object(agents, "_environ_value", return_value=str(home)),
                     mock.patch.object(agents, "_pgrep", side_effect=lambda _n, services=False:
                                       [77] if services else list(tuis)),
@@ -955,13 +996,13 @@ class ResumeAndIdentityTests(unittest.TestCase):
         self.assertEqual((crowded["sessionId"], crowded["identityExact"]), ("mine", False))
         self.assertEqual(
             agents._resume_command("codex", "mine", "/work", True, fresh["codexHome"]),
-            f"cd -- /work && CODEX_HOME={shlex.quote(str(home))} codex resume mine",
+            resume_line("/work", "codex", "resume", "mine", str(home)),
         )
         # The home only ever prefixes Codex, and a malformed one is dropped.
         self.assertEqual(agents._resume_command("claude", "s", "", True, str(home)),
-                         "claude --resume s")
+                         resume_line("", "claude", "--resume", "s"))
         self.assertEqual(agents._resume_command("codex", "s", "", True, "rel/home"),
-                         "codex resume s")
+                         resume_line("", "codex", "resume", "s"))
 
     def test_pi_launched_by_a_shell_is_named_by_that_command(self) -> None:
         script = "cd -- /work && pi --session 01a0-launched; exec /usr/bin/zsh -i"
@@ -1020,19 +1061,37 @@ class ResumeAndIdentityTests(unittest.TestCase):
         with (
             mock.patch.object(agents, "_INFO_FN", {"claude": info, "omp": info}),
             mock.patch.object(agents, "_pgrep", return_value=[42]),
-            mock.patch.object(
-                agents, "_parent_walk_for_host", return_value=("kitty", [42, 10])
-            ),
+            mock.patch.object(agents, "_session_host", return_value=("kitty", [42, 10])),
         ):
             records = agents._build_records()
         self.assertEqual(len(records), 1)
         self.assertEqual(records[0]["provider"], "claude")
         self.assertEqual(records[0]["sessionId"], "shared")
         self.assertTrue(records[0]["identityExact"])
-        self.assertEqual(records[0]["resumeCommand"], "cd -- /work && claude --resume shared")
+        self.assertEqual(records[0]["resumeCommand"], resume_line("/work", "claude", "--resume", "shared"))
 
 
 class HeadlessArgvTests(unittest.TestCase):
+    def test_script_hosted_agents_get_a_native_installs_argv(self) -> None:
+        claude = r"C:\Users\me\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js"
+        self.assertEqual(
+            agents._script_argv([r"C:\Program Files\nodejs\node.EXE", "--no-warnings", claude, "--resume", "abc"]),
+            ["claude", "--resume", "abc"],
+        )
+        # So a daemon or a one-shot reads as one, as a native install's does.
+        self.assertTrue(agents._is_service_argv(agents._script_argv(["node", claude, "daemon", "run"])))
+        self.assertTrue(agents._is_service_argv(agents._script_argv(["node", claude, "-p", "hi"])))
+        omp = "/home/me/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/src/cli.ts"
+        self.assertEqual(agents._script_argv(["bun", "run", omp, "--resume", "x"]), ["omp", "--resume", "x"])
+        pi = "/usr/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js"
+        self.assertEqual(agents._script_argv(["/usr/bin/node", pi]), ["pi"])
+        # npm's Codex wrapper starts the native binary, which is listed instead.
+        codex = r"C:\npm\node_modules\@openai\codex\bin\codex.js"
+        for argv in (["node", codex], ["node", "server.js"], ["node", "--inspect"], ["node"], [],
+                     ["claude", claude], ["python", claude]):
+            with self.subTest(argv=argv):
+                self.assertEqual(agents._script_argv(argv), argv)
+
     def test_omp_rpc_and_json_modes_are_headless(self) -> None:
         # Tern's built-in Carly assistant drives omp over RPC.
         self.assertTrue(agents._is_service_argv(["omp", "--mode", "rpc", "--no-tools"]))
@@ -1142,6 +1201,8 @@ class TernExecutableTests(unittest.TestCase):
                 mock.patch.object(agents.os, "access", return_value=True),
             ):
                 self.assertEqual(agents.tern_bin(), "")
+            if sys.platform == "win32":
+                return  # Windows has no execute permission bit to refuse.
             # Exercise real mode/type boundaries without touching installed apps.
             candidate = locations[0]
             candidate.parent.mkdir(parents=True)
@@ -1437,8 +1498,7 @@ class HistoryBackfillTests(unittest.TestCase):
         self.assertEqual(found["windowTitle"], "title found")
         self.assertEqual(found["lastPrompt"], "prompt found")
         self.assertEqual(
-            found["resumeCommand"],
-            f"{shlex.join(['cd', '--', str(work)])} && omp --resume found",
+            found["resumeCommand"], resume_line(str(work), "omp", "--resume", "found"),
         )
         # Our own row wins over omp's prompt history.
         self.assertEqual(rows["known"]["lastSeenAt"], 1)
@@ -1562,8 +1622,7 @@ class HistoryBackfillTests(unittest.TestCase):
             self.assertEqual(newest["cwd"], str(work))
             self.assertEqual(newest["lastState"], "idle")
             self.assertEqual(
-                newest["resumeCommand"],
-                f"{shlex.join(['cd', '--', str(work)])} && claude --resume newest",
+                newest["resumeCommand"], resume_line(str(work), "claude", "--resume", "newest"),
             )
             agents._dismiss_history({("claude", "newest")}, saved)
             again = self._sweep(home, saved, [], claude=claude)["history"]
@@ -1736,7 +1795,8 @@ class PersistenceTests(unittest.TestCase):
             payload = agents._merge_snapshot([], {}, "boot-a", 123)
             agents._write_aggregate(payload, path)
 
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+            if sys.platform != "win32":  # Windows has no mode bits; the profile ACL is private.
+                self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
             self.assertEqual(json.loads(path.read_text()), payload)
             self.assertEqual(list(path.parent.glob(f".{path.name}.*.tmp")), [])
 
@@ -1888,7 +1948,7 @@ class IncrementalParserTests(unittest.TestCase):
             sessions.mkdir(parents=True)
             for pid, record in enumerate([[], 3, {"sessionId": []}, {"sessionId": "healthy", "cwd": "/work", "status": "idle"}], 1):
                 (sessions / f"{pid}.json").write_text(json.dumps(record))
-            with mock.patch.object(agents.Path, "home", return_value=home), mock.patch.object(agents, "_INFO_FN", {"claude": agents._claude_info}), mock.patch.object(agents, "_pgrep", return_value=[1, 2, 3, 4]), mock.patch.object(agents, "_parent_walk_for_host", return_value=("kitty", [])), mock.patch.object(agents, "_cwd_of", return_value="/work"):
+            with mock.patch.object(agents.Path, "home", return_value=home), mock.patch.object(agents, "_INFO_FN", {"claude": agents._claude_info}), mock.patch.object(agents, "_pgrep", return_value=[1, 2, 3, 4]), mock.patch.object(agents, "_session_host", return_value=("kitty", [])), mock.patch.object(agents, "_cwd_of", return_value="/work"):
                 rows = agents._build_records()
             self.assertEqual(len(rows), 4)
             self.assertEqual(rows[-1]["sessionId"], "healthy")
@@ -1899,7 +1959,7 @@ class IncrementalParserTests(unittest.TestCase):
             if pid == 1:
                 raise ValueError("bad session")
             return {"sessionId": [] if pid == 2 else "healthy", "state": "idle", "identityExact": True}
-        with mock.patch.object(agents, "_INFO_FN", {"claude": info}), mock.patch.object(agents, "_pgrep", return_value=[1, 2, 3]), mock.patch.object(agents, "_parent_walk_for_host", return_value=("kitty", [])), mock.patch.object(agents, "_cwd_of", return_value="/work"):
+        with mock.patch.object(agents, "_INFO_FN", {"claude": info}), mock.patch.object(agents, "_pgrep", return_value=[1, 2, 3]), mock.patch.object(agents, "_session_host", return_value=("kitty", [])), mock.patch.object(agents, "_cwd_of", return_value="/work"):
             rows = agents._build_records()
         snapshot = agents._merge_snapshot(rows, {}, "boot", 1)
         self.assertEqual(snapshot["counts"], {"working": 0, "blocked": 0, "idle": 1, "untracked": 2, "total": 3})
@@ -1933,7 +1993,8 @@ a.main(["--once"])
 print(count[0])
 """
             # main() migrates the state directory, so keep it inside the sandbox.
-            environment = dict(os.environ, HOME=directory, XDG_STATE_HOME=str(Path(directory) / "state"))
+            # Windows finds home through USERPROFILE.
+            environment = dict(os.environ, HOME=directory, USERPROFILE=directory, XDG_STATE_HOME=str(Path(directory) / "state"))
             def run(mode="scan"):
                 return int(subprocess.check_output([sys.executable, "-c", script, str(SCRIPT_PATH), str(path), str(aggregate), mode], text=True, env=environment))
             self.assertEqual(run(), 3)
@@ -1942,7 +2003,8 @@ print(count[0])
                 output.write(self.encode([{"type": "ai-title", "aiTitle": "new title"}]))
             self.assertEqual(run(), 1)
             cache_path = aggregate.with_suffix(".parsers.json")
-            self.assertEqual(stat.S_IMODE(cache_path.stat().st_mode), 0o600)
+            if sys.platform != "win32":
+                self.assertEqual(stat.S_IMODE(cache_path.stat().st_mode), 0o600)
             self.assertEqual(run("prune"), 0)
             self.assertEqual(json.loads(cache_path.read_text())["entries"], {})
 
@@ -1956,6 +2018,207 @@ print(count[0])
             with mock.patch.object(agents, "_build_records", return_value=[]), mock.patch.object(agents, "_read_boot_id", return_value="boot"), mock.patch.object(agents.time, "time", side_effect=[1.0, 4.0]):
                 payload, _ = agents._locked_sweep(aggregate_path=path)
             self.assertEqual(payload["updatedAt"], 4000)
+
+
+class WindowsSessionTests(unittest.TestCase):
+    """Windows branches, driven through state_paths.WINDOWS on any platform."""
+
+    def windows(self):
+        return mock.patch.object(agents.state_paths, "WINDOWS", True)
+
+    def test_only_tern_panes_are_listed_on_windows(self) -> None:
+        def run(pane: str, walk: tuple[str, list[int]], windows: bool = True):
+            with (
+                mock.patch.object(agents.state_paths, "WINDOWS", windows),
+                mock.patch.object(agents, "_environ_value", side_effect=lambda pid, name: pane if name == "TERN_PANE" else ""),
+                mock.patch.object(agents, "_parent_walk_for_host", return_value=walk),
+                mock.patch.object(agents, "tern_window_pids", return_value=[42, 90]),
+            ):
+                return agents._session_host(42, {})
+        self.assertEqual(run("", ("tern", [42, 7])), ("", []))
+        self.assertEqual(run("x", ("tern", [42, 7])), ("", []))
+        self.assertEqual(run("\u00b2", ("tern", [42, 7])), ("", []))
+        self.assertEqual(run("7", ("tern", [42, 7, 90])), ("tern", [42, 7, 90]))
+        # A parent that exited or can't be read still leaves a Tern pane.
+        self.assertEqual(run("7", ("", [])), ("tern", [42, 90]))
+        # Another terminal started from the pane inherited its TERN_PANE.
+        self.assertEqual(run("7", ("code", [42, 5])), ("", []))
+        self.assertEqual(run("", ("kitty", [42, 5]), windows=False), ("kitty", [42, 5]))
+
+    def test_extension_reports_name_the_session_of_a_pane(self) -> None:
+        start = 1_790_000_000_000
+        stamp = lambda ms: datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat(timespec="seconds")
+        with tempfile.TemporaryDirectory() as directory:
+            waiting = Path(directory) / "codexbar-agentview" / "waiting.json"
+            waiting.parent.mkdir()
+
+            def run(state: object, pane: str = "7", windows: bool = True) -> str:
+                waiting.write_text(json.dumps(state))
+                # A rewrite within one clock tick may keep size and mtime.
+                agents._reported_panes.cache_clear()
+                with (
+                    mock.patch.object(agents.state_paths, "WINDOWS", windows),
+                    mock.patch.dict(agents.os.environ, {"XDG_STATE_HOME": directory}),
+                    mock.patch.object(agents, "_environ_value", side_effect=lambda pid, name: pane if name == "TERN_PANE" else ""),
+                    mock.patch.object(agents, "_start_ms", return_value=start),
+                ):
+                    return agents._extension_session(42)
+
+            state = {
+                "extension_panes": {"old-session": 8, "mine": 7, "flag": True},
+                "extensions": {"old-session": stamp(start + 5000), "mine": stamp(start + 400), "flag": stamp(start + 5000)},
+            }
+            # Reports carry whole seconds, so one in the start's second counts.
+            self.assertEqual(run(state), "mine")
+            self.assertEqual(run(state, pane="8"), "old-session")
+            self.assertEqual(run(state, pane="9"), "")
+            self.assertEqual(run(state, pane=""), "")
+            self.assertEqual(run(state, pane="\u00b2"), "")
+            # `True` is no pane number, and only Windows asks.
+            self.assertEqual(run(state, pane="1"), "")
+            self.assertEqual(run(state, windows=False), "")
+            # A report from before the process started was an earlier process's,
+            # even one from the second before.
+            state["extensions"]["mine"] = stamp(start - 60_000)
+            self.assertEqual(run(state), "")
+            state["extensions"]["mine"] = stamp(start - 1000)
+            self.assertEqual(run(state), "")
+            state["extensions"]["mine"] = stamp(start + 5000)
+            state["extension_panes"] = {"../escape*": 7}
+            state["extensions"]["../escape*"] = stamp(start + 5000)
+            self.assertEqual(run(state), "")
+            for broken in ([], {"extension_panes": []}, {"extension_panes": {"mine": 7}}):
+                self.assertEqual(run(broken), "")
+            waiting.write_text("{")
+            agents._reported_panes.cache_clear()
+            with self.windows(), mock.patch.dict(agents.os.environ, {"XDG_STATE_HOME": directory}), \
+                    mock.patch.object(agents, "_environ_value", return_value="7"), \
+                    mock.patch.object(agents, "_start_ms", return_value=start):
+                self.assertEqual(agents._extension_session(42), "")
+
+    def test_omp_rollout_reported_by_the_extension_is_exact(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            # The folder name every platform's slug gives /work.
+            folder = home / ".omp" / "agent" / "sessions" / "--work--"
+            folder.mkdir(parents=True)
+            for sid in ("01a0-reported", "01a0-newer"):
+                (folder / f"2026-09-28T10-00-00-000Z_{sid}.jsonl").write_text(
+                    json.dumps({"type": "session", "id": sid, "cwd": "/work"}) + "\n")
+            os.utime(folder / "2026-09-28T10-00-00-000Z_01a0-reported.jsonl", (1, 1))
+            with (
+                mock.patch.object(agents.Path, "home", return_value=home),
+                mock.patch.object(agents, "_open_jsonl_under", return_value=("", False)),
+                mock.patch.object(agents, "_argv_of", return_value=["omp"]),
+                mock.patch.object(agents, "_cwd_of", return_value="/work"),
+                mock.patch.object(agents, "_comm_of", return_value="omp"),
+                mock.patch.object(agents, "_ppid_of", return_value=1),
+                mock.patch.object(agents, "_start_ms", return_value=1_790_000_000_000),
+            ):
+                with mock.patch.object(agents, "_extension_session", return_value="01a0-reported"):
+                    info = agents._INFO_FN["omp"](42)
+                with mock.patch.object(agents, "_extension_session", return_value="01a0-gone"):
+                    unknown = agents._INFO_FN["omp"](42)
+        # The report wins over the folder's newest rollout and proves it.
+        self.assertEqual((info["sessionId"], info["identityExact"]), ("01a0-reported", True))
+        # A report naming no file leaves the folder guess unproven.
+        self.assertEqual((unknown["sessionId"], unknown["identityExact"]), ("01a0-newer", False))
+
+    def test_windows_session_folder_names(self) -> None:
+        with self.windows():
+            self.assertEqual(agents._claude_slug("C:\\Users\\me\\source\\repos\\app"), "C--Users-me-source-repos-app")
+            self.assertEqual(agents._claude_slug("C:\\My Work\\a.b"), "C--My-Work-a-b")
+            self.assertEqual(agents._pi_slug("C:\\Users\\me\\app"), "--C--Users-me-app--")
+        self.assertEqual(agents._pi_slug("/home/me/app"), "--home-me-app--")
+        home, temp = os.path.join(os.sep, "home", "me"), os.path.join(os.sep, "home", "me", "tmp")
+        with mock.patch.object(agents.Path, "home", return_value=Path(home)), \
+                mock.patch.object(agents.tempfile, "gettempdir", return_value=temp), self.windows():
+            self.assertEqual(agents._omp_dir_name(os.path.join(home, "Sync", "code")), "-Sync-code")
+            self.assertEqual(agents._omp_dir_name(home), "-")
+            self.assertEqual(agents._omp_dir_name(temp), "-tmp")
+            self.assertEqual(agents._omp_dir_name(os.path.join(temp, "x")), "-tmp-x")
+            # omp counts a `..`-prefixed name as outside home, like `..` itself.
+            outside = os.path.join(home, "..x")
+            self.assertEqual(agents._omp_dir_name(outside), agents._pi_slug(outside))
+            self.assertEqual(agents._omp_dir_name(os.path.join(os.sep, "data", "m")), agents._pi_slug(os.path.join(os.sep, "data", "m")))
+
+    def test_fresh_omp_session_is_found_under_omps_own_folder_name(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            folder = home / ".omp" / "agent" / "sessions" / "-work"
+            folder.mkdir(parents=True)
+            rollout = folder / "2026-09-28T10-00-00-000Z_01a0.jsonl"
+            rollout.write_text("{}\n")
+            with mock.patch.object(agents.Path, "home", return_value=home), \
+                    mock.patch.object(agents.tempfile, "gettempdir", return_value=str(home / "elsewhere")):
+                with mock.patch.object(agents.state_paths, "WINDOWS", False):
+                    self.assertEqual(agents._find_pi_rollout(str(home / "work")), "")
+                with self.windows():
+                    self.assertEqual(agents._find_pi_rollout(str(home / "work")), str(rollout))
+                    # pi keeps to its own folders, and omp to its own.
+                    self.assertEqual(agents._find_pi_rollout(str(home / "work"), "pi"), "")
+                    pi_folder = home / ".pi" / "agent" / "sessions" / agents._pi_slug(str(home / "work"))
+                    pi_folder.mkdir(parents=True)
+                    (pi_folder / "pi.jsonl").write_text("{}\n")
+                    self.assertEqual(agents._find_pi_rollout(str(home / "work")), str(rollout))
+                    self.assertEqual(agents._find_pi_rollout(str(home / "work"), "pi"), str(pi_folder / "pi.jsonl"))
+
+    def test_codex_rollouts_since_a_start_stand_in_for_held_ones(self) -> None:
+        start = int(time.time() * 1000) - 3_600_000
+        with tempfile.TemporaryDirectory() as directory:
+            day = Path(directory, "sessions", time.strftime("%Y/%m/%d", time.localtime(start / 1000)))
+            day.mkdir(parents=True)
+            new, old = day / "rollout-a-new.jsonl", day / "rollout-a-old.jsonl"
+            new.write_text("{}\n")
+            old.write_text("{}\n")
+            os.utime(old, (start / 1000 - 600, start / 1000 - 600))
+            (day / "notes.jsonl").write_text("{}\n")
+            self.assertEqual(agents._codex_recent_rollouts(directory, start), {str(new)})
+            self.assertEqual(agents._codex_recent_rollouts(directory, 0), set())
+
+    def test_codex_thread_found_by_recent_files_is_never_certain(self) -> None:
+        start = int(time.time() * 1000) - 60_000
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            day = home / "sessions" / time.strftime("%Y/%m/%d")
+            day.mkdir(parents=True)
+            iso = datetime.fromtimestamp(start / 1000 + 5, timezone.utc).isoformat()
+            (day / "rollout-x-mine.jsonl").write_text(json.dumps(
+                {"type": "session_meta", "payload": {"id": "mine", "cwd": "/work", "timestamp": iso}}) + "\n")
+
+            def run(argv: list[str]) -> dict:
+                with (
+                    self.windows(),
+                    mock.patch.object(agents, "_environ_value", side_effect=lambda pid, name: str(home) if name == "CODEX_HOME" else ""),
+                    mock.patch.object(agents, "_pgrep", return_value=[]),
+                    mock.patch.object(agents, "_open_jsonl_under", return_value=("", False)),
+                    mock.patch.object(agents, "_argv_of", return_value=argv),
+                    mock.patch.object(agents, "_cwd_of", return_value="/work"),
+                    mock.patch.object(agents, "_start_ms", return_value=start),
+                    mock.patch.object(agents, "_transcript_info", side_effect=lambda path, _p: {
+                        "sessionId": agents._codex_meta(path)[0], "cwd": "/work",
+                        "windowTitle": "", "lastPrompt": "", "state": "idle", "model": ""}),
+                ):
+                    return agents._codex_info(42)
+
+            # A `codex exec` or a TUI that has exited may have written it.
+            fresh = run(["codex"])
+            self.assertEqual((fresh["sessionId"], fresh["identityExact"]), ("mine", False))
+            resumed = run(["codex", "resume", "mine"])
+            self.assertEqual((resumed["sessionId"], resumed["identityExact"]), ("mine", True))
+
+    def test_writer_lock_and_private_mode_go_through_state_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "agents.json"
+            with mock.patch.object(agents.state_paths, "lock", wraps=agents.state_paths.lock) as lock, \
+                    mock.patch.object(agents.state_paths, "replace", wraps=agents.state_paths.replace) as replace:
+                with agents._aggregate_lock(path):
+                    agents._write_aggregate({"agents": []}, path)
+            lock.assert_called_once()
+            replace.assert_called_once()
+            self.assertEqual(json.loads(path.read_text()), {"agents": []})
+
+
 
 if __name__ == "__main__":
     unittest.main()
