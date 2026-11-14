@@ -36,8 +36,8 @@ Or asked of the agent, in your own words:
 
 > Open the PR and babysit it.
 
-> Check every Saturday morning whether the restore test still passes, for the
-> next month. If it fails, find out why.
+> Check once a week for the next month whether the restore test still passes.
+> If it fails, find out why.
 
 > Tell me when the deploy is green. If it isn't by 18:00, tell me anyway.
 
@@ -110,10 +110,12 @@ holds:
 The last form leaves the decision to the agent: each run tells it the
 condition, and it ends the repeat once that holds.
 
-For "every Saturday at 10:00", ask the agent. It sets a wait for the next
-Saturday 10:00 and a weekly repeat behind it, so the first run lands on the
-weekend and the rest follow a week apart. A run that comes due while the last
-one is still going is skipped, so a slow run never piles up.
+A repeat counts from when it starts, not from the calendar. The first run
+comes one interval after you set it, and each next one an interval after the
+last one started, so `every 1w` set on a Saturday morning runs on Saturday
+mornings. There is no "every Saturday at 10:00": a run due while the machine
+sleeps comes when it wakes, and the later runs move with it. A run that comes
+due while the last one is still going is skipped, so a slow run never piles up.
 
 ### Wait for a person
 

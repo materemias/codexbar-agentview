@@ -73,7 +73,7 @@ For sessions you leave and come back to later. Set one aside with
 /wait every 1d for 1w -- run the e2e suite and list the flaky tests
 ```
 
-Or ask the agent: "babysit the PR you just opened", "check every Saturday
+Or ask the agent: "babysit the PR you just opened", "check once a week
 whether the restore test still passes". Code watches each wait without
 spending tokens. When one fires, the session gets its prompt, Tern reopens it
 if you closed it, and a card over the pane tells you what happened while you
