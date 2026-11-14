@@ -1946,14 +1946,18 @@ local function snoozeSession(cx: WindowCx, base: { string }, closable: boolean)
 		{ label = "Custom…", detail = "a duration, a clock time or a date" },
 	} }, function(item, cx2)
 		if item.tomorrow then
-			-- Tomorrow's local date: a day from now, or from an hour later on a
-			-- 25-hour day's first hour, as the clock then still shows today.
-			local now = os.time()
-			local at = now + 86400
-			if os.date("%Y-%m-%d", at) == os.date("%Y-%m-%d", now) then
-				at += 3600
+			-- Tomorrow on the local calendar, counted in days: elapsed seconds skip
+			-- or repeat a date across a 23- or 25-hour day.
+			local d = os.date("*t")
+			local y, m, day = d.year, d.month, d.day + 1
+			local leap = y % 4 == 0 and (y % 100 ~= 0 or y % 400 == 0)
+			if day > ({ 31, if leap then 29 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31 })[m] then
+				day, m = 1, m + 1
+				if m > 12 then
+					m, y = 1, y + 1
+				end
 			end
-			commit(cx2, { "--at=" .. os.date("%Y-%m-%dT09:00:00", at) })
+			commit(cx2, { string.format("--at=%04d-%02d-%02dT09:00:00", y, m, day) })
 		elseif item.in_ then
 			commit(cx2, { "--in", item.in_ })
 		else
