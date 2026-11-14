@@ -39,3 +39,17 @@ jobs:
         run: |
           python -m py_compile contents/scripts/*.py
           python tests/run.py -v
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Python tests
+        shell: pwsh
+        run: |
+          python -m py_compile (Get-ChildItem contents/scripts/*.py).FullName
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          python tests/run.py -v
