@@ -130,6 +130,19 @@ and you stop the wait when the answer arrives.
 L) and lists it under "When I have time". It never notifies you. Open the
 group when you have an afternoon and pick by size.
 
+### Snooze a session
+
+`/wait snooze 2d` takes the session off the screen for two days and brings
+it back by itself, in a tab of its own, with a "Back from snooze" toast. Add a
+sentence if you like: `/wait snooze 3d after the offsite`. From the
+`Ctrl+Alt+B` menu or the Waiting tab (`F4`), **Snooze session…** asks for the time
+and whether to park the session or close it.
+
+Its other waits keep running meanwhile. **Snooze 1d** is a different, smaller
+thing: it only appears on a wait that's on you, and pushes that one wait to
+tomorrow. On a session that just came back from a snooze, it sends the
+session away for another day.
+
 ### Watch a job in a shell pane
 
 In a shell pane running a build, a deploy script or a long test run,
@@ -176,7 +189,7 @@ opens a pull request, it usually sets a wait on it right away.
 - **The Waiting tab** (`Ctrl+Alt+W`) lists every set-aside session grouped by
   who has the next step: On me, Machine watching, On a timer, Waiting on
   something, When I have time. `Space` peeks at a session without leaving the
-  list, `Enter` opens or resumes it, `+` snoozes it a day.
+  list, `Enter` opens or resumes it, `+` pushes a wait that's on you by a day.
 - **Above the omp composer** a row says what the session waits for and
   whether it's safe to close. Tern colours the tab green when a session in it
   is done and yellow when one needs you, and the **Back on me** widget counts

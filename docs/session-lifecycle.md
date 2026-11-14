@@ -303,7 +303,8 @@ session running outside Tern (kitty, say) has no pane to park, so there each
 | `Space` | details: your sentence, what it waits for, what happened since, the next step, the recap and the session's pull requests |
 | `Enter` | open the session in its own tab, or resume a closed one |
 | `Shift+Enter` | the session card |
-| `+` | Snooze 1d (below) |
+| `+` | Snooze 1d a wait that's on you (below) |
+| `F4` | Snooze session…: hide it until a time, then it comes back (below) |
 | `F2` | Manual wait…: edit the free-text wait |
 | `F5` | Retry a wait its failing checks stopped (when shown) |
 | `Delete` | Seen: you've read what's on you (only when something is) |
@@ -328,19 +329,38 @@ A row shows what the session waits for in your words when it has a manual wait
 session has one manual wait; setting it again replaces it, and an empty text
 removes it.
 
-**Snooze 1d** pushes the row's most pressing wait: the one that's on you, else
-the one due first. It always takes the wait off you, and a prompt that wait
-had queued is cancelled until it fires again.
+**Snooze 1d** is for a wait that's on you: "not now, remind me tomorrow". It
+takes the wait off you for 24 hours. A wait the machine still watches, or one
+on a timer, isn't on you, so it isn't offered there; to put a whole session
+out of sight, use **Snooze session** (below).
 
-| Wait | Snooze 1d |
+| Wait on you | Snooze 1d |
 |---|---|
-| Time | moves the time to 24 hours from now; the prompt runs then |
-| Repeat | moves the next run to 24 hours from now; a run already going finishes |
-| GitHub PR, release, command check still waiting | pauses the checks for 24 hours |
-| Manual wait | reminds you in 24 hours |
-| Anything that already happened: a job that ended, a fulfilled PR or check, a fired chain step | hides it for 24 hours (⏲, On a timer), then brings it back as it was; its prompt doesn't run again |
-| Anything overdue | moves the deadline to 24 hours from now |
-| When I have time, a chain step not started yet, a job still running, a wait whose prompt the agent has | not offered |
+| Something that happened: a time that passed, a fulfilled PR or check, a job that ended, a prompt that ran, a fired chain step | hides it for 24 hours (⏲, On a timer), then brings it back as it was; nothing runs again |
+| Overdue | moves the deadline to 24 hours from now; its checks go on |
+| A session back from a snooze | snoozes the session again for a day, parked or closed as before |
+| Anything not on you: still watched, on a timer, when I have time, a chain step not started yet, a job still running | not offered |
+
+**Snooze session** puts the whole session out of sight until a time, and
+brings it back by itself: `/wait snooze 2d`, `/wait snooze 2d after the
+offsite`, or **Snooze session…** in the `Ctrl+Alt+B` menu and on the Waiting
+tab (`F4`), which asks for the time (1h, 3h, tomorrow 09:00, 2d, 1w or your own) and
+whether to **Park it** or **Close the session**. Close is offered only when
+closing is safe; the one-line `/wait snooze` parks. Outside Tern there's no
+pane to park, so it closes the session, and refuses when that isn't safe.
+
+- While it's snoozed, its other waits are checked as usual. A parked session
+  runs their prompts off screen; a closed one keeps them until it's back.
+  Anything that comes to you still shows on the Waiting tab.
+- When the time comes, Tern unparks it, or resumes a closed one, into a tab of
+  its own without taking focus, and you get a "Back from snooze" toast. The
+  row is on you until you press **Seen**; **Snooze 1d** sends it away again
+  for a day.
+- Opening it earlier (`Enter`, Resume, or unparking it in Tern) ends the
+  snooze. **Stop** ends it and leaves the session where it is.
+- Snoozing a snoozed session again changes its time; a session has one snooze.
+- The agent's `waitingfor` tool can snooze its own session, but only by
+  parking it: it never closes a session.
 
 **Seen** and **Stop** are the two ways a wait ends by hand, and neither changes
 its meaning:

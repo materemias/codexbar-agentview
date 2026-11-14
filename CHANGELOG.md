@@ -31,9 +31,12 @@
 - A session is `park only` while closing it would kill work: a command the agent started still runs (`park only: work runs in this session`) or the agent is mid-turn on your request (`park only: the agent is working`). The agent can park its own session through the `waitingfor` tool when you ask it to set the session aside.
 - The session card and `/wait list` name each wait in its own words first ("Archive sessions indexed in cass"), with the command or time that watches it after it, muted, instead of only `bash -c '…'` or `until Nov 14 08:00`.
 - Usage tracking can be turned off (Plasma: **Track usage**; Tern: **Usage tracking**) for anyone without the `codexbar` CLI or who tracks usage elsewhere; off, nothing fetches usage and no meters, cards or alerts show. It stays on by default, and when the CLI is missing the usage area lists what to install instead of a bare error, with a button that turns tracking off.
+- Snooze session: `/wait snooze 2d [sentence]`, or **Snooze session…** in the `Ctrl+Alt+B` menu and on the Waiting tab, parks or closes a session until a time and brings it back by itself in a tab of its own, without taking focus, with a "Back from snooze" toast; its other waits keep running meanwhile, and opening it earlier ends the snooze. Snooze 1d on a session that came back sends it away for another day.
+- Snooze 1d is offered only on a wait that's on you; waits the machine still watches or that run on a timer no longer have it.
 
 ### Fixes
 
+- omp: choosing one of the session's waits in the `/wait` menu works again; it failed with "watched is not a function", so Retry, Seen, Stop and Snooze 1d couldn't be reached from there.
 - In the Plasma popup, each Claude and Codex account's windows sit indented under a guide line below its name, as in Tern, so they read as parts of the combined pool above them instead of its peers.
 - The Tern window works with the helpers again on Tern 0.9.20: wait cards, Seen, Stop, Snooze and Retry, the `Ctrl+Alt+B` menu, pane-closed and agent events, focusing a session and Install omp extension no longer fail with "table has a protected metatable".
 - An omp session running outside Tern is no longer offered parking: the `/wait` menu asks only Close the session or Keep it open, and skips the step when Close isn't possible; a one-line `/wait` doesn't queue a park, and every `park only` reason reads `keep open` for such a session.

@@ -71,6 +71,7 @@ For sessions you leave and come back to later. Set one aside with
 /wait 2d upstream fix should be out by then -- retry the migration
 /wait check the nightly backup finished -- summarise its log
 /wait every 1d for 1w -- run the e2e suite and list the flaky tests
+/wait snooze 3d after the offsite
 ```
 
 Or ask the agent: "babysit the PR you just opened", "check once a week
@@ -215,7 +216,8 @@ configuration. A failed write leaves the original configuration intact.
 | `Tab` | Hide or show sessions idle for over a day | Both |
 | `Delete` | Dismiss the selected History row; Waiting: Seen, you've read what's on you | Tern |
 | `F2` | Waiting: edit what the selected session waits for, in your words | Tern |
-| `+` | Waiting: snooze the selected wait by a day | Tern |
+| `+` | Waiting: push the selected wait that's on you by a day | Tern |
+| `F4` | Waiting: snooze the selected session; it comes back by itself | Tern |
 | `R` | Refresh (Usage tab) | Both |
 | Typing | Filter Agents, Waiting and History | Both |
 | `Esc` | Clear the filter, keeping the selected session, then close | Both |
