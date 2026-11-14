@@ -34,6 +34,7 @@
 
 ### Fixes
 
+- In the Plasma popup, each Claude and Codex account's windows sit indented under a guide line below its name, as in Tern, so they read as parts of the combined pool above them instead of its peers.
 - The Tern window works with the helpers again on Tern 0.9.20: wait cards, Seen, Stop, Snooze and Retry, the `Ctrl+Alt+B` menu, pane-closed and agent events, focusing a session and Install omp extension no longer fail with "table has a protected metatable".
 - An omp session running outside Tern is no longer offered parking: the `/wait` menu asks only Close the session or Keep it open, and skips the step when Close isn't possible; a one-line `/wait` doesn't queue a park, and every `park only` reason reads `keep open` for such a session.
 - Usage alerts no longer pile up: a reset the provider reports a few seconds or minutes apart no longer counts as a new period and repeats the alert, alerts from one refresh arrive as one notification so Plasma doesn't refuse them as too many, a failed one is retried after 10 minutes instead of on every refresh, and a pace projection warns only once a quarter of the window has passed.

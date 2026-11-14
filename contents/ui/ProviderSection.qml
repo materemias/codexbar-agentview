@@ -13,6 +13,11 @@ ColumnLayout {
     // shared header (FullRepresentation): each account, and the combined Codex
     // pool, gets a compact sub-heading instead of the full provider header.
     property bool subheading: false
+    // An account inside a group: its rows sit indented under a guide line
+    // that drops from the availability dot, so they read as parts of the
+    // combined pool above rather than its peers.
+    readonly property bool nested: subheading && !(record && record.composite)
+    readonly property real nestIndent: Kirigami.Units.gridUnit
     spacing: 4
 
     readonly property string iconSource: record && record.id
@@ -132,15 +137,16 @@ ColumnLayout {
     }
 
     // Sub-heading: availability indicator + account + plan, or the pool size.
-    // Indented past the window-label column so the row starts at the same x
-    // as the bars below it.
+    // Starts at the section's left edge; the rows below either align with it
+    // (combined pool) or indent under the guide line (nested account).
     RowLayout {
         visible: section.subheading
         Layout.fillWidth: true
-        Layout.leftMargin: section.labelColumnWidth + Kirigami.Units.smallSpacing
+        Layout.topMargin: section.nested ? Kirigami.Units.smallSpacing : 0
         spacing: Kirigami.Units.smallSpacing
 
         PC3.Label {
+            id: indicatorLabel
             text: section.record.error ? "" : root.accountAvailabilityIndicator(section.record)
             visible: text.length > 0
             font.pixelSize: Kirigami.Theme.smallFont.pixelSize
@@ -189,250 +195,272 @@ ColumnLayout {
         }
     }
 
-    // Per-window rows.
-    Repeater {
-        model: section.visibleRows
+    // Per-window rows; a nested account's rows hang off a guide line.
+    Item {
+        Layout.fillWidth: true
+        implicitHeight: rowsColumn.implicitHeight
+        visible: section.visibleRows.length > 0
 
-        // Two-line row: bar + percent on top, optional reset text underneath
-        // (indented to the bar column). Keeping reset off the bar row means
-        // every bar takes the same available width, so percentages line up
-        // vertically across windows.
-        delegate: ColumnLayout {
-            id: rowItem
-            Layout.fillWidth: true
-            spacing: 1
-            opacity: rowItem.pct < 1 ? 0.45 : 1.0
-            required property var modelData
-            required property int index
-            readonly property var rec: modelData.rec
-            // Composite (pooled) windows are recomputed per clock tick from the
-            // accounts' raw windows and describe the pool in base-plan-sized
-            // allowances: "12.4 of 41 Plus allowances left · next reset …".
-            readonly property bool isComposite: !!rec.compositeWindows
-            readonly property var pool: isComposite
-                ? root.compositeStats(rec.compositeWindows, rec.windowMinutes, root.nowMs) : null
-            readonly property real pct: Math.max(0, Math.min(100,
-                (isComposite ? pool.usedPercent : rec.usedPercent) || 0))
-            readonly property color tint: section.stale ? Kirigami.Theme.disabledTextColor
-                : root.colorFor(pct, paceSettled ? pacePct : -1)
-            readonly property string windowText: {
-                var wm = rec.windowMinutes || 0
-                return rec.startsAt ? root.relativeMs(paceWindowMs).replace(/^in /, "")
-                    : wm === 300 ? "5h" : wm === 1440 ? "1d"
-                    : wm === 10080 ? "7d"
-                    : root.relativeMs(paceWindowMs).replace(/^in /, "")
-            }
-            readonly property string resetText: {
-                if (!isComposite) {
-                    if (section.stale) return ""
-                    // Claude reports an unused window as 0% without a reset:
-                    // the next window opens on the first message.
-                    if (!rec.resetsAt && !rec.resetDescription && rec.windowMinutes && rec.usedPercent === 0)
-                        return "not started · resets " + windowText + " after first use"
-                    return root.formatReset(rec, root.nowMs)
-                }
-                // A last-known pool keeps its allowance count, not its reset.
-                var line = pool.remaining.toFixed(1) + " of " + pool.total + " "
-                    + rec.allowanceUnit + " allowances left"
-                var reset = pool.resetsAt && !section.stale
-                    ? root.formatReset({ resetsAt: pool.resetsAt }, root.nowMs) : ""
-                return reset.length > 0 ? line + " · next reset " + reset : line
-            }
-            // Codex and Claude "saved reset" credits ride on the weekly row's
-            // reset line (they restore the 7d + 5h windows), falling back to
-            // the last row. Grouped Codex rows show only the count; the
-            // expiry moves into the reset line's tooltip.
-            readonly property string creditsText: {
-                if (!section.record || section.stale) return ""
-                if (section.record.id !== "codex" && section.record.id !== "claude") return ""
-                if (index !== section.creditsRowIndex) return ""
-                return root.formatResetCredits(section.record.resetCredits, root.nowMs)
-            }
-            readonly property string creditsSuffix: creditsText.length === 0 ? ""
-                : " · " + (section.subheading
-                    ? root.formatResetCredits(section.record.resetCredits, root.nowMs, true)
-                    : creditsText)
+        Rectangle {
+            visible: section.nested
+            x: Math.round((indicatorLabel.visible ? indicatorLabel.width : section.nestIndent) / 2)
+            width: 1
+            height: parent.height
+            color: Kirigami.Theme.textColor
+            opacity: 0.25
+        }
 
-            // Consumption over the fetcher's lookback: 24h for 7d windows, 1h
-            // for 5h windows. The same share of the fill is highlighted as
-            // its tail; a reset inside the lookback can make it the whole fill.
-            readonly property var recent: section.stale || !root.showRecentUsage ? null
-                : rec.recent || null
-            readonly property real tailPct: recent ? Math.min(pct, Math.max(0, recent.consumedPercent)) : 0
-            readonly property string recentText: {
-                if (!recent) return ""
-                var used = recent.consumedPercent
-                var amount = used > 0 && used < 1 ? "<1" : Math.round(used).toString()
-                return amount + "% in last " + recent.hours + "h"
-            }
+        ColumnLayout {
+            id: rowsColumn
+            x: section.nested ? section.nestIndent : 0
+            width: parent.width - x
+            spacing: section.spacing
 
-            // Window pace: elapsed share of this usage window, assuming even
-            // consumption. Needs resetsAt + windowMinutes; balance-only rows
-            // (OpenRouter, Kilo) carry neither and render without a tick. A
-            // reset that is past or outside the declared window is treated as
-            // broken data — no tick rather than a confident fake position.
-            readonly property real paceWindowMs: rec.windowMinutes ? root.windowSpanMs(rec) : 0
-            readonly property real paceRemainingMs: rec.resetsAt
-                ? new Date(rec.resetsAt).getTime() - root.nowMs : NaN
-            readonly property bool paceValid: !section.stale && (isComposite ? pool.pacePct >= 0
-                : !isNaN(paceRemainingMs)
-                  && paceWindowMs > 0 && paceRemainingMs > 0
-                  && paceRemainingMs <= paceWindowMs)
-            readonly property real pacePct: !paceValid ? -1
-                : isComposite ? pool.pacePct
-                : (1 - paceRemainingMs / paceWindowMs) * 100
-            readonly property real paceElapsedMs: paceValid
-                ? paceWindowMs * pacePct / 100 : 0
-            // Status and projection need a settled window: in the first
-            // minutes elapsed is dominated by noise, so the tick stays
-            // neutral and no "proj" number is emitted yet.
-            readonly property bool paceSettled: pacePct >= 3
-            readonly property bool overPace: paceSettled && pct > pacePct
-            readonly property real projectedPct: paceSettled
-                ? Math.min(999, pct * 100 / pacePct) : 0
-            readonly property string projectionSuffix: !paceSettled ? ""
-                : " · proj " + Math.round(projectedPct) + "%"
-            readonly property string paceTip: {
-                if (!paceValid) return ""
-                if (!paceSettled) {
-                    return "Window just started — pace projection shows once "
-                        + "it passes 3% elapsed"
-                }
-                var elapsedTxt = paceElapsedMs >= 60000
-                    ? root.relativeMs(paceElapsedMs).replace(/^in /, "") : "<1m"
-                var line = (isComposite ? "Average " : "") + elapsedTxt + " elapsed of " + rowItem.windowText
-                    + " (" + Math.round(pacePct) + "%)"
-                if (overPace) {
-                    var msToFull = pct > 0
-                        ? paceElapsedMs * (100 - pct) / pct : 0
-                    line += " — over pace: projected "
-                        + Math.round(projectedPct) + "% at reset, hits 100% in ~"
-                        + root.relativeMs(Math.round(msToFull)).replace(/^in /, "")
-                } else {
-                    line += " — on pace: projected "
-                        + Math.round(projectedPct) + "% at reset"
-                }
-                return line
-            }
+            Repeater {
+                model: section.visibleRows
 
-            RowLayout {
-                Layout.fillWidth: true
-                spacing: Kirigami.Units.smallSpacing
-
-                PC3.Label {
-                    text: root.windowLabel(rowItem.modelData.providerId,
-                                           rowItem.modelData.slot, rowItem.rec,
-                                           rowItem.modelData.extraTitle)
-                    font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-                    Layout.minimumWidth: section.labelColumnWidth
-                    opacity: 0.85
-                }
-
-                Item {
+                // Two-line row: bar + percent on top, optional reset text underneath
+                // (indented to the bar column). Keeping reset off the bar row means
+                // every bar takes the same available width, so percentages line up
+                // vertically across windows.
+                delegate: ColumnLayout {
+                    id: rowItem
                     Layout.fillWidth: true
-                    implicitHeight: 8
-                    Rectangle {
-                        anchors.fill: parent
-                        radius: 4
-                        color: Qt.rgba(1, 1, 1, 0.10)
+                    spacing: 1
+                    opacity: rowItem.pct < 1 ? 0.45 : 1.0
+                    required property var modelData
+                    required property int index
+                    readonly property var rec: modelData.rec
+                    // Composite (pooled) windows are recomputed per clock tick from the
+                    // accounts' raw windows and describe the pool in base-plan-sized
+                    // allowances: "12.4 of 41 Plus allowances left · next reset …".
+                    readonly property bool isComposite: !!rec.compositeWindows
+                    readonly property var pool: isComposite
+                        ? root.compositeStats(rec.compositeWindows, rec.windowMinutes, root.nowMs) : null
+                    readonly property real pct: Math.max(0, Math.min(100,
+                        (isComposite ? pool.usedPercent : rec.usedPercent) || 0))
+                    readonly property color tint: section.stale ? Kirigami.Theme.disabledTextColor
+                        : root.colorFor(pct, paceSettled ? pacePct : -1)
+                    readonly property string windowText: {
+                        var wm = rec.windowMinutes || 0
+                        return rec.startsAt ? root.relativeMs(paceWindowMs).replace(/^in /, "")
+                            : wm === 300 ? "5h" : wm === 1440 ? "1d"
+                            : wm === 10080 ? "7d"
+                            : root.relativeMs(paceWindowMs).replace(/^in /, "")
                     }
-                    Rectangle {
-                        id: fill
-                        radius: 4
-                        color: rowItem.tint
-                        height: parent.height
-                        width: parent.width * (rowItem.pct / 100)
-                        Behavior on width { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
-                    }
-                    // Recent-consumption tail: the fill's last tailPct drawn
-                    // brighter. The clipped full-length copy keeps the fill's
-                    // rounded right end.
-                    Item {
-                        visible: rowItem.tailPct > 0
-                        x: fill.width - width
-                        width: Math.min(fill.width, parent.width * (rowItem.tailPct / 100))
-                        height: parent.height
-                        clip: true
-                        Rectangle {
-                            x: -parent.x
-                            width: fill.width
-                            height: parent.height
-                            radius: 4
-                            color: Qt.lighter(rowItem.tint, 1.45)
+                    readonly property string resetText: {
+                        if (!isComposite) {
+                            if (section.stale) return ""
+                            // Claude reports an unused window as 0% without a reset:
+                            // the next window opens on the first message.
+                            if (!rec.resetsAt && !rec.resetDescription && rec.windowMinutes && rec.usedPercent === 0)
+                                return "not started · resets " + windowText + " after first use"
+                            return root.formatReset(rec, root.nowMs)
                         }
-                        Behavior on width { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+                        // A last-known pool keeps its allowance count, not its reset.
+                        var line = pool.remaining.toFixed(1) + " of " + pool.total + " "
+                            + rec.allowanceUnit + " allowances left"
+                        var reset = pool.resetsAt && !section.stale
+                            ? root.formatReset({ resetsAt: pool.resetsAt }, root.nowMs) : ""
+                        return reset.length > 0 ? line + " · next reset " + reset : line
                     }
-                    // Pace tick: where even consumption would sit at this
-                    // point of the window. Tick ahead of the fill = budget
-                    // lasts until reset; red tick behind the fill's end =
-                    // current rate runs out before the window closes.
-                    Rectangle {
-                        visible: rowItem.paceValid
-                        x: Math.max(0, Math.min(parent.width - width,
-                            parent.width * rowItem.pacePct / 100 - width / 2))
-                        anchors.verticalCenter: parent.verticalCenter
-                        width: 2
-                        height: parent.height + 4
-                        radius: 1
-                        color: rowItem.overPace ? Kirigami.Theme.negativeTextColor
-                                                : Kirigami.Theme.textColor
-                        opacity: rowItem.overPace ? 0.95 : 0.65
-                        Behavior on x { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+                    // Codex and Claude "saved reset" credits ride on the weekly row's
+                    // reset line (they restore the 7d + 5h windows), falling back to
+                    // the last row. Grouped Codex rows show only the count; the
+                    // expiry moves into the reset line's tooltip.
+                    readonly property string creditsText: {
+                        if (!section.record || section.stale) return ""
+                        if (section.record.id !== "codex" && section.record.id !== "claude") return ""
+                        if (index !== section.creditsRowIndex) return ""
+                        return root.formatResetCredits(section.record.resetCredits, root.nowMs)
                     }
-                    MouseArea {
-                        anchors.fill: parent
-                        enabled: rowItem.paceValid
-                        hoverEnabled: enabled
-                        PC3.ToolTip.visible: enabled && containsMouse
-                        PC3.ToolTip.delay: 350
-                        PC3.ToolTip.text: rowItem.paceTip
+                    readonly property string creditsSuffix: creditsText.length === 0 ? ""
+                        : " · " + (section.subheading
+                            ? root.formatResetCredits(section.record.resetCredits, root.nowMs, true)
+                            : creditsText)
+
+                    // Consumption over the fetcher's lookback: 24h for 7d windows, 1h
+                    // for 5h windows. The same share of the fill is highlighted as
+                    // its tail; a reset inside the lookback can make it the whole fill.
+                    readonly property var recent: section.stale || !root.showRecentUsage ? null
+                        : rec.recent || null
+                    readonly property real tailPct: recent ? Math.min(pct, Math.max(0, recent.consumedPercent)) : 0
+                    readonly property string recentText: {
+                        if (!recent) return ""
+                        var used = recent.consumedPercent
+                        var amount = used > 0 && used < 1 ? "<1" : Math.round(used).toString()
+                        return amount + "% in last " + recent.hours + "h"
                     }
-                }
 
-                PC3.Label {
-                    text: Math.round(rowItem.pct) + "%"
-                    color: rowItem.tint
-                    font.weight: Font.DemiBold
-                    Layout.minimumWidth: Kirigami.Units.gridUnit * 2.4
-                    horizontalAlignment: Text.AlignRight
-                }
-            }
-
-            RowLayout {
-                visible: resetLine.text.length > 0 || recentLine.text.length > 0
-                Layout.fillWidth: true
-                Layout.leftMargin: section.labelColumnWidth + Kirigami.Units.smallSpacing
-                spacing: Kirigami.Units.smallSpacing
-
-                PC3.Label {
-                    id: resetLine
-                    Layout.fillWidth: true
-                    text: rowItem.resetText + rowItem.projectionSuffix + rowItem.creditsSuffix
-                    opacity: 0.55
-                    horizontalAlignment: Text.AlignLeft
-                    elide: Text.ElideRight
-                    MouseArea {
-                        anchors.fill: parent
-                        enabled: section.subheading && rowItem.creditsText.length > 0
-                        hoverEnabled: enabled
-                        PC3.ToolTip.visible: enabled && containsMouse
-                        PC3.ToolTip.delay: 350
-                        PC3.ToolTip.text: rowItem.creditsText
+                    // Window pace: elapsed share of this usage window, assuming even
+                    // consumption. Needs resetsAt + windowMinutes; balance-only rows
+                    // (OpenRouter, Kilo) carry neither and render without a tick. A
+                    // reset that is past or outside the declared window is treated as
+                    // broken data — no tick rather than a confident fake position.
+                    readonly property real paceWindowMs: rec.windowMinutes ? root.windowSpanMs(rec) : 0
+                    readonly property real paceRemainingMs: rec.resetsAt
+                        ? new Date(rec.resetsAt).getTime() - root.nowMs : NaN
+                    readonly property bool paceValid: !section.stale && (isComposite ? pool.pacePct >= 0
+                        : !isNaN(paceRemainingMs)
+                          && paceWindowMs > 0 && paceRemainingMs > 0
+                          && paceRemainingMs <= paceWindowMs)
+                    readonly property real pacePct: !paceValid ? -1
+                        : isComposite ? pool.pacePct
+                        : (1 - paceRemainingMs / paceWindowMs) * 100
+                    readonly property real paceElapsedMs: paceValid
+                        ? paceWindowMs * pacePct / 100 : 0
+                    // Status and projection need a settled window: in the first
+                    // minutes elapsed is dominated by noise, so the tick stays
+                    // neutral and no "proj" number is emitted yet.
+                    readonly property bool paceSettled: pacePct >= 3
+                    readonly property bool overPace: paceSettled && pct > pacePct
+                    readonly property real projectedPct: paceSettled
+                        ? Math.min(999, pct * 100 / pacePct) : 0
+                    readonly property string projectionSuffix: !paceSettled ? ""
+                        : " · proj " + Math.round(projectedPct) + "%"
+                    readonly property string paceTip: {
+                        if (!paceValid) return ""
+                        if (!paceSettled) {
+                            return "Window just started — pace projection shows once "
+                                + "it passes 3% elapsed"
+                        }
+                        var elapsedTxt = paceElapsedMs >= 60000
+                            ? root.relativeMs(paceElapsedMs).replace(/^in /, "") : "<1m"
+                        var line = (isComposite ? "Average " : "") + elapsedTxt + " elapsed of " + rowItem.windowText
+                            + " (" + Math.round(pacePct) + "%)"
+                        if (overPace) {
+                            var msToFull = pct > 0
+                                ? paceElapsedMs * (100 - pct) / pct : 0
+                            line += " — over pace: projected "
+                                + Math.round(projectedPct) + "% at reset, hits 100% in ~"
+                                + root.relativeMs(Math.round(msToFull)).replace(/^in /, "")
+                        } else {
+                            line += " — on pace: projected "
+                                + Math.round(projectedPct) + "% at reset"
+                        }
+                        return line
                     }
-                }
 
-                PC3.Label {
-                    id: recentLine
-                    visible: text.length > 0
-                    text: rowItem.recentText
-                    opacity: 0.55
-                    MouseArea {
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        PC3.ToolTip.visible: containsMouse
-                        PC3.ToolTip.delay: 350
-                        PC3.ToolTip.text: "Window usage consumed in the last " + (rowItem.recent ? rowItem.recent.hours : 0)
-                            + "h, from polled readings, highlighted as the bar's bright tail. Usage restored by a reset counts in full."
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: Kirigami.Units.smallSpacing
+
+                        PC3.Label {
+                            text: root.windowLabel(rowItem.modelData.providerId,
+                                                   rowItem.modelData.slot, rowItem.rec,
+                                                   rowItem.modelData.extraTitle)
+                            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                            Layout.minimumWidth: section.labelColumnWidth
+                            opacity: 0.85
+                        }
+
+                        Item {
+                            Layout.fillWidth: true
+                            implicitHeight: 8
+                            Rectangle {
+                                anchors.fill: parent
+                                radius: 4
+                                color: Qt.rgba(1, 1, 1, 0.10)
+                            }
+                            Rectangle {
+                                id: fill
+                                radius: 4
+                                color: rowItem.tint
+                                height: parent.height
+                                width: parent.width * (rowItem.pct / 100)
+                                Behavior on width { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+                            }
+                            // Recent-consumption tail: the fill's last tailPct drawn
+                            // brighter. The clipped full-length copy keeps the fill's
+                            // rounded right end.
+                            Item {
+                                visible: rowItem.tailPct > 0
+                                x: fill.width - width
+                                width: Math.min(fill.width, parent.width * (rowItem.tailPct / 100))
+                                height: parent.height
+                                clip: true
+                                Rectangle {
+                                    x: -parent.x
+                                    width: fill.width
+                                    height: parent.height
+                                    radius: 4
+                                    color: Qt.lighter(rowItem.tint, 1.45)
+                                }
+                                Behavior on width { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+                            }
+                            // Pace tick: where even consumption would sit at this
+                            // point of the window. Tick ahead of the fill = budget
+                            // lasts until reset; red tick behind the fill's end =
+                            // current rate runs out before the window closes.
+                            Rectangle {
+                                visible: rowItem.paceValid
+                                x: Math.max(0, Math.min(parent.width - width,
+                                    parent.width * rowItem.pacePct / 100 - width / 2))
+                                anchors.verticalCenter: parent.verticalCenter
+                                width: 2
+                                height: parent.height + 4
+                                radius: 1
+                                color: rowItem.overPace ? Kirigami.Theme.negativeTextColor
+                                                        : Kirigami.Theme.textColor
+                                opacity: rowItem.overPace ? 0.95 : 0.65
+                                Behavior on x { NumberAnimation { duration: 300; easing.type: Easing.OutCubic } }
+                            }
+                            MouseArea {
+                                anchors.fill: parent
+                                enabled: rowItem.paceValid
+                                hoverEnabled: enabled
+                                PC3.ToolTip.visible: enabled && containsMouse
+                                PC3.ToolTip.delay: 350
+                                PC3.ToolTip.text: rowItem.paceTip
+                            }
+                        }
+
+                        PC3.Label {
+                            text: Math.round(rowItem.pct) + "%"
+                            color: rowItem.tint
+                            font.weight: Font.DemiBold
+                            Layout.minimumWidth: Kirigami.Units.gridUnit * 2.4
+                            horizontalAlignment: Text.AlignRight
+                        }
+                    }
+
+                    RowLayout {
+                        visible: resetLine.text.length > 0 || recentLine.text.length > 0
+                        Layout.fillWidth: true
+                        Layout.leftMargin: section.labelColumnWidth + Kirigami.Units.smallSpacing
+                        spacing: Kirigami.Units.smallSpacing
+
+                        PC3.Label {
+                            id: resetLine
+                            Layout.fillWidth: true
+                            text: rowItem.resetText + rowItem.projectionSuffix + rowItem.creditsSuffix
+                            opacity: 0.55
+                            horizontalAlignment: Text.AlignLeft
+                            elide: Text.ElideRight
+                            MouseArea {
+                                anchors.fill: parent
+                                enabled: section.subheading && rowItem.creditsText.length > 0
+                                hoverEnabled: enabled
+                                PC3.ToolTip.visible: enabled && containsMouse
+                                PC3.ToolTip.delay: 350
+                                PC3.ToolTip.text: rowItem.creditsText
+                            }
+                        }
+
+                        PC3.Label {
+                            id: recentLine
+                            visible: text.length > 0
+                            text: rowItem.recentText
+                            opacity: 0.55
+                            MouseArea {
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                PC3.ToolTip.visible: containsMouse
+                                PC3.ToolTip.delay: 350
+                                PC3.ToolTip.text: "Window usage consumed in the last " + (rowItem.recent ? rowItem.recent.hours : 0)
+                                    + "h, from polled readings, highlighted as the bar's bright tail. Usage restored by a reset counts in full."
+                            }
+                        }
                     }
                 }
             }
