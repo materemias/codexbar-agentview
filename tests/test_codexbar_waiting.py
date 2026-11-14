@@ -6970,15 +6970,13 @@ class ExtensionMenuCloseTests(unittest.TestCase):
         self.assertEqual((answer["shutdown"], answer["left"]), (False, 1), answer)
 
 
-# Stands in for codexbar_waiting.py where a copy of the extension looks for it: logs each argv to
-# CLI_LOG and answers as the snooze contract says. FAKE_CLOSE: the session's close verdict before the
-# snooze; FAKE_WAITS: its open waits; FAKE_HIDDEN/FAKE_FALLBACK: what an add or snooze did to hide it
-# (else what --hide asked for).
+# Stands in for codexbar_waiting.py where a copy of the extension looks for it: answers as the snooze
+# contract says, then logs the argv to CLI_LOG. FAKE_CLOSE: the session's close verdict before the
+# snooze, FAKE_SAVED_CLOSE after it (else safe); FAKE_WAITS: its open waits; FAKE_HIDDEN/FAKE_FALLBACK:
+# what an add or snooze did to hide it (else what --hide asked for).
 SNOOZE_FAKE_CLI = r"""
 import json, os, sys
 args = sys.argv[1:]
-with open(os.environ["CLI_LOG"], "a", encoding="utf-8") as log:
-    log.write(json.dumps(args) + "\n")
 value = lambda name: args[args.index(name) + 1] if name in args else None
 close = json.loads(os.environ.get("FAKE_CLOSE") or "null")
 waits = json.loads(os.environ.get("FAKE_WAITS") or "[]")
@@ -6988,17 +6986,21 @@ answer = {"ok": True, "prompts": [], "view": view}
 if args[0] == "list":
     answer = {"ok": True, **view}
 elif args[0] in ("add", "snooze"):
-    saved = {**row, "close": {"verdict": "safe", "reason": "prompt", "text": "closable"}, "waits": [{"id": "w1", "label": "Snoozed"}]}
+    saved_close = json.loads(os.environ.get("FAKE_SAVED_CLOSE") or "null") or {"verdict": "safe", "reason": "prompt", "text": "closable"}
+    saved = {**row, "close": saved_close, "waits": [{"id": "w1", "label": "Snoozed"}]}
     answer = {
         "ok": True, "wait": {"id": "w1"}, "view": {"sessions": [saved]},
         "hidden": os.environ.get("FAKE_HIDDEN", value("--hide") or "") or None,
         "fallback": os.environ.get("FAKE_FALLBACK") or None,
     }
-print(json.dumps(answer))
+print(json.dumps(answer), flush=True)
+with open(os.environ["CLI_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(args) + "\n")
 """
 
-# Runs one /wait line (CALL.line) or one waitingfor tool call (CALL.tool) for SID, answering the
-# dialogs from CHOICES and LINES; reports the snooze-related CLI calls, the panel and whether omp closed.
+# Runs one /wait line (CALL.line) or one waitingfor tool call (CALL.tool) for SID once the first list
+# answered, answering the dialogs from CHOICES and LINES (with BUSY_AFTER_PICK a turn runs once no
+# choice is left); reports the snooze-related CLI calls, the panel and whether omp closed.
 SNOOZE_DRIVER = r"""
 import * as fs from "node:fs";
 const { default: install } = await import(process.env.EXTENSION);
@@ -7019,7 +7021,7 @@ const lines = JSON.parse(process.env.LINES);
 const titles = [];
 let shutdown = false;
 const ctx = {
-    hasUI: true, cwd: process.cwd(), isIdle: () => true, hasPendingMessages: () => false,
+    hasUI: true, cwd: process.cwd(), isIdle: () => !(process.env.BUSY_AFTER_PICK && choices.length === 0), hasPendingMessages: () => false,
     ui: {
         setWidget(name, factory) { widgets[name] = factory; },
         select: async (title) => { titles.push(title); return choices.shift(); }, editor: async () => lines.shift(),
@@ -7032,15 +7034,18 @@ const ctx = {
     clearTimer: (timer) => clearTimeout(timer),
     shutdown: async () => { shutdown = true; },
 };
+const log = () => { try { return fs.readFileSync(process.env.CLI_LOG, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)); } catch { return []; } };
 handlers.session_start({}, ctx);
-await Bun.sleep(300);
+for (let i = 0; i < 300 && !log().some((args) => args[0] === "list"); i++) await Bun.sleep(50);
+await Bun.sleep(100); // the list's answer applied
 const call = JSON.parse(process.env.CALL);
-const result = call.tool ? JSON.parse((await tool.execute("t", call.tool, null, null, ctx)).content[0].text) : null;
+const result = call.tool
+    ? await tool.execute("t", call.tool, null, null, ctx).then((answer) => JSON.parse(answer.content[0].text), (error) => ({ error: error.message }))
+    : null;
 if (!call.tool) await commands.wait.handler(call.line, ctx);
 const panel = widgets["waitingfor-panel"]?.(null, { fg: (_tone, text) => text })?.render(200).join("\n") ?? null;
 handlers.session_shutdown();
-const calls = fs.readFileSync(process.env.CLI_LOG, "utf8").trim().split("\n").map((line) => JSON.parse(line))
-    .filter((args) => ["add", "stop", "snooze"].includes(args[0]));
+const calls = log().filter((args) => ["add", "stop", "snooze"].includes(args[0]));
 console.log(JSON.stringify({ shutdown, panel, calls, titles, left: choices.length + lines.length, result }));
 process.exit(0);
 """
@@ -7053,7 +7058,7 @@ class ExtensionSnoozeTests(unittest.TestCase):
     """The session snooze: /wait snooze hides the session until a time; in Tern a park (or a close
     Tern carries out), outside Tern a close this omp does itself, refused while it would lose something."""
 
-    def snooze(self, call: dict, pane: str = "", choices: tuple = (), lines: tuple = (), **fake) -> dict:
+    def snooze(self, call: dict, pane: str = "", choices: tuple = (), lines: tuple = (), busy_after_pick: bool = False, **fake) -> dict:
         with extension_folder() as folder:
             root = Path(folder)
             package = root / "package"
@@ -7075,7 +7080,7 @@ class ExtensionSnoozeTests(unittest.TestCase):
                 self, SNOOZE_DRIVER, SID=SID, EXTENSION=str(extension), CALL=json.dumps(call),
                 CHOICES=json.dumps(choices), LINES=json.dumps(lines), CLI_LOG=str(root / "cli.log"),
                 XDG_STATE_HOME=str(root / "state"), OMP_AGENT_DIR=str(root / "omp"), PI_CODING_AGENT_DIR="",
-                TERN_PANE=pane, **env,
+                TERN_PANE=pane, BUSY_AFTER_PICK="1" if busy_after_pick else "", **env,
             )
 
     def add(self, *time: str, hide: str, by: str = "user") -> list:
@@ -7100,6 +7105,17 @@ class ExtensionSnoozeTests(unittest.TestCase):
         self.assertEqual((answer["calls"], answer["shutdown"]), ([], False))
         self.assertEqual(answer["panel"], "Not snoozed: keep open: turn cut off once already. Outside Tern a snooze closes the session.")
 
+    def test_outside_tern_a_running_turn_is_refused(self) -> None:
+        answer = self.snooze({"line": "snooze 2d"}, busy_after_pick=True)
+        self.assertEqual((answer["calls"], answer["shutdown"]), ([], False))
+        self.assertEqual(answer["panel"], "Not snoozed: keep open: the agent is working. Outside Tern a snooze closes the session.")
+
+    def test_outside_tern_a_close_refused_after_the_save_ends_the_snooze(self) -> None:
+        answer = self.snooze({"line": "snooze 2d"}, saved_close={**PARK_ONLY, "text": "keep open: it can't be resumed"})
+        self.assertEqual(answer["calls"], [self.add("--in=2d", hide="close"), ["stop", "--session", SID, "--wait=w1"]])
+        self.assertFalse(answer["shutdown"])
+        self.assertEqual(answer["panel"], "Not snoozed: keep open: it can't be resumed. Outside Tern a snooze closes the session.")
+
     def test_outside_tern_a_close_the_cli_fell_back_from_ends_the_snooze(self) -> None:
         answer = self.snooze({"line": "snooze 2d"}, hidden="park", fallback="keep open: it can't be resumed")
         self.assertEqual(answer["calls"], [self.add("--in=2d", hide="close"), ["stop", "--session", SID, "--wait=w1"]])
@@ -7107,11 +7123,17 @@ class ExtensionSnoozeTests(unittest.TestCase):
         self.assertEqual(answer["panel"], "Not snoozed: keep open: it can't be resumed. Outside Tern a snooze closes the session.")
 
     def test_the_picker_in_tern_offers_close_while_closing_loses_nothing(self) -> None:
+        before = (datetime.now() + timedelta(days=1)).date().isoformat()
         answer = self.snooze({"line": "snooze"}, pane="52", choices=("Tomorrow 09:00", "Close the session"))
-        tomorrow = (datetime.now() + timedelta(days=1)).date().isoformat()
-        self.assertEqual(answer["calls"], [self.add(f"--at={tomorrow}T09:00", hide="close")])
+        after = (datetime.now() + timedelta(days=1)).date().isoformat()
+        self.assertIn(answer["calls"], [[self.add(f"--at={day}T09:00", hide="close")] for day in (before, after)])
         # Tern's window closes the pane; this omp doesn't shut itself down.
         self.assertEqual((answer["shutdown"], answer["left"]), (False, 0))
+
+    def test_a_turn_started_while_the_picker_was_open_makes_close_a_park(self) -> None:
+        answer = self.snooze({"line": "snooze"}, pane="52", choices=("2d", "Close the session"), busy_after_pick=True)
+        self.assertEqual(answer["calls"], [self.add("--in=2d", hide="park")])
+        self.assertEqual(answer["panel"], "Parked instead of closed: park only: the agent is working")
 
     def test_the_picker_in_tern_parks_a_park_only_session_unasked(self) -> None:
         answer = self.snooze({"line": "snooze"}, pane="52", choices=("Custom…",), lines=("1h 30m",), close=PARK_ONLY)
@@ -7133,11 +7155,35 @@ class ExtensionSnoozeTests(unittest.TestCase):
         call = {"tool": {"action": "snooze", "in": "2h", "note": "after lunch"}}
         parked = self.snooze(call, pane="52")
         self.assertEqual(parked["calls"], [self.add("--in=2h", "--note=after lunch", hide="park", by="agent")])
-        self.assertTrue(parked["result"]["park"].startswith("parked:"), parked)
+        self.assertTrue(parked["result"]["snooze"].startswith("snoozed: a Tern window"), parked)
+        unlisted = self.snooze(call, pane="52", hidden="")
+        self.assertIn("park it with action park", unlisted["result"]["snooze"])
         outside = self.snooze(call)
         self.assertEqual(outside["calls"], [])
         self.assertIn("ask the user to run /wait snooze", outside["result"]["snooze"])
         self.assertFalse(outside["shutdown"])
+
+    def test_the_tool_takes_in_or_at(self) -> None:
+        for params in ({"action": "snooze"}, {"action": "snooze", "in": "2h", "at": "2026-11-20T09:00"}):
+            answer = self.snooze({"tool": params}, pane="52")
+            self.assertEqual((answer["calls"], answer["result"]), ([], {"error": "snooze takes in or at, one of them"}))
+
+    def test_a_snooze_line_reads_its_time_and_keeps_the_rest_as_the_sentence(self) -> None:
+        answer = run_extension_driver(self, r"""
+const { parseWait, waitCompletions } = await import(process.env.EXTENSION);
+const lines = ["snooze 2d", "snooze 2d waiting on Anna", "snooze 9:05 call back -- not a prompt",
+    "snooze 2026-11-20 09:00 after the release", "snooze", "snooze waiting on Anna", "snooze 2x"];
+console.log(JSON.stringify({
+    parsed: lines.map((line) => { const p = parseWait(line); return p.error ?? p.args; }),
+    completions: waitCompletions("snooze ").map((item) => item.label),
+}));
+""")
+        bad = "snooze takes a time first, such as 2d, 3h, 18:00 or 2026-11-07 09:00, not {}."
+        self.assertEqual(answer["parsed"], [
+            ["--in=2d"], ["--in=2d", "--note=waiting on Anna"], ["--at=09:05", "--note=call back -- not a prompt"],
+            ["--at=2026-11-20T09:00", "--note=after the release"], [], bad.format("waiting"), bad.format("2x"),
+        ])
+        self.assertEqual(answer["completions"], ["1h", "3h", "2d", "1w"])
 
 
 # Loads the extension for SID and changes what runs in it: a background job, then a bash call. The

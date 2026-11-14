@@ -215,14 +215,6 @@ const UNTIL_CHOICES = [
 ];
 /** Their text may hold a `--` of its own, as they never fire a prompt; list and help take no text at all. */
 const NO_PROMPT: Record<string, true> = { seen: true, stop: true, note: true, later: true, for: true, snooze: true, list: true, help: true };
-/** What can follow `/wait snooze `: the picker's times a line can say. */
-const SNOOZE_CHOICES = [
-	{ label: "1h", description: "for an hour" },
-	{ label: "3h", description: "for three hours" },
-	{ label: "09:00", description: "until the next 09:00" },
-	{ label: "2d", description: "for two days" },
-	{ label: "1w", description: "for a week" },
-];
 
 const messageOf = (error) => (error instanceof Error ? error.message : String(error));
 
@@ -559,7 +551,8 @@ function choicesAfter(words: string[], waits) {
 	if (path === "gh pr" || (words.length === 3 && path.startsWith("gh pr ") && PR_REF.test(words[2]))) return [...UNTILS, SENTENCE_START];
 	if (path === "gh babysit" || path === "gh release" || (words.length === 3 && path.startsWith("gh release ") && REPO.test(words[2]))) return [SENTENCE_START];
 	if (path === "later") return SIZES;
-	if (path === "snooze") return SNOOZE_CHOICES;
+	// The picker's durations; a clock or a date is typed out.
+	if (path === "snooze") return SNOOZE_TIMES.filter((time) => DURATION.test(time.label));
 	if (path === "check") return CHECK_CHOICES;
 	if (words.length === 3 && path.startsWith("check every ") && DURATION.test(words[2])) return [BANG];
 	const ids = (list) => list.map((wait) => ({ label: wait.id, value: wait.id, description: wait.label }));
@@ -877,8 +870,12 @@ const TOOL_FLAGS = {
 };
 
 const NOT_PARKED_OUTSIDE_TERN = "not parked: this omp runs outside Tern, so there is no pane to park";
-/** Why a session snooze outside Tern needs closing to be safe. */
-const SNOOZE_CLOSES = "Outside Tern a snooze closes the session.";
+/** A session snooze outside Tern refused: it closes the session, and closing now would lose `why`. */
+const snoozeRefused = (why: string) => new Error(`Not snoozed: ${why}. Outside Tern a snooze closes the session.`);
+/** The CLI command of a session snooze until `time` (its `--in` or `--at`, and a `--note`), set by `by`. */
+function snoozeAdd(session: string, time: string[], by: "user" | "agent", hide: "park" | "close"): string[] {
+	return ["add", "--session", session, "--kind", "snooze", ...time, "--by", by, "--hide", hide];
+}
 /** The agent never closes a session: outside Tern, where a snooze would, the user snoozes it. */
 const TOOL_SNOOZE_OUTSIDE_TERN = "not snoozed: this omp runs outside Tern, so there is no pane to park, and you never close the session; ask the user to run /wait snooze";
 
@@ -1708,8 +1705,11 @@ export default function (pi) {
 		else if (action === "Stop") await act(c, ["stop", "--session", session, `--wait=${id}`]);
 		else if (action === "Snooze 1d") {
 			const answer = await act(c, ["snooze", "--session", session, `--wait=${id}`, "--for", "1d"]);
-			// A session back from its own snooze is snoozed again; outside Tern its close is this process's.
-			if (!inTern() && answer.hidden === "close") await closeSession(c, session, answer);
+			// A session back from its own snooze is snoozed again, hidden as before: outside Tern its close is
+			// this process's, and a close the CLI fell back from hides nothing, so the session stays snoozed in view.
+			if (inTern()) showTernHide(c, session, answer);
+			else if (answer.hidden === "close") await closeSession(c, session, answer);
+			else if (answer.fallback) setPanel(c, errorPanel(`Not closed: ${answer.fallback}. It comes back to you in a day all the same.`));
 		}
 	}
 
@@ -1771,12 +1771,13 @@ export default function (pi) {
 	/**
 	 * Closes `session`, the one whose wait the CLI saved (`answer`), and with `pinned` its pin, which
 	 * is what brings a When I have time session back. Without it, with a turn running, with closing
-	 * losing something (closeBlocker), or with another session open by then, it stays open and says why.
+	 * losing something (closeBlocker), or with another session open by then, it stays open and says why;
+	 * the reason it stayed is the answer, undefined once it closed or another session is open.
 	 */
-	async function closeSession(c, session: string, answer, pinned = false) {
+	async function closeSession(c, session: string, answer, pinned = false): Promise<string | undefined> {
 		if (pinned && answer?.pinned !== true) {
 			setPanel(c, errorPanel(`Not closed: the session couldn't be pinned (${answer?.pin_error ?? "no pin"}). Try /pin, then close it.`));
-			return;
+			return "the session couldn't be pinned";
 		}
 		// The CLI steps under way (an ack, a turn's end) finish first, and so do the claims they chain
 		// on: a turn's end can claim a prompt, and its send starts a turn.
@@ -1793,13 +1794,13 @@ export default function (pi) {
 		if (!idle(c)) {
 			const kept = pinned ? "The session stays pinned" : "The wait is saved";
 			setPanel(c, errorPanel(`Not closed: the agent is still working. ${kept}; close it once the turn ends.`));
-			return;
+			return closeHere(BUSY_CLOSE).text;
 		}
 		const blocker = closeBlocker(true);
 		if (blocker) {
 			const kept = pinned ? "The session stays pinned" : "The wait is saved";
 			setPanel(c, errorPanel(`Not closed: ${blocker.text}. ${kept}${inTern() ? "; park the session instead" : ""}.`));
-			return;
+			return blocker.text;
 		}
 		await c.shutdown();
 	}
@@ -1819,35 +1820,55 @@ export default function (pi) {
 		closeSession(c, session, undefined).catch((error) => setPanel(c, errorPanel(messageOf(error))));
 	}
 
-	/** Outside Tern a snooze closes the session: refused, with the close verdict's text, while closing would lose something. */
-	function refuseSnoozeClose(c) {
-		if (inTern()) return;
-		const blocker = idle(c) ? closeBlocker() : closeHere(BUSY_CLOSE);
-		if (blocker) throw new Error(`Not snoozed: ${blocker.text}. ${SNOOZE_CLOSES}`);
+	/** What keeps a snooze from closing the session now: a turn that runs, or what closeBlocker says. */
+	function snoozeBlocker(c) {
+		if (!idle(c)) return closeHere(BUSY_CLOSE);
+		return closeBlocker();
+	}
+
+	/** Ends the snooze `answer` saved, which can't close the session outside Tern, and refuses it for `why`. */
+	async function unsnooze(c, session: string, answer, why: string) {
+		try {
+			await act(c, ["stop", "--session", session, `--wait=${answer.wait.id}`]);
+		} catch (error) {
+			throw snoozeRefused(`${why}; ending the saved snooze failed too: ${messageOf(error)}`);
+		}
+		throw snoozeRefused(why);
 	}
 
 	/**
-	 * Snoozes `session` until `time`, its `--in` or `--at` and the user's `--note`: `hide` park or close
-	 * in Tern, whose window carries it out. Outside Tern it closes: refused while closing would lose
-	 * something, and the CLI hands the close to this process (`hidden: "close"`); one it fell back to
-	 * park (`fallback`) parks nothing here, so the snooze ends again and the refusal shows.
+	 * What a snooze's CLI `answer` says of hiding the session in Tern, unless it hid it as asked: no pane
+	 * listed yet, or a park for a close (`fallback`, the reason).
 	 */
-	async function snoozeSession(c, session: string, time: string[], hide: "park" | "close") {
-		refuseSnoozeClose(c);
-		const answer = await act(c, ["add", "--session", session, "--kind", "snooze", ...time, "--by", "user", "--hide", hide]);
-		if (!inTern()) {
-			if (answer.hidden === "close") return closeSession(c, session, answer);
-			await act(c, ["stop", "--session", session, `--wait=${answer.wait.id}`]);
-			throw new Error(`Not snoozed: ${answer.fallback ?? "the session can't be closed"}. ${SNOOZE_CLOSES}`);
-		}
+	function showTernHide(c, session: string, answer, fallback = answer.fallback) {
 		if (c.sessionManager.getSessionId() !== session) return;
-		if (!answer.hidden) setPanel(c, errorPanel("Snoozed, but not hidden: Tern has not listed this session's pane yet; park it yourself."));
-		else if (answer.hidden !== hide) setPanel(c, (theme) => theme.fg("warning", `Parked instead of closed: ${answer.fallback}`));
+		if ("hidden" in answer && !answer.hidden) setPanel(c, errorPanel("Snoozed, but not hidden: Tern has not listed this session's pane yet; park it yourself."));
+		else if (fallback) setPanel(c, (theme) => theme.fg("warning", `Parked instead of closed: ${fallback}`));
+	}
+
+	/**
+	 * Snoozes `session` until `time`, its `--in` or `--at` and the user's `--note`, hidden as `wanted`.
+	 * In Tern its window carries out the park or close; a close that would lose something by now (a
+	 * turn or job started while the picker was open) parks instead, as the CLI's own fallback does.
+	 * Outside Tern it closes: refused while closing would lose something, and the CLI hands the close
+	 * to this process (`hidden: "close"`). A close the CLI fell back from (`fallback`), or one this
+	 * process can't make after all, hides nothing here: the snooze ends again and the refusal shows.
+	 */
+	async function snoozeSession(c, session: string, time: string[], wanted: "park" | "close") {
+		const blocker = wanted === "close" ? snoozeBlocker(c) : undefined;
+		if (blocker && !inTern()) throw snoozeRefused(blocker.text);
+		const answer = await act(c, snoozeAdd(session, time, "user", blocker ? "park" : wanted));
+		if (inTern()) return showTernHide(c, session, answer, blocker?.text ?? answer.fallback);
+		if (answer.hidden !== "close") return unsnooze(c, session, answer, answer.fallback ?? "the session can't be closed");
+		const kept = await closeSession(c, session, answer);
+		if (kept) await unsnooze(c, session, answer, kept);
 	}
 
 	/** The snooze picker: the time, then in Tern Park it or, while closing loses nothing, Close the session. */
 	async function snoozeMenu(c, session: string) {
-		refuseSnoozeClose(c);
+		// Outside Tern a refusal comes before the picker, not after a time was chosen in vain.
+		const blocker = inTern() ? undefined : snoozeBlocker(c);
+		if (blocker) throw snoozeRefused(blocker.text);
 		const chosen = await pick(c, "Snooze the session until?", SNOOZE_TIMES);
 		const time = chosen && (await chosen.options(c));
 		if (!time) return;
@@ -1934,6 +1955,8 @@ export default function (pi) {
 				const session = c.sessionManager.getSessionId();
 				try {
 					if (parsed.command !== "snooze-session") await perform(c, parsed, session);
+					// Hiding takes this process's UI: it closes the session outside Tern, and the picker asks.
+					else if (!c.hasUI) throw new Error("/wait snooze needs omp's interactive UI.");
 					else if (parsed.ask) await snoozeMenu(c, session);
 					else await snoozeSession(c, session, parsed.args, inTern() ? "park" : "close");
 				} catch (error) {
@@ -2042,20 +2065,13 @@ export default function (pi) {
 					break;
 				case "snooze":
 					if (!inTern()) return { content: [{ type: "text", text: JSON.stringify({ snooze: TOOL_SNOOZE_OUTSIDE_TERN }) }], details: {} };
-					args = [
-						"add",
-						"--session",
+					if ((params.in === undefined) === (params.at === undefined)) throw new Error("snooze takes in or at, one of them");
+					args = snoozeAdd(
 						session,
-						"--kind",
-						"snooze",
-						...(params.in !== undefined ? [`--in=${params.in}`] : []),
-						...(params.at !== undefined ? [`--at=${params.at}`] : []),
-						...(params.note ? [`--note=${params.note}`] : []),
-						"--by",
+						[params.in !== undefined ? `--in=${params.in}` : `--at=${params.at}`, ...(params.note ? [`--note=${params.note}`] : [])],
 						"agent",
-						"--hide",
 						"park",
-					];
+					);
 					break;
 				case "stop":
 					if (!params.wait) throw new Error("stop needs a wait id; list shows them");
@@ -2081,7 +2097,11 @@ export default function (pi) {
 			}
 			const result = params.action === "list" ? (answer.sessions?.[0] ?? { waits: [] }) : answer;
 			if (parking) result.park = parkNote(answer.parked != null);
-			else if (params.action === "snooze") result.park = parkNote(answer.hidden != null);
+			else if (params.action === "snooze") {
+				result.snooze = answer.hidden
+					? "snoozed: a Tern window takes this pane off its tab shortly, and it comes back by itself then"
+					: "snoozed, but not parked: Tern has not listed this session's pane yet; park it with action park in a few seconds";
+			}
 			return { content: [{ type: "text", text: JSON.stringify(result) }], details: {} };
 		},
 	});
