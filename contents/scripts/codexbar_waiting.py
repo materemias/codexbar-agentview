@@ -147,8 +147,9 @@ PR_UNTIL = {
     "released": "Released",
     "activity": "New activity",
 }
-# `release` is only an `add` shorthand: it stores a `command` wait.
-KINDS = ("time", "command", "job", "pr", "release", "something", "later", "repeat")
+# `release` is only an `add` shorthand: it stores a `command` wait. `snooze`
+# hides its session until its time, then brings it back (`_back_from_snooze`).
+KINDS = ("time", "command", "job", "pr", "release", "something", "later", "repeat", "snooze")
 KIND_OPTIONS = {
     "time": {"at", "in_"},
     # `describe`: the agent writes the argv from these words (`write-check`).
@@ -160,6 +161,7 @@ KIND_OPTIONS = {
     "later": {"size"},
     # A repeat's `until` is the agent's judgment in words, a PR's is a state.
     "repeat": {"until"},
+    "snooze": {"at", "in_", "hide"},
 }
 # The kinds a prompt may repeat on until they fire; `repeat` only repeats.
 REPEAT_KINDS = ("repeat", "command", "pr", "release")
@@ -181,6 +183,8 @@ MENU_TARGETS = ("session", "pane")
 
 REASON_CLOSED = "session closed: resume it to deliver the prompt"
 REASON_RESUMING = "resuming the session in Tern"
+# A closed session's prompts wait while it is snoozed: its wake reopens it for them.
+REASON_HELD = "sent when the session is back from its snooze"
 # A resume waits for a Tern window to carry it out.
 REASON_NO_WINDOW = "open a Tern window to reopen it"
 # Lead a prompt sent again because its earlier turn was cut off. A prompt is
@@ -217,13 +221,14 @@ REASON_MENU_NO_EXTENSION = "omp extension not loaded in this session"
 REASON_MENU_OLD_EXTENSION = "this session runs an older waitingfor extension: /restart it"
 REASON_MENU_NO_PANE = "no omp extension in this pane"
 # Who can take a queued prompt: these go away once the session can take it.
-DELIVERY_REASONS = (REASON_CLOSED, REASON_NO_EXTENSION, REASON_RESUMING, REASON_NO_WINDOW)
+DELIVERY_REASONS = (REASON_CLOSED, REASON_NO_EXTENSION, REASON_RESUMING, REASON_NO_WINDOW, REASON_HELD)
 # What "resuming" may say over; a closed session also over the deadline note.
 # Anything else on me (an error, a PR's news) says more than either.
 RESUMING_REPLACES = (None, REASON_QUESTION, *DELIVERY_REASONS)
 CLOSED_REPLACES = (*RESUMING_REPLACES, REASON_OVERDUE)
 # Actions that name a pane, which only the daemon that ran then knows.
-PANE_ACTIONS = ("park", "close_pane")
+PANE_ACTIONS = ("park", "close_pane", "unpark")
+SNOOZE_BACK = "Back from snooze"
 
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
 _REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
@@ -1397,6 +1402,24 @@ def _open_waits(record: dict) -> list[dict]:
     return [wait for wait in record["waits"] if wait["state"] != "done"]
 
 
+def _open_snooze(record: dict | None) -> dict | None:
+    """The target's session snooze, waiting or back: one at most (`cmd_add`)."""
+    return next((wait for wait in _open_waits(record) if wait["kind"] == "snooze"), None) if record else None
+
+
+def _hiding_snooze(record: dict | None) -> dict | None:
+    """The snooze that hides the target now: one whose time hasn't come."""
+    snooze = _open_snooze(record)
+    return snooze if snooze is not None and snooze["state"] == "waiting" else None
+
+
+def _wake_early(state: dict, record: dict, wait: dict, now: datetime) -> None:
+    """The session is back before its snooze's time: the snooze ends, and its
+    held prompts follow the usual rules."""
+    _log(record, now, wait, "Woken early")
+    _complete(state, record, wait, now)
+
+
 def _unwritten(wait: dict) -> bool:
     """A check the user described whose command the agent hasn't written yet:
     it waits, unarmed, for `write-check`."""
@@ -1952,9 +1975,9 @@ def _resuming_waits(record: dict) -> list[dict]:
     ]
 
 
-def _mark_resuming(record: dict) -> None:
+def _mark_resuming(record: dict, reason: str = REASON_RESUMING) -> None:
     for wait in _resuming_waits(record):
-        wait.update(on_me=False, reason=REASON_RESUMING)
+        wait.update(on_me=False, reason=reason)
 
 
 def _flag_no_window(state: dict, record: dict, now: datetime) -> None:
@@ -1969,6 +1992,26 @@ def _heard_lately(state: dict, session: str, now: datetime) -> bool:
     return seen is not None and now.timestamp() - seen < RESUME_QUIET_S
 
 
+def _count_resume(state: dict, pending: dict, now: datetime, window: bool) -> bool:
+    """Run a queued resume's countdown, which runs only while a window is up to
+    carry it out: a window going away restarts it from the next one. True when
+    it ran out and was dropped: a window was up all that time and didn't carry
+    it out. One that comes up much later would open a session nobody expects by
+    then; a window that wasn't up yet, as at login, doesn't count."""
+    if not window:
+        pending["window_since"] = None
+        pending["windowless_since"] = pending.get("windowless_since") or _iso(now)
+    else:
+        pending["windowless_since"] = None
+        if pending.get("window_since") is None:
+            pending["window_since"] = _iso(now)
+    since = _stamp(pending["window_since"])
+    if since is not None and now.timestamp() - since >= RESUME_GRACE_S:
+        state["actions"].remove(pending)
+        return True
+    return False
+
+
 def _resume(state: dict, record: dict, facts: Facts, now: datetime, window: bool) -> bool:
     """Have the Tern window resume a closed session whose prompts wait in its
     queue. True while that is under way; False when the prompts wait for me:
@@ -1976,28 +2019,14 @@ def _resume(state: dict, record: dict, facts: Facts, now: datetime, window: bool
     or there is no command. Each prompt gets one automatic resume."""
     session = record["session"]
     pending = _pending_resume(state, session)
+    if pending is not None and _count_resume(state, pending, now, window):
+        return False
     if pending is not None:
-        # The countdown runs only while a window is up to carry the resume out;
-        # a window going away restarts it from the next one.
-        if not window:
-            pending["window_since"] = None
-            pending["windowless_since"] = pending.get("windowless_since") or _iso(now)
-        else:
-            pending["windowless_since"] = None
-            if pending.get("window_since") is None:
-                pending["window_since"] = _iso(now)
         windowless = _stamp(pending["windowless_since"])
         if windowless is not None and now.timestamp() - windowless >= RESUME_GRACE_S:
             # It stays queued for the window that comes up; until then I'm told.
             _flag_no_window(state, record, now)
             return True
-    since = _stamp(pending.get("window_since")) if pending is not None else None
-    if pending is not None and since is not None and now.timestamp() - since >= RESUME_GRACE_S:
-        # A window was up all that time and didn't carry it out. One that comes
-        # up much later would open a session nobody expects by then; a window
-        # that wasn't up yet, as at login, doesn't count.
-        state["actions"].remove(pending)
-        return False
     queued = [entry["action"] for entry in record["prompt_queue"]]
     covered = record.get("resume_prompts") or []
     if pending is not None or _resume_opened_lately(record, now):
@@ -2017,17 +2046,48 @@ def _resume(state: dict, record: dict, facts: Facts, now: datetime, window: bool
         _mark_resuming(record)
         return True
     head = record["prompt_queue"][0]["wait"]
-    _enqueue(state, now, {
-        "type": "resume", "session": session, "command": info["resume_command"],
-        "cwd": info["cwd"], "tern_session": record.get("tern_session"), "wait": head,
-        "window_since": _iso(now) if window else None,
-        "windowless_since": None if window else _iso(now),
-    })
+    _enqueue_resume(state, record, info, head, now, window)
     record.update(resume_prompts=queued, resume_opened_at=None)
     wait = _wait_in(record, head)
     _log(record, now, wait, f"Resuming the session to send: {wait['label'] if wait else 'a prompt'}")
     _mark_resuming(record)
     return True
+
+
+def _enqueue_resume(
+    state: dict, record: dict, info: dict, wait_id: str, now: datetime, window: bool,
+    **extra: object,
+) -> None:
+    _enqueue(state, now, {
+        "type": "resume", "session": record["session"], "command": info["resume_command"],
+        "cwd": info["cwd"], "tern_session": record.get("tern_session"), "wait": wait_id,
+        "window_since": _iso(now) if window else None,
+        "windowless_since": None if window else _iso(now), **extra,
+    })
+
+
+def _wake(state: dict, record: dict, facts: Facts, now: datetime, live: bool, window: bool) -> None:
+    """A session back from its snooze comes back on screen: a running one is
+    unparked into a tab of its own (a window that finds it in one is done), a
+    closed one is resumed, and its held prompts go in with that resume. One
+    whose extension was heard lately may still run, so it waits; one that is
+    reopening already comes up in a tab anyway."""
+    wait = next((wait for wait in _open_waits(record) if wait.get("wake")), None)
+    if wait is None:
+        return
+    session = record["session"]
+    if live:
+        pane = _session_pane(state, facts.agents, session, now)
+        if pane is not None:
+            _enqueue(state, now, {"type": "unpark", "session": session, "pane": pane, "wait": wait["id"]})
+    elif _heard_lately(state, session, now):
+        return
+    elif _pending_resume(state, session) is None and not _resume_opened_lately(record, now):
+        info = facts.describe(session)
+        if info["resume_command"]:
+            _enqueue_resume(state, record, info, wait["id"], now, window, wake=True)
+            _log(record, now, wait, "Resuming the session")
+    wait["wake"] = False
 
 
 def _delivery_pass(
@@ -2077,8 +2137,25 @@ def _deliver(
                 _attention(state, record, wait, now, REASON_CUT_TWICE)
     # Cancelling prompts replaces the list.
     queue = record["prompt_queue"]
-    if live or not queue:
+    snooze = _hiding_snooze(record)
+    if snooze is not None and live and snooze.get("closed_seen_at"):
+        # It runs again before its time, and not by its own wake: it is back.
+        _wake_early(state, record, snooze, now)
+    elif snooze is not None and not live:
+        # Hidden until its time: nothing reopens it, and its prompts wait for the wake.
+        snooze["closed_seen_at"] = snooze.get("closed_seen_at") or _iso(now)
         _drop_resume(state, session)
+        _mark_resuming(record, REASON_HELD)
+        return
+    _wake(state, record, facts, now, live, window)
+    pending = _pending_resume(state, session)
+    if pending is not None and (live or not queue):
+        # A session that came back needs no second omp; a wake's resume brings
+        # it back with nothing to send.
+        if live or not pending.get("wake"):
+            state["actions"].remove(pending)
+        else:
+            _count_resume(state, pending, now, window)
     if not queue:
         return
     if fresh:
@@ -2807,7 +2884,8 @@ def _after_reboot(state: dict, agents: Agents, now: datetime) -> None:
     """Nothing that ran before the reboot runs now. Each closed session gets one
     fresh automatic resume, an extension heard from before the reboot doesn't
     hold it back, and a prompt the reboot cut off is sent again, once, saying
-    so; cut off a second time, by a reboot or a close, it comes to me."""
+    so; cut off a second time, by a reboot or a close, it comes to me. A session
+    back from its snooze that no window brought back yet is woken again."""
     booted = _booted_at()
 
     def this_boots(session: str) -> bool:
@@ -2831,6 +2909,12 @@ def _after_reboot(state: dict, agents: Agents, now: datetime) -> None:
             wait = _wait_in(record, entry["wait"])
             if wait is not None:
                 _log(record, now, wait, f"Sending again after a reboot: {wait['label']}")
+    # Its unpark or resume goes with the other actions (`_housekeeping`).
+    waking = {action.get("wait") for action in state["actions"] if action["type"] in ("unpark", "resume")}
+    for record in state["sessions"].values():
+        for wait in _open_waits(record):
+            if wait["id"] in waking and wait["kind"] == "snooze" and wait["state"] == "fired":
+                wait["wake"] = True
 
 
 def _fold_toasts(state: dict, now: datetime) -> None:
@@ -3023,14 +3107,14 @@ def _repeat_step(state: dict, record: dict, wait: dict, now: datetime) -> None:
     _log(record, now, wait, f"Run {repeat['runs']}: {wait['label']}")
 
 
-def _evaluate(state: dict, now: datetime) -> None:
-    """Everything that needs only the clock."""
+def _evaluate(state: dict, now: datetime, facts: Facts) -> None:
+    """Everything the clock brings about; `facts` names a session back from its snooze."""
     for record in _records(state):
         with _isolated(state, record, now):
-            _evaluate_record(state, record, now)
+            _evaluate_record(state, record, now, facts)
 
 
-def _evaluate_record(state: dict, record: dict, now: datetime) -> None:
+def _evaluate_record(state: dict, record: dict, now: datetime, facts: Facts) -> None:
     stamp = now.timestamp()
     for wait in list(record["waits"]):
         if wait["state"] == "snoozed" and _stamp(wait["refire_at"]) <= stamp:
@@ -3042,6 +3126,8 @@ def _evaluate_record(state: dict, record: dict, now: datetime) -> None:
         condition = wait["condition"]
         if wait["kind"] == "time" and _stamp(condition["at"]) <= stamp:
             _fire(state, record, wait, now, fired=_timer_text(wait))
+        elif wait["kind"] == "snooze" and _stamp(condition["at"]) <= stamp:
+            _back_from_snooze(state, record, wait, now, facts)
         else:
             deadline = _stamp(wait["deadline"])
             if deadline is not None and deadline <= stamp and not wait["overdue"]:
@@ -3050,6 +3136,19 @@ def _evaluate_record(state: dict, record: dict, now: datetime) -> None:
                 _log(record, now, wait, f"{wait['label']}: {REASON_OVERDUE}", "attention")
                 record["unseen"] = True
                 _toast(state, record, wait, now, "error", f"{wait['label']}: {REASON_OVERDUE}")
+
+
+def _back_from_snooze(state: dict, record: dict, wait: dict, now: datetime, facts: Facts) -> None:
+    """The snooze's time came: it fires like a time wait without a prompt, and
+    its target comes back on screen. A session's wake waits for the delivery
+    pass, which knows whether it runs (`_wake`); a shell pane is unparked now."""
+    session = record["session"]
+    name = facts.describe(session)["title"] if session else record["note"]
+    _fire(state, record, wait, now, f"{SNOOZE_BACK}: {name}" if name else SNOOZE_BACK, fired=SNOOZE_BACK)
+    if session:
+        wait["wake"] = True
+    else:
+        _enqueue(state, now, {"type": "unpark", "session": None, "pane": record["pane"], "wait": wait["id"]})
 
 
 def _check_bound_s(wait: dict, pr_bound: int) -> int:
@@ -3141,7 +3240,8 @@ def _record_times(state: dict, record: dict, now: datetime) -> list[float | None
         for since in (_stamp(pending.get("window_since")), _stamp(pending.get("windowless_since"))):
             if since is not None and since + RESUME_GRACE_S > stamp:
                 times.append(since + RESUME_GRACE_S)
-    if record["prompt_queue"] and _heard_lately(state, record["session"] or "", now):
+    waking = any(wait.get("wake") for wait in _open_waits(record))
+    if (record["prompt_queue"] or waking) and _heard_lately(state, record["session"] or "", now):
         # When a closed session's extension has been quiet long enough to resume it.
         times.append(_stamp(state["extensions"][record["session"]]) + RESUME_QUIET_S)
     for wait in record["waits"]:
@@ -3158,7 +3258,7 @@ def _record_times(state: dict, record: dict, now: datetime) -> list[float | None
             times += [_stamp(wait["repeat"]["next_at"]), _stamp(wait["repeat"]["ends_at"])]
         if not wait["overdue"]:
             times.append(_stamp(wait["deadline"]))
-        if wait["kind"] == "time":
+        if wait["kind"] in ("time", "snooze"):
             times.append(_stamp(wait["condition"]["at"]))
     return times
 
@@ -3177,7 +3277,7 @@ def _wait_due(wait: dict) -> float | None:
     if wait["state"] == "pending":
         return None
     times = [_stamp(wait["deadline"]), _stamp(wait["refire_at"])]
-    if wait["kind"] == "time":
+    if wait["kind"] in ("time", "snooze"):
         times.append(_stamp(wait["condition"]["at"]))
     repeat = wait.get("repeat")
     if repeat and wait["state"] == "waiting":
@@ -3195,6 +3295,7 @@ def _wait_ball(wait: dict) -> str:
         return "on_timer"
     return {
         "something": "on_someone", "later": "on_my_time", "time": "on_timer", "repeat": "on_timer",
+        "snooze": "on_timer",
     }.get(wait["kind"], "on_machine")
 
 
@@ -3254,7 +3355,7 @@ def _condition_summary(wait: dict, now: datetime) -> str:
     kind = wait["kind"]
     if kind == "pr":
         return f"PR#{condition['number']} {PR_UNTIL[condition['until']].lower()}"
-    if kind == "time":
+    if kind in ("time", "snooze"):
         if condition.get("at"):
             return f"until {_clock(_parse_time(condition['at']), now)}"
         if condition.get("clock"):
@@ -3276,10 +3377,10 @@ def _condition_summary(wait: dict, now: datetime) -> str:
 
 def _progress(wait: dict, outcome: str | None, now: datetime) -> str | None:
     """What the wait does right now, beyond waiting: Tern resumes the session for
-    it, its checks have failed a while for a reason that passes, or the agent
-    runs its prompt."""
-    if wait["reason"] == REASON_RESUMING:
-        return REASON_RESUMING
+    it, or its prompt waits for the session's snooze to end, its checks have
+    failed a while for a reason that passes, or the agent runs its prompt."""
+    if wait["reason"] in (REASON_RESUMING, REASON_HELD):
+        return wait["reason"]
     checked = wait["state"] == "waiting" or wait["state"] == "acting" and wait["verify_pending"]
     if checked and _transient_reported(wait, now):
         return _transient_text(wait, now)
@@ -3368,7 +3469,7 @@ def _wait_mark(view: dict) -> str:
         return WORKING_MARK
     if view["outcome"] is None and view["kind"] == "repeat" and view["state"] != "snoozed":
         return REPEAT_MARK
-    waits_for_time = view["kind"] == "time" or view["state"] == "snoozed"
+    waits_for_time = view["kind"] in ("time", "snooze") or view["state"] == "snoozed"
     return OUTCOME_MARKS.get(view["outcome"]) or ("⏲ " if waits_for_time else "⏳ ")
 
 
@@ -3401,6 +3502,8 @@ def _track_text(view: dict) -> str:
         text = view["summary"].removeprefix(REPEAT_MARK)
         own = _own_repeat_label(view)
         text = f"{own} · {text}" if own else text
+    elif view["kind"] == "snooze":
+        text = f"{view['label']} {view['summary']}"
     else:
         text = view["summary"] if view["kind"] in ("pr", "something") else view["label"]
     return f"{text}, {view['progress']}" if view["progress"] else text
@@ -3462,6 +3565,10 @@ def _status_lines(
                 own, timing, until and f"until {until}", detail, primary["progress"],
             ) if text]
             glance = f"{_clip(own, SHORT_LABEL_CHARS)} · {timing}" if own else timing
+        elif primary["kind"] == "snooze" and primary["outcome"] is None:
+            # `Snoozed until 09:00`: its time says it all.
+            glance = _track_text(primary)
+            parts = [glance, _when(primary, now)]
         else:
             if primary["kind"] == "pr":
                 short = f"PR#{primary['condition']['number']}"
@@ -3552,6 +3659,12 @@ def _reported_pane(state: dict, agents: Agents, session: str, now: datetime) -> 
     return state["extension_panes"].get(session)
 
 
+def _session_pane(state: dict, agents: Agents, session: str, now: datetime) -> int | None:
+    """The session's Tern pane: agents.json's, else the one its extension named."""
+    pane = agents.pane_of(session)
+    return pane if pane is not None else _reported_pane(state, agents, session, now)
+
+
 def _extension_panes(state: dict, agents: Agents, now: datetime) -> dict:
     """By pane: which session's extension runs there, and whether it has the menu."""
     panes = {}
@@ -3584,12 +3697,16 @@ def _target_view(
     ]
     outcome, headline = _outcome_headline(views)
     dues = [view["due_at"] for view in _active(views) if view["due_at"]]
+    snooze = _hiding_snooze(record)
     return {
         "ball": min((view["ball"] for view in _active(views)), key=BALL_RANK.get) if views else None,
         "outcome": outcome, "headline": headline,
         "threads": _track_texts(views), "still_waiting": _still_waiting(views),
         "waiting_for": _waiting_for(views),
         "due_at": min(dues, key=_stamp) if dues else None,
+        # Hidden by a session snooze until then, and how (`cmd_add --kind snooze`).
+        "snoozed_until": snooze["condition"]["at"] if snooze else None,
+        "snooze_hide": snooze["condition"]["hide"] if snooze else None,
         "waits": views, "history": _history_view(record),
         # What Seen (`mark-seen`) closes, and what Stop all (`stop --all`) ends.
         "on_you": [
@@ -3626,16 +3743,10 @@ def _session_view(
         # A card may show any session; a listed one without waits is pinned.
         target["ball"] = "on_my_time" if pinned else "on_machine"
     status, line = _status_lines(views, note, pinned, now)
-    pane = info["pane"]
-    if pane is None:
-        pane = _reported_pane(state, facts.agents, session, now)
+    pane = _session_pane(state, facts.agents, session, now)
     return {
         **target,
-        "close": _session_close(
-            record, info["resumable"], pane, pinned, _activity(state, session, info["live"], now),
-            # A session running outside Tern (kitty, say) has no pane to park.
-            parkable=pane is not None or not info["live"],
-        ),
+        "close": _current_close(state, session, record, info, pane, pinned, now),
         "session_id": session, "title": info["title"], "cwd": info["cwd"],
         "project": info["project"], "live": info["live"], "pane": pane,
         "tern_session": _text(live.get("ternSession")) or None,
@@ -3661,10 +3772,7 @@ def _pane_view(record: dict, now: datetime) -> dict:
     pane = record["pane"]
     return {
         **target,
-        # Closing the pane ends its record (`_pane_closed`): only a job comes back, to me.
-        "close": _close_view({
-            "job" if _watches_job(wait, pane) else "shell" for wait in _open_waits(record)
-        }),
+        "close": _pane_close(record),
         "pane": pane,
         "label": _primary(target["waits"])["label"],
         "note": record["note"],
@@ -3673,6 +3781,24 @@ def _pane_view(record: dict, now: datetime) -> dict:
         # The Tern daemon whose pane this is (`event --daemon`).
         "daemon": record.get("daemon"),
     }
+
+
+def _pane_close(record: dict) -> dict | None:
+    """Closing a shell pane ends its record (`_pane_closed`): only a job comes back, to me."""
+    pane = record["pane"]
+    return _close_view({"job" if _watches_job(wait, pane) else "shell" for wait in _open_waits(record)})
+
+
+def _current_close(
+    state: dict, session: str, record: dict | None, info: dict, pane: int | None, pinned: bool,
+    now: datetime,
+) -> dict | None:
+    """The session's `close` now: `info` is its `Facts.describe`, `pane` its `_session_pane`."""
+    return _session_close(
+        record, info["resumable"], pane, pinned, _activity(state, session, info["live"], now),
+        # A session running outside Tern (kitty, say) has no pane to park.
+        parkable=pane is not None or not info["live"],
+    )
 
 
 def _close_view(reasons: set[str], parkable: bool = True) -> dict | None:
@@ -3697,8 +3823,9 @@ def _on_me_already(wait: dict) -> bool:
 
 
 def _comes_back_alone(wait: dict) -> bool:
-    """A closed session is reopened for this wait's prompt, or each repeat run."""
-    return bool(wait["prompt"] or wait.get("repeat")) and wait["kind"] != "later"
+    """A closed session is reopened for this wait's prompt, each repeat run, or
+    its snooze's wake."""
+    return wait["kind"] == "snooze" or (bool(wait["prompt"] or wait.get("repeat")) and wait["kind"] != "later")
 
 
 def _activity(state: dict, session: str, live: bool, now: datetime) -> dict:
@@ -3933,11 +4060,23 @@ def _default_label(kind: str, condition: dict) -> str:
         return PR_UNTIL[condition["until"]]
     if kind == "something":
         return condition["what"]
-    return {"time": "Timer", "later": "When I have time"}[kind]
+    return {"time": "Timer", "later": "When I have time", "snooze": "Snoozed"}[kind]
 
 
 def _comma_list(text: str) -> list[str]:
     return [part.strip() for part in text.split(",") if part.strip()]
+
+
+def _time_condition(args: argparse.Namespace, kind: str) -> dict:
+    """When a time wait or a snooze comes: `--in`, an ISO `--at`, or a bare
+    clock `--at`, the next time it shows once the wait starts (`_arm`)."""
+    clock = _CLOCK_TIME.fullmatch((args.at or "").strip())
+    if clock and args.in_ is None:
+        return {"type": kind, "at": None, "clock": clock[0]}
+    at, in_s = _time_or_in(args.at, args.in_, "time")
+    if at is None and in_s is None:
+        raise BadInput(f"{kind} needs --at or --in")
+    return {"type": kind, "at": at} if at else {"type": kind, "at": None, "in_s": in_s}
 
 
 def _condition(args: argparse.Namespace) -> dict:
@@ -3946,14 +4085,13 @@ def _condition(args: argparse.Namespace) -> dict:
     for name in set().union(*KIND_OPTIONS.values()) - allowed:
         if getattr(args, name) not in (None, False):
             raise BadInput(f"--{name.strip('_').replace('_', '-')} does not apply to {kind}")
-    if kind == "time":
-        clock = _CLOCK_TIME.fullmatch((args.at or "").strip())
-        if clock and args.in_ is None:
-            return {"type": "time", "at": None, "clock": clock[0]}
-        at, in_s = _time_or_in(args.at, args.in_, "time")
-        if at is None and in_s is None:
-            raise BadInput("time needs --at or --in")
-        return {"type": "time", "at": at} if at else {"type": "time", "at": None, "in_s": in_s}
+    if kind in ("time", "snooze"):
+        condition = _time_condition(args, kind)
+        if kind == "snooze":
+            if args.hide is None:
+                raise BadInput("snooze needs --hide park or --hide close")
+            condition["hide"] = args.hide
+        return condition
     if kind == "command":
         describe = _text(args.describe)
         if (args.argv is None) == (not describe):
@@ -4064,6 +4202,48 @@ def _park(
     return pane
 
 
+def _hide(
+    state: dict, record: dict, wait: dict, agents: Agents, facts: Facts, now: datetime,
+    daemon: str | None = None,
+) -> dict:
+    """Take a snoozed target off the screen as its snooze's `hide` says. A close
+    whose close verdict is park only parks instead, and `fallback` says why.
+    `hidden` is what was done or is the caller's to do: "park"; "close", which a
+    Tern window does to the pane and the caller does outside Tern; or None when
+    there is nothing to hide (a closed session, no Tern pane to park)."""
+    hide, fallback = wait["condition"]["hide"], None
+    session = record["session"]
+    if session:
+        pane = _session_pane(state, agents, session, now)
+        close = _current_close(
+            state, session, record, facts.describe(session), pane, session in facts.omp.pins(), now,
+        )
+        live = _running(state, agents, session)
+    else:
+        pane, close, live = record["pane"], _pane_close(record), True
+    if hide == "close" and close is not None and close["verdict"] == "park":
+        hide, fallback = "park", close["text"]
+    if not live or (hide == "park" and pane is None):
+        return {"hidden": None, "fallback": fallback}
+    if pane is not None:
+        action = {"type": "park"} if hide == "park" else {"type": "close_pane", "wait": wait["id"]}
+        _enqueue(state, now, {**action, "session": session, "pane": pane}, daemon)
+    return {"hidden": hide, "fallback": fallback}
+
+
+def _snooze_until(state: dict, record: dict, wait: dict, condition: dict, now: datetime) -> None:
+    """Point the target's one snooze at a new time and hide: it waits again,
+    whatever it was, and a wake on its way is called off."""
+    state["actions"] = [
+        action for action in state["actions"]
+        if not (action.get("wait") == wait["id"] and action["type"] in ("unpark", "resume"))
+    ]
+    for key in ("wake", "closed_seen_at"):
+        wait.pop(key, None)
+    wait.update(condition=condition, on_me=False, reason=None, fired_text=None, fired_at=None)
+    _arm(wait, now)
+
+
 def _attach_after(record: dict, wait: dict, after: str | None, now: datetime) -> None:
     """Put `wait` at the end of `after`'s chain, or arm it when that has ended."""
     if after is None:
@@ -4158,6 +4338,15 @@ def cmd_add(args: argparse.Namespace) -> dict:
     condition = _condition(args)
     repeat = _repeat_options(args)
     kind = condition["type"] if kind == "release" else kind
+    if kind == "snooze":
+        # Its time and --hide say it all: it hides the session now and brings it back by itself.
+        given = {
+            "--prompt": args.prompt is not None, "--after": args.after, "--park": args.park,
+            "--deadline": args.deadline or args.deadline_in,
+        }
+        refused = next((flag for flag, value in given.items() if value), None)
+        if refused:
+            raise BadInput(f"snooze takes no {refused}")
     if args.prompt and session is None:
         raise BadInput("a prompt needs --session")
     if args.prompt is not None and kind == "something":
@@ -4192,6 +4381,12 @@ def cmd_add(args: argparse.Namespace) -> dict:
         wait = None
         if kind == "something" and not args.after:
             wait = _set_something(state, record, condition["what"], _text(args.label), args.by, now)
+        elif kind == "snooze":
+            # One snooze per target: another one moves it.
+            wait = _open_snooze(record)
+            if wait is not None:
+                _snooze_until(state, record, wait, condition, now)
+                _log(record, now, wait, f"Snoozed until {_clock(_parse_time(condition['at']), now)}")
         if wait is not None:
             if deadline is not None or deadline_in_s is not None:
                 _move_deadline(record, wait, deadline, deadline_in_s, now)
@@ -4227,8 +4422,9 @@ def cmd_add(args: argparse.Namespace) -> dict:
         parked = {}
         if args.park:
             parked["parked"] = _park(state, agents, now, record["session"], record["pane"], args.daemon)
+        hidden = _hide(state, record, wait, agents, facts, now, args.daemon) if kind == "snooze" else {}
         pin = _move_pin(state, session, True if kind == "later" else None, facts.omp, now)
-        return {"session": session, "pane": pane, "wait": _wait_view(wait, now), **pin, **parked}
+        return {"session": session, "pane": pane, "wait": _wait_view(wait, now), **pin, **parked, **hidden}
 
     return _mutate(apply, agents=agents, omp=facts.omp)
 
@@ -4485,26 +4681,30 @@ def _snooze_hides(wait: dict) -> bool:
 
 
 def _snooze_refusal(record: dict, wait: dict) -> str | None:
-    """Why Snooze 1d can't take this open wait (put after its id), or None. The
-    view's `snoozable` says the same, so no surface offers what this refuses."""
+    """Why Snooze 1d can't take this open wait (put after its id), or None. It
+    pushes only what is on me. The view's `snoozable` says the same, so no
+    surface offers what this refuses."""
     if wait["state"] == "pending":
         return " has not started yet"
     if wait["kind"] == "later":
         return " waits for my time: nothing brings it back"
-    if wait["kind"] == "job" and wait["state"] == "waiting" and not wait["overdue"]:
-        return " is a job that still runs: it comes back when it ends"
     # A repeat's run goes on whatever the wait does next.
     if wait["kind"] != "time" and not wait.get("repeat") and _prompt_handed_over(record, wait):
         return ": the agent runs its prompt now"
+    if _wait_ball(wait) != "on_me":
+        return " isn't on you"
     return None
 
 
 def cmd_snooze(args: argparse.Namespace) -> dict:
-    """Snooze 1d: the wait comes off me until `--for` from now. A waiting one is
-    watched again from then; one whose event happened is hidden until then and
-    comes back as it was (`_unsnooze`)."""
+    """Snooze 1d: the wait on me comes off me until `--for` from now. A waiting
+    one is watched again from then; one whose event happened is hidden until
+    then and comes back as it was (`_unsnooze`). A session back from its snooze
+    is snoozed again, and hides as it did."""
     session, pane = _target(args)
     delay = timedelta(seconds=_parse_duration(args.for_))
+    agents = _read_agents()
+    facts = Facts(agents)
 
     def apply(state: dict, now: datetime) -> dict:
         record = _lookup(state, session, pane)
@@ -4513,7 +4713,14 @@ def cmd_snooze(args: argparse.Namespace) -> dict:
         if refusal:
             raise BadInput(f"{args.wait}{refusal}")
         until = _iso(now + delay)
-        snoozed = f"Snoozed until {_clock(_parse_time(until), now)}"
+        clock = _clock(_parse_time(until), now)
+        if wait["kind"] == "snooze":
+            # Back from its snooze: the session hides again, as it did.
+            condition = {"type": "snooze", "at": until, "hide": wait["condition"]["hide"]}
+            _snooze_until(state, record, wait, condition, now)
+            _log(record, now, wait, f"Snoozed again until {clock}")
+            return _hide(state, record, wait, agents, facts, now)
+        snoozed = f"Snoozed until {clock}"
         if wait["overdue"] and wait["state"] == "waiting":
             # Only the deadline moves: its checks, and a repeat's runs, go on.
             wait.update(deadline=until, deadline_in_s=None, overdue=False, on_me=False, reason=None)
@@ -4558,7 +4765,30 @@ def cmd_snooze(args: argparse.Namespace) -> dict:
         _log(record, now, wait, snoozed)
         return {}
 
-    return _mutate(apply)
+    return _mutate(apply, agents=agents, omp=facts.omp)
+
+
+def cmd_wake(args: argparse.Namespace) -> dict:
+    """The session came back before its snooze's time (Tern opened, resumed or
+    unparked it): the snooze ends. Nothing snoozed is no error. `--pane` is a
+    shell pane's record, else the session that runs in that pane."""
+    session, pane = _target(args)
+    agents = _read_agents()
+
+    def apply(state: dict, now: datetime) -> dict:
+        record = _lookup(state, session, pane)
+        if _hiding_snooze(record) is None and session is None:
+            held = agents.session_of(pane) or next((
+                held for held in state["extension_panes"]
+                if _reported_pane(state, agents, held, now) == pane
+            ), None)
+            record = state["sessions"].get(held) if held else None
+        snooze = _hiding_snooze(record)
+        if snooze is not None:
+            _wake_early(state, record, snooze, now)
+        return {"woken": snooze is not None}
+
+    return _mutate(apply, agents=agents)
 
 
 def cmd_retry(args: argparse.Namespace) -> dict:
@@ -4794,6 +5024,12 @@ def cmd_heartbeat(args: argparse.Namespace) -> dict:
             state["extension_panes"][args.session] = args.pane
         record = state["sessions"].get(args.session)
         if record:
+            snooze = _hiding_snooze(record)
+            if snooze is not None and snooze.get("closed_seen_at"):
+                # Seen closed, it runs again before its time, and not by its wake:
+                # someone brought it back. A heartbeat still on its way from before
+                # the close comes before any tick saw it closed (`_deliver`).
+                _wake_early(state, record, snooze, now)
             _clear_delivery_flags(record)
             if args.idle:
                 _settle_idle(state, record, now)
@@ -5094,7 +5330,7 @@ def _tick(args: argparse.Namespace) -> dict:
         _housekeeping(state, agents, omp, now, args.daemon)
         _clamp(state, now, problems)
         _pin_pass(state, omp, now)
-        _evaluate(state, now)
+        _evaluate(state, now, Facts(agents, omp))
         _delivery_pass(state, agents, now, args.window, stale)
         jobs = _claim_checks(state, now)
         answer = None if jobs else finish(state, agents)
@@ -5364,6 +5600,8 @@ def _parser() -> argparse.ArgumentParser:
     add.add_argument("--close-on-success", action="store_true")
     add.add_argument("--after")
     add.add_argument("--park", action="store_true")
+    # What a snooze does with the session until its time.
+    add.add_argument("--hide", choices=("park", "close"))
     add.add_argument("--every")
     add.add_argument("--for", dest="for_")
     add.add_argument("--times", type=int)
@@ -5419,6 +5657,9 @@ def _parser() -> argparse.ArgumentParser:
     _add_target(snooze)
     snooze.add_argument("--wait", required=True)
     snooze.add_argument("--for", dest="for_", required=True)
+
+    wake = command("wake", cmd_wake)
+    _add_target(wake)
 
     for name, run in (("seen", cmd_seen), ("resume", cmd_resume)):
         command(name, run).add_argument("--session", type=_session_arg, required=True)

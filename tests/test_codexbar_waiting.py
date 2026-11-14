@@ -815,9 +815,12 @@ class ConditionTests(Case):
         self.assertEqual(pane["ball"], "on_someone")
 
     def test_snoozed_prompt_goes_out_once_at_the_new_time(self) -> None:
+        # The session is gone and can't be resumed: the prompt comes to me.
+        self.agents()
         wait = self.add("--kind", "time", "--in", "1h", "--prompt", "go")["id"]
         self.advance(hours=1)
         self.tick()
+        self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_CLOSED)
         self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
         self.assertEqual(self.state()["sessions"][SID]["prompt_queue"], [])
         self.tick()
@@ -1126,6 +1129,8 @@ class PrTests(Case):
         real = waiting._run_jobs
 
         def snooze_and_run_it_again(jobs, now):
+            # A question puts it on me, where Snooze 1d can take it.
+            self.run_cli("event", "--type", "waiting_input", "--session", SID)
             self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1s")
             self.advance(seconds=2)
             self.tick()
@@ -1197,18 +1202,11 @@ class DeadlineTests(Case):
         self.assertEqual(self.wait_of(timer)["state"], "fired")
         self.assertEqual(self.wait_of(something)["ball"], "on_me")
 
-    def test_snooze_pushes_a_deadline_still_ahead_of_something(self) -> None:
+    def test_something_not_late_yet_is_not_on_me_to_snooze(self) -> None:
         wait = self.add("--kind", "something", "--what", "x", "--deadline-in", "1h")["id"]
-        self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
-        self.assertEqual(self.wait_of(wait)["deadline"], (self.clock + timedelta(days=1)).isoformat())
-
-    def test_snooze_gives_something_a_time_to_come_back(self) -> None:
-        wait = self.add("--kind", "something", "--what", "x")["id"]
-        self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
-        self.assertEqual(self.wait_of(wait)["ball"], "on_someone")
-        self.advance(days=1)
-        self.tick()
-        self.assertEqual(self.wait_of(wait)["ball"], "on_me")
+        answer = self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d", expect=2)
+        self.assertEqual(answer["error"], f"{wait} isn't on you")
+        self.assertEqual(self.wait_of(wait)["deadline"], (self.clock + timedelta(hours=1)).isoformat())
 
     def test_snooze_brings_a_finished_job_back(self) -> None:
         wait = self.add("--kind", "job", "--pane", "51")["id"]
@@ -1221,8 +1219,8 @@ class DeadlineTests(Case):
 
 
 class SnoozeTests(Case):
-    """Snooze 1d: a wait still waiting is watched again from the new time; one whose
-    event happened is hidden until then and comes back as it was."""
+    """Snooze 1d pushes what is on me: a wait still waiting is watched again from
+    the new time; one whose event happened is hidden until then and comes back as it was."""
 
     def snooze(self, wait: str, expect: int = 0) -> dict:
         return self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d", expect=expect)
@@ -1335,17 +1333,212 @@ class SnoozeTests(Case):
         job = self.add("--kind", "job", "--pane", "51")["id"]
         first = self.add("--kind", "time", "--in", "1h")["id"]
         step = self.add("--kind", "time", "--in", "1h", "--after", first)["id"]
+        fired = self.add("--kind", "time", "--in", "1s")["id"]
+        self.advance(seconds=2)
         acting = self.ran_prompt()
         offered = {wait["id"]: wait["snoozable"] for wait in self.session()["waits"]}
-        self.assertEqual(offered, {later: False, job: False, first: True, step: False, acting: False})
+        # Only what is on me: a timer still running isn't.
+        self.assertEqual(
+            offered, {later: False, job: False, first: False, step: False, fired: True, acting: False},
+        )
         for wait, snoozable in offered.items():
             self.snooze(wait, expect=0 if snoozable else 2)
         # A job that ended can be hidden; so can a pane's wait.
         self.run_cli("event", "--type", "job_finished", "--pane", "51", "--status", "0")
         self.assertTrue(self.wait_of(job)["snoozable"])
-        self.run_cli("add", "--pane", "52", "--kind", "something", "--what", "deploy")
+        self.run_cli("add", "--pane", "52", "--kind", "time", "--in", "1s")
+        self.advance(seconds=2)
+        self.tick()
         pane = self.run_cli("list")["panes"][0]
         self.assertEqual([wait["snoozable"] for wait in pane["waits"]], [True])
+
+
+class SessionSnoozeTests(Case):
+    """`add --kind snooze`: the session leaves the screen until a time, then comes back by itself."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.agents(SID)
+        self.heartbeat()
+
+    def snooze(self, *argv: str, expect: int = 0) -> dict:
+        return self.run_cli("add", "--session", SID, "--kind", "snooze", *argv, expect=expect)
+
+    def actions(self, kind: str, *extra: str) -> list[dict]:
+        return [action for action in self.tick(*extra)["actions"] if action["type"] == kind]
+
+    def closed(self, boot: str = "") -> None:
+        """The session ended; omp can resume it."""
+        row = {"sessionId": SID, "cwd": "/w", "windowTitle": "x", "resumeCommand": f"omp --resume {SID}"}
+        self.agents(closed=[row], boot=boot)
+
+    def history(self) -> list[str]:
+        return [line["text"] for line in self.state()["sessions"][SID]["history"]]
+
+    def test_park_hides_it_and_the_view_says_until_when(self) -> None:
+        answer = self.snooze("--in", "2h", "--hide", "park")
+        self.assertEqual((answer["hidden"], answer["fallback"]), ("park", None))
+        self.assertEqual(
+            [(action["session"], action["pane"]) for action in self.actions("park")], [(SID, 40)],
+        )
+        seen = self.session()
+        self.assertEqual(
+            (seen["snoozed_until"], seen["snooze_hide"], seen["ball"]),
+            ((T0 + timedelta(hours=2)).isoformat(), "park", "on_timer"),
+        )
+        self.assertEqual((seen["status"], seen["threads"]), ("⏲ Snoozed until 14:00", ["⏲ Snoozed until 14:00"]))
+        self.assertEqual(seen["line"], "⏲ Snoozed until 14:00 · in 2h")
+        # It comes back by itself, so closing loses nothing; nothing is on me to push.
+        self.assertEqual(seen["close"]["verdict"], "safe")
+        self.assertFalse(seen["waits"][0]["snoozable"])
+
+    def test_close_closes_its_tern_pane_and_outside_tern_the_caller_does(self) -> None:
+        self.agents(SID, OTHER)
+        payload = json.loads((self.state_dir / "agents.json").read_text())
+        del payload["agents"][1]["ternPane"]  # OTHER runs in kitty, say
+        (self.state_dir / "agents.json").write_text(json.dumps(payload))
+        self.heartbeat(OTHER)
+        answer = self.snooze("--in", "2h", "--hide", "close")
+        self.assertEqual((answer["hidden"], answer["fallback"]), ("close", None))
+        outside = self.run_cli("add", "--session", OTHER, "--kind", "snooze", "--in", "2h", "--hide", "close")
+        self.assertEqual((outside["hidden"], outside["fallback"]), ("close", None))
+        self.assertEqual(
+            [(action["session"], action["pane"]) for action in self.actions("close_pane")], [(SID, 40)],
+        )
+
+    def test_a_close_its_verdict_refuses_parks_instead(self) -> None:
+        self.heartbeat(SID, "--features", "activity")  # a turn runs
+        answer = self.snooze("--in", "2h", "--hide", "close")
+        self.assertEqual((answer["hidden"], answer["fallback"]), ("park", "park only: the agent is working"))
+        self.assertEqual(self.actions("close_pane"), [])
+        self.assertEqual(len(self.actions("park")), 1)
+
+    def test_a_second_snooze_moves_the_first(self) -> None:
+        first = self.snooze("--in", "2h", "--hide", "park")["wait"]["id"]
+        second = self.snooze("--in", "1d", "--hide", "close")["wait"]
+        self.assertEqual(second["id"], first)
+        self.assertEqual(
+            (second["condition"]["at"], second["condition"]["hide"]), ((T0 + timedelta(days=1)).isoformat(), "close"),
+        )
+        self.assertEqual([wait["id"] for wait in self.session()["waits"]], [first])
+        self.assertIn("Snoozed until Nov 6 12:00", self.history())
+
+    def test_hide_belongs_to_a_snooze_alone(self) -> None:
+        self.snooze("--in", "2h", expect=2)
+        self.run_cli("add", "--session", SID, "--kind", "time", "--in", "2h", "--hide", "park", expect=2)
+        for extra in (("--prompt", "go"), ("--park",), ("--deadline-in", "1d"), ("--after", "w1")):
+            with self.subTest(extra=extra):
+                self.snooze("--in", "2h", "--hide", "park", *extra, expect=2)
+        self.assertNotIn(SID, self.state()["sessions"])
+
+    def test_back_from_snooze_unparks_a_running_session(self) -> None:
+        self.snooze("--in", "1h", "--hide", "park")
+        self.advance(hours=1)
+        actions = self.tick()["actions"]
+        self.assertEqual(
+            [(action["session"], action["pane"]) for action in actions if action["type"] == "unpark"], [(SID, 40)],
+        )
+        self.assertIn("Back from snooze: title 01a1", [action.get("text") for action in actions])
+        seen = self.session()
+        wait = seen["waits"][0]
+        self.assertEqual(
+            (wait["state"], wait["ball"], wait["fired_text"], wait["snoozable"]),
+            ("fired", "on_me", "Back from snooze", True),
+        )
+        self.assertEqual((seen["snoozed_until"], seen["snooze_hide"]), (None, None))
+        # Seen: done with it.
+        self.run_cli("mark-seen", "--session", SID)
+        self.assertEqual(self.run_cli("list")["sessions"], [])
+
+    def test_back_from_snooze_resumes_a_closed_session(self) -> None:
+        self.snooze("--in", "1h", "--hide", "close")
+        self.closed()
+        self.advance(hours=1)
+        resumes = self.actions("resume", "--window")
+        self.assertEqual(
+            [(action["session"], action["command"], action["wake"]) for action in resumes],
+            [(SID, f"omp --resume {SID}", True)],
+        )
+        self.assertEqual(len(self.actions("resume", "--window")), 1)  # one wake, not one per tick
+
+    def test_prompts_of_a_closed_snoozed_session_wait_for_its_wake(self) -> None:
+        prompted = self.add("--kind", "time", "--in", "30m", "--prompt", "go")["id"]
+        self.snooze("--in", "2h", "--hide", "close")
+        self.closed()
+        self.advance(minutes=10)
+        self.tick("--window")
+        self.advance(minutes=20)
+        self.assertEqual(self.actions("resume", "--window"), [])
+        seen = self.wait_of(prompted)
+        self.assertEqual((seen["state"], seen["ball"], seen["progress"]), ("acting", "on_machine", waiting.REASON_HELD))
+        self.advance(minutes=90)
+        resumes = self.actions("resume", "--window")
+        self.assertEqual([action["wake"] for action in resumes], [True])
+        self.assertEqual(self.wait_of(prompted)["reason"], waiting.REASON_RESUMING)
+        self.run_cli("ack", "--action", resumes[0]["id"], "--result", "done")
+        self.agents(SID)
+        self.heartbeat()
+        self.assertEqual([prompt["text"] for prompt in self.run_cli("claim-prompts", "--session", SID)["prompts"]], ["go"])
+
+    def test_wake_ends_it_early(self) -> None:
+        self.snooze("--in", "1d", "--hide", "park")
+        self.assertTrue(self.run_cli("wake", "--pane", "40")["woken"])
+        self.assertEqual(self.history()[-1], "Woken early")
+        self.assertEqual(self.run_cli("list")["sessions"], [])
+        self.assertFalse(self.run_cli("wake", "--session", SID)["woken"])
+
+    def test_a_closed_snooze_ends_when_the_session_runs_again(self) -> None:
+        self.snooze("--in", "1d", "--hide", "close")
+        # A heartbeat on its way before the close lands after it: still snoozed.
+        self.advance(seconds=1)
+        self.heartbeat()
+        self.closed()
+        self.advance(minutes=1)
+        self.tick()
+        self.assertEqual(self.session()["snooze_hide"], "close")
+        # Resumed by hand before its time: it is back.
+        self.agents(SID)
+        self.heartbeat()
+        self.assertEqual(self.history()[-1], "Woken early")
+        self.assertEqual(self.run_cli("list")["sessions"], [])
+
+    def test_snooze_1d_hides_a_session_back_from_its_snooze_again(self) -> None:
+        wait = self.snooze("--in", "1h", "--hide", "park")["wait"]["id"]
+        self.advance(hours=1)
+        self.tick()
+        answer = self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
+        self.assertEqual((answer["hidden"], answer["fallback"]), ("park", None))
+        seen = self.session()
+        self.assertEqual(
+            (seen["waits"][0]["state"], seen["snoozed_until"]), ("waiting", (self.clock + timedelta(days=1)).isoformat()),
+        )
+        self.assertEqual(self.history()[-1], "Snoozed again until Nov 6 13:00")
+        # The unpark its time queued goes; it parks again.
+        types = [action["type"] for action in self.tick()["actions"]]
+        self.assertNotIn("unpark", types)
+        self.assertEqual(types.count("park"), 2)
+
+    def test_snooze_1d_refuses_what_is_not_on_me(self) -> None:
+        snoozed = self.snooze("--in", "1h", "--hide", "park")["wait"]["id"]
+        timer = self.add("--kind", "time", "--in", "1h")["id"]
+        for wait in (snoozed, timer):
+            answer = self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d", expect=2)
+            self.assertEqual(answer["error"], f"{wait} isn't on you")
+
+    def test_a_wake_no_window_carried_out_before_a_reboot_comes_again(self) -> None:
+        self.agents(SID, boot="one")
+        self.snooze("--in", "1h", "--hide", "park")
+        self.advance(hours=1)
+        self.assertEqual(len(self.actions("unpark")), 1)
+        self.closed(boot="two")
+        self.advance(minutes=1)
+        self.assertEqual([action["wake"] for action in self.actions("resume", "--window")], [True])
+
+    def test_a_shell_pane_parks_and_comes_back_unparked(self) -> None:
+        answer = self.run_cli("add", "--pane", "52", "--kind", "snooze", "--in", "1h", "--hide", "close")
+        self.assertEqual((answer["hidden"], answer["fallback"]), ("park", "park only: its waits end with the pane"))
+        self.advance(hours=1)
+        self.assertEqual([(action["session"], action["pane"]) for action in self.actions("unpark")], [(None, 52)])
 
 
 class NoteTests(Case):
@@ -1959,6 +2152,8 @@ class PromptTests(Case):
         wait = self.add("--kind", "time", "--in", "1s", "--prompt", "go")["id"]
         self.advance(seconds=2)
         self.tick()
+        # The agent asks a question before the prompt goes in: the wait is on me.
+        self.run_cli("event", "--type", "waiting_input", "--session", SID)
         self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1h")
         self.assertEqual(self.run_cli("claim-prompts", "--session", SID)["prompts"], [])
         self.advance(hours=2)
@@ -2058,9 +2253,11 @@ class TickTests(Case):
             self.assertEqual(len(waiting._claim_checks(state, T0)), 1)
 
     def test_result_of_a_changed_wait_is_dropped(self) -> None:
+        # Overdue, it is on me: Snooze 1d moves its deadline while the check runs.
         wait = self.add(
-            "--kind", "command", "--argv", json.dumps([sys.executable, "-c", "pass"]),
+            "--kind", "command", "--argv", json.dumps([sys.executable, "-c", "pass"]), "--deadline-in", "1m",
         )["id"]
+        self.advance(minutes=2)
         real = waiting._run_jobs
 
         def run_while_i_snooze(jobs, now):
@@ -2169,7 +2366,7 @@ class ViewTests(Case):
                 "size", "set_aside_at", "pinned", "ball", "unseen", "outcome", "headline",
                 "status", "line", "composer_row",
                 "next_step", "threads", "still_waiting", "waiting_for", "recap", "recap_at", "recap_stale", "due_at", "prompts_queued", "waits",
-                "close",
+                "close", "snoozed_until", "snooze_hide",
                 "history", "prs", "on_you", "stoppable",
             },
         )
@@ -4555,6 +4752,8 @@ class RepeatTests(Case):
         wait = self.repeat()
         self.at(hours=1)
         self.deliver()
+        # The agent asks a question during the run: the repeat is on me.
+        self.run_cli("event", "--type", "waiting_input", "--session", SID)
         self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
         next_at = (T0 + timedelta(days=1, hours=1)).isoformat()
         seen = self.wait_of(wait)
@@ -4569,6 +4768,9 @@ class RepeatTests(Case):
     def test_one_more_day_drops_a_run_not_sent_yet(self) -> None:
         wait = self.repeat()
         self.at(hours=1)
+        # The extension went quiet with the run queued: the repeat is on me.
+        self.tick_through(minutes=20)
+        self.assertEqual(self.wait_of(wait)["reason"], waiting.REASON_NO_EXTENSION)
         self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
         self.assertEqual(self.claim(), [])
         repeat = self.state()["sessions"][SID]["waits"][0]["repeat"]
@@ -5393,7 +5595,7 @@ class IsolationTests(Case):
         wait = self.add("--kind", "later")["id"]
         count = iter(range(100))
 
-        def failing(state, record, now):
+        def failing(state, record, now, facts):
             raise RuntimeError(f"try {next(count)}")
 
         with mock.patch.object(waiting, "_evaluate_record", failing):
@@ -5597,12 +5799,16 @@ class TransientTests(Case):
         self.assertIsNone(self.wait_of(wait)["progress"])
 
     def test_an_outage_counts_from_when_checks_resume_after_a_snooze(self) -> None:
+        # The PR's news puts it on me, where Snooze 1d can take it.
+        news = [[{"key": "checks:1", "text": "Checks failed", "on_me": True}]]
         self.github(poll=lambda cond, memo, **kwargs: poll_result(
-            memo, error="error connecting to api.github.com", transient=True, next_poll_s=60,
+            memo, events=news.pop() if news else [], error="error connecting to api.github.com",
+            transient=True, next_poll_s=60,
         ))
         wait = self.add("--kind", "pr", "--repo", "o/r", "--number", "7")["id"]
         self.tick()
         self.tick_through(minutes=30)
+        self.assertEqual(self.wait_of(wait)["ball"], "on_me")
         self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
         self.advance(days=1)
         self.tick()
@@ -6135,6 +6341,18 @@ class ClampTests(Case):
     def far(self) -> str:
         return (self.clock + timedelta(days=365)).isoformat()
 
+    def failed_check(self) -> str:
+        """A check whose errors put it on me, where Snooze 1d can take it."""
+        wait = self.add(
+            "--kind", "command", "--argv", json.dumps([sys.executable, "-c", "pass"]),
+            "--predicate", "json_eq:a=1", "--interval", "1m",
+        )["id"]
+        for _ in range(waiting.MAX_ERRORS):
+            self.tick()
+            self.advance(minutes=2)
+        self.assertEqual(self.wait_of(wait)["ball"], "on_me")
+        return wait
+
     def test_times_a_clock_jump_left_far_ahead_come_back_within_their_interval(self) -> None:
         argv = json.dumps([sys.executable, "-c", "raise SystemExit(1)"])
         check = self.add("--kind", "command", "--argv", argv)["id"]
@@ -6157,8 +6375,7 @@ class ClampTests(Case):
         self.assertEqual(waits[deadline]["deadline"], self.far())
 
     def test_a_snooze_from_before_snooze_s_keeps_its_length(self) -> None:
-        argv = json.dumps([sys.executable, "-c", "raise SystemExit(1)"])
-        check = self.add("--kind", "command", "--argv", argv)["id"]
+        check = self.failed_check()
         self.run_cli("snooze", "--session", SID, "--wait", check, "--for", "3d")
         self.edit_waits(lambda wait: wait.pop("snooze_s"))
         self.advance(minutes=1)
@@ -6182,11 +6399,8 @@ class ClampTests(Case):
         self.assertEqual(waits[check]["next_check_at"], bound)
 
     def test_a_snooze_keeps_its_length(self) -> None:
-        argv = json.dumps([sys.executable, "-c", "raise SystemExit(1)"])
-        check = self.add("--kind", "command", "--argv", argv)["id"]
         fired = self.add("--kind", "command", "--argv", json.dumps([sys.executable, "-c", "pass"]))["id"]
-        self.advance(seconds=2)
-        self.tick()
+        check = self.failed_check()
         self.run_cli("snooze", "--session", SID, "--wait", check, "--for", "1d")
         self.run_cli("snooze", "--session", SID, "--wait", fired, "--for", "2d")
         self.edit_waits(lambda wait: wait.update(refire_at=self.far()) if wait["id"] == fired else None)
