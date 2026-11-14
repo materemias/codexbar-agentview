@@ -102,7 +102,7 @@ HELPERS = """colorFor relativeMs _monthDay _absoluteTime _forecastTimeLeft
 _forecastPercent codexForecastState formatCodexForecast formatCodexForecastIncident
 formatCodexForecastAlert formatResetCredits formatReset
 windowSpanMs planWeight compositeStats _compositeWindow compositeRecord
-windowLabel accountAvailabilityIndicator providerDisplayName agentStateColor cwdLabel ageFrom
+windowLabel providerRotation accountAvailabilityIndicator providerDisplayName agentStateColor cwdLabel ageFrom
 historyLaunchAllowed launchHost canTeleport modelTint""".split()
 
 
@@ -144,6 +144,8 @@ Window {
         color: Kirigami.Theme.backgroundColor
         property var snapshot: (@SNAPSHOT@)
         property var agentSnapshot: (@AGENTS@)
+        // main.qml keeps ended sessions apart from the live snapshot.
+        property var agentHistory: agentSnapshot.history || []
         property double nowMs: @NOW@
         property string requestedTab: "usage"
         property bool expanded: true

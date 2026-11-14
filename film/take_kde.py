@@ -257,6 +257,8 @@ Window {
         id: root
         property var snapshot: (@SNAPSHOT@)
         property var agentSnapshot: (@AGENTS@)
+        // main.qml keeps ended sessions apart from the live snapshot.
+        property var agentHistory: agentSnapshot.history || []
         property double nowMs: @NOW@
         property string requestedTab: ""
         property bool expanded: false
