@@ -1496,6 +1496,9 @@ class SessionSnoozeTests(Case):
         self.advance(minutes=1)
         self.tick()
         self.assertEqual(self.session()["snooze_hide"], "close")
+        # One that lands even after a tick saw it closed: agents.json still has it ended.
+        self.heartbeat()
+        self.assertEqual(self.session()["snooze_hide"], "close")
         # Resumed by hand before its time: it is back.
         self.agents(SID)
         self.heartbeat()
@@ -1513,10 +1516,33 @@ class SessionSnoozeTests(Case):
             (seen["waits"][0]["state"], seen["snoozed_until"]), ("waiting", (self.clock + timedelta(days=1)).isoformat()),
         )
         self.assertEqual(self.history()[-1], "Snoozed again until Nov 6 13:00")
-        # The unpark its time queued goes; it parks again.
+        # The unpark its time queued goes; it parks again, once.
         types = [action["type"] for action in self.tick()["actions"]]
         self.assertNotIn("unpark", types)
-        self.assertEqual(types.count("park"), 2)
+        self.assertEqual(types.count("park"), 1)
+
+    def test_a_hide_no_window_did_yet_goes_with_its_snooze(self) -> None:
+        wait = self.snooze("--in", "1h", "--hide", "close")["wait"]["id"]
+        self.snooze("--in", "1h", "--hide", "park")
+        self.assertEqual(self.actions("close_pane"), [])
+        # Stopped, the session stays where it is.
+        self.run_cli("stop", "--session", SID, "--wait", wait)
+        self.assertEqual(self.actions("park"), [])
+
+    def test_snooze_1d_while_its_wake_reopens_it_hides_it_once_it_runs(self) -> None:
+        wait = self.snooze("--in", "1h", "--hide", "close")["wait"]["id"]
+        self.closed()
+        self.advance(hours=1)
+        self.assertEqual(len(self.actions("resume", "--window")), 1)  # a window may have it already
+        answer = self.run_cli("snooze", "--session", SID, "--wait", wait, "--for", "1d")
+        self.assertIsNone(answer["hidden"])
+        self.assertEqual(self.actions("resume", "--window"), [])
+        self.advance(seconds=30)
+        self.tick()  # not up yet, and not taken for closed by hand
+        self.agents(SID)
+        self.heartbeat()
+        self.assertEqual([action["pane"] for action in self.actions("close_pane")], [40])
+        self.assertEqual(self.session()["snooze_hide"], "close")
 
     def test_snooze_1d_refuses_what_is_not_on_me(self) -> None:
         snoozed = self.snooze("--in", "1h", "--hide", "park")["wait"]["id"]
