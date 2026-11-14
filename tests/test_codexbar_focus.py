@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
-import fcntl
 import io
 import json
 import os
@@ -20,6 +19,9 @@ from unittest import mock
 SCRIPTS = Path(__file__).resolve().parents[1] / "contents" / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 import codexbar_focus as focus  # noqa: E402
+import state_paths  # noqa: E402
+
+WINDOWS = state_paths.WINDOWS
 
 _PGREP = mock.patch.object(focus.agents, "_pgrep", return_value=[])
 
@@ -41,7 +43,7 @@ def entry(**changes: object) -> dict:
         "host": "kitty",
         "desktop": "3",
         "closedBy": "exit",
-        "resumeCommand": "cd -- /work/project && omp --resume sid-1",
+        "resumeCommand": focus.agents._resume_command("omp", "sid-1", "/work/project", True),
     }
     record.update(changes)
     return record
@@ -86,18 +88,22 @@ class LaunchTests(unittest.TestCase):
             popen.return_value.pid = 4242
             popen.return_value.poll.return_value = None
             stderr = io.StringIO()
-            with (
-                mock.patch.object(focus, "AGGREGATE_PATH", path),
-                mock.patch.object(focus.subprocess, "Popen", popen),
-                mock.patch.object(focus, "_desktop_count", return_value=desktops),
-                mock.patch.object(focus, "_kwin_place", return_value=True) as place,
-                mock.patch.object(focus, "_set_current_desktop") as switch,
-                mock.patch.object(focus.sys, "platform", "linux"),
-                mock.patch.object(focus, "USE_KWIN", True),
-                mock.patch.object(focus.agents, "tern_bin", return_value="tern"),
-                mock.patch.dict(focus.os.environ, {"TERN_DAEMON_SOCKET": ""}),
-                mock.patch.object(focus.sys, "stderr", stderr),
-            ):
+            with ExitStack() as stack:
+                for patch in (
+                    mock.patch.object(focus, "AGGREGATE_PATH", path),
+                    mock.patch.object(focus.subprocess, "Popen", popen),
+                    mock.patch.object(focus, "_desktop_count", return_value=desktops),
+                    mock.patch.object(focus, "_set_current_desktop"),
+                    mock.patch.object(focus, "_kwin_place", return_value=True),
+                    # Windows launches as itself: its helper never has KWin or systemd.
+                    *(() if WINDOWS else (mock.patch.object(focus.sys, "platform", "linux"),
+                                          mock.patch.object(focus, "USE_KWIN", True))),
+                    mock.patch.object(focus.agents, "tern_bin", return_value="tern"),
+                    mock.patch.dict(focus.os.environ, {"TERN_DAEMON_SOCKET": ""}),
+                    mock.patch.object(focus.sys, "stderr", stderr),
+                ):
+                    stack.enter_context(patch)
+                switch, place = focus._set_current_desktop, focus._kwin_place
                 code = focus.launch("omp", "sid-1")
         return code, popen, place, switch, stderr.getvalue()
 
@@ -123,6 +129,7 @@ class LaunchTests(unittest.TestCase):
             popen.assert_not_called()
             self.assertIn(message, stderr)
 
+    @unittest.skipIf(WINDOWS, "kitty and systemd scopes don't exist on Windows")
     def test_verified_kitty_record_switches_desktop_then_launches_in_scope(self) -> None:
         code, popen, place, switch, _ = self.launch({"agents": [], "history": [entry()]})
         self.assertEqual(code, 0)
@@ -150,6 +157,7 @@ class LaunchTests(unittest.TestCase):
                 place.assert_not_called()
                 switch.assert_not_called()
 
+    @unittest.skipIf(WINDOWS, "kitty and KWin desktops don't exist on Windows")
     def test_missing_desktop_opens_on_current_and_reports_it(self) -> None:
         code, popen, place, switch, err = self.launch(
             {"agents": [], "history": [entry(desktop="9")]}, desktops=6
@@ -193,20 +201,24 @@ class LaunchTests(unittest.TestCase):
         place.assert_not_called()
         tab, shown = calls[-2:]
         self.assertEqual(tab[:5], ["new", "tab", "--json", "--cwd", "/work/project"])
-        self.assertIn("omp --resume sid-1", tab[-1])
+        self.assertIn(entry()["resumeCommand"], tab[-1])
         self.assertEqual(shown, ["focus", "9"])
-        activate.assert_called_once_with([77])
+        if WINDOWS:
+            self.assertEqual(tab[6:9], ["powershell", "-NoExit", "-Command"])
+            activate.assert_not_called()  # no KWin to raise the window with
+        else:
+            activate.assert_called_once_with([77])
 
     def test_tern_record_starts_tern_first_when_none_runs(self) -> None:
         code, popen, _, _, _, calls = self.tern_launch(daemon=False)
         self.assertEqual(code, 0)
-        self.assertEqual(popen.call_args.args[0][-2:], ["--", "tern"])
+        self.assertEqual(popen.call_args.args[0][-2:], ["tern"] if WINDOWS else ["--", "tern"])
         self.assertEqual(calls[-2][:2], ["new", "tab"])
 
     def test_tern_daemon_without_window_opens_a_window_before_the_tab(self) -> None:
         code, popen, _, _, _, calls = self.tern_launch(window=False)
         self.assertEqual(code, 0)
-        self.assertEqual(popen.call_args.args[0][-2:], ["--", "tern"])
+        self.assertEqual(popen.call_args.args[0][-2:], ["tern"] if WINDOWS else ["--", "tern"])
         self.assertEqual(calls[-2][:2], ["new", "tab"])
 
     def test_launch_all_restores_reboot_rows_in_desktop_order(self) -> None:
@@ -262,13 +274,12 @@ class SessionOperationOwnershipTests(unittest.TestCase):
         from contextlib import ExitStack
         from unittest import mock
 
-        scripts, directory, action, mode, provider, descriptor = sys.argv[1:]
+        scripts, directory, action, mode, provider, port = sys.argv[1:]
         sys.path.insert(0, scripts)
         import codexbar_focus as focus
 
         root = Path(directory)
-        channel = socket.socket(fileno=int(descriptor))
-        channel.settimeout(10)
+        channel = socket.create_connection(("127.0.0.1", int(port)), timeout=10)
 
         def event(value):
             data = (json.dumps(value) + "\n").encode()
@@ -378,6 +389,9 @@ class SessionOperationOwnershipTests(unittest.TestCase):
         for value in self.env.values():
             if value:
                 Path(value).mkdir(parents=True, exist_ok=True)
+        if WINDOWS:
+            # Path.home(), and what Python needs to start at all.
+            self.env.update(USERPROFILE=self.env["HOME"], SYSTEMROOT=os.environ["SYSTEMROOT"])
         self.path = Path(self.env["XDG_STATE_HOME"]) / "codexbar-agentview" / "agents.json"
         self.path.parent.mkdir()
         self.record = entry(
@@ -402,21 +416,22 @@ class SessionOperationOwnershipTests(unittest.TestCase):
 
     def start_helper(self, action: str = "--launch", mode: str = "normal",
                      provider: str = "codex"):
-        parent, child = socket.socketpair()
-        parent.settimeout(10)
-        try:
+        # A loopback connection, not an inherited socket, which Windows can't pass.
+        with socket.create_server(("127.0.0.1", 0)) as server:
+            server.settimeout(10)
             process = subprocess.Popen(
                 [sys.executable, "-I", "-B", "-c", self.WORKER, str(SCRIPTS),
-                 str(self.root), action, mode, provider, str(child.fileno())],
-                env=self.env, pass_fds=(child.fileno(),),
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                text=True,
+                 str(self.root), action, mode, provider, str(server.getsockname()[1])],
+                env=self.env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
             )
-        except BaseException:
-            parent.close()
-            raise
-        finally:
-            child.close()
+            try:
+                parent, _ = server.accept()
+            except BaseException:
+                process.kill()
+                process.communicate(timeout=5)
+                raise
+        parent.settimeout(10)
         self.addCleanup(self.stop_helper, process, parent)
         self.assertEqual(parent.recv(1), b"R", "helper failed before becoming ready")
         parent.sendall(b"G")
@@ -485,6 +500,7 @@ class SessionOperationOwnershipTests(unittest.TestCase):
         result = self.finish_helper(reserved)
         self.assertEqual(result[0], 0, result[1])
 
+    @unittest.skipIf(WINDOWS, "teleport moves kitty sessions; Windows has no kitty")
     def test_first_teleport_after_successful_launch_reconciles_discovered_writer(self) -> None:
         launched, _ = self.start_helper()
         result = self.finish_helper(launched)
@@ -500,6 +516,7 @@ class SessionOperationOwnershipTests(unittest.TestCase):
         self.assertEqual(json.loads(self.path.read_text())["agents"], [],
                          "teleport must observe the old writer exit before dispatch")
 
+    @unittest.skipIf(WINDOWS, "teleport moves kitty sessions; Windows has no kitty")
     def test_teleport_after_successful_launch_still_requires_old_writer_exit(self) -> None:
         launched, _ = self.start_helper()
         result = self.finish_helper(launched)
@@ -583,6 +600,7 @@ class SessionOperationOwnershipTests(unittest.TestCase):
         self.assertEqual(codex_result[0], 0, codex_result[1])
         self.assertEqual([event["provider"] for event in self.dispatches()], ["codex", "omp"])
 
+    @unittest.skipIf(WINDOWS, "teleport moves kitty sessions; Windows has no kitty")
     def test_teleport_and_launch_share_session_ownership(self) -> None:
         self.snapshot(live=True)
         teleport, barrier = self.start_helper(action="--teleport", mode="hold")
@@ -722,6 +740,7 @@ class SessionOperationOwnershipTests(unittest.TestCase):
         # Every codex writer holds its rollout open, and none holds this one.
         self.assertEqual(self.check_expired_codex_launch(files_visible=True), [0, 0])
 
+    @unittest.skipIf(WINDOWS, "reads /proc/<pid>/fd, which Windows lacks")
     def test_fd_visibility_needs_every_link(self) -> None:
         def readlink(path):
             if path.endswith("/4"):
@@ -837,6 +856,7 @@ class SessionOperationOwnershipTests(unittest.TestCase):
             self.assertEqual(self.release(token), 0)
 
 
+@unittest.skipIf(WINDOWS, "teleport moves kitty sessions; Windows has no kitty")
 class TeleportTests(unittest.TestCase):
     AGENT, SHELL, KITTY = 500, 400, 300
 
@@ -904,7 +924,7 @@ class TeleportTests(unittest.TestCase):
 
 class PlatformFocusTests(unittest.TestCase):
     def test_default_and_plugin_modes_disable_only_platform_specific_focus(self) -> None:
-        for platform, expected in (("darwin", False), ("linux", True)):
+        for platform, expected in (("darwin", False), ("linux", True), ("win32", False)):
             with mock.patch.object(focus.sys, "platform", platform):
                 module = runpy.run_path(str(SCRIPTS / "codexbar_focus.py"))
                 self.assertIs(module["USE_KWIN"], expected)
@@ -928,12 +948,29 @@ class PlatformFocusTests(unittest.TestCase):
             self.assertFalse(focus._t3_open("sid-1"))
         self.assertEqual(run.call_args.args[0], ["xdg-open", "t3code://threads/env/thread"])
 
+    def test_windows_resumes_in_powershell_and_teleports_nothing(self) -> None:
+        command = "Set-Location -LiteralPath 'C:\\w' -ErrorAction Stop; omp --resume 'sid-1'"
+        with (
+            mock.patch.object(focus.state_paths, "WINDOWS", True),
+            mock.patch.object(focus, "_session_operation") as operation,
+            mock.patch.object(focus.sys, "stderr", io.StringIO()) as stderr,
+        ):
+            self.assertEqual(focus._user_shell(), "powershell")
+            # -NoExit keeps the tab open once the agent exits.
+            self.assertEqual(focus._resume_shell_argv("powershell", command),
+                             ["powershell", "-NoExit", "-Command", command])
+            self.assertEqual(focus.teleport("omp", "sid-1"), 7)
+        operation.assert_not_called()
+        self.assertIn("Windows has no kitty", stderr.getvalue())
+
 
 class MacFocusTests(unittest.TestCase):
     def setUp(self) -> None:
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
-        self.stack.enter_context(mock.patch.object(focus.sys, "platform", "darwin"))
+        # Windows runs the Tern tests here as itself: it can't stand in for macOS.
+        if not WINDOWS:
+            self.stack.enter_context(mock.patch.object(focus.sys, "platform", "darwin"))
         self.stack.enter_context(mock.patch.object(focus, "USE_KWIN", False))
         self.stack.enter_context(mock.patch.object(focus.sys, "stderr", io.StringIO()))
         self.kwin = self.stack.enter_context(mock.patch.object(focus, "_kwin_activate"))
@@ -952,6 +989,7 @@ class MacFocusTests(unittest.TestCase):
         path.write_text(json.dumps({"agents": live or [], "history": records}))
         self.stack.enter_context(mock.patch.object(focus, "AGGREGATE_PATH", path))
 
+    @unittest.skipIf(WINDOWS, "macOS kitty app bundles don't exist on Windows")
     def test_kitty_bundle_discovery_requires_executable_file(self) -> None:
         directory = self.stack.enter_context(tempfile.TemporaryDirectory())
         home = Path(directory)
@@ -973,6 +1011,7 @@ class MacFocusTests(unittest.TestCase):
             executable.chmod(0o600)
             self.assertEqual(focus._kitty_bin(), "")
 
+    @unittest.skipIf(WINDOWS, "a POSIX login shell, which Windows lacks")
     def test_resume_shell_preserves_helper_home_across_terminal_environment(self) -> None:
         directory = self.stack.enter_context(tempfile.TemporaryDirectory())
         home = Path(directory) / "helper-home"
@@ -988,6 +1027,7 @@ class MacFocusTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), str(home))
 
+    @unittest.skipIf(WINDOWS, "kitty doesn't exist on Windows")
     def test_failed_kitty_start_and_missing_installation_are_failures(self) -> None:
         self.payload([entry()])
         with (
@@ -1003,6 +1043,7 @@ class MacFocusTests(unittest.TestCase):
             self.assertEqual(focus.launch("omp", "sid-1"), 8)
             spawn.assert_not_called()
 
+    @unittest.skipIf(WINDOWS, "kitty doesn't exist on Windows")
     def test_restore_reports_only_selected_verified_successful_rows(self) -> None:
         rows = [entry(sessionId=sid, closedBy="reboot",
                       resumeCommand=f"cd -- /work/project && omp --resume {sid}")
@@ -1025,6 +1066,7 @@ class MacFocusTests(unittest.TestCase):
         self.assertEqual(started.call_count, 2)
         self.assertTrue(all(call.args[0][0] == "/bundle/kitty" for call in started.call_args_list))
 
+    @unittest.skipIf(WINDOWS, "kitty doesn't exist on Windows")
     def test_kitty_focus_prefers_inherited_socket_without_abstract_fallbacks(self) -> None:
         record = entry(pid=42)
         addresses = []
@@ -1052,6 +1094,7 @@ class MacFocusTests(unittest.TestCase):
             self.assertFalse(focus._kitty_focus([42]))
         self.assertTrue(all("--to" not in call.args[0] for call in run.call_args_list))
 
+    @unittest.skipIf(WINDOWS, "macOS /usr/bin/open doesn't exist on Windows")
     def test_t3_focus_requires_opener_success(self) -> None:
         with (
             mock.patch.object(focus, "_find_sentinel", return_value=entry(host="t3code", pid=42)),
@@ -1163,7 +1206,7 @@ class StartupLockTests(unittest.TestCase):
         mine = self.lock_file("mine", day + 60)
         holder = os.open(held, os.O_RDWR)
         self.addCleanup(os.close, holder)
-        fcntl.flock(holder, fcntl.LOCK_EX)
+        state_paths.lock(holder)
         focus._prune_startup_locks(self.root, keep=mine)
         self.assertEqual([path.exists() for path in (old, fresh, held, mine)], [False, True, True, True])
 
@@ -1195,10 +1238,11 @@ class StartupLockTests(unittest.TestCase):
             focus._prune_startup_locks(self.root, keep=mine)
         self.assertFalse(second.exists())
 
+    @unittest.skipIf(WINDOWS, "Windows deletes no open file: a prune never removes a held lock")
     def test_a_waiter_on_a_removed_lock_takes_the_new_one(self) -> None:
         path = self.lock_file("s", 0)
         holder = os.open(path, os.O_RDWR)
-        fcntl.flock(holder, fcntl.LOCK_EX)
+        state_paths.lock(holder)
         entered = threading.Event()
         leave = threading.Event()
 
@@ -1217,8 +1261,7 @@ class StartupLockTests(unittest.TestCase):
         # The waiter holds the file the path names now, so nobody else gets it.
         probe = os.open(path, os.O_RDWR)
         try:
-            with self.assertRaises(BlockingIOError):
-                fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertFalse(state_paths.lock(probe, blocking=False))
         finally:
             os.close(probe)
             leave.set()

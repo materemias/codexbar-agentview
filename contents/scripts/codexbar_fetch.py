@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import argparse
 import datetime as _dt
-import fcntl
 import hashlib
 import json
 import math
@@ -536,9 +535,9 @@ def _claude_reset_credits_for(email: str | None, token: str | None, may_fetch: b
                     mode="w", encoding="utf-8", dir=os.path.dirname(path),
                     prefix=".claude_reset-", delete=False,
                 ) as fh:
-                    os.fchmod(fh.fileno(), 0o600)
+                    state_paths.make_private(fh.fileno())
                     json.dump(data, fh)
-                os.replace(fh.name, path)
+                state_paths.replace(fh.name, path)
             except OSError:
                 pass
     return credits
@@ -1475,8 +1474,8 @@ def _usage_cache_write(scopes: dict[str, str], records: list[dict], now: _dt.dat
         os.makedirs(os.path.dirname(path), exist_ok=True)
         # Lock the stable sidecar, not the cache inode replaced by os.replace().
         with open(path + ".lock", "a", encoding="utf-8") as lock:
-            os.fchmod(lock.fileno(), 0o600)
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            state_paths.make_private(lock.fileno())
+            state_paths.lock(lock)
             payload = _usage_cache_payload()
             entries = _usage_cache_entries(payload, now)
             entries.update(replacements)
@@ -1490,9 +1489,9 @@ def _usage_cache_write(scopes: dict[str, str], records: list[dict], now: _dt.dat
                 prefix=".usage_cache-", delete=False,
             ) as fh:
                 temporary = fh.name
-                os.fchmod(fh.fileno(), 0o600)
+                state_paths.make_private(fh.fileno())
                 json.dump({"version": 1, "providers": entries, "history": history}, fh, allow_nan=False)
-            os.replace(temporary, path)
+            state_paths.replace(temporary, path)
     except (OSError, ValueError):
         pass
     finally:
@@ -1723,7 +1722,8 @@ def _forecast_eta(
     if last_reset is None or median_days is None or median_days <= 0:
         return None
     try:
-        tz = ZoneInfo(zone or "UTC")
+        # UTC needs no time zone database, which Windows lacks without tzdata.
+        tz = _dt.timezone.utc if (zone or "UTC") == "UTC" else ZoneInfo(zone)
     except (ZoneInfoNotFoundError, ValueError):
         tz = None
     projected = last_reset + _dt.timedelta(days=median_days)
@@ -1774,7 +1774,7 @@ def _forecast_cache_write(payload: dict) -> None:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump({"cachedAt": time.time(), "forecast": payload}, fh)
         os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        state_paths.replace(tmp, path)
     except OSError:
         pass
 
@@ -2059,7 +2059,7 @@ def _claim_fetch(min_interval: float | None, providers: list[str]) -> list[str]:
     due = providers
     with os.fdopen(fd, "r+", encoding="utf-8") as fh:
         try:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            state_paths.lock(fh)
             now = time.time()
             try:
                 stamps = json.loads(fh.read() or "{}")
@@ -2102,6 +2102,12 @@ CLI_RELEASES = "https://github.com/steipete/CodexBar/releases"
 def _cli_setup(platform: str = sys.platform) -> list[str]:
     """What sets usage up when the CLI is missing, one step a line, for the
     surfaces to show beside their own switch that turns usage tracking off."""
+    if platform == "win32":
+        return [
+            "The CodexBar CLI has no Windows build: on Windows, usage comes from Meridian only.",
+            "Run Meridian (https://github.com/rynfar/meridian) for Claude accounts and ChatGPT seats, "
+            "or turn usage tracking off.",
+        ]
     if platform == "darwin":
         install = f"Install the CodexBar CLI: a CodexBarCLI macOS tarball from {CLI_RELEASES}."
     else:

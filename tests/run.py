@@ -86,12 +86,9 @@ def _selected(names: list[str]) -> tuple[list[str], list[str]]:
              else loader.discover(str(TESTS), top_level_dir=str(TESTS)))
     found, errors = [], list(loader.errors)
     for test in _tests(suite):
-        # An import that failed comes back as a stand-in test that raises it.
-        if type(test).__name__ == "_FailedTest":
-            result = unittest.TestResult()
-            test.run(result)
-            errors.extend(detail for _, detail in result.errors)
-        else:
+        # An import that failed comes back as a stand-in test that raises it;
+        # loader.errors already holds its traceback.
+        if type(test).__name__ != "_FailedTest":
             found.append(test.id())
     return found, errors
 
@@ -103,6 +100,8 @@ def main(argv: list[str]) -> int:
     parser.add_argument("-v", "--verbose", action="store_true", help="a line per test")
     args = parser.parse_args(argv)
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    # A test's output may hold what the console's code page lacks (Windows' cp1252).
+    sys.stdout.reconfigure(errors="backslashreplace")
     sys.path.insert(0, str(TESTS))
 
     started = time.monotonic()

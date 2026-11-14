@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import contextlib
 import json
 import os
-import signal
 import subprocess
 import sys
 import tempfile
@@ -11,6 +9,8 @@ import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from fakes import WINDOWS, fake_program, kill_tree
 
 
 SCRIPT_PATH = (
@@ -48,6 +48,10 @@ class WaitingRuntimeTests(unittest.TestCase):
             "PYTHONDONTWRITEBYTECODE": "1",
             "LANG": "C.UTF-8",
         }
+        if WINDOWS:
+            # Path.home(), and what Python and cmd.exe need to start at all.
+            self.env.update(USERPROFILE=str(self.home), SYSTEMROOT=os.environ["SYSTEMROOT"],
+                            COMSPEC=os.environ["COMSPEC"])
         # Tick after all creation timestamps, independent of second boundaries.
         self.now = datetime.now().astimezone().replace(microsecond=0) + timedelta(minutes=1)
         self.processes: list[subprocess.Popen] = []
@@ -63,15 +67,13 @@ class WaitingRuntimeTests(unittest.TestCase):
             try:
                 process.communicate(timeout=PROCESS_DEADLINE_S)
             except subprocess.TimeoutExpired:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(process.pid, signal.SIGKILL)
+                kill_tree(process.pid)
                 process.communicate(timeout=PROCESS_DEADLINE_S)
         for _, started, finished in self.gates:
             completed = set(finished.read_text().splitlines()) if finished.exists() else set()
             pids = started.read_text().splitlines() if started.exists() else []
             for pid in set(pids) - completed:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(int(pid), signal.SIGKILL)
+                kill_tree(int(pid))
 
     def start_cli(self, *argv: str, cwd: Path | None = None) -> subprocess.Popen:
         process = subprocess.Popen(
@@ -107,7 +109,7 @@ class WaitingRuntimeTests(unittest.TestCase):
         return self.cli("tick", "--now", now.isoformat())
 
     def state(self) -> dict:
-        return json.loads((self.state_dir / "waiting.json").read_text())
+        return json.loads((self.state_dir / "waiting.json").read_text(encoding="utf-8"))
 
     def saved_wait(self, wait_id: str, *, pane: int | None = None) -> dict:
         state = self.state()
@@ -233,7 +235,6 @@ class WaitingRuntimeTests(unittest.TestCase):
 
     def test_turn_finished_does_not_query_github_before_tick(self) -> None:
         calls = self.root / "gh-calls.jsonl"
-        gh = self.bin / "gh"
         response = {"data": {
             "viewer": {"login": "fixture-user"},
             "repository": {"pullRequest": {
@@ -241,8 +242,7 @@ class WaitingRuntimeTests(unittest.TestCase):
                 "mergeCommit": {"oid": "merge123"}, "mergedAt": self.now.isoformat(),
             }},
         }}
-        gh.write_text(
-            f"#!{sys.executable}\n"
+        fake_program(self.bin / "gh", (
             "import json, sys\n"
             "from pathlib import Path\n"
             f"with Path({str(calls)!r}).open('a') as stream:\n"
@@ -253,8 +253,7 @@ class WaitingRuntimeTests(unittest.TestCase):
             f"    print({json.dumps(response)!r})\n"
             "else:\n"
             "    raise SystemExit('unexpected fixture gh request')\n"
-        )
-        gh.chmod(0o755)
+        ))
         wait, following = self.delivered_prompt({
             "type": "pr", "repo": "fixture/repo", "number": 7, "until": "merged",
         })
@@ -300,17 +299,14 @@ class WaitingRuntimeTests(unittest.TestCase):
 
     def test_explicit_cwd_applies_to_release_commands(self) -> None:
         self.project_statuses()
-        gh = self.bin / "gh"
-        gh.write_text(
-            f"#!{sys.executable}\n"
+        fake_program(self.bin / "gh", (
             "import sys\n"
             "from pathlib import Path\n"
             "if sys.argv[1:] != ['api', 'repos/fixture/repo/releases/latest', '--jq', '.tag_name']:\n"
             "    raise SystemExit('unexpected fixture gh request')\n"
             "Path('checked').write_text(str(Path.cwd()))\n"
             "print(Path('status').read_text().strip())\n"
-        )
-        gh.chmod(0o755)
+        ))
         wait = self.cli(
             "add", "--pane", "72", "--kind", "release", "--repo", "fixture/repo",
             "--cwd", str(self.project), "--interval", "1s", "--no-toast",

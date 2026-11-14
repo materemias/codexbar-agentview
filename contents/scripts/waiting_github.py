@@ -33,6 +33,7 @@ from urllib.parse import quote
 Json = dict[str, Any]
 Run = Callable[..., subprocess.CompletedProcess]
 
+
 UNTILS = ("review_on_head", "ready", "merged", "released", "activity")
 # Event keys that count as someone else's activity for `activity`.
 ACTIVITY = ("c:", "bot:", "bot-comments:", "closed:", "merged:")
@@ -231,7 +232,8 @@ def _gh(run: Run, args: list[str]) -> str:
         proc = run(
             ["gh", *args],
             capture_output=True,
-            text=True,
+            # gh writes UTF-8 everywhere; Windows' locale encoding is another.
+            text=True, encoding="utf-8", errors="replace",
             stdin=subprocess.DEVNULL,
             timeout=GH_TIMEOUT_S,
         )

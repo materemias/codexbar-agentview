@@ -17,7 +17,6 @@ import concurrent.futures
 import contextlib
 import copy
 import errno
-import fcntl
 import functools
 import json
 import math
@@ -34,7 +33,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import BinaryIO
 
@@ -99,6 +98,10 @@ SHORT_LABEL_CHARS = 24
 COMMAND_LABEL_CHARS = 60
 LAST_PROMPT_CHARS = 300
 BRANCH_TIMEOUT_S = 2
+# A command line typed on Windows runs in this; POSIX splits it like a shell.
+WINDOWS_SHELL = ("powershell", "-NoProfile", "-NonInteractive", "-Command")
+# A Windows Tern daemon's start in its id, `<pid>-<start>` (`_windows_start_ticks`).
+_WINDOWS_DAEMON_START = re.compile(r"(\d{8}T\d{6})\.(\d{7})")
 
 PR_CACHE_VERSION = 1
 PR_MENTIONED_KEPT = 5
@@ -333,7 +336,7 @@ def _write_file(path: Path, text: str, durable: bool) -> None:
     ) as output:
         temporary = Path(output.name)
         try:
-            os.fchmod(output.fileno(), 0o600)
+            state_paths.make_private(output.fileno())
             output.write(text)
             if durable:
                 output.flush()
@@ -342,16 +345,12 @@ def _write_file(path: Path, text: str, durable: bool) -> None:
             temporary.unlink(missing_ok=True)
             raise
     try:
-        os.replace(temporary, path)
+        state_paths.replace(temporary, path)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
     if durable:
-        directory = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        state_paths.fsync_dir(path.parent)
 
 
 def _empty_state() -> dict:
@@ -386,7 +385,7 @@ def _writer_lock():
     state_paths.migrate()
     lock = os.open(state_paths.state_dir() / "waiting.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        state_paths.lock(lock)
         yield
     finally:
         os.close(lock)
@@ -702,7 +701,12 @@ class Omp:
 
 
 def _resume_text(session: str, cwd: str) -> str:
-    """Same form as codexbar_agents._resume_command, which Launch checks against."""
+    """Same form as codexbar_agents._resume_command, which Launch checks
+    against. Windows takes that one itself: its PowerShell quoting has more
+    rules than are worth keeping twice."""
+    if state_paths.WINDOWS:
+        import codexbar_agents
+        return codexbar_agents._resume_command("omp", session, cwd, True)
     command = shlex.join(["omp", "--resume", session])
     return f"{shlex.join(['cd', '--', cwd])} && {command}" if cwd else command
 
@@ -813,10 +817,11 @@ def _omp_lock_name(lock_path: str) -> str:
     return f"omp-file-lock-{_xxh64(data, 0x4f4d502d4c4f434b):016x}{_xxh64(data, 0x50492d46494c454c):016x}"
 
 
-def _try_omp_lock(lock_path: str) -> socket.socket | BinaryIO | None:
+def _try_omp_lock(lock_path: str) -> socket.socket | BinaryIO | _WindowsLease | None:
     """One try at the lock omp's withFileLock takes, or None while it's held.
-    On Linux that is an abstract socket and no file at all; elsewhere a flock on
-    a sidecar that stays behind. Either one ends with its process."""
+    On Linux that is an abstract socket, on Windows a named mutex, neither a
+    file; elsewhere a flock on a sidecar that stays behind. Each one ends with
+    its process."""
     if sys.platform == "linux":
         holder = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         try:
@@ -827,24 +832,81 @@ def _try_omp_lock(lock_path: str) -> socket.socket | BinaryIO | None:
                 return None
             raise
         return holder
+    if state_paths.WINDOWS:
+        return _WindowsLease.try_acquire(_omp_lock_name(lock_path))
     holder = os.fdopen(os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600), "r+b")
     try:
-        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as error:
-        holder.close()
-        if isinstance(error, BlockingIOError):
+        if not state_paths.lock(holder, blocking=False):
+            holder.close()
             return None
+    except OSError:
+        holder.close()
         raise
     return holder
+
+
+@functools.cache
+def _kernel32():
+    """kernel32 with the signatures this module calls (Windows only)."""
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexExW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD)
+    kernel32.CreateMutexExW.restype = wintypes.HANDLE
+    kernel32.CreateJobObjectW.argtypes = (ctypes.c_void_p, wintypes.LPCWSTR)
+    kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel32.AssignProcessToJobObject.argtypes = (wintypes.HANDLE, wintypes.HANDLE)
+    kernel32.TerminateJobObject.argtypes = (wintypes.HANDLE, wintypes.UINT)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    return kernel32
+
+
+class _WindowsLease:
+    """pi-natives' Windows file lock (file_lock/windows.rs): the existence of
+    the named mutex `Global\\<name>` is the lease, not owning it, so a
+    contender's create finds it and lets go. Ends with `close` or the process."""
+
+    _SYNCHRONIZE = 0x00100000
+    _ERROR_ALREADY_EXISTS = 183
+
+    def __init__(self, handle: int):
+        self._handle = handle
+
+    @classmethod
+    def try_acquire(cls, name: str) -> _WindowsLease | None:
+        import ctypes
+        kernel32 = _kernel32()
+        ctypes.set_last_error(0)
+        # Only SYNCHRONIZE, as omp asks: a contender that may not modify the
+        # holder's mutex still sees it exist.
+        handle = kernel32.CreateMutexExW(None, f"Global\\{name}", 0, cls._SYNCHRONIZE)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        if ctypes.get_last_error() == cls._ERROR_ALREADY_EXISTS:
+            kernel32.CloseHandle(handle)
+            return None
+        return cls(handle)
+
+    def close(self) -> None:
+        if self._handle:
+            _kernel32().CloseHandle(self._handle)
+            self._handle = 0
+
+    def __enter__(self) -> _WindowsLease:
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
 
 
 def _replace_pins(path: Path, rows: list) -> None:
     temporary = Path(f"{path}.{os.getpid()}.{uuid.uuid4()}.tmp")
     try:
         descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with open(descriptor, "w", encoding="utf-8") as output:
+        # "\n" as omp writes it, not Windows' "\r\n".
+        with open(descriptor, "w", encoding="utf-8", newline="\n") as output:
             json.dump(rows, output, indent="\t", ensure_ascii=False)
-        os.replace(temporary, path)
+        state_paths.replace(temporary, path)
     except BaseException:
         temporary.unlink(missing_ok=True)
         raise
@@ -1345,7 +1407,11 @@ def _check_instruction(description: str) -> str:
     """The prompt that asks the session's agent to write a described check."""
     return "\n".join((
         f'I want to wait until this holds: "{description}".',
-        "Write a command that exits 0 exactly when it holds and non-zero otherwise. It runs without a shell, as an argv; use sh -c '…' only when it needs pipes.",
+        "Write a command that exits 0 exactly when it holds and non-zero otherwise. It runs without a shell, as an argv; "
+        + ("use powershell -NoProfile -Command '…' only when it needs pipes, and end it with"
+           " `if (…) { exit 0 } else { exit 1 }`: a pipeline that matches nothing still exits 0."
+           if state_paths.WINDOWS
+           else "use sh -c '…' only when it needs pipes."),
         "Run it once now and show me its exit code and output.",
         "Then call the waitingfor tool with action add, kind command and argv, and nothing else: the label, the interval and the rest come from my /wait check.",
     ))
@@ -2077,24 +2143,67 @@ def _json_path(data: object, path: str) -> tuple[bool, object]:
 def _run_argv(argv: list[str], cwd: str | None) -> tuple[int | None, str, str]:
     """(exit code, stdout, detail); no shell, and a timeout kills the whole group.
     `detail` is the error without an exit code, else stderr's last line."""
+    group = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if state_paths.WINDOWS
+             else {"start_new_session": True})
     try:
         process = subprocess.Popen(
             argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, text=True, errors="replace",
-            start_new_session=True, cwd=cwd,
+            stderr=subprocess.PIPE, text=True, errors="replace", cwd=cwd, **group,
         )
     except (OSError, ValueError) as error:
+        # Windows' error for a missing cwd (WinError 267) names no folder.
+        if isinstance(error, OSError) and error.filename is None and cwd and not os.path.isdir(cwd):
+            return None, "", f"{error}: {cwd}"
         return None, "", str(error)
+    # Windows has no process groups to signal: a job holds what the check starts.
+    job = _job_holding(process) if state_paths.WINDOWS else None
     try:
         stdout, stderr = process.communicate(timeout=COMMAND_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        with contextlib.suppress(ProcessLookupError, PermissionError):
-            os.killpg(process.pid, signal.SIGKILL)
+        _kill_group(process, job)
         with contextlib.suppress(subprocess.TimeoutExpired):
             process.communicate(timeout=5)
         return None, "", f"timed out after {COMMAND_TIMEOUT_S} s"
+    finally:
+        if job:
+            _kernel32().CloseHandle(job)
     lines = stderr.strip().splitlines()
     return process.returncode, stdout, lines[-1][:200] if lines else ""
+
+
+def _job_holding(process: subprocess.Popen) -> int | None:
+    """A Windows job object holding `process` and every process it starts from
+    now on, even after it exits itself; None when it can't be assigned one.
+    Closing the job leaves them running."""
+    kernel32 = _kernel32()
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    if not kernel32.AssignProcessToJobObject(job, int(process._handle)):
+        kernel32.CloseHandle(job)
+        return None
+    return job
+
+
+def _kill_group(process: subprocess.Popen, job: int | None = None) -> None:
+    """Kill a check and every process it started: its session on POSIX, its
+    job on Windows, else the tree taskkill still finds under it."""
+    if not state_paths.WINDOWS:
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.killpg(process.pid, signal.SIGKILL)
+        return
+    if job and _kernel32().TerminateJobObject(job, 1):
+        return
+    try:
+        killed = subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(process.pid)], stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+        ).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        killed = False
+    if not killed:
+        with contextlib.suppress(OSError):
+            process.kill()
 
 
 def _predicate(predicate: str, code: int, stdout: str) -> tuple[bool, str]:
@@ -2298,7 +2407,10 @@ def _transient_text(wait: dict, now: datetime) -> str:
     since = _clock(_parse_time(wait["transient_since"]), now)
     verifying = wait["state"] == "acting" and wait["verify_pending"]
     if wait["kind"] == "command" and not verifying:
-        return f"{Path(wait['condition']['argv'][0]).name} failing since {since}"
+        # A Windows command line's first word; a blank one falls back to its PowerShell.
+        argv = wait["condition"]["argv"]
+        program = ((_windows_command(argv) or "").split() or argv)[0]
+        return f"{Path(program).name} failing since {since}"
     return f"GitHub unreachable since {since}"
 
 
@@ -3732,7 +3844,9 @@ def _check_argv(argv: object, forms: str = "a JSON array of strings") -> list[st
 
 def _parse_argv(text: str) -> list[str]:
     """A JSON array, or a command line split like a shell would; it still runs
-    without one. `[ -f x ]` is a command line: only a parsed list is an array."""
+    without one. `[ -f x ]` is a command line: only a parsed list is an array.
+    On Windows a command line runs in PowerShell (`WINDOWS_SHELL`): no split
+    matches how each program there parses its own command line."""
     forms = "a JSON array of strings or a plain command line"
     try:
         parsed = json.loads(text)
@@ -3740,10 +3854,21 @@ def _parse_argv(text: str) -> list[str]:
         parsed = None
     if isinstance(parsed, list):
         return _check_argv(parsed, forms)
+    if state_paths.WINDOWS:
+        if not text.strip():
+            raise BadInput(f"argv needs {forms}")
+        return [*WINDOWS_SHELL, text.strip()]
     try:
         return _check_argv(shlex.split(text), forms)
     except ValueError as error:
         raise BadInput(f"argv needs {forms}: {error}") from None
+
+
+def _windows_command(argv: list[str]) -> str | None:
+    """The command line a `WINDOWS_SHELL` argv runs, else None."""
+    if len(argv) == len(WINDOWS_SHELL) + 1 and argv[:-1] == list(WINDOWS_SHELL):
+        return argv[-1]
+    return None
 
 
 def _pr_reference(args: argparse.Namespace) -> tuple[str, int]:
@@ -3793,7 +3918,8 @@ def _command_line(condition: dict) -> str:
     """The command, or the words the agent is to write it from."""
     if condition["argv"] is None:
         return _clip(condition["describe"], COMMAND_LABEL_CHARS)
-    return _clip(shlex.join(condition["argv"]), COMMAND_LABEL_CHARS)
+    argv = condition["argv"]
+    return _clip(_windows_command(argv) or shlex.join(argv), COMMAND_LABEL_CHARS)
 
 
 def _default_label(kind: str, condition: dict) -> str:
@@ -4865,13 +4991,39 @@ def _awake_s() -> float:
 
 def _daemon_alive(daemon: str) -> bool | None:
     """Whether the `<pid>-<start time>` daemon still runs: False when its process
-    is gone or is another one now (a restart, a reboot). None when /proc can't
-    tell, or the id is in another form."""
+    is gone or is another one now (a restart, a reboot). None when neither /proc
+    nor Windows can tell, or the id is in another form."""
     pid, _, start = daemon.partition("-")
-    if not (pid.isdigit() and start.isdigit()) or not (PROC / "self" / "stat").exists():
+    if not pid.isdigit():
+        return None
+    if state_paths.WINDOWS:
+        ticks = _windows_start_ticks(start)
+        if ticks is None:
+            return None
+        import proc_windows
+        created = proc_windows.start_ms(int(pid))
+        if not created:
+            # Gone, or another user's process that can't be read.
+            return False if proc_windows.exited(int(pid)) else None
+        return created == ticks // 10_000
+    if not start.isdigit() or not (PROC / "self" / "stat").exists():
         return None
     stat = _proc_stat(pid)
     return stat is not None and stat[2] == start
+
+
+def _windows_start_ticks(start: str) -> int | None:
+    """The start time of a Windows daemon id, `yyyyMMddTHHmmss.fffffff` in UTC
+    (the process's creation time, as Tern's host names it), in 100 ns ticks
+    since the Unix epoch; None for another form."""
+    match = _WINDOWS_DAEMON_START.fullmatch(start)
+    if match is None:
+        return None
+    try:
+        whole = datetime.strptime(match[1], "%Y%m%dT%H%M%S").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+    return int(whole.timestamp()) * 10_000_000 + int(match[2])
 
 
 def _booted_at() -> float | None:
@@ -4882,11 +5034,16 @@ def _booted_at() -> float | None:
 
 
 def _started_at(daemon: str) -> float | None:
-    """When the `<pid>-<start time>` daemon started, on the wall clock: its start
-    time counts clock ticks since the boot."""
+    """When the `<pid>-<start time>` daemon started, on the wall clock. A Linux
+    start time counts clock ticks since the boot; a Windows one is a UTC time."""
     pid, _, start = daemon.partition("-")
+    if not pid.isdigit():
+        return None
+    ticks = _windows_start_ticks(start)
+    if ticks is not None:
+        return ticks / 10_000_000
     booted = _booted_at()
-    if booted is None or not (pid.isdigit() and start.isdigit()):
+    if booted is None or not start.isdigit():
         return None
     return booted + int(start) / os.sysconf("SC_CLK_TCK")
 

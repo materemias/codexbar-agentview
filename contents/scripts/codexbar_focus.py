@@ -48,11 +48,9 @@ launches open on the current desktop, and other hosts fail.
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import hashlib
 import json
 import os
-import pwd
 import shlex
 import shutil
 import signal
@@ -71,8 +69,8 @@ import state_paths
 
 AGENTS_DIR = state_paths.STATE_DIR / "agents"
 AGGREGATE_PATH = state_paths.STATE_DIR / "agents.json"
-# Darwin has neither KWin nor systemd; --tern also disables KWin on Linux.
-USE_KWIN = sys.platform != "darwin"
+# Darwin and Windows have neither KWin nor systemd; --tern also disables KWin on Linux.
+USE_KWIN = sys.platform not in ("darwin", "win32")
 T3_DIR = Path.home() / ".t3" / "userdata"
 
 
@@ -425,10 +423,11 @@ def _startup_lock(path: Path):
     while True:
         fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            os.fchmod(fd, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            state_paths.make_private(fd)
+            state_paths.lock(fd)
             if _names_inode(fd, path):
-                os.utime(fd)  # its last use, for `_prune_startup_locks`
+                # Its last use, for `_prune_startup_locks`; Windows can't utime an fd.
+                os.utime(path if state_paths.WINDOWS else fd)
                 yield
                 return
         finally:
@@ -464,17 +463,25 @@ def _prune_startup_locks(directory: Path, keep: Path) -> None:
             fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
         except OSError:
             continue
+        remove = False
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             # A startup may have reserved the session since the look above;
             # one that only used the lock leaves nothing a removal loses.
-            if _names_inode(fd, path) and _mtime(reservation) <= cutoff:
+            if (state_paths.lock(fd, blocking=False) and _names_inode(fd, path)
+                    and _mtime(reservation) <= cutoff):
                 reservation.unlink(missing_ok=True)
-                path.unlink()
+                remove = True
+                # Windows deletes no open file, so the lock goes once closed
+                # below, and stays while a startup has it open.
+                if not state_paths.WINDOWS:
+                    path.unlink()
         except OSError:
             pass
         finally:
             os.close(fd)
+        if remove and state_paths.WINDOWS:
+            with contextlib.suppress(OSError):
+                path.unlink()
 
 
 def _mtime(path: Path) -> float:
@@ -750,6 +757,9 @@ def _launch(provider: str, session_id: str, payload: dict, cwd: str) -> int:
     shell = _user_shell()
     if host == "tern":
         return _launch_tern(cwd, shell, command)
+    if state_paths.WINDOWS:
+        sys.stderr.write("codexbar_focus: kitty is not available on Windows\n")
+        return 8
     # An interactive shell loads the user's PATH; the trailing shell keeps
     # the window open after the agent exits, like the original terminal.
     executable = _kitty_bin() if sys.platform == "darwin" else "kitty"
@@ -789,10 +799,17 @@ def _launch(provider: str, session_id: str, payload: dict, cwd: str) -> int:
 
 
 def _user_shell() -> str:
+    if state_paths.WINDOWS:
+        return "powershell"
+    import pwd
     return os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
 
 
 def _resume_shell_argv(shell: str, command: str) -> list[str]:
+    if state_paths.WINDOWS:
+        # A PowerShell line (agents._resume_command); -NoExit keeps the tab
+        # open after the agent exits, like the trailing shell below.
+        return [shell, "-NoExit", "-Command", command]
     argv = [shell, "-ic", f"{command}; exec {shlex.quote(shell)} -i"]
     if sys.platform == "darwin":
         # Mac terminals customize direct-shell startup. Keep the helper's
@@ -811,6 +828,9 @@ def _exited(pid: int) -> bool:
     if sys.platform == "darwin":
         import proc_darwin
         return proc_darwin.exited(pid)
+    if state_paths.WINDOWS:
+        import proc_windows
+        return proc_windows.exited(pid)
     try:
         stat = Path(f"/proc/{pid}/stat").read_text()
     except OSError:
@@ -840,6 +860,9 @@ def teleport(provider: str, session_id: str) -> int:
 
     The agent must exit first: a session file has one live writer, so Tern
     starts only after the kitty process is gone."""
+    if state_paths.WINDOWS:
+        sys.stderr.write("codexbar_focus: only kitty sessions teleport, and Windows has no kitty\n")
+        return 7
     return _session_operation(provider, session_id, "teleport", _teleport)
 
 
@@ -925,13 +948,16 @@ def _start_tern() -> bool:
     if not executable:
         return False
     argv = [executable]
-    if sys.platform != "darwin":
+    if sys.platform not in ("darwin", "win32"):
         argv = ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", *argv]
+    # Its own session or process group, apart from the helper's.
+    detach = ({"creationflags": subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP}
+              if state_paths.WINDOWS else {"start_new_session": True})
     try:
         proc = subprocess.Popen(
             argv,
             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL, start_new_session=True,
+            stderr=subprocess.DEVNULL, **detach,
         )
     except OSError:
         return False

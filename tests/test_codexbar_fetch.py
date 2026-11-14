@@ -17,6 +17,8 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from unittest import mock
 
+from fakes import WINDOWS, fake_program
+
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
@@ -30,8 +32,14 @@ assert SPEC is not None and SPEC.loader is not None
 fetch = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(fetch)
 
-TRUE_EXECUTABLE = shutil.which("true")
+# Windows has no `true`: a batch file beside this one stands in.
+TRUE_EXECUTABLE = shutil.which("true") or (str(Path(__file__).with_name("true.cmd")) if WINDOWS else None)
 assert TRUE_EXECUTABLE is not None, "provider tests require the true executable"
+try:
+    fetch.ZoneInfo("America/Los_Angeles")
+    HAS_TZ_DATABASE = True
+except fetch.ZoneInfoNotFoundError:
+    HAS_TZ_DATABASE = False
 
 
 @contextlib.contextmanager
@@ -81,6 +89,7 @@ class IsolatedUsageTestCase(unittest.TestCase):
         self.home = Path(directory.name)
         environment = mock.patch.dict(fetch.os.environ, {
             "HOME": directory.name,
+            "USERPROFILE": directory.name,  # the home on Windows
             "XDG_STATE_HOME": str(self.home / ".local" / "state"),
             "XDG_CONFIG_HOME": str(self.home / ".config"),
             "CODEX_HOME": str(self.home / ".codex"),
@@ -170,13 +179,14 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.cli = self.home / "codexbar"
-        self.cli.write_text(
-            "#!/bin/sh\n"
-            'cat "$CLAUDE_CONFIG_DIR/usage.json" 2>/dev/null'
-            " || echo '{\"provider\":\"claude\",\"error\":{\"message\":\"rate limited\"}}'\n",
-        )
-        self.cli.chmod(0o700)
+        self.cli = fake_program(self.home / "codexbar", (
+            "import os, sys\n"
+            "try:\n"
+            "    with open(os.path.join(os.environ['CLAUDE_CONFIG_DIR'], 'usage.json')) as usage:\n"
+            "        sys.stdout.write(usage.read())\n"
+            "except (KeyError, OSError):\n"
+            "    print('{\"provider\":\"claude\",\"error\":{\"message\":\"rate limited\"}}')\n"
+        ))
         self.meridian = self.home / ".config" / "meridian"
         self.profile_urls: list[str] = []
 
@@ -697,7 +707,8 @@ class UsageCacheTests(IsolatedUsageTestCase):
         self.assertNotIn("secret", contents)
         self.assertNotIn("codexRotation", contents)
         self.assertNotIn("forecast", contents)
-        self.assertEqual(self.cache_path.stat().st_mode & 0o777, 0o600)
+        if not WINDOWS:  # Windows files have no mode bits; the profile's ACL keeps them private.
+            self.assertEqual(self.cache_path.stat().st_mode & 0o777, 0o600)
         restored = self.snapshot(cache_only=True)
         old = restored["providers"][0]
         self.assertTrue(restored["cacheOnly"])
@@ -723,6 +734,12 @@ class UsageCacheTests(IsolatedUsageTestCase):
         self.assertIn("CodexBar CLI", failed["fatal"]["setup"][0])
         self.assertIn("macOS tarball", fetch._cli_setup("darwin")[0])
         self.assertIn("codexbar-cli", fetch._cli_setup("linux")[0])
+        # No Windows build to install: Meridian or nothing.
+        windows = fetch._cli_setup("win32")
+        self.assertIn("no Windows build", windows[0])
+        self.assertIn("Meridian", windows[0])
+        self.assertIn("turn usage tracking off", windows[-1])
+        self.assertFalse(any("Install" in line or "brew" in line for line in windows))
         [kept] = failed["providers"]
         self.assertEqual((kept["stale"], kept["primary"]["usedPercent"]), (True, 42))
         self.assertEqual(failed["updatedAt"], self.measured.isoformat())
@@ -1112,7 +1129,8 @@ class StateMigrationTests(IsolatedUsageTestCase):
 
         target = fetch.state_paths.migrate()
         self.assertEqual(target, self.home / ".local/state/codexbar-agentview")
-        self.assertEqual(target.stat().st_mode & 0o777, 0o700)
+        if not WINDOWS:  # Windows folders have no mode bits; the profile's ACL keeps them private.
+            self.assertEqual(target.stat().st_mode & 0o777, 0o700)
         self.assertEqual(sorted(path.name for path in target.iterdir()), [
             "agents", "agents.json", "agents.parsers.json", "forecast_cache.json", "usage_cache.json",
         ])
@@ -1146,6 +1164,7 @@ class CodexRotationTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         home = mock.patch.dict(fetch.os.environ, {
             "HOME": directory.name,
+            "USERPROFILE": directory.name,
             "XDG_STATE_HOME": str(Path(directory.name) / ".local" / "state"),
         })
         home.start()
@@ -1344,6 +1363,7 @@ class ClaudeRotationTests(unittest.TestCase):
         self.addCleanup(directory.cleanup)
         home = mock.patch.dict(fetch.os.environ, {
             "HOME": directory.name,
+            "USERPROFILE": directory.name,
             "XDG_STATE_HOME": str(Path(directory.name) / ".local" / "state"),
         })
         home.start()
@@ -1537,6 +1557,7 @@ class ForecastTests(IsolatedUsageTestCase):
 
         self.assertEqual(eta, dt.datetime(2026, 9, 3, 23, 30, tzinfo=dt.timezone.utc))
 
+    @unittest.skipUnless(HAS_TZ_DATABASE, "needs the IANA time zone database (tzdata on Windows)")
     def test_eta_window_hours_are_in_the_window_zone(self) -> None:
         # Projection 2026-11-01 12:00Z is 04:00 PST, after the DST change; the
         # 23:00 Los Angeles window start that day is 07:00Z on Nov 2.
@@ -1549,6 +1570,7 @@ class ForecastTests(IsolatedUsageTestCase):
         self.assertEqual(eta, dt.datetime(2026, 11, 2, 7, tzinfo=dt.timezone.utc))
         self.assertEqual(unknown, dt.datetime(2026, 11, 1, 12, tzinfo=dt.timezone.utc))
 
+    @unittest.skipUnless(HAS_TZ_DATABASE, "needs the IANA time zone database (tzdata on Windows)")
     def test_eta_rolls_in_window_zone_across_dst(self) -> None:
         # Projection Oct 31 23:30 PDT is inside the window but elapsed; one
         # day later is Nov 1 23:30 PST, not 22:30.

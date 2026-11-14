@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import importlib.util
 import io
 import json
@@ -33,10 +32,26 @@ SPEC = importlib.util.spec_from_file_location("codexbar_waiting", SCRIPT_PATH)
 assert SPEC is not None and SPEC.loader is not None
 waiting = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(waiting)
+import state_paths  # noqa: E402  (after the path insert above)
+
+WINDOWS = state_paths.WINDOWS
+# A Tern daemon's `<pid>-<start time>` id read from /proc, which Windows and macOS lack.
+HAS_PROC = Path("/proc/self/stat").exists()
+# Whether a running daemon's id can be checked: /proc, or Windows' process times.
+NAMES_DAEMONS = HAS_PROC or WINDOWS
+# A daemon id of no running process, in the platform's form.
+GONE_DAEMON = "999999999-20261114T073633.9672515" if WINDOWS else "999999999-1"
 
 SID = "01a1abf1-15c8-748b-b9fa-126ebc0b88e5"
 OTHER = "01a1abf1-0000-748b-b9fa-126ebc0b88e6"
 T0 = datetime(2026, 11, 5, 12, 0, 0).astimezone()
+
+
+def resume_line(cwd: str) -> str:
+    """The command that resumes SID in `cwd`, in the platform's shell."""
+    if WINDOWS:
+        return f"Set-Location -LiteralPath '{cwd}' -ErrorAction Stop; omp --resume '{SID}'"
+    return f"cd -- {cwd} && omp --resume {SID}"
 
 
 class FakeGhError(Exception):
@@ -83,6 +98,8 @@ class Case(unittest.TestCase):
         self.env = {
             "XDG_STATE_HOME": str(self.root / "state"),
             "HOME": str(self.root / "home"),
+            # Path.home() on Windows.
+            "USERPROFILE": str(self.root / "home"),
             "OMP_AGENT_DIR": str(self.omp),
             "PI_CODING_AGENT_DIR": "",
         }
@@ -178,7 +195,7 @@ class Case(unittest.TestCase):
         return wait, action
 
     def state(self) -> dict:
-        return json.loads((self.state_dir / "waiting.json").read_text())
+        return json.loads((self.state_dir / "waiting.json").read_text(encoding="utf-8"))
 
     def github(self, **overrides):
         patch = mock.patch.dict(sys.modules, {"waiting_github": fake_github(**overrides)})
@@ -199,7 +216,7 @@ class CliShapeTests(Case):
             ["add", "--pane", "4", "--kind", "time", "--in", "1h", "--prompt", "x"],
             ["add", "--session", SID, "--kind", "command", "--argv", ""],
             ["add", "--session", SID, "--kind", "command", "--argv", "[1]"],
-            ["add", "--session", SID, "--kind", "command", "--argv", "ls 'open"],
+            *([] if WINDOWS else [["add", "--session", SID, "--kind", "command", "--argv", "ls 'open"]]),
             ["add", "--session", SID, "--kind", "command", "--argv", '["ls"]',
              "--predicate", "stdout_regex:("],
             ["add", "--session", SID, "--kind", "time", "--at", "24:00"],
@@ -584,6 +601,28 @@ class ConditionTests(Case):
         self.assertIsNone(code)
         self.assertIn("timed out", error)
 
+    def test_a_timeout_also_kills_what_the_command_started(self) -> None:
+        # The grandchild holds the output pipe: alive, it keeps the read waiting 5 s more.
+        command = ("import subprocess, sys, time; "
+                   "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], stdout=sys.stdout); "
+                   "time.sleep(30)")
+        started = time.monotonic()
+        with mock.patch.object(waiting, "COMMAND_TIMEOUT_S", 1):
+            code, _, error = waiting._run_argv([sys.executable, "-c", command], None)
+        self.assertEqual((code, error), (None, "timed out after 1 s"))
+        self.assertLess(time.monotonic() - started, 4, "the command's child outlived the kill")
+
+    def test_a_timeout_kills_a_child_that_outlives_the_command(self) -> None:
+        # The command exits at once; its child keeps the output pipe open, so
+        # the read times out, and only the child is left to kill.
+        command = ("import subprocess, sys; "
+                   "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], stdout=sys.stdout)")
+        started = time.monotonic()
+        with mock.patch.object(waiting, "COMMAND_TIMEOUT_S", 2):
+            code, _, error = waiting._run_argv([sys.executable, "-c", command], None)
+        self.assertEqual((code, error), (None, "timed out after 2 s"))
+        self.assertLess(time.monotonic() - started, 5, "the orphaned child outlived the kill")
+
     def test_events_by_pane_resolve_the_session(self) -> None:
         self.agents(SID)
         self.heartbeat()
@@ -804,6 +843,7 @@ class ConditionTests(Case):
         tomorrow = (self.clock + timedelta(days=1)).replace(second=0)
         self.assertEqual(wait["condition"]["at"], tomorrow.isoformat())
 
+    @unittest.skipUnless(hasattr(time, "tzset"), "needs time.tzset to change the time zone in-process")
     def test_a_bare_clock_keeps_the_wall_clock_over_a_dst_change(self) -> None:
         self.addCleanup(time.tzset)
         with mock.patch.dict(os.environ, {"TZ": "CET-1CEST,M3.5.0,M10.5.0/3"}):
@@ -812,6 +852,7 @@ class ConditionTests(Case):
             wait = self.add("--kind", "time", "--at", "18:00")
         self.assertEqual(wait["condition"]["at"], "2026-10-25T18:00:00+01:00")
 
+    @unittest.skipUnless(hasattr(time, "tzset"), "needs time.tzset to change the time zone in-process")
     def test_a_bare_clock_takes_the_second_pass_of_a_repeated_hour(self) -> None:
         self.addCleanup(time.tzset)
         with mock.patch.dict(os.environ, {"TZ": "CET-1CEST,M3.5.0,M10.5.0/3"}):
@@ -1562,6 +1603,7 @@ class MenuRequestTests(Case):
         self.tick()  # agents.json is still the last boot's
         self.assertEqual(list(self.run_cli("list")["extension_panes"]), ["52"])
 
+    @unittest.skipUnless(HAS_PROC, "dates a daemon by its /proc start time")
     def test_a_new_daemon_keeps_the_panes_reported_since_it_started(self) -> None:
         self.tick("--daemon", "999999999-1")  # no such process
         self.heartbeat(OTHER, "--pane", "51", "--features", "menu")
@@ -2308,7 +2350,7 @@ class ClosedSessionTests(Case):
         self.assertEqual(seen["cwd"], "/w/project")
         self.assertEqual(seen["project"], "project")
         self.assertEqual(seen["recap"], "newest recap")
-        self.assertEqual(seen["resume_command"], f"cd -- /w/project && omp --resume {SID}")
+        self.assertEqual(seen["resume_command"], resume_line("/w/project"))
         self.assertFalse(seen["live"])
 
     def test_a_closed_sessions_recap_has_its_time(self) -> None:
@@ -2375,7 +2417,7 @@ class ClosedSessionTests(Case):
         self.agents()
         self.transcript(SID)
         answer = self.run_cli("resume", "--session", SID)
-        self.assertEqual(answer["command"], f"cd -- /w/project && omp --resume {SID}")
+        self.assertEqual(answer["command"], resume_line("/w/project"))
         self.assertEqual(answer["cwd"], "/w/project")
 
     def test_resume_prefers_agents_history(self) -> None:
@@ -2422,7 +2464,7 @@ class ClosedSessionTests(Case):
                 "session_id": SID, "title": "Fix the thing", "cwd": "/w/project",
                 "project": "project", "note": None, "size": None, "age_s": 7200,
                 "recap": "what happened", "live": False, "pane": None,
-                "resume_command": f"cd -- /w/project && omp --resume {SID}",
+                "resume_command": resume_line("/w/project"),
             },
         )
 
@@ -2779,10 +2821,7 @@ class PrStatusTickTests(SessionPrCase):
         def status(repo: str, number: int, run=None) -> dict:
             descriptor = os.open(self.state_dir / "waiting.lock", os.O_RDWR)
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                free.append(True)
-            except BlockingIOError:
-                free.append(False)
+                free.append(state_paths.lock(descriptor, blocking=False))
             finally:
                 os.close(descriptor)
             return self.status
@@ -3821,8 +3860,9 @@ class PinTests(Case):
 
     def test_the_file_is_written_the_way_omp_writes_it(self) -> None:
         self.add_answer("--kind", "later")
-        self.assertEqual(self.pins_path.read_text(), f'[\n\t"{SID}"\n]')
-        self.assertEqual(self.pins_path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.pins_path.read_bytes(), f'[\n\t"{SID}"\n]'.encode())
+        if not WINDOWS:  # Windows files have no mode bits; the profile's ACL keeps them private.
+            self.assertEqual(self.pins_path.stat().st_mode & 0o777, 0o600)
         self.assertEqual([path.name for path in self.omp.iterdir()], ["session-pins.json"])
 
     def test_the_view_shows_the_pin_at_once(self) -> None:
@@ -3921,10 +3961,7 @@ class PinTests(Case):
         def write(path: Path, rows: list) -> None:
             descriptor = os.open(self.state_dir / "waiting.lock", os.O_RDWR)
             try:
-                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                held.append(False)
-            except BlockingIOError:
-                held.append(True)
+                held.append(not state_paths.lock(descriptor, blocking=False))
             finally:
                 os.close(descriptor)
             real(path, rows)
@@ -4056,6 +4093,26 @@ class PinTests(Case):
             "omp-file-lock-bd764e9a96bf2f299508f3ce85f622c4",
         )
 
+    @unittest.skipUnless(WINDOWS, "omp's Windows lease is a named kernel mutex")
+    def test_the_windows_lease_is_omps_named_mutex(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.OpenMutexW.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR)
+        kernel32.OpenMutexW.restype = wintypes.HANDLE
+        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+        lock = f"{self.pins_path}.lock"
+        # pi-natives' file_lock/windows.rs: `Global\` and the memory lock name.
+        name = f"Global\\{waiting._omp_lock_name(lock)}"
+        holder = waiting._try_omp_lock(lock)
+        handle = kernel32.OpenMutexW(0x00100000, False, name)
+        self.assertTrue(handle, ctypes.get_last_error())
+        kernel32.CloseHandle(handle)
+        self.assertIsNone(waiting._try_omp_lock(lock))
+        holder.close()
+        self.assertFalse(kernel32.OpenMutexW(0x00100000, False, name))
+        self.assertFalse(Path(lock).exists(), "the lease is no file")
+
     def test_the_agent_dir_follows_omp(self) -> None:
         with mock.patch.dict(os.environ, {"PI_CODING_AGENT_DIR": "/a", "OMP_AGENT_DIR": "/b"}):
             self.assertEqual(waiting.Omp().root, Path("/a"))
@@ -4069,28 +4126,50 @@ class ArgvTests(Case):
     def test_a_json_array(self) -> None:
         self.assertEqual(waiting._parse_argv('["ls", "-l a"]'), ["ls", "-l a"])
 
+    @unittest.skipIf(WINDOWS, "Windows runs a command line in PowerShell, with no POSIX split")
     def test_a_command_line(self) -> None:
         self.assertEqual(
             waiting._parse_argv("curl -s 'http://x/y z' --retry 2"),
             ["curl", "-s", "http://x/y z", "--retry", "2"],
         )
 
+    @unittest.skipIf(WINDOWS, "Windows runs a command line in PowerShell, with no POSIX split")
     def test_a_command_line_that_only_looks_like_an_array(self) -> None:
         self.assertEqual(waiting._parse_argv("[ -f /tmp/x ]"), ["[", "-f", "/tmp/x", "]"])
 
     def test_errors_name_both_forms(self) -> None:
-        for text in ("", "[]", "[1]", "ls 'open"):
+        # PowerShell, not a split, parses a Windows command line: an open quote is its error.
+        for text in ("", "[]", "[1]", *(() if WINDOWS else ("ls 'open",))):
             with self.subTest(text=text), self.assertRaises(waiting.BadInput) as caught:
                 waiting._parse_argv(text)
             self.assertIn("JSON array", str(caught.exception))
             self.assertIn("command line", str(caught.exception))
 
+    @unittest.skipIf(WINDOWS, "Windows runs a command line in PowerShell, with no POSIX split")
     def test_a_command_line_runs_without_a_shell(self) -> None:
         marker = self.root / "ran"
         script = f"import sys; open({str(marker)!r}, 'w').write(sys.argv[1])"
         argv = shlex.join([sys.executable, "-c", script, "a|b"])
         wait = self.add("--kind", "command", "--argv", argv)
         self.assertEqual(wait["condition"]["argv"][-1], "a|b")
+        self.tick()
+        self.assertEqual(marker.read_text(), "a|b")
+
+    def test_a_windows_command_line_runs_in_powershell(self) -> None:
+        line = "  gh pr view 7 | Select-String MERGED  "
+        with mock.patch.object(waiting.state_paths, "WINDOWS", True):
+            argv = waiting._parse_argv(line)
+            self.assertEqual(waiting._parse_argv('["gh", "a b"]'), ["gh", "a b"])
+            self.assertRaises(waiting.BadInput, waiting._parse_argv, "   ")
+        self.assertEqual(argv, [*waiting.WINDOWS_SHELL, line.strip()])
+        self.assertEqual(waiting._command_line({"argv": argv}), line.strip()[:waiting.COMMAND_LABEL_CHARS])
+
+    @unittest.skipUnless(WINDOWS, "needs Windows PowerShell")
+    def test_a_windows_command_line_gets_powershell_pipes(self) -> None:
+        marker = self.root / "ran"
+        line = f"Set-Content -LiteralPath '{marker}' -NoNewline -Value ('a', 'b' -join '|')"
+        wait = self.add("--kind", "command", "--argv", line)
+        self.assertEqual(wait["condition"]["argv"], [*waiting.WINDOWS_SHELL, line])
         self.tick()
         self.assertEqual(marker.read_text(), "a|b")
 
@@ -5715,14 +5794,40 @@ class DaemonTests(Case):
 
     def own_daemon(self) -> str:
         """This process, named as a running Tern daemon."""
+        if WINDOWS:
+            import proc_windows
+            created = proc_windows.start_ms(os.getpid())
+            stamp = datetime.fromtimestamp(created // 1000, timezone.utc).strftime("%Y%m%dT%H%M%S")
+            return f"{os.getpid()}-{stamp}.{created % 1000 * 10_000:07d}"
         stat = Path("/proc/self/stat").read_text()
         return f"{os.getpid()}-{stat[stat.rfind(')') + 2:].split()[19]}"
 
+    @unittest.skipUnless(NAMES_DAEMONS, "names a running daemon by /proc or Windows' process times")
     def test_a_running_daemon_keeps_the_ticker_however_long_it_slept(self) -> None:
         self.tick("--daemon", self.own_daemon())
         self.advance(hours=2)
         self.assertEqual(self.tick("--daemon", "b")["skipped"], waiting.TICK_SKIPPED)
 
+    def test_a_windows_daemon_id_is_its_pid_and_utc_creation_time(self) -> None:
+        self.assertAlmostEqual(waiting._started_at("4880-20261114T073633.9672515"),
+                               datetime(2026, 11, 14, 7, 36, 33, tzinfo=timezone.utc).timestamp() + 0.9672515)
+        for start in ("20261114T073633.967251", "20261314T073633.9672515", "1234"):
+            self.assertIsNone(waiting._windows_start_ticks(start), start)
+        created = {4880: 1794641793967, 4881: 0, 4882: 0}
+        fake = types.SimpleNamespace(start_ms=created.get, exited=lambda pid: pid == 4881)
+        with (
+            mock.patch.object(waiting.state_paths, "WINDOWS", True),
+            mock.patch.dict(sys.modules, {"proc_windows": fake}),
+        ):
+            alive = {daemon: waiting._daemon_alive(f"{daemon}-20261114T073633.9672515")
+                     for daemon in created}
+            created[4880] += 1  # the pid now names a younger process
+            self.assertFalse(waiting._daemon_alive("4880-20261114T073633.9672515"))
+            self.assertIsNone(waiting._daemon_alive("4880-12345"))
+        # Running; gone; another user's that can't be read.
+        self.assertEqual(alive, {4880: True, 4881: False, 4882: None})
+
+    @unittest.skipUnless(NAMES_DAEMONS, "names a running daemon by /proc or Windows' process times")
     def test_a_running_daemon_that_stopped_ticking_loses_the_ticker(self) -> None:
         awake = [1000.0]
         with mock.patch.object(waiting, "_awake_s", lambda: awake[0]):
@@ -5762,8 +5867,9 @@ class DaemonTests(Case):
         self.assertEqual([action["pane"] for action in actions if action["type"] == "park"], [53])
         self.assertEqual([action["pane"] for action in self.state()["actions"]], [52, 53])
 
+    @unittest.skipUnless(NAMES_DAEMONS, "tells a gone daemon by /proc or Windows' process times")
     def test_a_daemon_that_is_gone_holds_no_lease(self) -> None:
-        self.tick("--daemon", "999999999-1")  # no such process
+        self.tick("--daemon", GONE_DAEMON)  # no such process
         self.advance(minutes=1)
         self.assertNotIn("skipped", self.tick("--daemon", "b"))
 
@@ -6154,6 +6260,25 @@ class PruneTests(Case):
 
 EXTENSION_PATH = Path(__file__).resolve().parents[1] / "omp-extension" / "waitingfor.ts"
 
+
+@contextlib.contextmanager
+def extension_folder():
+    """A temporary folder for a driver run. The CLI calls the extension started last
+    may outlive the driver; Windows can't delete a folder they still use, so wait."""
+    folder = tempfile.mkdtemp()
+    try:
+        yield folder
+    finally:
+        for attempt in range(100):
+            try:
+                shutil.rmtree(folder)
+                break
+            except PermissionError:
+                if attempt == 99:
+                    raise
+                time.sleep(0.1)
+
+
 # Loads the extension into a stand-in for omp 18.19 and moves its session the way omp's
 # SessionManager does when the file is open for writing elsewhere: a new id whose header continues
 # the old one, then each `onPersistenceNotice` observer at once (which replays earlier notices on
@@ -6231,15 +6356,7 @@ class ExtensionSessionMoveTests(unittest.TestCase):
     """omp moves a session it can't write to a new file under a new id, with no session event."""
 
     def evaluate(self, code: str, **env: str) -> dict:
-        with tempfile.TemporaryDirectory() as folder:
-            script = Path(folder) / "driver.mjs"
-            script.write_text(code)
-            done = subprocess.run(
-                ["bun", "run", str(script)], cwd=folder, capture_output=True, text=True, timeout=60,
-                env={**os.environ, "EXTENSION": str(EXTENSION_PATH), **env},
-            )
-        self.assertEqual(done.returncode, 0, done.stderr)
-        return json.loads(done.stdout.strip().splitlines()[-1])
+        return run_extension_driver(self, code, **env)
 
     def test_session_change_tells_a_move_from_a_switch(self) -> None:
         answer = self.evaluate(r"""
@@ -6260,7 +6377,7 @@ console.log(JSON.stringify({
         })
 
     def moved(self, notice: str) -> dict:
-        with tempfile.TemporaryDirectory() as folder:
+        with extension_folder() as folder:
             root = Path(folder)
             (root / "omp").mkdir()
             return self.evaluate(
@@ -6287,11 +6404,11 @@ console.log(JSON.stringify({
 
 def run_extension_driver(test: unittest.TestCase, code: str, **env: str) -> dict:
     """Runs `code` under bun with the extension's path in EXTENSION; the JSON of its last line."""
-    with tempfile.TemporaryDirectory() as folder:
+    with extension_folder() as folder:
         script = Path(folder) / "driver.mjs"
-        script.write_text(code)
+        script.write_text(code, encoding="utf-8")
         done = subprocess.run(
-            ["bun", "run", str(script)], cwd=folder, capture_output=True, text=True, timeout=60,
+            ["bun", "run", str(script)], cwd=folder, capture_output=True, encoding="utf-8", timeout=60,
             env={**os.environ, "EXTENSION": str(EXTENSION_PATH), **env},
         )
     test.assertEqual(done.returncode, 0, done.stderr)
@@ -6501,7 +6618,7 @@ process.exit(0);
 @unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
 class ExtensionDescribedCheckTests(unittest.TestCase):
     def test_the_instruction_goes_through_the_queue_and_the_tool_writes_the_check(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
+        with extension_folder() as folder:
             root = Path(folder)
             (root / "omp").mkdir()
             answer = run_extension_driver(
@@ -6565,31 +6682,35 @@ process.exit(0);
 @unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
 class ExtensionMenuCloseTests(unittest.TestCase):
     def closed(self, strip_close: bool, jobs: str = "[]") -> dict:
-        with tempfile.TemporaryDirectory() as folder:
+        with extension_folder() as folder:
             root = Path(folder)
             (root / "omp").mkdir()
-            folder_bin = root / "bin"
-            folder_bin.mkdir()
-            # The CLI as an older or broken one would answer: views without `close`.
-            python = folder_bin / "python3"
-            python.write_text(
-                f"#!/bin/sh\n{shlex.quote(sys.executable)} \"$@\" | {shlex.quote(sys.executable)} -c "
-                + shlex.quote(
-                    "import json, sys\n"
-                    "answer = json.load(sys.stdin)\n"
+            extension = EXTENSION_PATH
+            if strip_close:
+                # The CLI as an older or broken one would answer: views without `close`. A copy
+                # of the extension finds this wrapper where it looks for the CLI, on any platform.
+                package = root / "package"
+                extension = package / "omp-extension" / EXTENSION_PATH.name
+                scripts = package / "contents" / "scripts"
+                extension.parent.mkdir(parents=True)
+                scripts.mkdir(parents=True)
+                shutil.copy(EXTENSION_PATH, extension)
+                shutil.copy(SCRIPT_PATH.parent / "waiting_menu.json", scripts)
+                (scripts / SCRIPT_PATH.name).write_text(
+                    "import json, subprocess, sys\n"
+                    f"done = subprocess.run([sys.executable, {str(SCRIPT_PATH)!r}, *sys.argv[1:]], capture_output=True)\n"
+                    "sys.stderr.buffer.write(done.stderr)\n"
+                    "answer = json.loads(done.stdout)\n"
                     "for row in (answer.get('view') or answer).get('sessions') or []:\n"
                     "    row.pop('close', None)\n"
                     "print(json.dumps(answer))\n"
+                    "sys.exit(done.returncode)\n"
                 )
-                + "\n"
-            )
-            python.chmod(0o755)
-            path = f"{folder_bin}{os.pathsep}{os.environ['PATH']}" if strip_close else os.environ["PATH"]
             # A transcript makes the session resumable, as one with messages is.
             (root / "omp" / "sessions" / "-w").mkdir(parents=True)
             (root / "omp" / "sessions" / "-w" / f"2026-11-05_{SID}.jsonl").write_text("")
             return run_extension_driver(
-                self, MENU_CLOSE_DRIVER, SID=SID, PATH=path, JOBS=jobs,
+                self, MENU_CLOSE_DRIVER, SID=SID, JOBS=jobs, EXTENSION=str(extension),
                 XDG_STATE_HOME=str(root / "state"), OMP_AGENT_DIR=str(root / "omp"), PI_CODING_AGENT_DIR="",
                 TERN_PANE="",
             )
@@ -6664,7 +6785,7 @@ process.exit(0);
 @unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
 class ExtensionActivityTests(unittest.TestCase):
     def test_each_change_of_what_runs_reaches_the_cli(self) -> None:
-        with tempfile.TemporaryDirectory() as folder:
+        with extension_folder() as folder:
             root = Path(folder)
             (root / "omp").mkdir()
             answer = run_extension_driver(
@@ -6717,7 +6838,7 @@ process.exit(0);
 @unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
 class ExtensionToolParkTests(unittest.TestCase):
     def parked(self, pane: str, listed: int | None = 52) -> dict:
-        with tempfile.TemporaryDirectory() as folder:
+        with extension_folder() as folder:
             root = Path(folder)
             (root / "omp").mkdir()
             state = root / "state" / "codexbar-agentview"
@@ -6759,7 +6880,7 @@ import { execFileSync } from "node:child_process";
 const { default: install } = await import(process.env.EXTENSION);
 const [OLD, MID, NEW] = JSON.parse(process.env.IDS);
 const reasons = JSON.parse(process.env.REASONS);
-execFileSync("python3", [process.env.CLI, "add", "--session", OLD, "--kind", "later", "--label", "Keep"]);
+execFileSync(process.env.PYTHON, [process.env.CLI, "add", "--session", OLD, "--kind", "later", "--label", "Keep"]);
 const state = () => { try { return JSON.parse(fs.readFileSync(process.env.STATE_FILE, "utf8")); } catch { return {}; } };
 async function until(test) {
     for (let i = 0; i < 300; i++) { if (test(state())) return true; await Bun.sleep(50); }
@@ -6805,7 +6926,7 @@ process.exit(0);
 @unittest.skipUnless(shutil.which("bun"), "needs bun to load the omp extension")
 class ExtensionMoveReasonTests(unittest.TestCase):
     def moved(self, *reasons: str) -> dict:
-        with tempfile.TemporaryDirectory() as folder:
+        with extension_folder() as folder:
             root = Path(folder)
             (root / "omp").mkdir()
             env = {
@@ -6814,7 +6935,8 @@ class ExtensionMoveReasonTests(unittest.TestCase):
             }
             return run_extension_driver(
                 self, MOVE_REASON_DRIVER, REASONS=json.dumps(reasons), IDS=json.dumps([SID, MID, OTHER]),
-                CLI=str(SCRIPT_PATH), STATE_FILE=str(root / "state" / "codexbar-agentview" / "waiting.json"), **env,
+                CLI=str(SCRIPT_PATH), PYTHON=sys.executable,
+                STATE_FILE=str(root / "state" / "codexbar-agentview" / "waiting.json"), **env,
             )
 
     def test_a_replaced_session_takes_its_waits_along(self) -> None:
