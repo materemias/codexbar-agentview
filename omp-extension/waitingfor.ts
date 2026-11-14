@@ -1148,7 +1148,7 @@ export default function (pi) {
 	let menuSeq = 0; // the last menu request seen
 	let activatedAt = 0; // in whole seconds, as a request's time has no finer ones
 	let unwatchMoves; // ends the subscription to omp's notices of a session moved to a new file
-	let watched; // the SessionManager unwatchMoves listens to
+	let movesManager; // the SessionManager unwatchMoves listens to
 	const formerIds = new Set<string>(); // the ids omp moved this conversation from (followSession)
 	let moves: { from: string; reason: string }[] = []; // the moves to this id the CLI has yet to hear of, oldest first (followSession)
 	// Views applied, counted apart: one with only a failed tick's health leaves the sessions as they were.
@@ -1529,10 +1529,10 @@ export default function (pi) {
 		watchView();
 		// omp tells of each move here, inside the write that made it, so a tool call or claim in the same
 		// tick already sees the new id; it replays the earlier moves at once, which name this id already.
-		if (c.sessionManager !== watched) {
+		if (c.sessionManager !== movesManager) {
 			unwatchMoves?.();
-			watched = c.sessionManager;
-			unwatchMoves = watched.onPersistenceNotice?.((notice) => followSession(notice));
+			movesManager = c.sessionManager;
+			unwatchMoves = movesManager.onPersistenceNotice?.((notice) => followSession(notice));
 		}
 		timers = [
 			c.setInterval(() => quietly(refresh), REFRESH_MS),
@@ -1564,7 +1564,7 @@ export default function (pi) {
 		watcher = undefined;
 		unwatchMoves?.();
 		unwatchMoves = undefined;
-		watched = undefined;
+		movesManager = undefined;
 		ctx = undefined;
 		runningTools.clear();
 	});
