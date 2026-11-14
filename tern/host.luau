@@ -461,11 +461,15 @@ local store = {
 	-- published it, else open (tick, from window.luau's publishPanes).
 	paneStates = {} :: { [number]: string },
 	paneStatesSig = "",
+	-- Panes last published parked, kept while no window says (open): one that
+	-- shows as running next was unparked, which ends a snooze early (tick).
+	parkedSeen = {} :: { [number]: boolean },
 	jobEventAt = {} :: { [number]: number }, -- pane -> os.clock() when its last job event went to the CLI
 	waitingMemo = nil :: any, -- waitingGroups' last answer, for one view and filter
 	lastPoke = nil :: any,
 	menuRetryAt = nil :: number?, -- os.clock() when a failed `menu` load runs again
 	loadMenu = nil :: (() -> ())?,
+	hidable = nil :: any, -- (r) -> boolean, set beside waitingOpen
 }
 
 type Block = {
@@ -1377,26 +1381,19 @@ local function waitingCounts(): any
 	return if type(counts) == "table" then counts else {}
 end
 
--- The wait Snooze 1d pushes: one on me first, then the earliest due, of those the
--- view marks `snoozable` (the ones `snooze --wait` accepts). An older CLI marks
--- none: then this skips the ones `snooze` refuses for their kind or state (not
--- started, done, my-time ones, a job still running in time). Second, the wait
+-- The wait Snooze 1d pushes: the earliest due of the ones on me that the view
+-- marks `snoozable` (the ones `snooze --wait` accepts); a session back from a
+-- snooze is one, and snoozing it hides the session again. Second, the wait
 -- Retry checks again: one the CLI put on me after its checks kept failing
 -- (`retryable`), which nothing polls until then. (Inline, and one function for
 -- both: the main chunk is at Luau's 200-local limit.)
 local function firstDue(r: any): (any, any)
-	local first, at, onMe, retry = nil, math.huge, false, nil
+	local first, at, retry = nil, math.huge, nil
 	for _, w in val(r.waits) or {} do
-		local snoozable = val(w.snoozable)
-		if type(snoozable) ~= "boolean" then
-			snoozable = w.state ~= "pending" and w.state ~= "done" and w.kind ~= "later"
-				and not (w.kind == "job" and w.state == "waiting" and val(w.overdue) ~= true)
-		end
-		if snoozable then
+		if val(w.snoozable) == true and w.ball == "on_me" then
 			local due = epoch(w.due_at) or math.huge
-			local mine = w.ball == "on_me"
-			if not first or (mine and not onMe) or (mine == onMe and due < at) then
-				first, at, onMe = w, due, mine
+			if not first or due < at then
+				first, at = w, due
 			end
 		end
 		if not retry and val(w.retryable) == true then
@@ -2239,6 +2236,29 @@ local function tick()
 		table.sort(parts)
 		local sig = table.concat(parts, ",")
 		if sig ~= store.paneStatesSig then
+			-- A window unparked a pane snoozed until later (the user took it from
+			-- the deck, or opened it): its snooze ends early. A pane still counts
+			-- as parked while no window says (open). One coming back at its time
+			-- has no snooze left by then: the tick that ended it queued the unpark.
+			-- Pane ids name this daemon's panes: a row stamped with another
+			-- daemon's (`daemon`, as in jobPanes) isn't the pane unparked here.
+			local parked: { [number]: boolean } = {}
+			for pane, state in states do
+				parked[pane] = state == "parked" or (state == "open" and store.parkedSeen[pane]) or nil
+			end
+			for _, field in { "sessions", "panes" } do
+				for _, r in waitingList(field) do
+					local pane = tonumber(val(r.pane))
+					local session = str(r.session_id)
+					local stamp = val(r.daemon)
+					local ours = if stamp ~= nil and (store.daemonId or not store.daemonKnown) then stamp == store.daemonId else not store.waitingSkipped
+					if ours and pane and val(r.snoozed_until) ~= nil and (session == "" or val(r.live) == true)
+						and store.parkedSeen[pane] and states[pane] == "running" then
+						waitingRun(nil, "wake", { "wake", if session ~= "" then "--session" else "--pane", if session ~= "" then session else tostring(pane) })
+					end
+				end
+			end
+			store.parkedSeen = parked
 			store.paneStatesSig = sig
 			store.paneStates = states
 			renderAll()
@@ -3415,9 +3435,12 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	if retry then -- any of the row's waits, not only the one its headline tells: each is a dead end without it
 		table.insert(buttons, button("Retry", "wait_retry", { icon = "repeat", title = "Check “" .. oneLine(retry.label) .. "” again now" }))
 	end
-	table.insert(buttons, button("Snooze 1d", "wait_snooze", {
-		disabled = if due then false else "Nothing to snooze",
-	}))
+	if due then -- only what is on me: a wait still watched or timed needs no push
+		table.insert(buttons, button("Snooze 1d", "wait_snooze", { title = "Push “" .. oneLine(due.label) .. "” by a day" }))
+	end
+	if store.hidable(r) then
+		table.insert(buttons, button("Snooze session…", "wait_snooze_session", { title = "Hide the session until a time; it comes back by itself" }))
+	end
 	local stoppable = tonumber(val(r.stoppable)) or 0
 	if stoppable > 0 then
 		local armed = b.stopArmed and b.stopArmed.key == rowKey and os.clock() - b.stopArmed.at < 4
@@ -3587,7 +3610,11 @@ local function dockView(b: Block, now: number): Node
 			table.insert(hints, key("tab"))
 			table.insert(hints, ui.span(if setting("hideOld") then "\u{a0}show\u{a0}old   " else "\u{a0}hide\u{a0}old   ", "dim"))
 		elseif b.tab == "waiting" then
-			if b.filter == "" then
+			local due, retry = nil, nil
+			if row and row.waiting then
+				due, retry = firstDue(row.record)
+			end
+			if b.filter == "" and due then
 				table.insert(hints, key("+"))
 				table.insert(hints, ui.span("\u{a0}1\u{a0}day   ", "dim"))
 			end
@@ -3597,7 +3624,11 @@ local function dockView(b: Block, now: number): Node
 			end
 			table.insert(hints, key("f2"))
 			table.insert(hints, ui.span("\u{a0}manual\u{a0}wait   ", "dim"))
-			if row and row.waiting and select(2, firstDue(row.record)) then
+			if row and row.waiting and store.hidable(row.record) then
+				table.insert(hints, key("f4"))
+				table.insert(hints, ui.span("\u{a0}snooze\u{a0}session   ", "dim"))
+			end
+			if retry then
 				table.insert(hints, key("f5"))
 				table.insert(hints, ui.span("\u{a0}retry   ", "dim"))
 			end
@@ -3818,19 +3849,34 @@ local function waitArgs(verb: string, r: any, extra: { string }?): { string }
 	return args
 end
 
+-- Whether Snooze session… can hide the row's session: not one running outside
+-- Tern, which nothing here can park or close. (A store field: the main chunk
+-- is at Luau's 200-local limit.)
+store.hidable = function(r: any): boolean
+	return not (str(r.session_id) ~= "" and val(r.live) == true and tonumber(val(r.pane)) == nil)
+end
+
 -- Resume, like History's Launch, holds a minute: until the agents scan lists the
 -- session as live, a second press would start a second writer of its file.
-local function waitingOpen(b: Block, r: any)
+-- Opening a session snoozed until later wakes it first: its snooze ends, so it
+-- neither hides again nor comes back by itself; a failed wake still opens it.
+local function waitingOpen(b: Block, r: any, woken: boolean?)
 	local pane = tonumber(val(r.pane))
+	local key = waitKey(r)
+	if not waitLive(r) and (b.busy == key or (b.launched[key] and os.clock() - b.launched[key] < 60)) then
+		return
+	end
+	if not woken and val(r.snoozed_until) ~= nil then
+		waitingRun(b.cx, "wake", waitArgs("wake", r), function()
+			waitingOpen(b, r, true)
+		end)
+		return
+	end
 	if waitLive(r) and pane then
 		waitingRequest(b, { op = "open", target = pane })
 	elseif waitLive(r) then -- running outside Tern
 		focusRecord(b, { sessionId = r.session_id })
 	else
-		local key = waitKey(r)
-		if b.busy == key or (b.launched[key] and os.clock() - b.launched[key] < 60) then
-			return
-		end
 		b.busy = key
 		b.cx:render()
 		waitingRun(b.cx, "resume", waitArgs("resume", r), function(data)
@@ -3882,6 +3928,23 @@ local function waitingAct(b: Block, name: string, r: any)
 	elseif name == "wait_what" then
 		-- `cx:prompt` is the window's: it asks over the dashboard and calls `what`.
 		waitingRequest(b, { op = "what", args = waitArgs("what", r), text = oneLine(r.waiting_for) })
+	elseif name == "wait_snooze_session" and store.hidable(r) then
+		-- The window's pickers too. Pane ids name panes of the row's daemon.
+		-- Close only for a live session in a Tern pane, or a shell pane whose
+		-- close verdict says so (snoozeClosable in window.luau).
+		local session = str(r.session_id) ~= ""
+		local args = waitArgs("add", r)
+		local daemon = val(r.daemon) or store.daemonId
+		if not session and daemon then
+			table.insert(args, "--daemon")
+			table.insert(args, daemon)
+		end
+		waitingRequest(b, {
+			op = "snooze",
+			args = args,
+			close = val(r.close),
+			session = session and val(r.live) == true and tonumber(val(r.pane)) ~= nil,
+		})
 	end
 end
 
@@ -4114,6 +4177,8 @@ tern.block.define("dashboard", {
 			act(b, "wait_snooze")
 		elseif name == "f2" and b.tab == "waiting" then
 			act(b, "wait_what")
+		elseif name == "f4" and b.tab == "waiting" then
+			act(b, "wait_snooze_session")
 		elseif name == "f5" and b.tab == "waiting" then
 			act(b, "wait_retry")
 		elseif name == "backspace" then

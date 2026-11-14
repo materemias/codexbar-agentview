@@ -1094,7 +1094,7 @@ end
 
 -- Seen, Retry, Snooze 1d and Stop waits… need waits of a record; Seen only
 -- with something on the user, Retry one whose checks kept failing, Snooze 1d
--- one that snoozing moves. They act on the pane's entry, so it has to be the
+-- one on the user that snoozing moves. They act on the pane's entry, so it has to be the
 -- card's session: a link can name one the agents scan has not mapped to the
 -- pane yet. `armed`: Stop waits… was pressed once; the next press stops them.
 local function cardDock(pane: number, r: any, armed: boolean): Node
@@ -1168,7 +1168,7 @@ local function openCard(cx: WindowCx, pane: number, known: string?)
 		dock = cardDock(pane, shown, false),
 		about = CARD_ABOUT .. pane .. (if session then " for session " .. session else "")
 			.. ". Seen, when shown, closes what's on you, Retry, when shown, checks a failed wait again,"
-			.. " Snooze 1d, when shown, pushes the first due one by a day, Stop waits… ends every open wait"
+			.. " Snooze 1d, when shown, pushes what is on you by a day, Stop waits… ends every open wait"
 			.. " on a second press, × beside a wait ends that one, Close only closes this card.",
 		how = "beside",
 		target = pane,
@@ -1501,6 +1501,21 @@ local function carryOut(cx: WindowCx, a: any, info: PaneInfo?): (string, string?
 		end
 		local ok, err = cx.layout:park(info.pane)
 		return if ok then "done" else "failed", err
+	elseif a.type == "unpark" then
+		-- A session back from a snooze: a tab of its own, behind what the user looks at.
+		if not info.parked then
+			return "done"
+		end
+		local ok, err = cx.layout:unpark(info.pane, { focus = false })
+		if not ok then
+			return "failed", err
+		end
+		-- Back in the current tab at worst: it came back, so a failed move is only logged.
+		local tab, moveErr = cx.layout:move_to_new_tab(info.pane, nil, { focus = false })
+		if not tab then
+			tern.log.warn("codexbar: the pane back from a snooze stays in the current tab", moveErr)
+		end
+		return "done"
 	elseif a.type == "close_pane" then
 		cx.layout:close(info.pane)
 		return "done"
@@ -1518,8 +1533,9 @@ local heldSince: { [string]: number } = {} -- resume action id -> when a dashboa
 -- stays queued for the window that will; the host acks it once the pane is gone.
 local function ownsAction(a: any, info: PaneInfo?, leader: boolean): boolean
 	if info then
-		-- A dashboard's layout restore would bring a pane parked now back.
-		return not (a.type == "park" and opened)
+		-- A dashboard's layout restore would bring a pane parked now back, park
+		-- one unparked now again, and refuses once a pane closed under it.
+		return not ((a.type == "park" or a.type == "unpark" or a.type == "close_pane") and opened)
 	end
 	if not leader or (a.type ~= "toast" and tonumber(a.pane) ~= nil) then
 		return false
@@ -1865,6 +1881,89 @@ local function timeArgs(text: string): { string }
 	return { "--at=" .. text }
 end
 
+-- Whether Snooze session… may offer to close: `close` is the record's close
+-- verdict, which mustn't be park only, nor the waits unchecked. `session`: a
+-- live omp session in a Tern pane, the one thing here that a close hides and
+-- the snooze reopens; a shell pane can't be reopened, so it needs a verdict
+-- that says so. The CLI parks instead whenever the verdict it reaches is park only.
+local function snoozeClosable(close: any, session: boolean): boolean
+	local health = waitingHealth()
+	if health and health.unchecked == true then
+		return false
+	end
+	local verdict = if type(close) == "table" and type(close.verdict) == "string" and close.verdict ~= "" then close.verdict else nil
+	return verdict ~= "park" and (session or verdict ~= nil)
+end
+
+-- Snooze session…: until when, then park or close (park alone skips that
+-- question); `base` is the `add` call naming the session or pane. The CLI
+-- queues the park or the close, and brings the session back at that time. A
+-- dashboard open here closes, as setting aside does: its layout restore holds
+-- the park back, and a close under it would leave the layout as the dashboard did.
+local function snoozeSession(cx: WindowCx, base: { string }, closable: boolean)
+	local function save(when: { string }, hide: string)
+		local args = table.clone(base)
+		for _, a in { "--kind", "snooze", "--by", "user", "--hide", hide } do
+			table.insert(args, a)
+		end
+		for _, a in when do
+			table.insert(args, a)
+		end
+		waitingCli(args, function(data, err, cx2)
+			if not data then
+				waitingFailed("snooze", err, cx2)
+				return
+			elseif not cx2 then
+				return
+			end
+			if type(data.fallback) == "string" then
+				cx2:toast("info", "Parked instead of closed", data.fallback)
+			end
+			local open = dashboard(cx2)
+			if open then
+				closePane(cx2, open.pane)
+			end
+		end)
+	end
+	local function commit(cx2: WindowCx, when: { string })
+		if not closable then
+			save(when, "park")
+			return
+		end
+		choose(cx2, { placeholder = "Hide it how?", items = {
+			{ label = "Park it", detail = "off the screen until then", hide = "park" },
+			{ label = "Close the session", detail = "reopens by itself then", hide = "close" },
+		} }, function(item)
+			save(when, item.hide)
+		end)
+	end
+	choose(cx, { placeholder = "Snooze until", action = "next", items = {
+		{ label = "1 hour", in_ = "1h" },
+		{ label = "3 hours", in_ = "3h" },
+		{ label = "Tomorrow 09:00", tomorrow = true },
+		{ label = "2 days", in_ = "2d" },
+		{ label = "1 week", in_ = "1w" },
+		{ label = "Custom…", detail = "a duration, a clock time or a date" },
+	} }, function(item, cx2)
+		if item.tomorrow then
+			-- Tomorrow's local date: a day from now, or from an hour later on a
+			-- 25-hour day's first hour, as the clock then still shows today.
+			local now = os.time()
+			local at = now + 86400
+			if os.date("%Y-%m-%d", at) == os.date("%Y-%m-%d", now) then
+				at += 3600
+			end
+			commit(cx2, { "--at=" .. os.date("%Y-%m-%dT09:00:00", at) })
+		elseif item.in_ then
+			commit(cx2, { "--in", item.in_ })
+		else
+			ask(cx2, { value = "1d", placeholder = "Until? 2d, 18:00 or 2026-11-07 09:00", action = "next" }, function(text, cx3)
+				commit(cx3, timeArgs(text))
+			end)
+		end
+	end)
+end
+
 -- Runs the CLI command that sets the pane aside, then parks the pane if asked to.
 local function commitSetAside(t: SetAside, args: { string }, park: boolean)
 	waitingCli(args, function(data, err, cx)
@@ -2037,6 +2136,10 @@ local SET_ASIDE_FLOWS: { [string]: (WindowCx, SetAside) -> () } = {
 				end)
 			end
 		end)
+	end,
+	snooze = function(cx, t)
+		local record = waitingRecord(t.pane, true)
+		snoozeSession(cx, withDaemon({ "add", "--pane", tostring(t.pane) }), snoozeClosable(record and record.close, false))
 	end,
 }
 
@@ -2212,11 +2315,16 @@ local function waitingRequest(cx: WindowCx)
 	if held then
 		tern.kv.set("waitingRequestTaken", seq)
 	end
+	local args: { string } = {} -- strings only, as the CLI takes them
+	for _, a in (if type(request.args) == "table" then request.args else {}) do
+		table.insert(args, tostring(a))
+	end
+	-- Both ask over the dashboard: Snooze session… then closes it.
+	if request.op == "snooze" then
+		snoozeSession(cx, args, snoozeClosable(request.close, request.session == true))
+		return
+	end
 	if request.op == "what" then
-		local args: { string } = {} -- strings only, as the CLI takes them
-		for _, a in (if type(request.args) == "table" then request.args else {}) do
-			table.insert(args, tostring(a))
-		end
 		ask(cx, { value = tostring(request.text or ""), placeholder = "What are you waiting for? Empty clears it", action = "save" }, function(text)
 			table.insert(args, "--text=" .. text)
 			waitingCli(args, function(data, err, cx2)
