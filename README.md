@@ -5,8 +5,8 @@ interfaces:
 
 - A **KDE Plasma 6 widget** puts usage rings and agent counts in your panel,
   with a popup for Usage, Agents and History and a global shortcut.
-- A **Tern extension** runs on Linux and macOS. It puts usage and agent counts
-  in Tern's widget bar and opens the same three tabs as a temporary sidebar.
+- A **Tern extension** runs on Linux, macOS and Windows. It puts usage and agent
+  counts in Tern's widget bar and opens the same three tabs as a temporary sidebar.
 
 What you get:
 
@@ -78,9 +78,9 @@ The films and screenshots use made-up accounts and sessions.
 
 ## Requirements
 
-The Plasma widget needs Linux and KDE Plasma 6. The Tern extension runs on
-Linux and macOS. Windows is not supported, since there is no `codexbar` CLI
-for it.
+The Plasma widget needs Linux and KDE Plasma 6. The Tern extension and the omp
+extension run on Linux, macOS and Windows. The `codexbar` CLI has no Windows
+build, so there usage comes from Meridian only, or you turn it off.
 
 | Requirement | Plasma | Tern | Enables |
 | --- | :---: | :---: | --- |
@@ -150,6 +150,21 @@ On macOS:
   Claude's token from the login Keychain.
 - Restores open on the current desktop.
 
+On Windows:
+
+- Install Tern and Python 3.10+ from python.org (the `py` launcher), then
+  link as above. Tern and the omp extension start the helpers with `py -3`,
+  else `python`; the Microsoft Store `python3` alias is never used.
+- State lives in `%LOCALAPPDATA%\codexbar-agentview`.
+- Agents lists only sessions running in Tern panes. omp sessions are matched
+  exactly once the omp extension reports them, Claude Code through its session
+  file; a new Codex session shows but isn't matched exactly.
+- Resume and Launch open the session's folder in `powershell -NoExit`.
+- A typed check (`/wait check ! …`) runs in Windows PowerShell and passes when
+  the line exits 0, so end it with `if (…) { exit 0 } else { exit 1 }`. A
+  check the agent writes as an argv list runs `.exe` programs only.
+- Kitty, Teleport and Restore into kitty don't exist there.
+
 ### omp extension (set-aside sessions)
 
 The extension gives omp the `/wait` command and the `waitingfor` agent tool,
@@ -165,9 +180,10 @@ python3 contents/scripts/install_integration.py --omp-extension
 The Plasma package includes the omp extension. The installer links
 `~/.omp/agent/extensions/codexbar-waitingfor.ts` (under
 `$PI_CODING_AGENT_DIR` or `$OMP_AGENT_DIR` when set) to the installed package
-or checkout it runs from. Keep that source in place. omp loads extensions at
-start, so run `/restart` in sessions that were already open.
-`--omp-extension --uninstall` removes the link. What it does:
+or checkout it runs from; on Windows, where a link needs Developer Mode, it
+writes a one-line loader file there instead. Keep that source in place. omp
+loads extensions at start, so run `/restart` in sessions that were already
+open. `--omp-extension --uninstall` removes the link or loader. What it does:
 [Session lifecycle](docs/session-lifecycle.md).
 
 ## Keyboard shortcuts

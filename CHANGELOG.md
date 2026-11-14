@@ -9,6 +9,7 @@
 
 ### Features
 
+- Windows support for the Tern extension, the omp extension and the helpers: state in `%LOCALAPPDATA%\codexbar-agentview`, helpers started with `py -3` (else `python`), Agents limited to sessions in Tern panes, resume tabs in `powershell -NoExit`, typed checks run in PowerShell, and the omp extension installed as a loader file instead of a link. Usage comes from Meridian only there, since the `codexbar` CLI has no Windows build. CI runs the tests on Windows too.
 - `/wait every 2h -- <prompt>` repeats a prompt into the session, for a while (`for 1d`, `3 times`) or until the agent says it's done, a command passes or a PR or release gets there; a run due while the last one's turn is still going is skipped. It replaces the omp-schedule extension, whose jobs no longer show in the Waiting tab.
 - A closed session whose wait has a prompt to send reopens by itself in a new Tern tab of the Tern session it was last in, without switching to it, and gets the prompt; every set-aside menu offers Close the session while the agent is idle.
 - Waits pick up after a reboot: due times fire once Tern starts, closed sessions with a prompt to send reopen, and a prompt whose turn the reboot cut off is sent again once with a note asking the agent to check what was already done.
