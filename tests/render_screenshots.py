@@ -59,14 +59,14 @@ def fixture():
     ]
     agents = []
     for i, (folder, title, provider, state, model) in enumerate([
-        ("atlas", "Review cache invalidation", "codex", "working", "gpt-5.4"),
-        ("atlas", "Polish settings layout", "claude", "idle", "claude-sonnet-4-6"),
-        ("harbor", "Trace upload retries", "omp", "working", "gpt-5.4"),
-        ("harbor", "Review query timeout", "codex", "blocked", "gpt-5.4"),
-        ("harbor", "Check export permissions", "claude", "idle", "claude-sonnet-4-6"),
-        ("beacon", "Fix runner shutdown", "omp", "working", "gpt-5.4"),
-        ("beacon", "Review webhook errors", "claude", "blocked", "claude-sonnet-4-6"),
-        ("beacon", "Improve log grouping", "codex", "working", "gpt-5.4"),
+        ("atlas", "Review cache invalidation", "codex", "working", "gpt-6.1-sol"),
+        ("atlas", "Polish settings layout", "claude", "idle", "claude-sonnet-5"),
+        ("harbor", "Trace upload retries", "omp", "working", "claude-opus-5-5"),
+        ("harbor", "Review query timeout", "codex", "blocked", "gpt-6.1-sol"),
+        ("harbor", "Check export permissions", "claude", "idle", "claude-sonnet-5"),
+        ("beacon", "Fix runner shutdown", "omp", "working", "gpt-6.1-sol"),
+        ("beacon", "Review webhook errors", "claude", "blocked", "claude-sonnet-5"),
+        ("beacon", "Improve log grouping", "codex", "working", "gpt-6.1-sol"),
     ]):
         session_id = f"00000000-0000-4000-8000-{i + 1:012d}"
         agents.append({"provider": provider, "sessionId": session_id,

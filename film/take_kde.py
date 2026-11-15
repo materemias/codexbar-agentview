@@ -96,18 +96,18 @@ def film_fixture():
         return row
 
     data["agentSnapshot"]["history"] = [
-        ended(101, "atlas", "Tune image cache", "claude", "claude-sonnet-4-6", "reboot", 300,
+        ended(101, "atlas", "Tune image cache", "claude", "claude-sonnet-5", "reboot", 300,
               turns(("user", "Cap the image cache at 200 MB."), ("assistant", "Capped. The oldest entries go first.")), "1"),
-        ended(102, "harbor", "Draft release notes", "codex", "gpt-5.4", "reboot", 310,
+        ended(102, "harbor", "Draft release notes", "codex", "gpt-6.1-sol", "reboot", 310,
               turns(("user", "Draft notes for 2.4."), ("assistant", "The draft lists the upload fixes and the new export scope.")), "2"),
-        ended(103, "beacon", "Map flaky tests", "omp", "gpt-5.4", "reboot", 320,
+        ended(103, "beacon", "Map flaky tests", "omp", "gpt-6.1-sol", "reboot", 320,
               turns(("user", "Which tests fail at random?"), ("assistant", "Three, all waiting on the same mock clock.")), "2"),
-        ended(104, "atlas", "Fix keyboard navigation", "codex", "gpt-5.4", "exit", 40,
+        ended(104, "atlas", "Fix keyboard navigation", "codex", "gpt-6.1-sol", "exit", 40,
               turns(("user", "Keep selection on the same session when the list changes."),
                     ("assistant", "Selection now follows session identity, not the row index."))),
-        ended(105, "harbor", "Rename config keys", "claude", "claude-sonnet-4-6", "exit", 130,
+        ended(105, "harbor", "Rename config keys", "claude", "claude-sonnet-5", "exit", 130,
               turns(("user", "Rename the retry keys to snake case."), ("assistant", "Renamed, with the old keys still read once."))),
-        ended(106, "beacon", "Bump lint rules", "omp", "gpt-5.4", "exit", 220,
+        ended(106, "beacon", "Bump lint rules", "omp", "gpt-6.1-sol", "exit", 220,
               turns(("user", "Turn on the unused-import rule."), ("assistant", "On, and the 14 offenders are fixed."))),
     ]
     return data
@@ -138,7 +138,7 @@ def box(rows, width=60, color=DIM):
 
 CODEX = [
     [">_ OpenAI Codex", FG, True],
-    ["   model gpt-5.4 · directory /workspace/atlas", DIM, False],
+    ["   model gpt-6.1-sol · directory /workspace/atlas", DIM, False],
     ["", FG, False],
     ["› Does a failed refresh keep the last good result?", FG, True],
     ["", FG, False],
@@ -153,7 +153,7 @@ CODEX = [
     ["◦ Working (32s · esc to interrupt)", DIM, False],
 ]
 OMP = [
-    [" omp · harbor · gpt-5.4", BLUE, True],
+    [" omp · harbor · claude-opus-5-5", BLUE, True],
     ["", FG, False],
     [" ❯ Why do large uploads retry three times?", FG, True],
     ["", FG, False],
