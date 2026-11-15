@@ -46,7 +46,7 @@ CodexBar module.
 
 ## Tern extension
 
-![The Tern extension: usage rings and agent counts in the widget bar, the dashboard opened with Ctrl+Alt+A, filtering by typing, a peek, jumping to the session's pane, the Usage tab, Restore all after a reboot and one closed session brought back](docs/tern.gif)
+![The Tern extension: usage rings and agent counts in the widget bar, the dashboard opened with Ctrl+Alt+A, filtering by typing, a peek, jumping to the session's pane, the Waiting tab with sessions set aside and a peek at the one back on you, the Usage tab, the Settings search, and one closed session brought back from History](docs/tern.gif)
 
 <details>
 <summary>Screenshots</summary>

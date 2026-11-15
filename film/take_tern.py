@@ -109,6 +109,16 @@ HISTORY = [
      "turns": [("user", "text", "Alerts fire on every deploy. Tune the thresholds."),
                ("assistant", "text", "Error-rate alerts now wait five minutes after a deploy before they fire.")]},
 ]
+# Sessions set aside, by title, with the `codexbar_waiting.py add` arguments that set them aside:
+# one back on you (a check that already passed), one waiting on someone, one for when you have time.
+# None needs the network or a prompt, so no agent is ever asked anything.
+WAITS = [
+    ("Check export permissions", ["--kind", "command", "--argv", "true", "--label", "Staging deploy finished",
+                                  "--note", "Re-run the export audit on staging once the deploy is out"]),
+    ("Polish settings layout", ["--kind", "something", "--what", "Mia's design review",
+                                "--note", "Fix what Mia flags in the settings review"]),
+    ("Improve log grouping", ["--kind", "later", "--note", "Rework the grouping UI on a quiet afternoon"]),
+]
 RESUME_PREFIXES = {"claude": ("claude", "--resume"), "codex": ("codex", "resume"), "omp": ("omp", "--resume")}
 
 
@@ -517,6 +527,17 @@ class Take:
         write_json(self.work / "world.json", self.world)
         refresh(self.work)
 
+    def set_aside(self):
+        """Sets WAITS's sessions aside through the CLI, as Ctrl+Alt+B would, and ticks once so the
+        passed check is back on you before the take starts."""
+        cli = [PYTHON, str(SCRIPTS / "codexbar_waiting.py")]
+        ids = {s["title"]: s for s in SESSIONS}
+        for title, args in WAITS:
+            s = ids[title]
+            subprocess.run([*cli, "add", "--session", s["id"], "--cwd", str(self.home / "code" / s["folder"]), *args],
+                           env=self.env, capture_output=True, text=True, check=True)
+        subprocess.run([*cli, "tick"], env=self.env, capture_output=True, text=True, check=True)
+
     def keep_fresh(self):
         while self.alive:
             with self.world_lock:
@@ -625,8 +646,8 @@ class Take:
         raise RuntimeError(f"no {kind} block opened")
 
     def film(self):
-        """The story: the widget bar, the agent list (filter, peek, jump), usage, the native
-        settings tab, then one closed session brought back from History."""
+        """The story: the widget bar, the agent list (filter, peek, jump), the sessions set aside,
+        usage, the native settings tab, then one closed session brought back from History."""
         # Framings, in window pixels: the widget bar under the panes' lower part, the dashboard
         # beside a tab's one pane (it opens as the right half), the tab bar over the question the
         # blocked session asks, and the settings tab's search and results.
@@ -673,6 +694,17 @@ class Take:
             time.sleep(0.3)
             self.cut(asked)
             time.sleep(1.1)
+
+            self.caption("Waiting", "Set a session aside with why you stopped.")
+            self.command("waiting", "Ctrl", "Alt", "W")
+            self.cut(dash)
+            time.sleep(1.8)
+            # The first row is the one back on you: its check passed while you were away.
+            self.caption("Waiting", "Code watches the wait and brings it back to you.")
+            self.key("Space", "Space")
+            time.sleep(2.4)
+            self.key("Space", "Space")
+            time.sleep(0.4)
 
             self.caption("Usage", "No surprise limits.")
             self.command("usage", "Ctrl", "Alt", "U")
@@ -734,6 +766,7 @@ class Take:
         try:
             self.start()
             self.build_workspace()
+            self.set_aside()
             threading.Thread(target=self.keep_fresh, daemon=True).start()
             self.film()
         finally:
