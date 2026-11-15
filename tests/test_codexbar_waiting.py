@@ -6679,6 +6679,56 @@ console.log(JSON.stringify({
     def test_the_extension_notices_a_move_without_the_notice(self) -> None:
         self.assert_followed(self.moved("0"))
 
+    def test_a_move_omp_made_before_the_session_started_reaches_the_cli(self) -> None:
+        # omp opened a copy at startup because another process runs SID; it replays that notice
+        # on subscribe, when the manager already names the new id.
+        driver = r"""
+import * as fs from "node:fs";
+const { default: install } = await import(process.env.EXTENSION);
+const [OLD, NEW] = JSON.parse(process.env.IDS);
+const added = Bun.spawnSync([process.env.PYTHON, process.env.CLI, "add", "--session", OLD, "--kind", "later"]);
+if (added.exitCode !== 0) throw new Error(added.stderr.toString());
+const state = () => { try { return JSON.parse(fs.readFileSync(process.env.STATE_FILE, "utf8")); } catch { return {}; } };
+const chain = new Proxy(function () {}, { get: () => chain, apply: () => chain });
+const handlers = {};
+install({
+    zod: chain, logger: { debug() {} }, sendUserMessage() {},
+    pi: { Text: class { setText() {} render() { return []; } describe() { return {}; } } },
+    on: (name, fn) => { handlers[name] = fn; }, registerCommand() {}, registerShortcut() {}, registerTool() {},
+});
+const notice = { reason: "open-elsewhere", from: "/s/old.jsonl", to: "/s/new.jsonl" };
+const manager = {
+    getSessionId: () => NEW, getSessionFile: () => "/s/new.jsonl", getBranch: () => [],
+    getHeader: () => ({ type: "session", id: NEW, parentSession: OLD, continuationOf: OLD }),
+    onPersistenceNotice(fn) { fn(notice); return () => {}; },
+};
+const ctx = {
+    hasUI: true, cwd: process.cwd(), isIdle: () => true, hasPendingMessages: () => false, ui: { setWidget() {} },
+    sessionManager: manager,
+    setTimeout: (fn, ms) => setTimeout(fn, ms), setInterval: (fn, ms) => setInterval(fn, ms),
+    clearTimer: (timer) => clearTimeout(timer),
+};
+handlers.session_start({}, ctx);
+let continued = null;
+for (let i = 0; i < 300 && !continued; i++) {
+    continued = state().sessions?.[OLD]?.continued_in ?? null;
+    if (!continued) await Bun.sleep(50);
+}
+handlers.session_shutdown();
+console.log(JSON.stringify({ continued }));
+process.exit(0);
+"""
+        with extension_folder() as folder:
+            root = Path(folder)
+            (root / "omp").mkdir()
+            answer = self.evaluate(
+                driver, IDS=json.dumps([SID, OTHER]), TERN_PANE="52", PYTHON=sys.executable,
+                CLI=str(Path(waiting.__file__)), XDG_STATE_HOME=str(root / "state"),
+                OMP_AGENT_DIR=str(root / "omp"), PI_CODING_AGENT_DIR="",
+                STATE_FILE=str(root / "state" / "codexbar-agentview" / "waiting.json"),
+            )
+        self.assertEqual(answer["continued"], OTHER)
+
 
 def run_extension_driver(test: unittest.TestCase, code: str, **env: str) -> dict:
     """Runs `code` under bun with the extension's path in EXTENSION; the JSON of its last line."""

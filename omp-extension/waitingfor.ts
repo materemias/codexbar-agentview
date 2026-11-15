@@ -1589,6 +1589,19 @@ export default function (pi) {
 		return true;
 	}
 
+	/**
+	 * A move omp made before this activation, as it replays it on subscribe: the id it names is this one
+	 * already, so `followSession` sees no change. omp opens a session another process runs as a copy at
+	 * startup, and the CLI hands the old id's waits over once that process is gone.
+	 */
+	function followStartupMove(notice) {
+		const manager = ctx?.sessionManager;
+		const from = manager?.getHeader?.()?.continuationOf;
+		if (!MOVE_REASONS.includes(notice?.reason) || typeof from !== "string" || from === sessionId) return;
+		if (!notice.to || notice.to !== manager.getSessionFile?.() || moves.some((move) => move.from === from)) return;
+		moves = [...moves, { from, reason: notice.reason }];
+	}
+
 	/** `session` is this conversation's: the open one, or one omp moved it from. */
 	const ours = (session: string) => session === sessionId || formerIds.has(session);
 
@@ -1622,7 +1635,7 @@ export default function (pi) {
 		if (c.sessionManager !== movesManager) {
 			unwatchMoves?.();
 			movesManager = c.sessionManager;
-			unwatchMoves = movesManager.onPersistenceNotice?.((notice) => followSession(notice));
+			unwatchMoves = movesManager.onPersistenceNotice?.((notice) => followSession(notice) || followStartupMove(notice));
 		}
 		timers = [
 			c.setInterval(() => quietly(refresh), REFRESH_MS),
