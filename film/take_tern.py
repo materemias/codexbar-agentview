@@ -704,10 +704,9 @@ class Take:
             time.sleep(0.6)
 
             self.caption("History", "Closed one by mistake? Bring it back.")
-            self.command("agents", "Ctrl", "Alt", "A")
-            time.sleep(0.6)
+            # Its own key: → from Agents now lands on Waiting, which sits between them.
+            self.command("history", "Ctrl", "Alt", "H")
             self.cut(dash)
-            self.key("ArrowRight", "→")
             time.sleep(1.2)
             self.key("Enter", "Enter")
             self.restored([exited])
