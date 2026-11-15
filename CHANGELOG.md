@@ -84,6 +84,7 @@
 ### Docs
 
 - The README leads with the Tern extension; the Plasma widget is the optional extra. A new page, [Set sessions aside](docs/waiting.md), starts with examples and walks through what waits can do: babysitting a PR, waiting for a merge or release, coming back later, waiting on a check, repeating on a schedule, asking the agent to set them up, and where you see them again.
+- [Set sessions aside](docs/waiting.md) is the full guide to waits: use cases, the agent's `waitingfor` tool, plain omp versus Tern, and the keyboard shortcuts.
 
 ## 0.3.0 (2026-11-02)
 

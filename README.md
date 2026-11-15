@@ -63,29 +63,48 @@ The films and screenshots use made-up accounts and sessions.
 
 ## Set sessions aside
 
-For sessions you leave and come back to later. Set one aside with
-`Ctrl+Alt+B`, or a one-line `/wait` in omp:
+For the sessions you leave and come back to later. Set one aside with one
+sentence about why you stopped and what it waits for, and optionally a prompt
+to run when the wait is over. Code watches the wait without spending tokens.
+When it fires, the session gets its prompt (Tern reopens it if you closed it),
+and a card over the pane tells you what happened while you were away.
 
-```text
-/wait gh babysit
-/wait 2d upstream fix should be out by then -- retry the migration
-/wait check the nightly backup finished -- summarise its log
-/wait every 1d for 1w -- run the e2e suite and list the flaky tests
-/wait snooze 3d after the offsite
-```
+What you can now leave alone:
 
-Or ask the agent: "babysit the PR you just opened", "check once a week
-whether the restore test still passes". Code watches each wait without
-spending tokens. When one fires, the session gets its prompt, Tern reopens it
-if you closed it, and a card over the pane tells you what happened while you
-were away. The Waiting tab (`Ctrl+Alt+W`) lists every set-aside session by who
-has the next step, and [tern-awui](https://github.com/materemias/tern-awui)
+- A PR you opened: a review bot comments, the agent fixes what's real, and the
+  wait follows it to ready and merged. `/wait gh babysit`
+- A merge, then the release notes. `/wait gh pr 42 merged -- write the release notes`
+- Someone else's fix: upgrade once their release ships.
+  `/wait gh release vercel/next.js bump once their fix ships -- upgrade and run the tests`
+- "Retry in two days." `/wait 2d upstream fix should be out by then -- retry the migration`
+- A deploy or a job elsewhere, until a command passes.
+  `/wait check every 10m ! curl -fsS https://staging.example.com/health -- run the smoke tests`
+- A check on a schedule. `/wait every 1d for 1w -- run the e2e suite and list the flaky tests`
+- A person's answer, a big task for a free afternoon, or a session you want out
+  of sight for three days. `/wait for Anna's answer`, `/wait later L rewrite the sync engine`,
+  `/wait snooze 3d`
+
+**The agent can do all of it.** The whole toolkit is also its `waitingfor`
+tool, so you can say it in your own words: "babysit the PR you just opened",
+"tell me when CI on main is green, or on Friday either way", "check once a
+week whether the restore test still passes". It picks the wait, the interval,
+the deadline and the prompt. It never closes a session and never overwrites
+your sentence.
+
+**It works in plain omp, and best in Tern.** `/wait`, `Ctrl+Alt+B`, the row
+above the composer and the agent's tool work in omp in any terminal, as long
+as Tern runs in the background to check the waits. In Tern the session can
+also be parked, the card floats over the pane, and shell panes and other
+agents can be set aside too.
+
+**Keys.** `Ctrl+Alt+B` sets the focused session aside, `Ctrl+Alt+W` opens the
+Waiting tab, where every set-aside session is grouped by who has the next
+step, and `Ctrl+Alt+I` opens a session's card. [tern-awui](https://github.com/materemias/tern-awui)
 shows the same list on your phone.
 
-[Set sessions aside](docs/waiting.md) walks through what you can do with it:
-babysit a pull request, wait for a merge or a release, come back in two days,
-wait until a command passes, repeat a check on a schedule, and keep big work
-for when you have time.
+[Set sessions aside](docs/waiting.md) explains every use case, what each wait
+watches, what happens when one fires, Seen, Stop and Snooze, when a session is
+safe to close, and every keyboard shortcut.
 
 ## Requirements
 
@@ -225,6 +244,9 @@ configuration. A failed write leaves the original configuration intact.
 KDE binds `Ctrl+Alt+A` to Activate Window Demanding Attention. Clear it in
 System Settings → Shortcuts → KWin, or Tern never sees the key.
 
+[Set sessions aside](docs/waiting.md#keyboard-shortcuts) lists the waiting
+keys by place: anywhere in Tern, in omp, and on the Waiting tab.
+
 ## Features
 
 ### Waiting (set-aside sessions)
@@ -232,10 +254,10 @@ System Settings → Shortcuts → KWin, or Tern never sees the key.
 `Ctrl+Alt+B` or `/wait` sets a session aside with your sentence and what it
 waits for. The Waiting tab (`Ctrl+Alt+W`) groups the set-aside sessions by who
 has the next step, and the session card (`Ctrl+Alt+I`) shows one session's
-waits, what happened since and what's next. [Set sessions aside](docs/waiting.md)
-shows what you can do with it. [Session lifecycle](docs/session-lifecycle.md)
-is the full reference: the commands, what each wait watches, the groups,
-Snooze 1d, Seen and Stop, follow-up prompts, and how it works.
+waits, what happened since and what's next. See [Set sessions aside](#set-sessions-aside)
+above and [the full guide](docs/waiting.md). [Session lifecycle](docs/session-lifecycle.md)
+is the technical reference: every option, how each wait is checked, and how
+it works.
 
 ### Agents
 
