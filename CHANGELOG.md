@@ -37,6 +37,7 @@
 
 ### Fixes
 
+- `Ctrl+Alt+I` in Tern opens the same session card as a click on the row above the composer: the session the pane's omp extension reports, not the one an older agents scan still maps to the pane.
 - omp: choosing one of the session's waits in the `/wait` menu works again; it failed with "watched is not a function", so Retry, Seen, Stop and Snooze 1d couldn't be reached from there.
 - In the Plasma popup, each Claude and Codex account's windows sit indented under a guide line below its name, as in Tern, so they read as parts of the combined pool above them instead of its peers.
 - The Tern window works with the helpers again on Tern 0.9.20: wait cards, Seen, Stop, Snooze and Retry, the `Ctrl+Alt+B` menu, pane-closed and agent events, focusing a session and Install omp extension no longer fail with "table has a protected metatable".

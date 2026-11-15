@@ -1146,8 +1146,13 @@ end
 -- skeleton without one, fills in from `card --cached`, local files only, and
 -- then from `card`, which asks GitHub and can take seconds.
 -- `known` is the session a link named: it wins over what the agents scan, which
--- lags a session started or resumed in the pane, maps there.
+-- lags a session started or resumed in the pane, maps there. Without one, the
+-- session the pane's omp extension reports wins, as its row's link names it.
 local function openCard(cx: WindowCx, pane: number, known: string?)
+	if not known then
+		local extension = paneExtension(pane)
+		known = if extension and type(val(extension.session)) == "string" then extension.session else nil
+	end
 	if cardOf(cx, pane) then
 		return
 	end
