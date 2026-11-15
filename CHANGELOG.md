@@ -33,6 +33,7 @@
 - Usage tracking can be turned off (Plasma: **Track usage**; Tern: **Usage tracking**) for anyone without the `codexbar` CLI or who tracks usage elsewhere; off, nothing fetches usage and no meters, cards or alerts show. It stays on by default, and when the CLI is missing the usage area lists what to install instead of a bare error, with a button that turns tracking off.
 - Snooze session: `/wait snooze 2d [sentence]`, or **Snooze session…** in the `Ctrl+Alt+B` menu and on the Waiting tab, parks or closes a session until a time and brings it back by itself in a tab of its own, without taking focus, with a "Back from snooze" toast; its other waits keep running meanwhile, and opening it earlier ends the snooze. Snooze 1d on a session that came back sends it away for another day.
 - Snooze 1d is offered only on a wait that's on you; waits the machine still watches or that run on a timer no longer have it.
+- The row above the omp composer leads with your sentence and ends with whether the session can be closed; in Tern it is a strip as wide as the composer, tinted by what came back, with the close answer as a coloured badge.
 
 ### Fixes
 

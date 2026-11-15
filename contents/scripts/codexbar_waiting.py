@@ -3590,10 +3590,13 @@ def _still_waiting(views: list[dict]) -> list[str]:
 
 def _status_lines(
     views: list[dict], note: str | None, pinned: bool, now: datetime,
-) -> tuple[str, str]:
-    """(status segment, line). A repeat says when it runs next instead of how
-    long it has been; a `repeat` wait is only that, so it says it once."""
+) -> tuple[str, str, dict | None]:
+    """(status segment, line, composer row). A repeat says when it runs next
+    instead of how long it has been; a `repeat` wait is only that, so it says
+    it once. The composer row leads with the user's sentence, else with what
+    the primary wait is, and puts the rest after it (`said` minus its lead)."""
     status = line = ""
+    composer = None
     if views:
         primary = _primary(views)
         mark = _wait_mark(primary)
@@ -3603,6 +3606,9 @@ def _status_lines(
             ran = [f"prompt {REASON_REVIEW}"] if primary["state"] == "review" else []
             parts = [primary["fired_text"], *ran, age]
             glance = f"{short} · {age}"
+            said = [primary["fired_text"]] + (
+                [f"ran {age} ago", "take a look"] if ran else [f"{age} ago"]
+            )
         elif _repeats_alone(primary):
             timing = _repeat_text(primary["repeat"], primary["state"], now)
             own = _own_repeat_label(primary)
@@ -3611,11 +3617,13 @@ def _status_lines(
             parts = [text for text in (
                 own, timing, until and f"until {until}", detail, primary["progress"],
             ) if text]
+            said = list(parts)
             glance = f"{_clip(own, SHORT_LABEL_CHARS)} · {timing}" if own else timing
         elif primary["kind"] == "snooze" and primary["outcome"] is None:
             # `Snoozed until 09:00`: its time says it all.
             glance = _track_text(primary)
             parts = [glance, _when(primary, now)]
+            said = list(parts)
         else:
             if primary["kind"] == "pr":
                 short = f"PR#{primary['condition']['number']}"
@@ -3630,6 +3638,8 @@ def _status_lines(
                 age = _when(primary, now)
             parts = [short] + ([detail] if detail != short else []) + [age]
             glance = f"{short} · {age}"
+            name = short if primary["kind"] == "pr" else primary["label"]
+            said = [name] + ([detail] if detail not in (short, name) else []) + [age]
         # The session's other threads, each by its current step: one line tells them all.
         others = _track_texts(views)[1:]
         parts += [f"+ {text}" for text in others[:OTHER_TRACKS_SHOWN]]
@@ -3639,10 +3649,15 @@ def _status_lines(
             parts.append(f'"{_clip(note, NOTE_IN_LINE_CHARS)}"')
         status = mark + glance + (f" +{len(others)}" if others else "")
         line = mark + " · ".join(parts)
+        composer = {
+            "mark": mark.strip(), "text": note or said[0],
+            "detail": " · ".join(said if note else said[1:]), "more": len(others),
+        }
     elif pinned:
         status = "📌 pinned"
         line = status + (f' · "{_clip(note, NOTE_IN_LINE_CHARS)}"' if note else "")
-    return status, line
+        composer = {"mark": "📌", "text": note or "pinned", "detail": "pinned" if note else "", "more": 0}
+    return status, line, composer
 
 
 def _claimable(record: dict) -> dict | None:
@@ -3797,7 +3812,7 @@ def _session_view(
     if not views:
         # A card may show any session; a listed one without waits is pinned.
         target["ball"] = "on_my_time" if pinned else "on_machine"
-    status, line = _status_lines(views, note, pinned, now)
+    status, line, composer = _status_lines(views, note, pinned, now)
     pane = _session_pane(state, facts.agents, session, now)
     return {
         **target,
@@ -3813,7 +3828,9 @@ def _session_view(
         "size": record["size"] if record else None,
         "set_aside_at": record["set_aside_at"] if record else None,
         "pinned": pinned, "unseen": bool(record and record["unseen"]),
-        "status": status, "line": line, "composer_row": line,
+        # `composer`: the row over the omp composer, by parts (`_status_lines`). `composer_row`
+        # stays the plain line for extensions loaded before it.
+        "status": status, "line": line, "composer_row": line, "composer": composer,
         "next_step": _next_step(views),
         "recap": info["recap"], "recap_at": info["recap_at"], "recap_stale": info["recap_stale"],
         "prompts_queued": _prompts_queued(record, now),
@@ -3823,7 +3840,7 @@ def _session_view(
 
 def _pane_view(record: dict, now: datetime) -> dict:
     target = _target_view(record, now)
-    status, line = _status_lines(target["waits"], record["note"], False, now)
+    status, line, _ = _status_lines(target["waits"], record["note"], False, now)
     pane = record["pane"]
     return {
         **target,

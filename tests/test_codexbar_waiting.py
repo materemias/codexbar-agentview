@@ -2390,7 +2390,7 @@ class ViewTests(Case):
                 "session_id", "title", "cwd", "project", "live", "pane", "tern_session",
                 "agent_state", "extension", "resume_command", "note", "suggested_note",
                 "size", "set_aside_at", "pinned", "ball", "unseen", "outcome", "headline",
-                "status", "line", "composer_row",
+                "status", "line", "composer_row", "composer",
                 "next_step", "threads", "still_waiting", "waiting_for", "recap", "recap_at", "recap_stale", "due_at", "prompts_queued", "waits",
                 "close", "snoozed_until", "snooze_hide",
                 "history", "prs", "on_you", "stoppable",
@@ -2417,6 +2417,21 @@ class ViewTests(Case):
         self.assertEqual(seen["status"], "✅ 1h passed · 6h")
         self.assertEqual(seen["line"], '✅ 1h passed · 6h · "x"')
         self.assertEqual(seen["composer_row"], seen["line"])
+        # Over the composer: the user's sentence first, then what came and when.
+        self.assertEqual(
+            seen["composer"], {"mark": "✅", "text": "x", "detail": "1h passed · 6h ago", "more": 0},
+        )
+
+    def test_composer_row_names_a_long_label_once(self) -> None:
+        label = "watchtower release with the OpenVZ fix"
+        self.add("--kind", "time", "--in", "2d", "--label", label, "--note", "restart it then")
+        self.add("--kind", "later")
+        composer = self.session()["composer"]
+        # The line says the label clipped and whole; the row says it whole, once.
+        self.assertIn("…", self.session()["line"])
+        self.assertEqual((composer["text"], composer["more"]), ("restart it then", 1))
+        self.assertRegex(composer["detail"], rf"^{label} · \S")
+        self.assertNotIn("…", composer["detail"])
 
     def test_pr_line(self) -> None:
         self.add(
@@ -4613,7 +4628,7 @@ class RepeatTests(Case):
         session = self.session()
         self.assertEqual(session["status"], "↻ every 1h · next 13:00")
         self.assertEqual(session["line"], "↻ every 1h · next 13:00")
-        self.assertEqual(session["composer_row"], session["line"])
+        self.assertEqual(session["composer"], {"mark": "↻", "text": "every 1h · next 13:00", "detail": "", "more": 0})
         self.at(minutes=59)
         self.assertEqual(self.claim(), [])
         self.assertEqual(self.at(hours=1)["actions"], [])
@@ -6765,17 +6780,22 @@ console.log(JSON.stringify([
 
     def rows(self, pane: str) -> list:
         return run_extension_driver(self, r"""
-const { closeVerdict, rowText } = await import(process.env.EXTENSION);
+const { closeVerdict, rowNode, rowText } = await import(process.env.EXTENSION);
 const now = Date.parse("2026-11-12T12:00:00");
 const at = (minutes) => new Date(now - minutes * 60_000).toISOString();
 const theme = { fg: (tone, text) => `<${tone}>${text}</>` };
-const session = (close) => ({ composer_row: "⏲ Retry · in 2h", outcome: null, close });
+const plain = { fg: (_tone, text) => text };
+const session = (close, composer = { mark: "⏲", text: "Retry", detail: "in 2h", more: 0 }) => ({ composer, outcome: null, close });
 const safe = { verdict: "safe", reason: "prompt", text: "closable" };
+const manual = { verdict: "manual", reason: "manual", text: "closable · you reopen" };
 const park = { verdict: "park", reason: "turn", text: "park only: turn cut off once already" };
 const checked = { checked_at: at(1) };
 const row = (close, health) => rowText(session(close), theme, closeVerdict(session(close), health, now));
+const long = session(safe, { mark: "⏲", text: "Reggel 8: lefutottak-e a stop-ágak", detail: "23h passed · ran 4h ago", more: 2 });
+const narrow = (width) => rowText(long, plain, safe, width);
 console.log(JSON.stringify([
     row(safe, checked),
+    row(manual, checked),
     row(park, checked),
     // Nothing checks waits: whatever the session's verdict, it is park.
     row(safe, { checked_at: at(20) }),
@@ -6783,24 +6803,41 @@ console.log(JSON.stringify([
     // One check failed in a recent tick: the others were checked.
     row(safe, { checked_at: at(1), error: "boom", error_kind: "partial" }),
     row(null, { checked_at: at(20) }),
+    [80, 40, 20].map((width) => [Bun.stringWidth(narrow(width)), narrow(width).replace(/\x1b\[\d+m/g, "")]),
+    rowNode(session(park), closeVerdict(session(park), checked, now)).c.map((node) => node.p.text ?? node.p.spans),
 ]));
 """, TERN_PANE=pane)
 
-    def test_the_row_leads_with_whether_the_session_can_be_closed(self) -> None:
-        self.assertEqual(self.rows("52"), [
-            "<muted>closable</> │ ⏲ Retry · in 2h",
-            "<warning>park only: turn cut off once already</> │ ⏲ Retry · in 2h",
-            "<warning>park only: nothing checks waits</> │ ⏲ Retry · in 2h",
-            "<warning>park only: nothing checks waits</> │ ⏲ Retry · in 2h",
-            "<muted>closable</> │ ⏲ Retry · in 2h",
-            "⏲ Retry · in 2h",
+    def test_the_row_ends_with_whether_the_session_can_be_closed(self) -> None:
+        lead = "⏲ \x1b[1mRetry\x1b[22m<muted> · in 2h</>"
+        answer = self.rows("52")
+        self.assertEqual(answer[:7], [
+            f"{lead}  <success>closable</>",
+            f"{lead}  <accent>closable · you reopen</>",
+            f"{lead}  <warning>park only: turn cut off once already</>",
+            f"{lead}  <warning>park only: nothing checks waits</>",
+            f"{lead}  <warning>park only: nothing checks waits</>",
+            f"{lead}  <success>closable</>",
+            lead,
+        ])
+        # The verdict sits at the right edge and is never cut: the rest gives way first, then the sentence.
+        self.assertEqual(answer[7], [
+            [80, "⏲ Reggel 8: lefutottak-e a stop-ágak · 23h passed · ran 4h ago · +2" + " " * 5 + "closable"],
+            [40, "⏲ Reggel 8: lefutottak-e a st…  closable"],
+            [20, "⏲ Reggel …  closable"],
+        ])
+        # In Tern: the mark, the sentence with the rest muted, and the verdict as a badge.
+        self.assertEqual(answer[8], [
+            "⏲",
+            [{"t": "Retry", "s": "strong"}, {"t": " · in 2h", "s": "muted"}],
+            "park only: turn cut off once already",
         ])
 
     def test_outside_tern_nothing_says_park(self) -> None:
-        self.assertEqual(self.rows("")[1:4], [
-            "<warning>keep open: turn cut off once already</> │ ⏲ Retry · in 2h",
-            "<warning>keep open: nothing checks waits</> │ ⏲ Retry · in 2h",
-            "<warning>keep open: nothing checks waits</> │ ⏲ Retry · in 2h",
+        self.assertEqual(self.rows("")[2:5], [
+            "⏲ \x1b[1mRetry\x1b[22m<muted> · in 2h</>  <warning>keep open: turn cut off once already</>",
+            "⏲ \x1b[1mRetry\x1b[22m<muted> · in 2h</>  <warning>keep open: nothing checks waits</>",
+            "⏲ \x1b[1mRetry\x1b[22m<muted> · in 2h</>  <warning>keep open: nothing checks waits</>",
         ])
 
 

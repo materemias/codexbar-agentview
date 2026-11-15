@@ -206,17 +206,27 @@ shows it the same way:
 | ⏳ | waiting for anything else | |
 
 A session can wait for several things at once, say two babysat PRs and a
-release. Each chain of steps, and each wait of its own, is a thread. The row
-above the composer, the status segment (`+2`) and the Waiting tab row show
-every thread by its current step, the most urgent first:
+release. Each chain of steps, and each wait of its own, is a thread. The
+status segment (`+2`) and the Waiting tab row show every thread by its
+current step, the most urgent first:
 `⏳ PR#18849 · Ready · 27m · + ⏳ PR#26 review on head`. Next step lists each
 thread's next step.
 
-The row above the composer, the Waiting tab row and the status segment start
-with the mark. The session card opens with a banner such as
-`✅ Fulfilled · PR#20 merged · 2h ago`. While another thread still waits, the
-banner drops "Fulfilled" and names it underneath:
-`✅ PR#18849 merged · 1h ago`, then `Still waiting for ⏳ PR#18849 released`.
+The row above the composer is a strip as wide as the composer: the mark, your
+sentence in bold, then in muted text the current step and when, and `+N` for
+the other threads, with whether you may close the session at the right end
+(below). Without a sentence it leads with the step. In Tern the strip is tinted
+green when something came back and amber when something needs you, and the
+close answer is a badge: green `closable`, blue `closable · you reopen`, amber
+`park only: …`. When it's narrow the details give way first, then the
+sentence; the close answer is never cut. A plain terminal shows the same row in
+text, the close answer at the right edge in its colour.
+
+The Waiting tab row and the status segment start with the mark. The session
+card opens with a banner such as `✅ Fulfilled · PR#20 merged · 2h ago`. While
+another thread still waits, the banner drops "Fulfilled" and names it
+underneath: `✅ PR#18849 merged · 1h ago`, then `Still waiting for ⏳ PR#18849
+released`.
 Each wait under "Waiting for" carries its mark, and the fulfilling line in
 "Since set aside" is green. In On me, the ⚠️ sessions come first, then ⏰,
 then ✅. A tab holding a session that's on you turns green when all of them
@@ -288,7 +298,7 @@ the agent to check what was already done; a reboot and a close count
 together, so a second cut of either kind comes to you. A repeat's run is sent
 again the same way, counted once; cut twice, that run is over and the repeat
 goes on. A check the agent is to
-write goes through the same queue (above). The row above the composer starts
+write goes through the same queue (above). The row above the composer ends
 with the answer, and `/wait list` shows it on a `Closing:` line. The menu's
 Close the session is offered only when the answer is not "park only". A
 session running outside Tern (kitty, say) has no pane to park, so there each

@@ -579,25 +579,63 @@ const TONES: Record<string, string> = { fulfilled: "success", attention: "warnin
 /** theme.bold can come out plain, so the bold is written out. */
 const bold = (text: string) => `\x1b[1m${text}\x1b[22m`;
 
-/**
- * The CLI's composer row: its prefix in the outcome's color, and what happened in bold when fulfilled;
- * led by `close`, whether the session may be closed (closeVerdict).
- */
-export function rowText(session, theme, close?): string {
-	const row = outcomeRow(session, theme);
-	return close ? `${theme.fg(close.verdict === "park" ? "warning" : "muted", close.text)} │ ${row}` : row;
+/** The theme color of a close verdict: closable, closable but you reopen it, park only (keep open outside Tern). */
+const CLOSE_TONES: Record<string, string> = { safe: "success", manual: "accent", park: "warning" };
+
+/** The CLI's composer row (`composer`): its mark, the user's sentence (else what it waits for), and the rest. */
+function rowParts(session): { mark: string; text: string; detail: string } {
+	const { mark, text, detail, more } = session.composer;
+	return { mark, text, detail: [detail, more > 0 ? `+${more}` : ""].filter(Boolean).join(" · ") };
 }
 
-function outcomeRow(session, theme): string {
-	const row: string = session.composer_row;
+/** `text` cut to `width` terminal columns, ending in "…" when cut. */
+function fit(text: string, width: number): string {
+	if (Bun.stringWidth(text) <= width) return text;
+	let out = "";
+	for (const { segment } of new Intl.Segmenter().segment(text)) {
+		if (Bun.stringWidth(`${out}${segment}…`) > width) break;
+		out += segment;
+	}
+	return width > 0 ? `${out}…` : "";
+}
+
+/**
+ * The composer row in terminal cells, `width` columns wide: the mark in the outcome's color, the sentence
+ * in bold, the rest muted, and `close`, whether the session may be closed (closeVerdict), at the right
+ * edge in its tone. The rest gives way first, then the sentence; the close verdict is never cut.
+ */
+export function rowText(session, theme, close?, width = Infinity): string {
+	const { mark, text, detail } = rowParts(session);
 	const tone = TONES[session.outcome];
-	const space = row.indexOf(" ");
-	if (!tone || space < 0) return row;
-	const prefix = row.slice(0, space);
-	const rest = row.slice(space + 1);
-	const headline = session.headline;
-	const fired = session.outcome === "fulfilled" && headline && row.startsWith(headline) ? headline.slice(space + 1) : "";
-	return `${theme.fg(tone, prefix)} ${fired ? `${bold(fired)}${rest.slice(fired.length)}` : rest}`;
+	const tag: string = close?.text ?? "";
+	const room = width - Bun.stringWidth(mark) - 1 - (tag ? Bun.stringWidth(tag) + 2 : 0);
+	const lead = fit(text, room);
+	const left = room - Bun.stringWidth(lead);
+	const rest = detail && left > 4 ? fit(` · ${detail}`, left) : "";
+	const row = `${tone ? theme.fg(tone, mark) : mark} ${bold(lead)}${rest && theme.fg("muted", rest)}`;
+	if (!tag) return row;
+	const used = Bun.stringWidth(mark) + 1 + Bun.stringWidth(lead) + Bun.stringWidth(rest);
+	const gap = Number.isFinite(width) ? Math.max(2, width - used - Bun.stringWidth(tag)) : 2;
+	return `${row}${" ".repeat(gap)}${theme.fg(CLOSE_TONES[close.verdict] ?? "muted", tag)}`;
+}
+
+/**
+ * The composer row as Tern draws it natively: a row of the mark, the sentence with the rest muted, and the
+ * close verdict as a badge in its tone. codexbar.css styles it by its roles; the row's role names the
+ * outcome (`codexbar.wait-row.fulfilled`). With `href`, a click opens it.
+ */
+export function rowNode(session, close?, href?: string) {
+	const { mark, text, detail } = rowParts(session);
+	const role = `codexbar.wait-row${TONES[session.outcome] ? `.${session.outcome}` : ""}`;
+	const children = [
+		{ k: "text", p: { role: "codexbar.wait-mark", text: mark, wrap: "none" } },
+		{
+			k: "text",
+			p: { role: "codexbar.wait-text", wrap: "none", spans: [{ t: text, s: "strong" }, ...(detail ? [{ t: ` · ${detail}`, s: "muted" }] : [])] },
+		},
+	];
+	if (close?.text) children.push({ k: "badge", p: { role: "codexbar.wait-close", text: close.text, tone: CLOSE_TONES[close.verdict] ?? "muted" } });
+	return { k: "row", p: { role, align: "center", gap: "sm", ...(href ? { href, actions: { click: "open" } } : {}) }, c: children };
 }
 
 /** An ISO time as the panel shows it, without seconds and year. */
@@ -1235,13 +1273,13 @@ export default function (pi) {
 	};
 	const inOrder = (step) => (tail = tail.then(step).catch(log));
 
-	/** Draws the health warning, when there is one, over the session's row, when it has one, led by its close verdict. */
+	/** Draws the health warning, when there is one, over the session's row, when it has one, with its close verdict. */
 	function drawRow() {
 		const session = ownSession;
-		const line = session?.composer_row || undefined;
+		const row = session?.composer || undefined;
 		const warning = healthWarning(health, Date.now(), uncheckedSince);
 		const verdict = closeVerdict(session, health, Date.now(), uncheckedSince);
-		const shown = JSON.stringify([session?.outcome, session?.headline, line, warning, verdict]);
+		const shown = JSON.stringify([session?.outcome, row, warning, verdict]);
 		if (!ctx || shown === shownLine) return;
 		shownLine = shown;
 		// omp draws widgets in the order they were set: the warning, the row, then the panel.
@@ -1250,28 +1288,17 @@ export default function (pi) {
 		const href = process.env.TERN_PANE ? `codexbar-agentview://card/${sessionId}` : undefined;
 		const [open, close] = href ? [`\x1b]8;;${href}\x1b\\`, "\x1b]8;;\x1b\\"] : ["", ""];
 		const widget = (_tui, theme) => {
-			const text = new pi.pi.Text("", 1, 0);
-			let plain;
-			let linked;
+			// Tern's native view paints an undescribed widget as terminal cells, where the link shows
+			// no pointer and no hover. Described, the row opens its card on a plain click (a span link
+			// would want Ctrl), and codexbar.css shapes it. The same node object while the row holds
+			// lets omp skip it.
+			const node = rowNode(session, verdict, href);
 			return {
-				...panelComponent((t) => open + rowText(session, t, verdict) + close, theme),
-				// Tern's native view paints an undescribed widget as terminal cells, where the link
-				// shows no pointer and no hover. Described, the row opens its card on a plain click
-				// (a span link would want Ctrl), and codexbar.css underlines it on hover. The same
-				// node object while the text holds lets omp skip it.
-				describe(cx) {
-					text.setText(rowText(session, theme, verdict));
-					const node = text.describe(cx);
-					if (!href) return node;
-					if (node !== plain) {
-						plain = node;
-						linked = { ...node, p: { ...node.p, href, actions: { click: "open" } } };
-					}
-					return linked;
-				},
+				...panelComponent((t, width) => open + rowText(session, t, verdict, width) + close, theme),
+				describe: () => node,
 			};
 		};
-		ctx.ui.setWidget(WIDGET, line ? widget : undefined, { placement: "aboveEditor" });
+		ctx.ui.setWidget(WIDGET, row ? widget : undefined, { placement: "aboveEditor" });
 		if (panel) drawPanel(ctx);
 	}
 

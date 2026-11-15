@@ -150,16 +150,54 @@
 	}
 }
 
-/* The waitingfor row over an omp composer (omp-extension/waitingfor.ts), which
-   opens the session card on a click: indented a cell, as the details panel drawn
-   under it in terminal cells, and underlined on hover, as Tern's links are. */
-.sf-text[data-href^='codexbar-agentview://card/'] {
-	padding-left: var(--sf-cw);
+/* The waitingfor row over an omp composer (omp-extension/waitingfor.ts `rowNode`): a strip tinted
+   by the outcome, the user's sentence first and the rest muted after it, cut with "…" when narrow,
+   and the close verdict as a badge at the right end that is never cut. A click opens the session
+   card; the sentence underlines on hover, as Tern's links do. It spans the composer box: 8px in, as
+   the composer outside the console layout, and in the console the composer's own column (Tern's
+   rule for `omp.composer.focus`), with room under it for the meters drawn over the box's top edge. */
+.sf-row[data-role^='codexbar.wait-row'] {
+	--tc: var(--t3);
+	box-sizing: border-box;
+	flex: none;
+	min-width: 0;
+	margin: 0 8px 10px;
+	padding: 3px 4px 3px 12px;
+	border-radius: 999px;
+	background: rgb(from var(--tc) r g b / 6%);
+	box-shadow: inset 0 0 0 1px rgb(from var(--tc) r g b / 24%);
+	cursor: pointer;
 
-	&:hover {
+	&[data-role='codexbar.wait-row.fulfilled'] {
+		--tc: var(--sf-ok);
+	}
+	&:is([data-role='codexbar.wait-row.attention'], [data-role='codexbar.wait-row.overdue']) {
+		--tc: var(--sf-warn);
+	}
+	> [data-role='codexbar.wait-mark'] {
+		flex: none;
+	}
+	> [data-role='codexbar.wait-text'] {
+		flex: 1 1 auto;
+		min-width: 0;
+		overflow: hidden;
+		white-space: nowrap;
+		text-overflow: ellipsis;
+	}
+	&:hover > [data-role='codexbar.wait-text'] {
 		text-decoration: underline;
 		text-decoration-color: rgb(from var(--accent) r g b / 45%);
 	}
+	/* Park only: the verdict that asks something of you stands out. */
+	> .sf-badge[data-tone='warning'] {
+		background: rgb(from var(--tc) r g b / 20%);
+	}
+}
+
+.sf-chat-console .sf-row[data-role^='codexbar.wait-row'] {
+	width: calc(min(100%, 1040px) - var(--cn-gut) + 12px);
+	margin-left: calc(max(0px, (100% - 1040px) / 2) + var(--cn-gut) - 12px);
+	margin-right: 0;
 }
 
 @keyframes codexbar-pulse {
