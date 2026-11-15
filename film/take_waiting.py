@@ -596,6 +596,12 @@ class WaitingTake(base.Take):
             self.cut()
             time.sleep(4.5)
 
+            # You merge on GitHub; the last step of the babysat chain sees it and closes the PR out.
+            self.caption("Merged", "You merge it on GitHub. The wait sees it.")
+            self.set_stage("merged")
+            self.poke_while(PR_SESSION["id"], lambda: self.wait_state(PR_SESSION["id"], "merged") in ("fired", "done"), 15)
+            time.sleep(4.0)
+
             self.caption("Meanwhile", "The job is done. Its closed session reopens.")
             reported = self.model_log.tell()
             self.migration_done.write_text("")
