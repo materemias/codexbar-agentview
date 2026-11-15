@@ -6229,6 +6229,29 @@ class SessionMoveTests(Case):
         self.assertEqual([w["id"] for w in self.session(SID)["waits"]], [wait])
         self.assertNotIn(OTHER, self.state()["sessions"])
 
+    def test_a_session_open_elsewhere_hands_its_waits_over_once_its_process_is_gone(self) -> None:
+        wait = self.add("--kind", "later")["id"]
+        self.moved("open-elsewhere")
+        self.tick()
+        self.assertEqual([w["id"] for w in self.session(SID)["waits"]], [wait])
+        self.agents(OTHER)  # the process that ran SID exited
+        self.tick()
+        self.assertNotIn(SID, self.state()["sessions"])
+        self.assertEqual([w["id"] for w in self.session(OTHER)["waits"]], [wait])
+        self.assertEqual(json.loads((self.omp / "session-pins.json").read_text()), [OTHER])
+
+    def test_a_handover_to_an_id_that_set_up_the_same_waits_stops_the_old_twins(self) -> None:
+        twin = self.add("--kind", "something", "--what", "x")["id"]
+        own = self.add("--kind", "later")["id"]
+        self.moved("open-elsewhere")
+        # The agent under the new id, seeing no waits, set the same one up again.
+        kept = self.add("--kind", "something", "--what", "x", session=OTHER)["id"]
+        self.agents(OTHER)
+        self.tick()
+        old = {w["id"]: w["state"] for w in self.state()["sessions"][SID]["waits"]}
+        self.assertEqual((old[twin], old[own]), ("done", "waiting"))
+        self.assertEqual([w["id"] for w in self.session(OTHER)["waits"]], [kept])
+
     def test_a_new_id_with_waits_of_its_own_keeps_both_and_says_so_once(self) -> None:
         mine = self.add("--kind", "later")["id"]
         theirs = self.add("--kind", "something", "--what", "x", session=OTHER)["id"]

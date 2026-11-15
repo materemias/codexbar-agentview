@@ -5040,12 +5040,17 @@ def cmd_event(args: argparse.Namespace) -> dict:
 def _move_session(state: dict, old: str, new: str, omp: Omp, now: datetime) -> None:
     """omp moved the conversation from `old` to a new file under `new`: what the
     CLI keeps under `old` goes with it. A record `new` already has stays, and so
-    does `old`'s, beside it. Running it again changes nothing."""
+    does `old`'s, beside it, less the open waits `new` also has: the agent set
+    those up again, and both would fire. Running it again changes nothing."""
     record = state["sessions"].get(old)
     if record is None:
         return
+    record.pop("continued_in", None)
     held = state["sessions"].get(new)
     if held is not None:
+        if _drop_twins(state, record, held, now) and not _open_waits(record):
+            # As Stop unpins once no wait is left.
+            _move_pin(state, old, False, omp, now)
         text = f"Session {old[:8]} moved here; its waits stay under {old[:8]}, since this session had its own"
         if all(entry["text"] != text for entry in held["history"]):
             _log(held, now, None, text)
@@ -5070,6 +5075,46 @@ def _move_session(state: dict, old: str, new: str, omp: Omp, now: datetime) -> N
     _log(record, now, None, f"Moved from session {old[:8]}")
 
 
+def _condition_key(wait: dict) -> str:
+    return json.dumps(wait["condition"], sort_keys=True)
+
+
+def _drop_twins(state: dict, record: dict, held: dict, now: datetime) -> bool:
+    """Stop `record`'s open waits that watch what one of `held`'s open waits
+    watches, as Stop does: with the steps behind them that never started.
+    True when it stopped any."""
+    watched = {_condition_key(wait) for wait in _open_waits(held)}
+    twins = [wait for wait in _open_waits(record) if _condition_key(wait) in watched]
+    for wait in twins:
+        if wait["state"] == "done":  # stopped behind an earlier twin
+            continue
+        _log(record, now, wait, f"Stopped: {wait['label']}, which session {held['session'][:8]} waits for too")
+        _stop_behind(record, wait, now)
+        _finish(record, wait, now, activate=False)
+    if twins:
+        _settle(state, record, now)
+    return bool(twins)
+
+
+def _note_continuation(state: dict, old: str, new: str) -> None:
+    """omp moved the conversation from `old` to `new` because another process
+    still runs `old`: that one keeps the waits until it ends (`_hand_over`)."""
+    record = state["sessions"].get(old)
+    if record is not None:
+        record["continued_in"] = new
+
+
+def _hand_over(state: dict, agents: Agents, omp: Omp, now: datetime) -> None:
+    """A session that went on under another id while its process still ran
+    (`_note_continuation`) moves there once that process is gone: nothing runs
+    the old id any more, and omp resumes the newest copy anyway. Callers make
+    sure agents.json is fresh, else every session would look gone."""
+    for old, record in list(state["sessions"].items()):
+        new = record.get("continued_in")
+        if new and new != old and not _running(state, agents, old):
+            _move_session(state, old, new, omp, now)
+
+
 def cmd_heartbeat(args: argparse.Namespace) -> dict:
     features = _comma_list(args.features or "")
     if (args.moved_from is None) != (args.move_reason is None):
@@ -5080,9 +5125,12 @@ def cmd_heartbeat(args: argparse.Namespace) -> dict:
     agents = _read_agents()
 
     def apply(state: dict, now: datetime) -> dict:
-        # On `open-elsewhere` another omp still runs the old session and keeps its waits.
+        # On `open-elsewhere` another omp still runs the old session and keeps
+        # its waits until it ends.
         if args.move_reason in ("replaced", "contested"):
             _move_session(state, args.moved_from, args.session, omp, now)
+        elif args.move_reason == "open-elsewhere":
+            _note_continuation(state, args.moved_from, args.session)
         state["extensions"][args.session] = _iso(now)
         state["extension_features"][args.session] = features
         if FEATURE_ACTIVITY in features:
@@ -5395,6 +5443,8 @@ def _tick(args: argparse.Namespace) -> dict:
             }
         _note_tick(state, now)
         _housekeeping(state, agents, omp, now, args.daemon)
+        if not stale:
+            _hand_over(state, agents, omp, now)
         _clamp(state, now, problems)
         _pin_pass(state, omp, now)
         _evaluate(state, now, Facts(agents, omp))

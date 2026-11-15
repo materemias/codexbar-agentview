@@ -59,7 +59,7 @@ const RESEND_WINDOW = 10;
 const PR_WINDOW = 4;
 /** How often a check runs when nothing says; the CLI's default too. */
 const CHECK_EVERY = "15m";
-/** Why omp moved a session to a new id (its persistence notice); the CLI re-keys the old record on all but open-elsewhere. */
+/** Why omp moved a session to a new id (its persistence notice); the CLI re-keys the old record at once, on open-elsewhere once the old id's process is gone. */
 const MOVE_REASONS = ["open-elsewhere", "replaced", "contested"];
 
 const DURATION = /^(\d+[smhdw])+$/;
@@ -1567,7 +1567,7 @@ export default function (pi) {
 	 * moves a session it can't write to a new file under a new id, with no session event: the conversation
 	 * goes on there, and the old id is another process's (or nobody's). A move keeps what the turn is doing,
 	 * the described check it writes and the panel; anything else is a switch. `notice`, omp's report of
-	 * the move, says why; a move seen without one counts as open-elsewhere, which the CLI leaves alone.
+	 * the move, says why; a move seen without one counts as open-elsewhere, which the CLI hands over only once the old id's process is gone.
 	 */
 	function followSession(notice?): boolean {
 		const c = ctx;

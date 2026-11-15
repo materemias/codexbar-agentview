@@ -78,6 +78,7 @@
 - Wait checks use the saved project or pane directory and report a missing directory.
 - Plasma and Tern share usage refreshes within the configured interval.
 - The installed Plasma package includes the omp extension.
+- A session reopened while another pane still ran it no longer splits its waits: once the other pane closes, its waits move to the copy that goes on, and any the copy already set up again are stopped instead of firing twice.
 
 ### Docs
 
