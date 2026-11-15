@@ -215,6 +215,8 @@ def pane(work: Path, sid: str, resumed: bool) -> None:
 
 
 class Take:
+    size = SIZE  # the window, in shot pixels
+
     def __init__(self, work: Path):
         self.work = work
         self.home = work / "home"
@@ -231,7 +233,7 @@ class Take:
         self.frames: list[dict] = []
         self.filming = False
         self.t0 = time.monotonic()
-        self.pointer = (SIZE[0] * 0.5, SIZE[1] * 0.5)
+        self.pointer = (self.size[0] * 0.5, self.size[1] * 0.5)
 
     def now(self) -> float:
         return (time.monotonic() - self.t0) * 1000
@@ -315,8 +317,10 @@ class Take:
 
         (self.config / "plugins").mkdir(parents=True)
         (self.config / "plugins/codexbar-agentview.path").write_text(str(REPO / "tern"))
+        # A blinking cursor would be on in one shot and off in the next.
         (self.config / "settings.json").write_text(json.dumps(
-            {"theme": "Dark", "widgets": WIDGETS, "plugins_disabled": ["agents"], "new_tabs": "Home"}, indent=1))
+            {"theme": "Dark", "widgets": WIDGETS, "plugins_disabled": ["agents"], "new_tabs": "Home",
+             "cursor": {"blink": False}}, indent=1))
         # Tern finds the stand-in `omp` through $SHELL and would offer, in a dialog on your desktop,
         # to keep it up to date: this is its record of having asked.
         (self.config / "omp").mkdir()
@@ -409,7 +413,7 @@ class Take:
                 break
             time.sleep(0.25)
         self.ctl("ready")
-        self.ctl("resize", str(SIZE[0]), str(SIZE[1]))
+        self.ctl("resize", str(self.size[0]), str(self.size[1]))
         self.ctl("font", str(FONT))
         self.ctl("css", "codexbar-agentview-film", str(self.work / "film.css"))
         # Opaque, as the README's screenshots: glass lets your desktop through.
@@ -721,7 +725,7 @@ class Take:
             # The keyboard takes over: the pointer goes, and Tern's real one leaves the window's
             # content, whose hover shows a drag handle.
             self.event("hide", surface="desktop")
-            self.ctl("move", "4", str(SIZE[1] - 4))
+            self.ctl("move", "4", str(self.size[1] - 4))
             self.wait_open("settings")
             self.cut(settings)
             self.type("combined")
@@ -753,7 +757,7 @@ class Take:
             shooter.join()
         write_json(self.work / "timeline.json", {
             "transitionMs": TRANSITION_MS,
-            "devices": [{"surface": "desktop", "kind": "display", "size": list(SIZE)}],
+            "devices": [{"surface": "desktop", "kind": "display", "size": list(self.size)}],
             "frames": {"desktop": self.frames},
             "events": self.events,
         })

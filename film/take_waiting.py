@@ -207,6 +207,9 @@ def user_text(message: dict) -> str:
 
 
 class WaitingTake(base.Take):
+    # The explainer's stage is about 4:3, and the window fills it.
+    size = (1180, 900)
+
     def prepare(self):
         super().prepare()
         if not OMP:
@@ -500,21 +503,21 @@ class WaitingTake(base.Take):
 
     # Filming.
 
+    def chapter(self, title: str, **fields):
+        """The explainer column's text from now on: step, title, body, say, then and dot."""
+        self.event("chapter", title=title, **fields)
+
     def ask(self, s: dict, line: str, after: float):
-        """Types `line` into the session's omp and gives the agent `after` seconds."""
+        """Puts `line` into the session's omp, sends it and gives the agent `after` seconds. The
+        column shows what you say, so the line goes in whole instead of being typed out."""
         self.tern("focus", str(self.blocks_of[s["id"]]))
         time.sleep(0.6)
-        self.type(line, pause=0.04)
-        time.sleep(0.5)
+        self.ctl("type", json.dumps(line))
+        time.sleep(1.4)
         self.key("Enter", "Enter")
         time.sleep(after)
 
     def film(self):
-        # With every session set aside no tab is left, so the dashboard opens as a tab of its own.
-        dash = (0, 40, 1500, 640)
-        # The left of two panes, and an omp alone in its tab, whose conversation sits in the middle.
-        left_pane = (0, 40, 760, 640)
-        whole_pane = (300, 40, 900, 640)
         self.tern("focus", str(self.blocks_of[PR_SESSION["id"]]))
         time.sleep(2.0)
         self.filming = True
@@ -522,87 +525,100 @@ class WaitingTake(base.Take):
         shooter.start()
         try:
             self.cut(scene="wide", wait=False)
-            self.caption("Set sessions aside", "Never lose why you stopped.")
-            time.sleep(2.8)
-
-            self.caption("Babysit a pull request", "Ask the agent in your own words.")
-            self.cut(left_pane)
-            self.ask(PR_SESSION, PR_LINE, 1.5)
-            self.caption("Babysit a pull request", "It watches reviews, CI and the merge.")
+            self.chapter("Set sessions aside", body="You leave agent sessions all the time. Say why in one "
+                         "sentence, and code watches what the session waits for.")
             time.sleep(5.0)
 
-            self.caption("Wait for a job", "The agent writes the check. Code runs it, no tokens.")
-            self.cut(whole_pane)
-            self.ask(JOB_SESSION, JOB_LINE, 5.5)
-            self.caption("Close it", "It reopens by itself when there's work.")
-            time.sleep(1.4)
-            self.close_session(JOB_SESSION)
-            time.sleep(2.4)
-
-            self.caption("Check on a schedule", "Every day for a week, then it stops.")
-            self.cut(left_pane)
-            self.ask(ROLLOUT_SESSION, ROLLOUT_LINE, 6.0)
-
-            self.caption("When you have time", "Or type the wait yourself.")
-            self.cut(whole_pane)
-            self.ask(LATER_SESSION, LATER_LINE, 2.8)
-
-            self.caption("Waiting", "Grouped by who has the next step.")
-            self.command("waiting", "Ctrl", "Alt", "W")
-            self.cut(dash)
+            pr = {"dot": 0, "step": "Babysit a pull request", "title": "The agent just opened PR #42.",
+                  "body": "Review, CI and the merge will take hours. You don't want to keep checking.",
+                  "say": PR_LINE}
+            self.chapter(**pr)
+            self.cut()
             time.sleep(3.0)
-            self.caption("Waiting", "Code watches every wait. No tokens spent.")
-            self.key("ArrowDown", "↓")
-            time.sleep(0.4)
-            self.key("Space", "Space")
-            time.sleep(3.2)
-            self.key("Space", "Space")
-            time.sleep(0.4)
+            self.ask(PR_SESSION, PR_LINE, 1.5)
+            self.chapter(**pr, then=["The agent sets a babysit on the PR and parks the session.",
+                                     "Code polls GitHub. No tokens are spent while it waits."])
+            time.sleep(6.0)
 
-            self.caption("Snooze", "Out of sight until you want it back.")
-            for _ in range(3):
+            job = {"dot": 1, "step": "Wait for a job", "title": "A migration runs for 40 minutes.",
+                   "body": "You want its result, not the session open in front of you.", "say": JOB_LINE}
+            self.chapter(**job)
+            time.sleep(3.5)
+            self.ask(JOB_SESSION, JOB_LINE, 5.0)
+            self.chapter(**job, then=["The agent writes a check that passes when the job is done.",
+                                      "You close the session. It reopens when the check passes."])
+            time.sleep(3.5)
+            self.close_session(JOB_SESSION)
+            time.sleep(3.0)
+
+            rollout = {"dot": 2, "step": "Check on a schedule", "title": "A rollout needs a daily look.",
+                       "body": "Every day for a week, and then it should stop by itself.", "say": ROLLOUT_LINE}
+            self.chapter(**rollout)
+            time.sleep(3.0)
+            self.ask(ROLLOUT_SESSION, ROLLOUT_LINE, 5.0)
+            self.chapter(**rollout, then=["A daily repeat sends the agent its prompt once a day.",
+                                          "After seven runs it ends."])
+            time.sleep(5.0)
+
+            later = {"dot": 3, "step": "When you have time", "title": "A big task for a quiet afternoon.",
+                     "body": "Nothing to watch, only a note on why you'll come back.",
+                     "say_label": "You type", "say": LATER_LINE}
+            self.chapter(**later)
+            time.sleep(3.0)
+            self.ask(LATER_SESSION, LATER_LINE, 2.5)
+            self.command("waiting", "Ctrl", "Alt", "W")
+            self.chapter(**later, then=["The Waiting tab groups every session by who has the next step."])
+            time.sleep(5.0)
+            self.chapter(**later, then=["The Waiting tab groups every session by who has the next step.",
+                                        "Not today? Snooze session hides it until the time you pick."])
+            for _ in range(4):
                 self.key("ArrowDown", "↓")
                 time.sleep(0.3)
             self.key("F4", "F4")
-            time.sleep(1.6)
+            time.sleep(1.8)
             for _ in range(4):
                 self.key("ArrowDown", "↓")
                 time.sleep(0.25)
             self.key("Enter", "Enter")
             time.sleep(1.4)
             self.key("Enter", "Enter")
-            time.sleep(1.8)
+            # Snoozed, it leaves no tab; the Waiting tab comes right back for the PR.
+            time.sleep(1.0)
 
-            self.caption("An hour later", "A review lands. The agent fixes it, still parked.")
+            review = {"dot": 0, "step": "Babysit a pull request", "title": "An hour later, a review lands.",
+                      "body": "Two open threads on PR #42. The session is still parked."}
+            self.chapter(**review)
             self.command("waiting", "Ctrl", "Alt", "W")
-            time.sleep(0.8)
+            time.sleep(2.5)
             self.set_stage("reviewed")
             self.age(PR_SESSION["id"], 60)
+            fixed = ["The babysit sends its fix prompt to the parked session.",
+                     "The agent pushes a fix and resolves the threads."]
+            self.chapter(**review, then=fixed)
             self.poke_while(PR_SESSION["id"], lambda: self.stage == "fixed", 12)
             time.sleep(3.0)
-            self.caption("Ready to merge", "Green, reviewed, no open threads: your turn.")
             self.poke_while(PR_SESSION["id"], lambda: self.wait_state(PR_SESSION["id"], "ready") in ("fired", "done"), 20)
+            self.chapter(**review, then=[*fixed, "Checks green, reviewed, no open threads: it's back on you."])
             for _ in range(8):
                 self.key("ArrowUp", "↑")
                 time.sleep(0.1)
             self.key("Space", "Space")
-            time.sleep(4.0)
+            time.sleep(4.5)
             self.key("Space", "Space")
             time.sleep(0.4)
-
-            self.caption("Babysit a pull request", "What the agent fixed, in its own words.")
             self.key("Enter", "Enter")
-            time.sleep(0.6)
-            self.cut()
-            time.sleep(4.5)
+            time.sleep(5.0)
 
             # You merge on GitHub; the last step of the babysat chain sees it and closes the PR out.
-            self.caption("Merged", "You merge it on GitHub. The wait sees it.")
+            self.chapter(dot=0, step="Babysit a pull request", title="You merge it on GitHub.",
+                         body="The babysit's last step sees the merge and tells you. The agent never merges.")
             self.set_stage("merged")
             self.poke_while(PR_SESSION["id"], lambda: self.wait_state(PR_SESSION["id"], "merged") in ("fired", "done"), 15)
-            time.sleep(4.0)
+            time.sleep(4.5)
 
-            self.caption("Meanwhile", "The job is done. Its closed session reopens.")
+            self.chapter(dot=1, step="Wait for a job", title="Meanwhile, the migration finished.",
+                         then=["Tern reopens the closed session in a new tab.",
+                               "The agent reads the log and reports."])
             reported = self.model_log.tell()
             self.migration_done.write_text("")
             self.age(JOB_SESSION["id"], 60)
@@ -621,18 +637,23 @@ class WaitingTake(base.Take):
             time.sleep(6.0)
 
             # Focusing a session with a wait back on you opens its card by itself.
-            self.caption("Coming back", "Why you left, and what happened since.")
-            time.sleep(5.0)
+            self.chapter(dot=4, step="Coming back", title="Why you left, and what happened since.",
+                         body="Focus a session with news and its card opens: your sentence, its waits "
+                         "and what each one saw.")
+            time.sleep(6.5)
 
-            self.caption("Set sessions aside", "Works in omp. Best in Tern.")
+            self.chapter("Set sessions aside", body="Ask the agent in your own words, or type /wait. "
+                         "Works in omp, best in Tern.")
             self.cut(scene="wide")
-            time.sleep(2.8)
+            time.sleep(3.5)
         finally:
             self.filming = False
             shooter.join()
         base.write_json(self.work / "timeline.json", {
             "transitionMs": base.TRANSITION_MS,
-            "devices": [{"surface": "desktop", "kind": "display", "size": list(base.SIZE)}],
+            "layout": "explainer",
+            "dots": 5,
+            "devices": [{"surface": "desktop", "kind": "display", "size": list(self.size)}],
             "frames": {"desktop": self.frames},
             "events": self.events,
         })

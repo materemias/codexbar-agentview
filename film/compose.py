@@ -13,15 +13,21 @@ The take (film/take_kde.py, film/take_tern.py) writes WORK/timeline.json:
 
     transitionMs  how long the camera takes between scenes
     link          the outro pill's text (default github.com/materemias/codexbar-agentview)
+    layout        "headline" (default): a caption above a wide stage card; "explainer": a column
+                  of text on the left, telling the current chapter, and the stage card on the right
     devices       [{surface, kind: "display", size: [w, h], crop?: [x0, y0, x1, y1]}], left to right
     frames        {surface: [{t, path}]}, t in ms
     events        [{t, kind, ...}]:
                     scene    scene: a surface or "wide"; rect?: [x, y, w, h]; fill?
-                    caption  eyebrow, headline
+                    caption  eyebrow, headline (headline layout)
+                    chapter  explainer layout: step?, title, body?, say?, say_label?, then?: [lines],
+                             dot?: its place among `dots`; a chapter with the previous one's
+                             title keeps what is unchanged and fades in only what is new
                     move     surface, x, y
                     click    surface
                     hide     surface (the pointer stays hidden until its next move)
                     key      keys: ["Super", "A"] or label: "harb"
+    dots          explainer layout: how many progress dots the chapters fill
 
 Coordinates are shot pixels, before the crop. Needs ffmpeg, gifsicle optionally. Inter (SIL OFL)
 is downloaded once into ~/.cache/codexbar-agentview-film.
@@ -90,6 +96,13 @@ LINK = timeline.get("link", "github.com/materemias/codexbar-agentview")
 scenes = [e for e in events if e["kind"] == "scene"]
 captions = [e for e in events if e["kind"] == "caption"]
 keys = [e for e in events if e["kind"] == "key"]
+chapters = [e for e in events if e["kind"] == "chapter"]
+EXPLAINER = timeline.get("layout") == "explainer"
+if EXPLAINER:
+    # The text column takes the left; the stage, the rest of the page.
+    CARD_BOX = (560, 70, 1560, 830)
+COLUMN = (64, CARD_BOX[0] - 52)  # explainer text: left edge, right edge
+STAGE_MID = (CARD_BOX[0] + CARD_BOX[2]) / 2
 
 
 def ease(k: float) -> float:
@@ -426,7 +439,7 @@ def pressed_keys(image: Image.Image, t: float):
     layer = caps.resize((round(caps.width * scale), round(caps.height * scale)), Image.BICUBIC)
     layer.putalpha(layer.getchannel("A").point(lambda v: round(v * q)))
     y = CARD_BOX[3] - 44 - CAP_H / 2 + 6 * (1 - q)
-    image.paste(layer, (round(W / 2 - layer.width / 2), round(y - layer.height / 2)), layer)
+    image.paste(layer, (round(STAGE_MID - layer.width / 2), round(y - layer.height / 2)), layer)
 
 
 def text_layer(image: Image.Image, cap: dict, alpha: float, dy: float, eyebrow_alpha: float):
@@ -460,8 +473,118 @@ def outro_pill(image: Image.Image, t: float):
     d = ImageDraw.Draw(image, "RGBA")
     w = d.textlength(LINK, font=PILL_FONT) + 56
     cy = CARD_BOX[1] + 46 + 10 * (1 - q)
-    d.rounded_rectangle((W / 2 - w / 2, cy - 23, W / 2 + w / 2, cy + 23), radius=23, fill=(*BLUE, round(255 * q)))
-    d.text((W / 2, cy), LINK, font=PILL_FONT, fill=(255, 255, 255, round(255 * q)), anchor="mm")
+    d.rounded_rectangle((STAGE_MID - w / 2, cy - 23, STAGE_MID + w / 2, cy + 23), radius=23, fill=(*BLUE, round(255 * q)))
+    d.text((STAGE_MID, cy), LINK, font=PILL_FONT, fill=(255, 255, 255, round(255 * q)), anchor="mm")
+
+
+MUTED = (110, 110, 115)
+STEP_FONT = font("text-semibold", 19)
+TITLE_FONT = font("display", 44)
+BODY_FONT = font("text", 22)
+LABEL_FONT = font("text-semibold", 14)
+FOOT_FONT = font("text", 18)
+
+
+def wrap(text: str, face: ImageFont.FreeTypeFont, width: float) -> list[str]:
+    lines, line = [], ""
+    for word in text.split():
+        joined = f"{line} {word}".strip()
+        if line and face.getlength(joined) > width:
+            lines.append(line)
+            line = word
+        else:
+            line = joined
+    return [*lines, line] if line else lines
+
+
+def chapter_blocks(ch: dict) -> list[tuple[str, str, object, float]]:
+    """A chapter's pieces top to bottom, each (key, kind, content, y). Pieces above a change keep
+    their place, so an update with the same title moves nothing already shown."""
+    x0, x1 = COLUMN
+    width = x1 - x0
+    y = 150.0
+    blocks = []
+    if ch.get("step"):
+        blocks.append(("step", "step", ch["step"].upper(), y))
+        y += 34
+    lines = wrap(ch["title"], TITLE_FONT, width)
+    blocks.append(("title", "title", lines, y))
+    y += 54 * len(lines) + 16
+    if ch.get("body"):
+        lines = wrap(ch["body"], BODY_FONT, width)
+        blocks.append(("body", "body", lines, y))
+        y += 32 * len(lines) + 26
+    if ch.get("say"):
+        blocks.append(("say_label", "label", ch.get("say_label", "You say").upper(), y))
+        y += 24
+        lines = wrap(f"“{ch['say']}”", BODY_FONT, width - 40)
+        blocks.append(("say", "say", lines, y))
+        y += 24 + 32 * len(lines) + 28
+    if ch.get("then"):
+        blocks.append(("then_label", "label", "THEN", y))
+        y += 24
+        for i, item in enumerate(ch["then"]):
+            lines = wrap(item, BODY_FONT, width - 22)
+            blocks.append((f"then:{i}:{item}", "item", lines, y))
+            y += 32 * len(lines) + 10
+    return blocks
+
+
+def draw_block(d: ImageDraw.ImageDraw, kind: str, content, y: float, alpha: float):
+    x0, x1 = COLUMN
+    a = round(255 * alpha)
+    if kind == "step":
+        d.text((x0, y), content, font=STEP_FONT, fill=(*BLUE, a))
+    elif kind == "title":
+        for i, line in enumerate(content):
+            d.text((x0, y + 54 * i), line, font=TITLE_FONT, fill=(*INK, a))
+    elif kind == "body":
+        for i, line in enumerate(content):
+            d.text((x0, y + 32 * i), line, font=BODY_FONT, fill=(*MUTED, a))
+    elif kind == "label":
+        d.text((x0, y), content, font=LABEL_FONT, fill=(*MUTED, a))
+    elif kind == "say":
+        d.rounded_rectangle((x0, y, x1, y + 24 + 32 * len(content)), radius=18, fill=(*CARD, a))
+        for i, line in enumerate(content):
+            d.text((x0 + 20, y + 12 + 32 * i), line, font=BODY_FONT, fill=(*INK, a))
+    elif kind == "item":
+        d.ellipse((x0 + 1, y + 12, x0 + 9, y + 20), fill=(*BLUE, a))
+        for i, line in enumerate(content):
+            d.text((x0 + 22, y + 32 * i), line, font=BODY_FONT, fill=(*INK, a))
+
+
+def chapter_column(image: Image.Image, t: float):
+    """The explainer's text: the current chapter, faded in over the one before, and progress dots."""
+    i = max((i for i, c in enumerate(chapters) if c["t"] <= t), default=None)
+    if i is None:
+        return
+    ch, prev = chapters[i], chapters[i - 1] if i > 0 else None
+    layer = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    d = ImageDraw.Draw(layer)
+    kept: set[str] = set()
+    out = (t - ch["t"]) / TEXT_OUT_MS
+    if prev is not None and prev["title"] == ch.get("title"):
+        kept = {key for key, *_ in chapter_blocks(prev)}
+    elif prev is not None and out < 1:
+        for _, kind, content, y in chapter_blocks(prev):
+            draw_block(d, kind, content, y - 10 * ease_out(out), 1 - ease_out(out))
+    delay = TEXT_OUT_MS * 0.6 / TEXT_IN_MS if prev is not None and not kept else 0
+    k = (t - ch["t"]) / TEXT_IN_MS
+    q = ease_out((k - delay) / (1 - delay)) if k > delay else 0
+    for key, kind, content, y in chapter_blocks(ch):
+        if key in kept:
+            draw_block(d, kind, content, y, 1)
+        elif q > 0:
+            draw_block(d, kind, content, y + 16 * (1 - q), q)
+    dots, dot = timeline.get("dots", 0), ch.get("dot")
+    if dots:
+        x0 = COLUMN[0]
+        d.text((x0, H - 62), "Set sessions aside", font=FOOT_FONT, fill=(*MUTED, 255))
+        start = x0 + FOOT_FONT.getlength("Set sessions aside") + 24
+        for n in range(dots):
+            cx = start + n * 20
+            d.ellipse((cx - 4, H - 52 - 4, cx + 4, H - 52 + 4), fill=(*(BLUE if n == dot else (210, 210, 215)), 255))
+    image.paste(layer, (0, 0), layer)
 
 
 START = scenes[0]["t"]
@@ -478,7 +601,10 @@ def render(n: int):
     card = render_card(t, cam, alpha)
     image.paste(card.convert("RGB"), CARD_BOX[:2], CARD_MASK)
     pressed_keys(image, t)
-    headline(image, t)
+    if EXPLAINER:
+        chapter_column(image, t)
+    else:
+        headline(image, t)
     outro_pill(image, t)
     image.save(OUT / f"{n:05d}.png", compress_level=1)
 

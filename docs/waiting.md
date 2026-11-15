@@ -11,7 +11,7 @@ wait is over. Code watches the wait, not a model, so no tokens are spent until
 something happens. When it does, the session gets your prompt (Tern reopens it
 if you closed it), and a card tells you what happened while you were away.
 
-![Asked in plain words, the agent babysits a pull request, sets a check on a migration (and the session is closed), and repeats a fleet check daily for a week; a task is put off with /wait later. Then the Waiting tab, Snooze session, a review landing on the PR that the agent fixes while parked until the PR is ready and then merged, and the migration finishing, which reopens the closed session so the agent can report](waiting.gif)
+![One use case at a time, each explained beside the screen: asked in plain words, the agent babysits a pull request, sets a check on a migration (and the session is closed), and repeats a fleet check daily for a week; a task is put off with /wait later. Then the Waiting tab, Snooze session, a review landing on the PR that the agent fixes while parked until the PR is ready and then merged, and the migration finishing, which reopens the closed session so the agent can report](waiting.gif)
 
 You don't have to learn any of this to use it. The agent has the same toolkit
 as a tool, so "babysit the PR you just opened" or "check every morning whether
