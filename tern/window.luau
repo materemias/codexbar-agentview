@@ -2403,7 +2403,10 @@ local function waitingRequest(cx: WindowCx)
 			local ok, err = cx2.layout:unpark(target)
 			if ok then
 				local tab, moveErr = cx2.layout:move_to_new_tab(target)
-				ok, err = tab ~= nil, moveErr
+				-- With no other pane left (the dashboard was the last tab), it came
+				-- back as the sole block of a tab already, and the move refuses that.
+				local after = if tab == nil then paneInfo(cx2, target) else nil
+				ok, err = tab ~= nil or (after ~= nil and not after.parked), moveErr
 			end
 			if not ok then
 				waitingFailed("open", err, cx2)
