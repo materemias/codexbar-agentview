@@ -3,13 +3,14 @@
 # requires-python = ">=3.11"
 # dependencies = []
 # ///
-"""Films the waiting take for docs/waiting.mp4 and docs/waiting.gif: one omp session set aside with
-a one-line `/wait`, the Waiting tab, Snooze session, the wait coming back and the session card. It
-runs take_tern.py's world (scratch HOME, private Tern daemon, stand-in agents, fixture agents.json)
-plus one real omp, resumed from a transcript this script writes, with the omp extension in a
-scratch agent folder. Nobody sends that omp a prompt, so no model is ever asked anything. Time
-waits fire after `--in`; the take fast-forwards one by rewriting its times under the CLI's lock,
-which the caption calls "20 minutes later".
+"""Films the waiting take for docs/waiting.mp4 and docs/waiting.gif: four omp sessions set aside
+with one-line `/wait`s (babysit a PR, come back in two days, wait on a person, repeat daily), the
+Waiting tab, Snooze session, the two-day wait coming back and the session card. It runs
+take_tern.py's world (scratch HOME, private Tern daemon, stand-in agents, fixture agents.json) plus
+four real omps, each resumed from a transcript this script writes, with the omp extension in a
+scratch agent folder. Nobody sends those omps a prompt, so no model is ever asked anything. A fake
+`gh` first on PATH serves an open PR without a review, so the babysat PR waits without the network.
+The take fast-forwards the two-day wait by rewriting its times under the CLI's lock.
 
     uv run film/take_waiting.py [WORK]   (default /tmp/codexbar-agentview-film-waiting)
     uv run film/compose.py waiting [WORK]
@@ -19,11 +20,11 @@ Needs Tern, omp and a Wayland session (headless-gui keeps the window off your de
 
 import fcntl
 import json
-import os
 import re
 import shutil
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from datetime import datetime, timedelta, timezone
@@ -33,29 +34,64 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import take_tern as base  # noqa: E402
 
 OMP = shutil.which("omp")
-# The session set aside on camera: a real omp in its own pane, its conversation written here.
-OMP_SESSION = {
-    "id": "019a4b21-6c3e-7d14-9b2a-5e8f1c3a7d20", "folder": "harbor", "title": "Ship deploy 1824",
-    "provider": "omp", "model": "claude-opus-5-5", "state": "idle", "ago": 4,
-    "turns": [("user", "text", "Deploy build 1824 to staging, then we smoke-test it."),
-              ("assistant", "text", "The staging deploy of build 1824 is running. It takes about 20 minutes; "
-                                    "the smoke tests can start once it's out.")],
-}
-SET_ASIDE = "/wait 20m smoke-test staging once deploy 1824 is out"
-# The take_tern sessions this take shows, and the waits already set on them.
-SHOWN = ["Review query timeout", "Polish settings layout", "Review cache invalidation", "Check export permissions",
-         "Improve log grouping"]
+
+
+def omp_session(sid: str, folder: str, title: str, model: str, ask: str, answer: str) -> dict:
+    return {"id": sid, "folder": folder, "title": title, "provider": "omp", "model": model, "state": "idle",
+            "ago": 5, "turns": [("user", "text", ask), ("assistant", "text", answer)]}
+
+
+# Each montage step: a real omp session in a tab of its own, beside take_tern stand-ins that stay
+# when it parks, the line typed into it, and the caption over it.
+MONTAGE = [
+    {"session": omp_session("019a4b21-6c3e-7d14-9b2a-5e8f1c3a7d20", "harbor", "Fix upload retry backoff",
+                            "claude-opus-5-5", "Fix the upload retry backoff and open a pull request.",
+                            "Opened PR #42 with the backoff fix. CI is running, and the review bot "
+                            "usually comments within the hour."),
+     "standins": ["Review query timeout"],
+     "line": "/wait gh babysit 42 ship the backoff fix",
+     "caption": ("Babysit a pull request", "Review, fixes, merge. Code watches it.")},
+    {"session": omp_session("019a4b22-1d5f-7a20-8c3b-6f9e2d4b8e21", "atlas", "Migrate billing tables",
+                            "claude-sonnet-5", "Run the billing table migration.",
+                            "The provider's API quota ran out halfway, so nothing was written. "
+                            "It resets in two days."),
+     "standins": ["Review cache invalidation"],
+     "line": "/wait 2d retry the migration once the quota resets",
+     "caption": ("Come back later", "In two days, at 18:00, or on a date.")},
+    {"session": omp_session("019a4b23-8e2a-7b31-9d4c-7a0f3e5c9f22", "beacon", "Restyle the settings page",
+                            "claude-opus-5-5", "Restyle the settings page from Mia's mockups.",
+                            "The layout follows the mockups. Mia wants to review it before it ships."),
+     "standins": ["Improve log grouping"],
+     "line": "/wait for Mia's design review",
+     "caption": ("Wait on a person", "In your own words.")},
+    {"session": omp_session("019a4b24-3f6b-7c42-ae5d-8b1a4f6d0a23", "orbit", "Hunt flaky e2e tests",
+                            "claude-sonnet-5", "The e2e suite fails at random. Find the flaky tests.",
+                            "Three runs passed. The flakes are rare, so catching them takes a week of runs."),
+     "standins": ["Check export permissions"],
+     "line": "/wait every 1d for 1w catch the flaky tests -- Run the e2e suite and list what failed",
+     "caption": ("Repeat on a schedule", "A prompt every day, for a week.")},
+]
+COMES_BACK = MONTAGE[1]["session"]
+# Waits already set on stand-ins, so the Waiting tab shows the other groups too.
 WAITS = [
     ("Check export permissions", ["--kind", "command", "--argv", "test -f export.done", "--interval", "10m",
                                   "--label", "Export job finished", "--note", "Re-run the audit once the export is done"]),
-    ("Review cache invalidation", ["--kind", "repeat", "--every", "1d", "--for", "1w", "--label", "Flaky e2e watch",
-                                   "--note", "Run the e2e suite daily for a week",
-                                   "--prompt", "Run the e2e suite three times and list the flaky tests"]),
-    ("Polish settings layout", ["--kind", "something", "--what", "Mia's design review",
-                                "--note", "Fix what Mia flags in the settings review"]),
     ("Improve log grouping", ["--kind", "later", "--note", "Rework the grouping UI on a quiet afternoon"]),
 ]
 ISO = re.compile(r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d")
+# acme/harbor#42 as the PR poller reads it: open, CI running, no review yet.
+PR = {"data": {"viewer": {"login": "me"}, "repository": {"pullRequest": {
+    "state": "OPEN", "headRefOid": "a" * 40, "baseRefName": "main", "mergeStateStatus": "BLOCKED",
+    "mergedAt": None, "closedAt": None, "mergeCommit": None, "author": {"login": "me"},
+    "baseRef": {"target": {"oid": "e" * 40}}, "comments": {"nodes": []}, "reviews": {"nodes": []},
+    "reviewThreads": {"pageInfo": {"hasPreviousPage": False, "startCursor": None}, "nodes": []},
+    "commits": {"nodes": [{"commit": {"statusCheckRollup": {"contexts": {
+        "pageInfo": {"hasNextPage": False, "endCursor": None},
+        "nodes": [{"name": "test", "status": "IN_PROGRESS", "conclusion": None, "isRequired": True}]}}}}]},
+}}}}
+# The same PR as `gh pr view --json` answers it for the session card.
+PR_VIEW = {"title": "Fix upload retry backoff", "state": "OPEN", "isDraft": False, "reviewDecision": "REVIEW_REQUIRED",
+           "statusCheckRollup": [{"name": "test", "status": "IN_PROGRESS", "conclusion": None}]}
 
 
 class WaitingTake(base.Take):
@@ -68,15 +104,48 @@ class WaitingTake(base.Take):
         (self.omp_home / "extensions/codexbar-waitingfor.ts").symlink_to(base.REPO / "omp-extension/waitingfor.ts")
         # Past omp's first-run setup, which would ask for a provider login.
         (self.omp_home / "config.yml").write_text("setupVersion: 3\n")
-        self.omp_file = self.write_transcript(OMP_SESSION)
+        self.omp_files = {step["session"]["id"]: self.write_transcript(step["session"]) for step in MONTAGE}
+        self.write_gh()
+
+    def write_gh(self):
+        """A `gh` that answers as acme/harbor with PR #42 open and unreviewed, and fails the rest."""
+        pr = self.work / "pr.json"
+        pr.write_text(json.dumps(PR))
+        gh = self.bin / "gh"
+        gh.write_text(textwrap.dedent(f"""\
+            #!{base.PYTHON}
+            # film/take_waiting.py: GitHub as the film shows it, without the network.
+            import sys
+            args = sys.argv[1:]
+            with open({str(self.work / "gh.log")!r}, "a") as log:
+                log.write(" ".join(args) + "\\n")
+            if args[:2] == ["repo", "view"] and (len(args) == 2 or args[2].startswith("-")):
+                print("acme/harbor"); sys.exit(0)
+            if args[:3] == ["pr", "view", "42"]:
+                print({json.dumps(PR_VIEW)!r}); sys.exit(0)
+            if args[:1] == ["api"]:
+                target = next((a for a in args[1:] if a.startswith(("repos/", "query=", "rate_limit", "user"))), "")
+                if target == "rate_limit":
+                    print(5000); sys.exit(0)
+                if target == "user":
+                    print("me"); sys.exit(0)
+                if target.startswith("query="):
+                    print(open({str(pr)!r}).read()); sys.exit(0)
+                if "/rules/branches/" in target or "/actions/runs" in target:
+                    sys.exit(0)
+            sys.stderr.write("gh: Not Found (HTTP 404)\\n")
+            sys.exit(1)
+            """))
+        gh.chmod(0o755)
 
     def write_transcript(self, s: dict) -> Path:
         """An omp session file holding `turns`, as omp writes one, so `omp --resume` shows them."""
         cwd = self.home / "code" / s["folder"]
+        cwd.mkdir(parents=True, exist_ok=True)
         start = datetime.now(timezone.utc) - timedelta(minutes=s["ago"] + 2)
         stamp = lambda d: d.strftime("%Y-%m-%dT%H:%M:%S.") + f"{d.microsecond // 1000:03d}Z"  # noqa: E731
         folder = self.omp_home / "sessions" / ("-" + str(cwd.relative_to(self.home)).replace("/", "-"))
-        folder.mkdir(parents=True)
+        folder.mkdir(parents=True, exist_ok=True)
         lines = [
             {"type": "title", "v": 1, "title": s["title"], "source": "auto", "updatedAt": stamp(start), "pad": ""},
             {"type": "session", "version": 3, "id": s["id"], "timestamp": stamp(start), "cwd": str(cwd)},
@@ -103,56 +172,53 @@ class WaitingTake(base.Take):
         return path
 
     def build_workspace(self):
-        """harbor: the omp session beside a stand-in; atlas and beacon: stand-ins. Waits on the
-        stand-ins come from WAITS, through the CLI."""
-        shown = [s for s in base.SESSIONS if s["title"] in SHOWN]
+        """One tab per montage step: its omp on the left, its stand-ins split to the right."""
+        by_title = {s["title"]: s for s in base.SESSIONS}
         first = [b["id"] for b in self.blocks()]
-        cwd = str(self.home / "code" / "harbor")
-        # The omp extension calls the CLI with this environment: the film's state, never yours. The
-        # placeholder key lets omp restore the session's model; nobody prompts, so it's never used.
-        omp = ["env", f"HOME={self.home}", f"XDG_STATE_HOME={self.state}", f"PATH={self.env['PATH']}",
-               "ANTHROPIC_API_KEY=film-placeholder", OMP, "--resume", str(self.omp_file)]
-        made = json.loads(self.tern("new", "tab", "--json", "--cwd", cwd, "--", *omp))
-        self.omp_block = made["block"]
-        self.tern("rename", str(self.omp_block), "harbor")
-        tabs = {"harbor": self.omp_block}
-        for s in shown:
-            launch = ["--cwd", str(self.home / "code" / s["folder"]), "--", *self.pane_command(s["id"])]
-            if s["folder"] in tabs:
-                self.tern("split", str(tabs[s["folder"]]), "right", *launch)
-            else:
-                made = json.loads(self.tern("new", "tab", "--json", *launch))
-                tabs[s["folder"]] = made["block"]
-                self.tern("rename", str(made["block"]), s["folder"])
+        self.omp_blocks = []
+        for step in MONTAGE:
+            s = step["session"]
+            # The omp extension calls the CLI with this environment: the film's state, never yours.
+            # The placeholder key lets omp restore the session's model; nobody prompts, so it's never used.
+            omp = ["env", f"HOME={self.home}", f"XDG_STATE_HOME={self.state}", f"PATH={self.env['PATH']}",
+                   "ANTHROPIC_API_KEY=film-placeholder", OMP, "--resume", str(self.omp_files[s["id"]])]
+            made = json.loads(self.tern("new", "tab", "--json", "--cwd", str(self.home / "code" / s["folder"]),
+                                        "--", *omp))
+            self.omp_blocks.append(made["block"])
+            self.tern("rename", str(made["block"]), s["folder"])
+            for title in step["standins"]:
+                stand = by_title[title]
+                self.tern("split", str(made["block"]), "right", "--cwd", str(self.home / "code" / stand["folder"]),
+                          "--", *self.pane_command(stand["id"]))
         for block in first:
             self.tern("close", str(block))
         self.tern("rename", self.session_name(), "Demo workspace")
-        self.tabs = tabs
         time.sleep(1.5)
-        for _ in range(80):
+        for _ in range(120):
             self.panes = self.pane_processes()
-            if OMP_SESSION["id"] in self.panes:
+            if all(sid in self.panes for sid in self.omp_files):
                 break
             time.sleep(0.25)
         else:
-            raise RuntimeError("omp didn't start in its pane")
+            raise RuntimeError("an omp didn't start in its pane")
+        shown = [by_title[t] for step in MONTAGE for t in step["standins"]]
         with self.world_lock:
-            self.world = {"stateDir": str(self.state_dir),
-                          "agents": [self.live_record(s) for s in [OMP_SESSION, *shown]], "history": []}
+            self.world = {"stateDir": str(self.state_dir), "history": [],
+                          "agents": [self.live_record(s) for s in [*(m["session"] for m in MONTAGE), *shown]]}
             self.save_world()
         cli = [base.PYTHON, str(base.SCRIPTS / "codexbar_waiting.py")]
-        ids = {s["title"]: s for s in shown}
         for title, args in WAITS:
-            s = ids[title]
+            s = by_title[title]
             subprocess.run([*cli, "add", "--session", s["id"], "--cwd", str(self.home / "code" / s["folder"]), *args],
                            cwd=self.home / "code" / s["folder"], env=self.env, capture_output=True, text=True, check=True)
         subprocess.run([*cli, "tick"], env=self.env, capture_output=True, text=True, check=True)
-        # omp loads its extension and draws its conversation.
+        # The omps load their extension and draw their conversations.
         time.sleep(8)
 
     def pane_processes(self) -> dict[str, tuple[int, int]]:
-        """The stand-ins, as take_tern finds them, and the omp running OMP_SESSION's file."""
+        """The stand-ins, as take_tern finds them, and each omp running a montage session's file."""
         found = super().pane_processes()
+        files = {str(path): sid for sid, path in self.omp_files.items()}
         for proc in Path("/proc").iterdir():
             if not proc.name.isdigit():
                 continue
@@ -161,11 +227,12 @@ class WaitingTake(base.Take):
                 environ = (proc / "environ").read_bytes().split(b"\0")
             except OSError:
                 continue
-            if str(self.omp_file) not in argv or "--resume" not in argv or argv[0] == "env":
+            sid = next((files[a] for a in argv if a in files), None)
+            if sid is None or "--resume" not in argv or argv[0] == "env":
                 continue
             env = dict(e.decode().split("=", 1) for e in environ if b"=" in e)
             if env.get("TERN_PANE_SOCKET") == str(self.daemon_sock) and env.get("TERN_PANE", "").isdigit():
-                found[OMP_SESSION["id"]] = (int(proc.name), int(env["TERN_PANE"]))
+                found[sid] = (int(proc.name), int(env["TERN_PANE"]))
         return found
 
     def fast_forward(self, session: str, minutes: int):
@@ -190,11 +257,11 @@ class WaitingTake(base.Take):
                        env=self.env, capture_output=True, text=True, check=True)
 
     def film(self):
-        """The story: set the omp session aside in one line, the Waiting tab and its groups, a peek,
-        Snooze session, the wait coming back 20 minutes later, and the session with its card."""
+        """The story: four sessions set aside in one line each, the Waiting tab and its groups, a
+        peek, Snooze session, the two-day wait coming back, and that session with its card."""
         dash = (700, 40, 800, 430)
         omp_pane = (0, 40, 760, 640)
-        self.tern("focus", str(self.omp_block))
+        self.tern("focus", str(self.omp_blocks[0]))
         time.sleep(2.0)
         self.filming = True
         shooter = threading.Thread(target=self.shoot)
@@ -204,31 +271,30 @@ class WaitingTake(base.Take):
             self.caption("Set sessions aside", "Never lose why you stopped.")
             time.sleep(2.6)
 
-            self.caption("Set it aside", "One line: what it waits for, and why.")
-            self.cut(omp_pane)
-            self.type(SET_ASIDE, pause=0.06)
-            time.sleep(0.4)
-            self.key("Enter", "Enter")
-            time.sleep(2.2)
+            for i, step in enumerate(MONTAGE):
+                if i:
+                    self.tern("focus", str(self.omp_blocks[i]))
+                    time.sleep(0.8)
+                self.caption(*step["caption"])
+                self.cut(omp_pane)
+                time.sleep(0.6)
+                self.type(step["line"], pause=0.045)
+                time.sleep(0.5)
+                self.key("Enter", "Enter")
+                time.sleep(1.8)
 
-            self.caption("Waiting", "Code watches the wait. No tokens spent.")
+            self.caption("Waiting", "Code watches every wait. No tokens spent.")
             self.command("waiting", "Ctrl", "Alt", "W")
             self.cut(dash)
-            time.sleep(2.2)
+            time.sleep(2.4)
 
             self.caption("Waiting", "Grouped by who has the next step.")
             self.key("ArrowDown", "↓")
             time.sleep(0.4)
             self.key("Space", "Space")
             time.sleep(2.4)
-            self.key("Space", "Space")
-            time.sleep(0.3)
-
-            self.caption("Ask the agent", "\"Check it daily for a week\" works too.")
-            self.key("ArrowDown", "↓")
-            time.sleep(0.4)
-            self.key("Space", "Space")
-            time.sleep(2.2)
+            self.caption("Ask the agent", "\"Babysit the PR you just opened\" works too.")
+            time.sleep(2.4)
             self.key("Space", "Space")
             time.sleep(0.3)
 
@@ -238,12 +304,12 @@ class WaitingTake(base.Take):
             self.key("Escape", "Esc")
             time.sleep(0.6)
 
-            self.caption("20 minutes later", "It comes back when it's your turn.")
-            self.fast_forward(OMP_SESSION["id"], 20)
+            self.caption("Two days later", "It comes back when it's your turn.")
+            self.fast_forward(COMES_BACK["id"], 2 * 24 * 60)
             time.sleep(1.2)
-            for _ in range(6):
+            for _ in range(8):
                 self.key("ArrowUp", "↑")
-                time.sleep(0.15)
+                time.sleep(0.12)
             time.sleep(1.6)
 
             self.caption("Coming back", "Why you left, and what happened since.")

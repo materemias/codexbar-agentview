@@ -69,7 +69,7 @@ to run when the wait is over. Code watches the wait without spending tokens.
 When it fires, the session gets its prompt (Tern reopens it if you closed it),
 and a card over the pane tells you what happened while you were away.
 
-![Set sessions aside: an omp session set aside with one /wait line, the Waiting tab grouped by who has the next step, a peek at a daily repeat, the Snooze menu, the timer firing 20 minutes later, and the session's card over its pane](docs/waiting.gif)
+![Set sessions aside: four omp sessions set aside with one /wait line each (babysit a pull request, come back in two days, wait for a person's review, repeat a prompt daily for a week), the Waiting tab grouped by who has the next step, a peek at the babysat PR, the Snooze menu, the two-day wait coming back, and the session's card over its pane](docs/waiting.gif)
 
 What you can now leave alone:
 

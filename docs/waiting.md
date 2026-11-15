@@ -11,7 +11,7 @@ wait is over. Code watches the wait, not a model, so no tokens are spent until
 something happens. When it does, the session gets your prompt (Tern reopens it
 if you closed it), and a card tells you what happened while you were away.
 
-![An omp session set aside with one /wait line, the Waiting tab grouped by who has the next step, a peek at a daily repeat, the Snooze menu, the timer firing 20 minutes later, and the session's card over its pane](waiting.gif)
+![Four omp sessions set aside with one /wait line each (babysit a pull request, come back in two days, wait for a person's review, repeat a prompt daily for a week), the Waiting tab grouped by who has the next step, a peek at the babysat PR, the Snooze menu, the two-day wait coming back, and the session's card over its pane](waiting.gif)
 
 You don't have to learn any of this to use it. The agent has the same toolkit
 as a tool, so "babysit the PR you just opened" or "check every morning whether
