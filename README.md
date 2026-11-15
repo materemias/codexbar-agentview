@@ -69,6 +69,8 @@ to run when the wait is over. Code watches the wait without spending tokens.
 When it fires, the session gets its prompt (Tern reopens it if you closed it),
 and a card over the pane tells you what happened while you were away.
 
+![Set sessions aside: an omp session set aside with one /wait line, the Waiting tab grouped by who has the next step, a peek at a daily repeat, the Snooze menu, the timer firing 20 minutes later, and the session's card over its pane](docs/waiting.gif)
+
 What you can now leave alone:
 
 - A PR you opened: a review bot comments, the agent fixes what's real, and the
@@ -591,8 +593,8 @@ Build and test with `cmake -S . -B build -DCODEXBAR_BUILD_TESTS=ON`,
 with `python tests/run.py` (parallel; `-j N` sets the workers, names narrow
 it). Re-render the films with
 `uv run film/take_kde.py && uv run film/compose.py kde`, or `take_tern.py` and
-`compose.py tern`; the Tern take opens a window on a scratch daemon for about
-a minute.
+`compose.py tern`, or `take_waiting.py` and `compose.py waiting`; the Tern takes
+open a window on a scratch daemon for about a minute.
 
 ## License
 

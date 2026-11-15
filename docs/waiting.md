@@ -11,6 +11,8 @@ wait is over. Code watches the wait, not a model, so no tokens are spent until
 something happens. When it does, the session gets your prompt (Tern reopens it
 if you closed it), and a card tells you what happened while you were away.
 
+![An omp session set aside with one /wait line, the Waiting tab grouped by who has the next step, a peek at a daily repeat, the Snooze menu, the timer firing 20 minutes later, and the session's card over its pane](waiting.gif)
+
 You don't have to learn any of this to use it. The agent has the same toolkit
 as a tool, so "babysit the PR you just opened" or "check every morning whether
 the nightly build passed" is enough. See [Ask the agent](#ask-the-agent).
