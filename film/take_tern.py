@@ -216,6 +216,7 @@ def pane(work: Path, sid: str, resumed: bool) -> None:
 
 class Take:
     size = SIZE  # the window, in shot pixels
+    font = FONT  # Tern's font size, which its interface zooms by too
 
     def __init__(self, work: Path):
         self.work = work
@@ -414,7 +415,7 @@ class Take:
             time.sleep(0.25)
         self.ctl("ready")
         self.ctl("resize", str(self.size[0]), str(self.size[1]))
-        self.ctl("font", str(FONT))
+        self.ctl("font", str(self.font))
         self.ctl("css", "codexbar-agentview-film", str(self.work / "film.css"))
         # Opaque, as the README's screenshots: glass lets your desktop through.
         self.ctl("style", "solid")

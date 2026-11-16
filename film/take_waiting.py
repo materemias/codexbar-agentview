@@ -209,8 +209,10 @@ def user_text(message: dict) -> str:
 
 
 class WaitingTake(base.Take):
-    # The explainer's stage is about 4:3, and the window fills it.
-    size = (1180, 900)
+    # The explainer's stage is about 4:3. A window near its size is drawn almost 1:1, and the
+    # larger font keeps the conversation readable in the film.
+    size = (900, 690)
+    font = 16
 
     def prepare(self):
         super().prepare()
@@ -662,8 +664,25 @@ class WaitingTake(base.Take):
             card = {**back, "title": "The session card.",
                     "body": "It opens by itself when you come back to news, or with Ctrl+Alt+I."}
             self.chapter(**card)
+            # A float shows at its glance size until focused; focused, it grows to its content, as
+            # it does when you click into it to read it.
+            self.glide(x + w * 0.4, y + 14)
+            self.click()
+            tree = json.loads(self.tern("ls", "--json"))
+            floats = [b for s in tree["sessions"] if s.get("shown") for t in s["tabs"] if t.get("shown")
+                      for b in t["blocks"] if b.get("pip")]
+            if floats:
+                self.tern("focus", str(floats[0]["id"]))
+            else:
+                print("no floating block to focus:", self.blocks(), file=sys.stderr)
+            time.sleep(0.8)
+            x, y, w, h = self.wait_shown(CARD)
             self.mark((x, y, w, h))
-            self.cut((max(0, x - 60), max(0, y - 40), w + 100, h + 80))
+            # The window is drawn almost 1:1, so the camera only needs to come a little closer.
+            cw, ch = max(w + 100, self.size[0] * 0.7), max(h + 80, self.size[1] * 0.7)
+            cx = min(max(0, x + w / 2 - cw / 2), self.size[0] - cw)
+            cy = min(max(0, y + h / 2 - ch / 2), self.size[1] - ch)
+            self.cut((round(cx), round(cy), round(cw), round(ch)))
             time.sleep(1.0)
             self.chapter(**card, then=["Why you left, and when.", "Every wait, and what each one saw.",
                                        "What happened since, step by step.", "Seen, Snooze 1d, Stop and Close."])
