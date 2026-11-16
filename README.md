@@ -69,7 +69,7 @@ to run when the wait is over. Code watches the wait without spending tokens.
 When it fires, the session gets its prompt (Tern reopens it if you closed it),
 and a card over the pane tells you what happened while you were away.
 
-![Set sessions aside, one use case at a time, each explained beside the screen: asked in plain words, the agent babysits a pull request, sets a check on a migration (and the session is closed), and repeats a fleet check daily for a week; a task is put off with /wait later. Then the Waiting tab, Snooze session, a review landing on the PR that the agent fixes while parked until the PR is ready and then merged, and the migration finishing, which reopens the closed session so the agent can report](docs/waiting.gif)
+![Set sessions aside, one use case at a time, each explained beside the screen: asked in plain words, the agent babysits a pull request, sets a check on a migration (and the session is closed with Ctrl+Shift+W), and repeats a fleet check daily for a week; a task is put off with /wait later. Then the Waiting tab, Snooze session, a review landing on the PR that the agent fixes while parked until the PR is ready and then merged, and the migration finishing, which reopens the closed session so the agent can report. Last, the strip above the composer and the session card, each ringed and explained](docs/waiting.gif)
 
 What you can now leave alone:
 

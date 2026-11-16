@@ -27,6 +27,7 @@ The take (film/take_kde.py, film/take_tern.py) writes WORK/timeline.json:
                     click    surface
                     hide     surface (the pointer stays hidden until its next move)
                     key      keys: ["Super", "A"] or label: "harb"
+                    mark     surface, rect?: a ring around that rect of the screen; none clears it
     dots          explainer layout: how many progress dots the chapters fill
 
 Coordinates are shot pixels, before the crop. Needs ffmpeg, gifsicle optionally. Inter (SIL OFL)
@@ -356,6 +357,24 @@ def pointer(card: Image.Image, cam, device: Device, t: float):
     draw.polygon(pts, fill=(0, 0, 0, 255), outline=(255, 255, 255, 255), width=2 if size > 0.7 else 1)
 
 
+def mark(card: Image.Image, cam, device: Device, t: float):
+    """The device's latest `mark`: a ring around a rect of its screen that closes in as it starts."""
+    m = latest(events, t, lambda e: e["kind"] == "mark" and e.get("surface") == device.surface)
+    if not m or not m.get("rect"):
+        return
+    x, y, w, h = m["rect"]
+    x0, y0 = to_card(cam, *device.to_world(x, y))
+    x1, y1 = to_card(cam, *device.to_world(x + w, y + h))
+    q = ease_out((t - m["t"]) / 450)
+    pad = 9 + 14 * (1 - q)
+    draw = ImageDraw.Draw(card, "RGBA")
+    box = (x0 - pad, y0 - pad, x1 + pad, y1 + pad)
+    # PIL draws an outline inside its box: the glow's box is wider, so it lies outside the line.
+    glow = (box[0] - 6, box[1] - 6, box[2] + 6, box[3] + 6)
+    draw.rounded_rectangle(glow, radius=18 + pad, outline=(*BLUE, round(60 * q)), width=6)
+    draw.rounded_rectangle(box, radius=12 + pad, outline=(*BLUE, round(255 * q)), width=3)
+
+
 def render_card(t: float, cam, alpha: float) -> Image.Image:
     card = Image.new("RGBA", (card_w, card_h), (*CARD, 255))
     _, _, z = cam
@@ -382,6 +401,7 @@ def render_card(t: float, cam, alpha: float) -> Image.Image:
         if alpha < 1:
             layer.putalpha(layer.getchannel("A").point(lambda v: round(v * alpha)))
         card.alpha_composite(layer, (round(left + x0), round(top + y0)))
+        mark(card, cam, device, t)
         pointer(card, cam, device, t)
     return card
 

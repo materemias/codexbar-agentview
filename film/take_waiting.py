@@ -66,8 +66,10 @@ LATER_SESSION = omp_session(
     "How much work is it to group the logs by request instead of by host?",
     "About a day: the grouping, the filters and the tests all change. Worth doing on a quiet afternoon.")
 SESSIONS = [PR_SESSION, JOB_SESSION, ROLLOUT_SESSION, LATER_SESSION]
-# Two tabs, each with two of them side by side.
-TABS = [(PR_SESSION, JOB_SESSION), (ROLLOUT_SESSION, LATER_SESSION)]
+
+# The strip above the focused omp's composer, and the session card floating over its pane.
+STRIP = r"sf-dock[^>]*>div\.sf\.sf-col\.gap-none>div\.sf\.sf-row\.sf-act\.gap-sm\.al-center$"
+CARD = r"section\.tn-pane\.tn-float-card\.pip[.a-z-]*$"
 
 # The lines typed into each session, in its own words.
 PR_LINE = "babysit it until it's merged"
@@ -367,18 +369,15 @@ class WaitingTake(base.Take):
         return path
 
     def build_workspace(self):
-        """A tab per project, each with two omp sessions side by side."""
+        """A tab for each omp session."""
         first = [b["id"] for b in self.blocks()]
         self.blocks_of = {}
-        for left, right in TABS:
-            cwd = str(self.home / "code" / left["folder"])
-            omp = [str(self.bin / "omp-film"), "--resume"]
-            made = json.loads(self.tern("new", "tab", "--json", "--cwd", cwd, "--", *omp, left["id"]))
-            self.blocks_of[left["id"]] = made["block"]
-            self.tern("rename", str(made["block"]), left["folder"])
-            split = json.loads(self.tern("split", str(made["block"]), "right", "--json", "--cwd", cwd, "--",
-                                         *omp, right["id"]))
-            self.blocks_of[right["id"]] = split["block"]
+        omp = [str(self.bin / "omp-film"), "--resume"]
+        for s in SESSIONS:
+            cwd = str(self.home / "code" / s["folder"])
+            made = json.loads(self.tern("new", "tab", "--json", "--cwd", cwd, "--", *omp, s["id"]))
+            self.blocks_of[s["id"]] = made["block"]
+            self.tern("rename", str(made["block"]), s["folder"])
         for block in first:
             self.tern("close", str(block))
         self.tern("rename", self.session_name(), "Demo workspace")
@@ -479,7 +478,10 @@ class WaitingTake(base.Take):
         return next((w["state"] for w in self.waits(session) if (w.get("condition") or {}).get("until") == until), None)
 
     def close_session(self, s: dict):
-        """Closes the session's pane; the fixture then lists it as closed, as the scanner would."""
+        """Closes the session's pane with Tern's key; the fixture then lists it as closed, as the
+        scanner would."""
+        self.event("key", keys=["Ctrl", "Shift", "W"])
+        time.sleep(0.3)
         self.tern("close", str(self.blocks_of[s["id"]]))
         with self.world_lock:
             self.world["agents"] = [r for r in self.world["agents"] if r["sessionId"] != s["id"]]
@@ -506,6 +508,10 @@ class WaitingTake(base.Take):
     def chapter(self, title: str, **fields):
         """The explainer column's text from now on: step, title, body, say, then and dot."""
         self.event("chapter", title=title, **fields)
+
+    def mark(self, rect=None):
+        """Rings `rect` of the window on the stage until the next mark; none clears it."""
+        self.event("mark", surface="desktop", rect=[round(v) for v in rect] if rect else None)
 
     def ask(self, s: dict, line: str, after: float):
         """Puts `line` into the session's omp, sends it and gives the agent `after` seconds. The
@@ -547,7 +553,7 @@ class WaitingTake(base.Take):
             self.ask(JOB_SESSION, JOB_LINE, 5.0)
             self.chapter(**job, then=["The agent writes a check that passes when the job is done.",
                                       "You close the session. It reopens when the check passes."])
-            time.sleep(3.5)
+            time.sleep(3.0)
             self.close_session(JOB_SESSION)
             time.sleep(3.0)
 
@@ -634,13 +640,35 @@ class WaitingTake(base.Take):
             while time.monotonic() < end and "billing migration finished" not in \
                     (self.work / "model.log").read_text()[reported:].lower():
                 time.sleep(0.5)
-            time.sleep(6.0)
+            time.sleep(4.0)
 
-            # Focusing a session with a wait back on you opens its card by itself.
-            self.chapter(dot=4, step="Coming back", title="Why you left, and what happened since.",
-                         body="Focus a session with news and its card opens: your sentence, its waits "
-                         "and what each one saw.")
-            time.sleep(6.5)
+            # What you see in a session you come back to: the strip, then the card, which opened
+            # by itself on focusing a session with a wait back on you.
+            back = {"dot": 4, "step": "Coming back"}
+            strip = {**back, "title": "A strip above the composer.",
+                     "body": "Every set-aside session shows it while you work in it."}
+            self.chapter(**strip)
+            self.mark(self.wait_shown(STRIP))
+            time.sleep(2.0)
+            self.chapter(**strip, then=["Your sentence first, then what it waits for and what came back.",
+                                        "Green when something came back, amber when it needs you.",
+                                        "The badge says whether the session is safe to close."])
+            time.sleep(7.0)
+            try:
+                x, y, w, h = self.wait_shown(CARD, 3.0)
+            except RuntimeError:
+                self.command("session_card", "Ctrl", "Alt", "I")
+                x, y, w, h = self.wait_shown(CARD)
+            card = {**back, "title": "The session card.",
+                    "body": "It opens by itself when you come back to news, or with Ctrl+Alt+I."}
+            self.chapter(**card)
+            self.mark((x, y, w, h))
+            self.cut((max(0, x - 60), max(0, y - 40), w + 100, h + 80))
+            time.sleep(1.0)
+            self.chapter(**card, then=["Why you left, and when.", "Every wait, and what each one saw.",
+                                       "What happened since, step by step.", "Seen, Snooze 1d, Stop and Close."])
+            time.sleep(7.5)
+            self.mark()
 
             self.chapter("Set sessions aside", body="Ask the agent in your own words, or type /wait. "
                          "Works in omp, best in Tern.")
