@@ -596,6 +596,10 @@ class WaitingTake(base.Take):
             time.sleep(3.0)
             self.ask(LATER_SESSION, LATER_LINE, 2.5)
             self.command("waiting", "Ctrl", "Alt", "W")
+            # The dashboard opens as the tab's right half, too narrow at the film's window size;
+            # zoomed, it has the window, as Tern's zoom key would give it.
+            time.sleep(0.8)
+            self.ctl("zoom")
             self.chapter(**later, then=["The Waiting tab groups every session by who has the next step."])
             time.sleep(5.0)
             self.chapter(**later, then=["The Waiting tab groups every session by who has the next step.",
