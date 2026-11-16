@@ -4234,12 +4234,14 @@ tern.block.define("dashboard", {
 
 -- Native preferences --------------------------------------------------------
 
+-- Icons from Tern's own 16px set, so they share its stroke and box; names outside it fall back to
+-- glyphs that sit off the line.
 local SETTINGS_PAGES = {
-	{ id = "usage", label = "Usage", icon = "gauge" },
-	{ id = "providers", label = "Providers", icon = "cloud" },
+	{ id = "usage", label = "Usage", icon = "chart" },
+	{ id = "providers", label = "Providers", icon = "server" },
 	{ id = "agents", label = "Agents", icon = "users" },
 	{ id = "general", label = "General", icon = "sliders" },
-	{ id = "about", label = "About", icon = "info" },
+	{ id = "about", label = "About", icon = "globe" },
 }
 local SETTINGS_LEADS = {
 	usage = "Choose the details shown in the Usage tab. Changes save immediately.",
@@ -4524,19 +4526,9 @@ end
 -- or a window over the pane, as Tern's own settings say.
 function prefs.layer(s: Settings): Node
 	local sections = settingsSections(s)
-	local pages = {}
-	for _, page in SETTINGS_PAGES do
-		local changed = 0
-		for _, row in SETTINGS_ROWS do
-			if row.page == page.id and rowValue(row) ~= rowValue(row, true) then
-				changed += 1
-			end
-		end
-		table.insert(pages, { id = page.id, label = page.label, icon = page.icon, changed = changed })
-	end
 	local editing = s.editing
 	return ui.col({ ui.node("prefs", {
-		key = "settings", title = "CodexBar AgentView Settings", pages = pages, page = s.page,
+		key = "settings", title = "CodexBar AgentView Settings", pages = SETTINGS_PAGES, page = s.page,
 		-- Native controls consume their clicks; search and whitespace reach this action.
 		actions = { click = "search_focus" },
 		lead = SETTINGS_LEADS[s.page],
