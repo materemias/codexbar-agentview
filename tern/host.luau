@@ -472,6 +472,17 @@ local store = {
 	hidable = nil :: any, -- (r) -> boolean, set beside waitingOpen
 }
 
+-- The settings dialog's state, while it is open over a dashboard (in its layer).
+type Settings = {
+	cx: BlockCx, -- the dashboard's
+	page: string,
+	query: string,
+	cursor: number,
+	searching: boolean,
+	focus: string?,
+	editing: { row: string, draft: string, cursor: number }?,
+}
+
 type Block = {
 	cx: BlockCx,
 	tab: string,
@@ -482,26 +493,15 @@ type Block = {
 	busy: string?,
 	stopArmed: { key: string, at: number }?, -- the Waiting row whose Stop waits the next press within 4 s confirms
 	closed: boolean?,
+	settings: Settings?, -- the settings dialog, when open
 }
 
 local blocks: { [number]: Block } = {}
-
-type SettingsBlock = {
-	cx: BlockCx,
-	page: string,
-	query: string,
-	cursor: number,
-	searching: boolean,
-	focus: string?,
-	editing: { row: string, draft: string, cursor: number }?,
-}
-local settingsBlocks: { [number]: SettingsBlock } = {}
+-- The settings dialog (Native preferences, below the dashboard): new, layer, key and event.
+local prefs: { [string]: any } = {}
 
 local function renderAll()
 	for _, b in blocks do
-		b.cx:render()
-	end
-	for _, b in settingsBlocks do
 		b.cx:render()
 	end
 end
@@ -1538,9 +1538,6 @@ local function publishOpen()
 	for pane, b in blocks do
 		table.insert(open, { pane = pane, tab = b.tab, kind = "dashboard" })
 	end
-	for pane in settingsBlocks do
-		table.insert(open, { pane = pane, kind = "settings" })
-	end
 	table.sort(open, function(a, b)
 		return a.pane < b.pane
 	end)
@@ -2129,11 +2126,6 @@ local function prune()
 			blocks[pane] = nil
 		end
 	end
-	for pane in settingsBlocks do
-		if not live[pane] then
-			settingsBlocks[pane] = nil
-		end
-	end
 end
 
 local function applyGoto()
@@ -2143,12 +2135,11 @@ local function applyGoto()
 	end
 	store.lastGoto = g.seq
 	local target = tonumber(g.pane)
-	-- From the window half's openSettings: its open settings tab turns to a page and row.
-	local s = if target then settingsBlocks[target] else nil
-	if s and type(g.page) == "string" then
-		local focus = if type(g.focus) == "string" and g.focus ~= "" then g.focus else nil
-		s.page, s.query, s.cursor, s.focus, s.editing, s.searching = g.page, "", 0, focus, nil, focus == nil
-		s.cx:render()
+	-- From the window half's openSettings: its dashboard opens the settings dialog.
+	local d = if target then blocks[target] else nil
+	if d and g.settings == true then
+		d.settings = d.settings or prefs.new(d.cx)
+		d.cx:render()
 		return
 	end
 	if not target or not table.find(store.tabs(), g.tab) then
@@ -3708,7 +3699,7 @@ local function closeBlock(b: Block)
 end
 
 -- Layout work belongs to the window half; the dashboard's window takes this up
--- like `settingsRequest`, at once through the link, else on its poll. A target
+-- at once through the link, else on its poll. A target
 -- gone from every window is said here, where every pane is known; `at` lets a
 -- window that sees the request late drop it.
 local function waitingRequest(b: Block, request: { [string]: any })
@@ -3968,10 +3959,10 @@ local function act(b: Block, name: string)
 		fetchUsage()
 		scanAgents(true)
 	elseif name == "settings" then
-		tern.kv.set("settingsRequest", { pane = b.cx.pane, seq = tern.now() })
+		b.settings = b.settings or prefs.new(b.cx)
 	elseif name == "setup_settings" then
-		-- The setup panel's: settings on the CLI path, in a new tab or the window's open one (applyGoto).
-		tern.kv.set("settingsRequest", { pane = b.cx.pane, seq = tern.now(), page = "general", focus = "cliPath" })
+		-- The setup panel's: the dialog on the CLI path.
+		b.settings = prefs.new(b.cx, "general", "cliPath")
 	elseif name == "usage_off" then
 		if setting("usage") then -- a second press on a panel not yet redrawn changes nothing
 			store.writeSetting("usage", false)
@@ -4033,12 +4024,18 @@ end
 
 tern.block.define("dashboard", {
 	init = function(cx: BlockCx, args: { string }, saved: any): Block
-		-- A restart (plugin reload, daemon restart) keeps the tab shown; a new block opens on its launch argument.
+		-- A restart (plugin reload, daemon restart) keeps the tab shown and the settings dialog
+		-- open; a new block opens on its launch arguments: a tab, then "settings" to open the dialog.
 		local tab = if type(saved) == "table" then saved.tab else args[1]
 		if not table.find(store.tabs(), tab) then
 			tab = "agents"
 		end
 		local b: Block = { cx = cx, tab = tab, sel = nil, peek = false, filter = "", launched = {}, busy = nil }
+		if type(saved) == "table" and type(saved.settings) == "string" then
+			b.settings = prefs.new(cx, saved.settings)
+		elseif type(saved) ~= "table" and args[2] == "settings" then
+			b.settings = prefs.new(cx)
+		end
 		blocks[cx.pane] = b
 		publishOpen()
 		if not store.usage then
@@ -4107,10 +4104,19 @@ tern.block.define("dashboard", {
 			-- of the pane; this box is absolutely sized to the region and gives the list the rest.
 			main = { ui.el("div", { key = "fill", class = "cb-fill" }, main) }
 		end
-		return { main = withp(ui.col(main), { role = "codexbar.main" }), dock = dockView(b, now) }
+		return {
+			main = withp(ui.col(main), { role = "codexbar.main" }),
+			-- The dock's key hints and status are the dashboard's: the dialog over it takes the keys.
+			dock = if b.settings then nil else dockView(b, now),
+			layer = if b.settings then prefs.layer(b.settings) else nil,
+		}
 	end,
 
 	key = function(b: Block, k: Key, cx: BlockCx): boolean?
+		-- The settings dialog is modal: it takes every key while open.
+		if b.settings then
+			return prefs.key(b.settings, k)
+		end
 		local name = k.name
 		if k.ctrl or k.alt or k.meta then
 			return false
@@ -4200,6 +4206,11 @@ tern.block.define("dashboard", {
 	end,
 
 	event = function(b: Block, ev: UiEvent, cx: BlockCx)
+		-- The layer holds only the settings dialog.
+		if b.settings and type(ev.id) == "string" and string.sub(ev.id, 1, 6) == "layer." then
+			prefs.event(b.settings, ev)
+			return
+		end
 		if ev.ev == "select" and type(ev.item) == "string" and table.find(store.tabs(), ev.item) then
 			b.tab = ev.item
 			b.sel = nil
@@ -4217,7 +4228,7 @@ tern.block.define("dashboard", {
 	end,
 
 	save = function(b: Block): any
-		return { tab = b.tab }
+		return { tab = b.tab, settings = if b.settings then b.settings.page else nil }
 	end,
 })
 
@@ -4294,7 +4305,7 @@ local function rowValue(row: any, defaults: boolean?): any
 	return if defaults then DEFAULTS[row.id] else setting(row.id)
 end
 
-local function settingsSections(b: SettingsBlock): ({ any }, { any })
+local function settingsSections(b: Settings): ({ any }, { any })
 	local sections, rows = {}, {}
 	local query = string.lower(b.query)
 	for _, row in SETTINGS_ROWS do
@@ -4341,7 +4352,7 @@ local function settingsSections(b: SettingsBlock): ({ any }, { any })
 	return sections, rows
 end
 
-local function saveSetting(b: SettingsBlock, row: any, value: any): boolean
+local function saveSetting(b: Settings, row: any, value: any): boolean
 	if row.kind == "action" then
 		return false
 	end
@@ -4453,7 +4464,7 @@ local function editSettingsText(text: string, cursor: number, k: Key): (string, 
 	return text, cursor, false
 end
 
-local function focusSettingsRow(b: SettingsBlock, delta: number)
+local function focusSettingsRow(b: Settings, delta: number)
 	local _, rows = settingsSections(b)
 	local i = 0
 	if not b.searching then
@@ -4470,7 +4481,7 @@ local function focusSettingsRow(b: SettingsBlock, delta: number)
 	b.editing = nil
 end
 
-local function activateSetting(b: SettingsBlock, row: any)
+local function activateSetting(b: Settings, row: any)
 	b.focus = row.id
 	b.searching = false
 	if row.kind == "action" then
@@ -4492,139 +4503,127 @@ local function activateSetting(b: SettingsBlock, row: any)
 	end
 end
 
-local function closeSettings(b: SettingsBlock)
-	settingsBlocks[b.cx.pane] = nil
-	publishOpen()
-	pcall(b.cx.exit, b.cx, 0)
+local function closeSettings(s: Settings)
+	local b = blocks[s.cx.pane]
+	if b then
+		b.settings = nil
+	end
 end
 
-tern.block.define("settings", {
-	init = function(cx: BlockCx, args: { string }, saved: any): SettingsBlock
-		-- A new tab opens on its launch arguments, a page and a row to focus (the usage setup panel's).
-		args = args or {}
-		local page = if type(saved) == "table" then saved.page else args[1]
-		-- With usage tracking off, General holds its switch; the Usage page shows nothing it applies to.
-		if not SETTINGS_LEADS[page] then
-			page = if setting("usage") then "usage" else "general"
-		end
-		local focus = if type(saved) ~= "table" and SETTINGS_BY_ID[args[2]] then args[2] else nil
-		local b: SettingsBlock = { cx = cx, page = page, query = "", cursor = 0, searching = focus == nil, focus = focus, editing = nil }
-		settingsBlocks[cx.pane] = b
-		publishOpen()
-		return b
-	end,
+-- Opens on `page`, else Usage (General with usage tracking off: the Usage page then shows
+-- nothing it applies to), with the row `focus` selected, else the search field.
+function prefs.new(cx: BlockCx, page: string?, focus: string?): Settings
+	if not (page and SETTINGS_LEADS[page]) then
+		page = if setting("usage") then "usage" else "general"
+	end
+	local row = if focus and SETTINGS_BY_ID[focus] then focus else nil
+	return { cx = cx, page = page :: string, query = "", cursor = 0, searching = row == nil, focus = row, editing = nil }
+end
 
-	title = function(_b: SettingsBlock): string?
-		return "CodexBar AgentView · Settings"
-	end,
-
-	view = function(b: SettingsBlock, _cx: BlockCx): BlockView
-		local sections = settingsSections(b)
-		local pages = {}
-		for _, page in SETTINGS_PAGES do
-			local changed = 0
-			for _, row in SETTINGS_ROWS do
-				if row.page == page.id and rowValue(row) ~= rowValue(row, true) then
-					changed += 1
-				end
+-- In the dashboard's layer Tern draws the dialog as it draws omp's settings: a sheet,
+-- or a window over the pane, as Tern's own settings say.
+function prefs.layer(s: Settings): Node
+	local sections = settingsSections(s)
+	local pages = {}
+	for _, page in SETTINGS_PAGES do
+		local changed = 0
+		for _, row in SETTINGS_ROWS do
+			if row.page == page.id and rowValue(row) ~= rowValue(row, true) then
+				changed += 1
 			end
-			table.insert(pages, { id = page.id, label = page.label, icon = page.icon, changed = changed })
 		end
-		local editing = b.editing
-		return { main = ui.col({ ui.node("prefs", {
-			key = "settings", title = "CodexBar AgentView Settings", pages = pages, page = b.page,
-			-- Native controls consume their clicks; search and whitespace reach this action.
-			actions = { click = "search_focus" },
-			lead = SETTINGS_LEADS[b.page],
-			sections = sections, query = b.query, focus = b.focus,
-			cursor = if b.searching then prefsCursor(b.query, b.cursor) else nil,
-			editing = if editing then { row = editing.row, draft = editing.draft, cursor = prefsCursor(editing.draft, editing.cursor) } else nil,
-		}) }) }
-	end,
+		table.insert(pages, { id = page.id, label = page.label, icon = page.icon, changed = changed })
+	end
+	local editing = s.editing
+	return ui.col({ ui.node("prefs", {
+		key = "settings", title = "CodexBar AgentView Settings", pages = pages, page = s.page,
+		-- Native controls consume their clicks; search and whitespace reach this action.
+		actions = { click = "search_focus" },
+		lead = SETTINGS_LEADS[s.page],
+		sections = sections, query = s.query, focus = s.focus,
+		cursor = if s.searching then prefsCursor(s.query, s.cursor) else nil,
+		editing = if editing then { row = editing.row, draft = editing.draft, cursor = prefsCursor(editing.draft, editing.cursor) } else nil,
+	}) })
+end
 
-	key = function(b: SettingsBlock, k: Key, _cx: BlockCx): boolean?
-		if k.name == "escape" then
-			if b.editing then
-				b.editing = nil
-			elseif b.query ~= "" then
-				b.query, b.cursor, b.focus, b.searching = "", 0, nil, true
-			else
-				closeSettings(b)
+function prefs.key(s: Settings, k: Key): boolean
+	if k.name == "escape" then
+		if s.editing then
+			s.editing = nil
+		elseif s.query ~= "" then
+			s.query, s.cursor, s.focus, s.searching = "", 0, nil, true
+		else
+			closeSettings(s)
+		end
+		return true
+	elseif k.ctrl and k.name == "f" then
+		s.editing, s.focus, s.searching = nil, nil, true
+		return true
+	elseif k.name == "tab" or k.name == "up" or k.name == "down" then
+		focusSettingsRow(s, if k.name == "up" or (k.name == "tab" and k.shift) then -1 else 1)
+		return true
+	end
+	if s.editing then
+		local edit = s.editing
+		if k.name == "enter" then
+			if saveSetting(s, SETTINGS_BY_ID[edit.row], edit.draft) then
+				s.editing = nil
 			end
 			return true
-		elseif k.ctrl and k.name == "f" then
-			b.editing, b.focus, b.searching = nil, nil, true
-			return true
-		elseif k.name == "tab" or k.name == "up" or k.name == "down" then
-			focusSettingsRow(b, if k.name == "up" or (k.name == "tab" and k.shift) then -1 else 1)
-			return true
 		end
-		if b.editing then
-			local edit = b.editing
-			if k.name == "enter" then
-				if saveSetting(b, SETTINGS_BY_ID[edit.row], edit.draft) then
-					b.editing = nil
-				end
-				return true
-			end
-			local handled
-			edit.draft, edit.cursor, handled = editSettingsText(edit.draft, edit.cursor, k)
-			return handled
-		end
-		if k.ctrl or k.alt or k.meta then
-			if not (b.searching and k.ctrl and k.name == "a") then
-				return false
-			end
-		end
-		local row = b.focus and SETTINGS_BY_ID[b.focus]
-		if not b.searching and row then
-			if k.name == "space" or k.name == "enter" then
-				activateSetting(b, row)
-				return true
-			elseif k.name == "delete" then
-				saveSetting(b, row, tern.json.null)
-				return true
-			elseif row.kind == "number" and (k.text == "+" or k.text == "-" or k.name == "+" or k.name == "-") then
-				local limits = NUMBER_LIMITS[row.id]
-				saveSetting(b, row, math.clamp(rowValue(row) + (if k.text == "-" or k.name == "-" then -1 else 1), limits[1], limits[2]))
-				return true
-			end
-		end
-		-- Typing off a control always starts/continues search.
-		local text, cursor, handled = editSettingsText(b.query, b.cursor, k)
-		if handled then
-			b.query, b.cursor, b.focus, b.searching = text, cursor, nil, true
-		end
+		local handled
+		edit.draft, edit.cursor, handled = editSettingsText(edit.draft, edit.cursor, k)
 		return handled
-	end,
-
-	event = function(b: SettingsBlock, ev: UiEvent, _cx: BlockCx)
-		local row = if type(ev.item) == "string" then SETTINGS_BY_ID[ev.item] else nil
-		if ev.ev == "change" and row then
-			b.focus, b.searching, b.editing = row.id, false, nil
-			saveSetting(b, row, ev.value)
-		elseif ev.ev == "activate" and row then
-			activateSetting(b, row)
-		elseif ev.ev == "select" and row then
-			b.focus, b.searching, b.editing = row.id, false, nil
-		elseif ev.ev == "action" and ev.act == "open_github" and type(ev.value) == "string" then
-			local actionRow = SETTINGS_BY_ID[ev.value]
-			if actionRow and actionRow.kind == "action" then
-				activateSetting(b, actionRow)
-			end
-		elseif ev.ev == "action" and ev.act == "page" and type(ev.value) == "string" and SETTINGS_LEADS[ev.value] then
-			b.page, b.query, b.cursor, b.focus, b.editing, b.searching = ev.value, "", 0, nil, nil, true
-		elseif (ev.ev == "action" and ev.act == "search_focus") or ev.ev == "focus" then
-			b.focus, b.editing, b.searching = nil, nil, true
-		elseif ev.ev == "action" and ev.act == "close" and (ev.value == nil or ev.value == tern.json.null) then
-			closeSettings(b)
+	end
+	if k.ctrl or k.alt or k.meta then
+		if not (s.searching and k.ctrl and k.name == "a") then
+			return false
 		end
-	end,
+	end
+	local row = s.focus and SETTINGS_BY_ID[s.focus]
+	if not s.searching and row then
+		if k.name == "space" or k.name == "enter" then
+			activateSetting(s, row)
+			return true
+		elseif k.name == "delete" then
+			saveSetting(s, row, tern.json.null)
+			return true
+		elseif row.kind == "number" and (k.text == "+" or k.text == "-" or k.name == "+" or k.name == "-") then
+			local limits = NUMBER_LIMITS[row.id]
+			saveSetting(s, row, math.clamp(rowValue(row) + (if k.text == "-" or k.name == "-" then -1 else 1), limits[1], limits[2]))
+			return true
+		end
+	end
+	-- Typing off a control always starts/continues search.
+	local text, cursor, handled = editSettingsText(s.query, s.cursor, k)
+	if handled then
+		s.query, s.cursor, s.focus, s.searching = text, cursor, nil, true
+	end
+	return handled
+end
 
-	save = function(b: SettingsBlock): any
-		return { page = b.page }
-	end,
-})
+function prefs.event(s: Settings, ev: UiEvent)
+	local row = if type(ev.item) == "string" then SETTINGS_BY_ID[ev.item] else nil
+	if ev.ev == "change" and row then
+		s.focus, s.searching, s.editing = row.id, false, nil
+		saveSetting(s, row, ev.value)
+	elseif ev.ev == "activate" and row then
+		activateSetting(s, row)
+	elseif ev.ev == "select" and row then
+		s.focus, s.searching, s.editing = row.id, false, nil
+	elseif ev.ev == "action" and ev.act == "open_github" and type(ev.value) == "string" then
+		local actionRow = SETTINGS_BY_ID[ev.value]
+		if actionRow and actionRow.kind == "action" then
+			activateSetting(s, actionRow)
+		end
+	elseif ev.ev == "action" and ev.act == "page" and type(ev.value) == "string" and SETTINGS_LEADS[ev.value] then
+		s.page, s.query, s.cursor, s.focus, s.editing, s.searching = ev.value, "", 0, nil, nil, true
+	elseif (ev.ev == "action" and ev.act == "search_focus") or ev.ev == "focus" then
+		s.focus, s.editing, s.searching = nil, nil, true
+	elseif ev.ev == "action" and ev.act == "close" and (ev.value == nil or ev.value == tern.json.null) then
+		closeSettings(s)
+	end
+end
 
 local initialGoto = tern.kv.get("goto")
 store.lastGoto = if type(initialGoto) == "table" then initialGoto.seq else nil

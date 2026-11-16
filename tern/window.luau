@@ -1,10 +1,10 @@
 -- Window half of the CodexBar AgentView plugin: widget bar widgets and status segments, palette commands,
 -- and the pane you came from, which the dashboard marks with a ring.
 --
--- The host half publishes `summary` (widget bar and status data) and `settingsRequest`
--- (dashboard settings button) through `tern.kv`; this half answers with `goto`
--- (switch a dashboard tab, or turn a settings tab to a page and row) and `focus`
--- (the last focused pane that is not a CodexBar AgentView block).
+-- The host half publishes `summary` (widget bar and status data) through
+-- `tern.kv`; this half answers with `goto` (switch a dashboard tab, or open its
+-- settings dialog) and `focus` (the last focused pane that is not a CodexBar
+-- AgentView block).
 --
 -- For sessions set aside it adds the set-aside command, which on an omp pane asks
 -- the omp extension to open its menu and elsewhere shows Tern's own picker, and
@@ -21,7 +21,6 @@
 -- daemon. Layout work therefore goes through the window API only.
 
 local KIND = "codexbar-agentview.dashboard"
-local SETTINGS_KIND = "codexbar-agentview.settings"
 local CANVAS_KIND = "tern.canvas"
 local SCRIPTS = tern.plugin.dir .. "/../contents/scripts"
 local WINDOWS = tern.runtime.os == "windows"
@@ -282,31 +281,36 @@ local function placeDashboard(cx: WindowCx, o: Popup)
 	again()
 end
 
+-- Opens a new dashboard beside the rightmost pane; `args` are its launch arguments.
+local function openDashboard(cx: WindowCx, args: { string })
+	-- A dashboard closing right now never restores: nothing waits for it.
+	if opened then
+		opened = nil
+		restoreFinished(cx)
+	end
+	-- Capture the original layout before creating the dashboard.
+	local snap = cx.layout:snapshot()
+	local pane = cx:new_block(KIND, args, "beside", { focus = true })
+	if pane then
+		local o: Popup = {
+			pane = pane, snap = snap, deadline = tern.now() + 3000,
+			restoreBy = 0, restoring = false, placing = true, closed = false,
+			equalized = false, moves = 0, targets = {},
+		}
+		opened = o
+		tern.timer(0, function(cx2)
+			if cx2 then
+				placeDashboard(cx2, o)
+			end
+		end)
+	end
+end
+
 -- Opens the dashboard on `tab`; on the shown, focused tab it closes it, like a popup.
 local function toggle(cx: WindowCx, tab: string)
 	local info, shown = dashboard(cx)
 	if not info then
-		-- A dashboard closing right now never restores: nothing waits for it.
-		if opened then
-			opened = nil
-			restoreFinished(cx)
-		end
-		-- Capture the original layout before creating the dashboard.
-		local snap = cx.layout:snapshot()
-		local pane = cx:new_block(KIND, { tab }, "beside", { focus = true })
-		if pane then
-			local o: Popup = {
-				pane = pane, snap = snap, deadline = tern.now() + 3000,
-				restoreBy = 0, restoring = false, placing = true, closed = false,
-				equalized = false, moves = 0, targets = {},
-			}
-			opened = o
-			tern.timer(0, function(cx2)
-				if cx2 then
-					placeDashboard(cx2, o)
-				end
-			end)
-		end
+		openDashboard(cx, { tab })
 		return
 	end
 	if info.focused and shown == tab then
@@ -319,19 +323,18 @@ local function toggle(cx: WindowCx, tab: string)
 	end
 end
 
--- Settings are a persistent tab, not a dashboard sidebar. `args` (a page and a row)
--- opens a new one there, or turns this window's open one (the host's applyGoto).
-local function openSettings(cx: WindowCx, args: { string }?)
-	for _, p in cx.session:panes() do
-		if p.block == SETTINGS_KIND then
-			if args then
-				tern.kv.set("goto", { pane = p.pane, page = args[1], focus = args[2], seq = tern.now() })
-			end
-			cx.layout:focus(p.pane)
-			return
-		end
+-- Settings are a dialog over the dashboard, as omp's are over omp: this window's
+-- dashboard opens it (the host's applyGoto), else a new dashboard opens with it.
+local function openSettings(cx: WindowCx)
+	local info = dashboard(cx)
+	if not info then
+		openDashboard(cx, { "agents", "settings" })
+		return
 	end
-	cx:new_block(SETTINGS_KIND, args, "tab", { focus = true })
+	tern.kv.set("goto", { pane = info.pane, settings = true, seq = tern.now() })
+	if not info.focused then
+		cx.layout:focus(info.pane)
+	end
 end
 
 tern.command({ id = "agents", title = "CodexBar AgentView: Agents", icon = "users", keys = { "ctrl+alt+a" }, run = function(cx)
@@ -498,7 +501,7 @@ local function remember(cx: WindowCx, pane: number?)
 		return
 	end
 	local info = paneInfo(cx, pane)
-	if info and info.block ~= KIND and info.block ~= SETTINGS_KIND and info.block ~= CANVAS_KIND and tern.kv.get("focus") ~= pane then
+	if info and info.block ~= KIND and info.block ~= CANVAS_KIND and tern.kv.get("focus") ~= pane then
 		tern.kv.set("focus", pane)
 	end
 end
@@ -1324,7 +1327,7 @@ end
 local function focusedTarget(cx: WindowCx): (number?, PaneInfo?)
 	local pane = cx.session:focused()
 	local info = if pane then paneInfo(cx, pane) else nil
-	if info and (info.block == KIND or info.block == SETTINGS_KIND or info.block == CANVAS_KIND) then
+	if info and (info.block == KIND or info.block == CANVAS_KIND) then
 		pane = tonumber(tern.kv.get("focus"))
 		info = if pane then paneInfo(cx, pane) else nil
 	end
@@ -2289,8 +2292,6 @@ end)
 
 -- Redraws the widgets and status segment when the host publishes a new summary.
 local summarySig = ""
-local initialSettingsRequest = tern.kv.get("settingsRequest")
-local lastSettingsRequest = if type(initialSettingsRequest) == "table" then initialSettingsRequest.seq else nil
 local initialWaitingRequest = tern.kv.get("waitingRequest")
 local lastWaitingRequest = if type(initialWaitingRequest) == "table" then initialWaitingRequest.seq else nil
 -- A request no window took up within this long is dropped: the target may come
@@ -2455,14 +2456,6 @@ local function poll(cx: WindowCx?)
 	end
 	if cx then
 		restoreLayout(cx)
-		local request = tern.kv.get("settingsRequest")
-		if type(request) == "table" and type(request.pane) == "number" and request.seq ~= lastSettingsRequest then
-			local info = paneInfo(cx, request.pane)
-			if info and info.block == KIND then
-				lastSettingsRequest = request.seq
-				openSettings(cx, if type(request.page) == "string" then { request.page, if type(request.focus) == "string" then request.focus else "" } else nil)
-			end
-		end
 		for _, step in { waitingRequest, dropOrphanCards, lead, publishPanes, refreshCards } do
 			local ok, err = pcall(step, cx)
 			if not ok then

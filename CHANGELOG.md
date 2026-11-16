@@ -32,6 +32,7 @@
 - Usage tracking can be turned off; without the `codexbar` CLI, the usage area says what to install.
 - Windows support for the Tern extension, the omp extension and the helpers; usage comes from Meridian only.
 - Tern dashboard buttons no longer show their keys; the footer lists them.
+- Tern settings open as a dialog over the dashboard, in the style of Tern's and omp's own, instead of a tab.
 
 ### Fixes
 

@@ -13,9 +13,3 @@ id = "dashboard"
 title = "CodexBar AgentView"
 icon = "gauge"
 palette = true
-
-[[blocks]]
-id = "settings"
-title = "CodexBar AgentView Settings"
-icon = "sliders"
-palette = true

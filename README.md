@@ -55,7 +55,7 @@ CodexBar module.
 
 | Usage | Agents | History | Settings |
 | :---: | :---: | :---: | :---: |
-| [![Tern usage](docs/tern/usage.png)](docs/tern/usage.png) | [![Tern agents](docs/tern/agents.png)](docs/tern/agents.png) | [![Tern history](docs/tern/history.png)](docs/tern/history.png) | [![Tern settings](docs/tern/settings-general.png)](docs/tern/settings-general.png) |
+| [![Tern usage](docs/tern/usage.png)](docs/tern/usage.png) | [![Tern agents](docs/tern/agents.png)](docs/tern/agents.png) | [![Tern history](docs/tern/history.png)](docs/tern/history.png) | [![Tern settings](docs/tern/settings.png)](docs/tern/settings.png) |
 
 </details>
 
@@ -374,7 +374,8 @@ focus anything else, putting the layout back as it was. Palette commands
 `CodexBar AgentView: Agents`, `Usage`, `Waiting`, `History`, `Settings`,
 `Set aside…` and `Install omp extension` cover what the
 keys do not. Settings, also at the right of the dashboard's status bar,
-opens a native tab with search; **Include non-Tern agents** (off by default)
+opens over the dashboard as a dialog in the style of Tern's and omp's own
+settings, with search; **Include non-Tern agents** (off by default)
 adds kitty, VS Code and other hosts. Desktop notifications and the panel are
 Plasma-only.
 

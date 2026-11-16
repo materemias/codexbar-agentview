@@ -636,31 +636,28 @@ class Take:
                 return e["rect"]
         raise RuntimeError(f"no visible element matches {pattern}")
 
-    def wait_open(self, kind: str, timeout=5.0):
-        """Waits until the plugin reports one of its `kind` blocks open (its `open` key)."""
-        kv = self.config / "plugin-data/codexbar-agentview/kv.json"
+    def wait_shown(self, pattern: str, timeout=5.0):
+        """Waits until an element matching `pattern` is on screen."""
         deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
+        while True:
             try:
-                if any(e.get("kind") == kind for e in json.loads(kv.read_text()).get("open") or []):
-                    return
-            except (OSError, ValueError):
-                pass
+                return self.find(pattern)
+            except RuntimeError:
+                if time.monotonic() >= deadline:
+                    raise
             time.sleep(0.1)
-        raise RuntimeError(f"no {kind} block opened")
 
     def film(self):
         """The story: the widget bar, the agent list (filter, peek, jump), the sessions set aside,
-        usage, the native settings tab, then one closed session brought back from History."""
+        usage, the settings dialog, then one closed session brought back from History."""
         # Framings, in window pixels: the widget bar under the panes' lower part, the dashboard
-        # beside a tab's one pane (it opens as the right half), the tab bar over the question the
-        # blocked session asks, and the settings tab's search and results.
+        # beside a tab's one pane (it opens as the right half) and the tab bar over the question
+        # the blocked session asks. The settings dialog, over the whole dashboard, gets the window.
         status = (0, 410, 740, 270)
         dash = (700, 40, 800, 430)
         # The dashboard's lower part, where its status bar holds Settings.
         dash_foot = (700, 270, 800, 430)
         asked = (0, 0, 900, 370)
-        settings = (20, 40, 1260, 480)
         # The status bar's Settings segment, its only clickable one.
         cog = r"sf-st-r>div\.sf\.sf-seg\.sf-act$"
         exited = min(HISTORY, key=lambda s: s["ago"])["id"]
@@ -726,8 +723,8 @@ class Take:
             # content, whose hover shows a drag handle.
             self.event("hide", surface="desktop")
             self.ctl("move", "4", str(self.size[1] - 4))
-            self.wait_open("settings")
-            self.cut(settings)
+            self.wait_shown(r"sf-prefs\.sf-act\.sf-window$")
+            self.cut()
             self.type("combined")
             time.sleep(0.7)
             self.key("ArrowDown", "↓")
