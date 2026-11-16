@@ -69,6 +69,8 @@ SESSIONS = [PR_SESSION, JOB_SESSION, ROLLOUT_SESSION, LATER_SESSION]
 
 # The strip above the focused omp's composer, and the session card floating over its pane.
 STRIP = r"sf-dock[^>]*>div\.sf\.sf-col\.gap-none>div\.sf\.sf-row\.sf-act\.gap-sm\.al-center$"
+# The strip's close verdict, the badge at its right end.
+BADGE = STRIP[:-1] + r">.*sf-badge[^>]*$"
 CARD = r"section\.tn-pane\.tn-float-card\.pip[.a-z-]*$"
 
 # The lines typed into each session, in its own words.
@@ -533,9 +535,15 @@ class WaitingTake(base.Take):
         shooter.start()
         try:
             self.cut(scene="wide", wait=False)
-            self.chapter("Set sessions aside", body="You leave agent sessions all the time. Say why in one "
-                         "sentence, and code watches what the session waits for.")
-            time.sleep(5.0)
+            self.chapter("Sessions pile up", body="A session waits on a review, a job or a free afternoon, "
+                         "so you leave it open. The tabs multiply, and every switch back starts with "
+                         "working out what it was for.")
+            time.sleep(6.0)
+            self.chapter("Set sessions aside", body="Say why in one sentence. Code watches what the "
+                         "session waits for and follows up on time, so you can close the tab.",
+                         then=["You come back to the reason and what happened since.",
+                               "Code does the watching, on a timer or a check, without tokens."])
+            time.sleep(6.5)
 
             pr = {"dot": 0, "step": "Babysit a pull request", "title": "The agent just opened PR #42.",
                   "body": "Review, CI and the merge will take hours. You don't want to keep checking.",
@@ -553,9 +561,22 @@ class WaitingTake(base.Take):
             self.chapter(**job)
             time.sleep(3.5)
             self.ask(JOB_SESSION, JOB_LINE, 5.0)
+            self.chapter(**job, then=["The agent writes a check that passes when the job is done."])
+            time.sleep(2.5)
+            try:
+                badge = self.wait_shown(BADGE, 3.0)
+            except RuntimeError:
+                print("no strip badge on screen; ringing the strip", file=sys.stderr)
+                badge = self.wait_shown(STRIP)
+            self.mark(badge)
             self.chapter(**job, then=["The agent writes a check that passes when the job is done.",
+                                      "The strip's badge always says whether closing is safe."])
+            time.sleep(4.0)
+            self.mark()
+            self.chapter(**job, then=["The agent writes a check that passes when the job is done.",
+                                      "The strip's badge always says whether closing is safe.",
                                       "You close the session. It reopens when the check passes."])
-            time.sleep(3.0)
+            time.sleep(1.5)
             self.close_session(JOB_SESSION)
             time.sleep(3.0)
 
@@ -653,9 +674,8 @@ class WaitingTake(base.Take):
             self.mark(self.wait_shown(STRIP))
             time.sleep(2.0)
             self.chapter(**strip, then=["Your sentence first, then what it waits for and what came back.",
-                                        "Green when something came back, amber when it needs you.",
-                                        "The badge says whether the session is safe to close."])
-            time.sleep(7.0)
+                                        "Green when something came back, amber when it needs you."])
+            time.sleep(5.5)
             try:
                 x, y, w, h = self.wait_shown(CARD, 3.0)
             except RuntimeError:
