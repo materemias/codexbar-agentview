@@ -2016,23 +2016,23 @@ export default function (pi) {
 		name: "waitingfor",
 		label: "Waiting for",
 		description: [
-			"Wait for an event and tell the user when it happens: a PR's review, comments, merge or release, CI, a command's output or a time. Code polls; no tokens until it fires.",
-			"Use this whenever the user says wait for X, notify me when, or tell me if, and right after you create a pull request (kind pr, or babysit_pr for review, ready and merged). The user is notified in Tern and on their phone: don't add your own ntfy call or polling loop.",
+			"Wait across turns for an outside event and tell the user when it happens: a PR's review, comments, merge or release, CI, a command's output or a time. Code polls; no tokens until it fires.",
+			"Not for jobs, agents or questions you started this turn: those finish within it, so block on them with the wait tool.",
+			"Use this whenever the user says wait for X, notify me when, or tell me if, and right after you create a pull request (kind pr, or babysit_pr for review, ready and merged). It notifies the user in Tern and on their phone, so it replaces any ntfy call or polling loop of your own.",
 			"The session can be parked or closed meanwhile; a closed one reopens in Tern by itself when a prompt is due, else it comes back to the user with a Resume button.",
-			"Kinds: pr for a known PR's review_on_head, ready, merged, released, or activity (the next comment, review, merge or close from someone other than the user); release for a repo's next release; command for anything else code can check; time to retry later; repeat to send prompt on a timer; something for what code can't watch, such as a person's reply, named by what: it never fires and the user stops it or clears its text; later for when the user has time.",
-			"after chains a step behind another wait: it starts when that one fires or completes. Stopping a wait never starts the steps behind it; it stops them too. So don't chain behind something or later, which never fire: a step behind a something starts only if the user clears its text, and one behind a later never does.",
-			"every sends prompt again and again instead of once: kind repeat runs until the user stops it; with kind command, pr or release it ends once that holds; for or times end it after a while or a number of runs; with kind repeat, until is a condition in words that you judge at each run, ending the repeat with end_repeat once it holds. A run due while the last run's turn still goes is skipped.",
-			"note is your suggested sentence for the user. The user's own sentence always stands: never try to overwrite it, and don't repeat a note the session already has.",
-			"prompt is sent into this session when the wait fires. list shows the open waits, stop ends one by its id.",
-			"park (add, babysit_pr), or action park alone, parks this session in Tern: its pane only leaves its tab and keeps running until the user opens it again, so parking is always safe. Park when the user asks you to park the session or set it aside. Never close the session yourself. Outside Tern nothing can be parked, and the result says so.",
+			"Kinds: pr for a known PR's review_on_head, ready, merged, released, or activity (the next comment, review, merge or close from someone other than the user); release for a repo's next release; command for anything else code can check; time to come back after in or at a clock time (for tomorrow morning, pick a time such as 09:00 yourself); repeat to send prompt on a timer, with until for its stop condition; something for what code can't watch, such as a person's reply, named by what: it never fires and the user stops it or clears its text; later for when the user has time.",
+			"Parking (park on add or babysit_pr, or action park) only takes this session's pane off its tab; it keeps running until the user opens it again, so parking is always safe. Park when the user asks you to set the session aside. Never close the session yourself. Outside Tern nothing parks, and the result says so.",
 			"snooze parks this session until in or at, then brings it back to a tab by itself; use it only when the user asks to snooze the session. Outside Tern it does nothing, and the result says to ask the user for /wait snooze.",
 			"When the user's /wait check asked you for a command, call add with kind command and argv only: it becomes their check.",
 		].join("\n"),
 		parameters: z.object({
-			action: z.enum(["add", "babysit_pr", "list", "stop", "end_repeat", "park", "snooze"]).describe("What to do"),
+			action: z.enum(["add", "babysit_pr", "list", "stop", "end_repeat", "park", "snooze"]).describe("What to do; list shows the open waits, stop ends one by its id"),
 			kind: z.enum(["time", "command", "pr", "release", "repeat", "something", "later"]).optional().describe("add: what to wait for"),
 			label: z.string().optional().describe("add: short label; derived when omitted"),
-			note: z.string().optional().describe("add, babysit_pr, snooze: suggested sentence for the user"),
+			note: z
+				.string()
+				.optional()
+				.describe("add, babysit_pr, snooze: suggested sentence for the user; the user's own sentence always stands, and a note the session already has needs no repeat"),
 			in: z.string().optional().describe("time, snooze: delay such as 30m, 2h, 1d, 1h30m"),
 			at: z.string().optional().describe("time, snooze: ISO 8601, local time without an offset"),
 			argv: z.array(z.string()).optional().describe("command: argv, run without a shell"),
@@ -2048,8 +2048,13 @@ export default function (pi) {
 			until: z
 				.string()
 				.optional()
-				.describe("pr: review_on_head, ready (default), merged, released, or activity for any feedback from others; repeat: when to stop, in words you judge"),
-			every: z.string().optional().describe("repeat, command, pr, release: send prompt every this long (30m, 2h, 1d; at least 1m); prompt is then required"),
+				.describe("pr: review_on_head, ready (default), merged, released, or activity for any feedback from others; repeat: a condition in words you judge at each run, then end_repeat once it holds"),
+			every: z
+				.string()
+				.optional()
+				.describe(
+					"repeat, command, pr, release: send prompt every this long (30m, 2h, 1d; at least 1m) instead of once; prompt is then required. repeat runs until stopped; command, pr and release end once their condition holds. A run due while the last run's turn still goes is skipped",
+				),
 			for: z.string().optional().describe("with every: end the repeat after this long, longer than every"),
 			times: z.number().int().optional().describe("with every: end the repeat after this many runs"),
 			bots: z.string().optional().describe("pr: review bots, comma separated"),
@@ -2058,7 +2063,12 @@ export default function (pi) {
 			deadline_in: z.string().optional().describe("add: the same as a delay from now"),
 			prompt: z.string().optional().describe("add: text to send into this session when the wait fires; with every, at each run"),
 			verify: z.string().optional().describe("add: JSON condition that must hold after the prompt's turn"),
-			after: z.string().optional().describe("add: start only after this wait id fires or completes; never after a stop"),
+			after: z
+				.string()
+				.optional()
+				.describe(
+					"add: start once this wait id fires or completes; stopping it stops this step too. Chain only behind waits code watches (pr, release, command, time, repeat); for a step after a something or later, ask the user in your reply to tell you once it happened",
+				),
 			no_fix: z.boolean().optional().describe("babysit_pr: skip the automatic review-fix prompt"),
 			released: z.boolean().optional().describe("babysit_pr: also wait for a release"),
 			park: z.boolean().optional().describe("add, babysit_pr: also park this session in Tern"),
