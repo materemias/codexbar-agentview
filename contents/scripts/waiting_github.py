@@ -26,6 +26,7 @@ import itertools
 import json
 import re
 import subprocess
+from datetime import datetime
 import time
 from typing import Any, Callable
 from urllib.parse import quote
@@ -87,9 +88,12 @@ _NAMES = re.compile(r"https?://[^\s\"'<>()\[\]{},]+|[\w.-]+/[\w./-]+")
 RATE_LIMITED = re.compile(r"HTTP 429|rate limit", re.IGNORECASE)
 # How many keys memo.seen keeps, or every key a poll met when it met more.
 SEEN_KEPT = 500
-REPO_RE = re.compile(r"[\w.-]+/[\w.-]+")
-PR_URL_RE = re.compile(r"https?://(?:www\.)?github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)(?:[/?#]\S*)?")
-PR_SHORT_RE = re.compile(r"([\w.-]+/[\w.-]+)#(\d+)")
+# ASCII names, never `.` or `..`: a repo goes into API paths.
+_SEGMENT = r"(?!\.\.?(?![A-Za-z0-9_.-]))[A-Za-z0-9_.-]+"
+_REPO = rf"{_SEGMENT}/{_SEGMENT}"
+REPO_RE = re.compile(_REPO)
+PR_URL_RE = re.compile(rf"https?://(?:www\.)?github\.com/({_REPO})/pull/(\d+)(?:[/?#]\S*)?")
+PR_SHORT_RE = re.compile(rf"({_REPO})#(\d+)")
 
 GREEN = ("pass", "skipping")
 FAILED = ("fail", "cancel")
@@ -108,6 +112,8 @@ BUCKETS = {
     "TIMED_OUT": "fail",
     "ACTION_REQUIRED": "fail",
     "STARTUP_FAILURE": "fail",
+    # Superseded by a newer run of the same check.
+    "STALE": "cancel",
 }
 PR_STATES = {"OPEN": "open", "MERGED": "merged", "CLOSED": "closed"}
 CODEX_STATE = re.compile(r"<!-- codex-review-state:v1 (.*?) -->", re.DOTALL)
@@ -116,7 +122,7 @@ CODEX_STATE = re.compile(r"<!-- codex-review-state:v1 (.*?) -->", re.DOTALL)
 COMMENTS_FRAGMENT = """
 fragment Comments on PullRequestReviewCommentConnection {
   pageInfo { hasNextPage endCursor }
-  nodes { id body author { login __typename } }
+  nodes { id body createdAt author { login __typename } }
 }
 """
 
@@ -153,13 +159,13 @@ query($owner: String!, $name: String!, $number: Int!) {
   viewer { login }
   repository(owner: $owner, name: $name) {
     pullRequest(number: $number) {
-      state headRefOid baseRefName mergeStateStatus mergedAt closedAt
+      state isDraft headRefOid baseRefName mergeStateStatus mergedAt closedAt
       mergeCommit { oid }
       author { login }
       baseRef { target { oid } }
-      comments(last: 100) { nodes { id body author { login __typename } } }
+      comments(last: 100) { nodes { id body createdAt author { login __typename } } }
       reviews(last: 100) {
-        nodes { id state body commit { oid } author { login __typename } }
+        nodes { id state body createdAt commit { oid } author { login __typename } }
       }
       reviewThreads(last: 100) { ...Threads }
       commits(last: 1) {
@@ -222,9 +228,11 @@ A review landed on {repo}#{number} at head {head}. Triage it:
 
 
 class GhError(Exception):
-    def __init__(self, message: str, transient: bool) -> None:
+    def __init__(self, message: str, transient: bool, auth: bool = False) -> None:
         super().__init__(message)
         self.transient = transient
+        # gh is logged out: a later poll works once you log in.
+        self.auth = auth
 
 
 def _gh(run: Run, args: list[str]) -> str:
@@ -243,6 +251,8 @@ def _gh(run: Run, args: list[str]) -> str:
         raise GhError(f"cannot run gh: {error}", False) from error
     if proc.returncode == 0:
         return proc.stdout
+    if proc.returncode == 4:  # gh's exit code for "not logged in"
+        raise GhError("gh is not logged in: run `gh auth login`", True, auth=True)
     stderr = proc.stderr or ""
     message = " ".join(stderr.split())[:300] or f"gh exited {proc.returncode}"
     raise GhError(message, is_transient(stderr))
@@ -297,6 +307,7 @@ def _row(node: Json) -> Json:
         "login": _login(node),
         "is_bot": (node.get("author") or {}).get("__typename") == "Bot",
         "body": node.get("body") or "",
+        "created": node.get("createdAt"),
     }
 
 
@@ -392,6 +403,7 @@ def _fetch_graphql(repo: str, number: int, run: Run) -> Json:
     return {
         "full": True,
         "state": pr.get("state"),
+        "draft": bool(pr.get("isDraft")) or pr.get("mergeStateStatus") == "DRAFT",
         "head": head,
         "base": pr.get("baseRefName") or "",
         "base_oid": ((pr.get("baseRef") or {}).get("target") or {}).get("oid"),
@@ -431,6 +443,7 @@ def _fetch_rest(repo: str, number: int, run: Run, viewer: str) -> Json:
     return {
         "full": False,
         "state": "MERGED" if merged else str(pr.get("state") or "").upper(),
+        "draft": bool(pr.get("draft")),
         "head": head,
         "base": (pr.get("base") or {}).get("ref") or "",
         "base_oid": (pr.get("base") or {}).get("sha"),
@@ -458,8 +471,11 @@ def _fetch_rest(repo: str, number: int, run: Run, viewer: str) -> Json:
 
 
 def _graphql_starved(memo: Json, run: Run, now: float) -> bool:
+    """Asks for the budget only while it was low or unknown: a GraphQL rate
+    limit error falls back to REST at once anyway."""
     rate = memo.get("rate") or {}
-    if now - rate.get("at", float("-inf")) >= RATE_CHECK_S:
+    low = rate.get("remaining", 0) < RATE_FLOOR
+    if low and now - rate.get("at", float("-inf")) >= RATE_CHECK_S:
         rate = {**rate, "at": now}
         memo["rate"] = rate
         try:
@@ -674,6 +690,8 @@ class _Events:
         self.whole = False
         self.baseline = not memo.get("baselined")
         self.rest_baseline = self.baseline and not memo.get("rest_baselined")
+        # When the wait's first poll ran; None during it.
+        self.since = memo.get("since")
 
     def mark(self, key: str) -> bool:
         """Note that this poll met `key`. True when it is news."""
@@ -684,12 +702,30 @@ class _Events:
         return new
 
     def emit(
-        self, key: str, text: str, on_me: bool = False, always: bool = False, rest: bool = False
+        self,
+        key: str,
+        text: str,
+        on_me: bool = False,
+        always: bool = False,
+        rest: bool = False,
+        created: str | None = None,
     ) -> None:
         if not self.mark(key):
             return
-        if always or not (self.rest_baseline if rest else self.baseline):
+        held = self.rest_baseline if rest else self.baseline
+        if always or not held or self._after_start(created):
             self.out.append({"key": key, "text": text, "on_me": on_me})
+
+    def _after_start(self, created: str | None) -> bool:
+        """Written after the wait's first poll: a REST-only start can't see
+        comments, so the GraphQL baseline still reports those as news."""
+        if not created or self.since is None:
+            return False
+        try:
+            stamp = datetime.fromisoformat(created.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return False
+        return stamp > self.since
 
     def drop(self, keys: set[str]) -> None:
         self.out[:] = [event for event in self.out if event["key"] not in keys]
@@ -716,7 +752,11 @@ def _talk_events(pr: Json, events: _Events, known_bots: tuple[str, ...], mine: s
             or (comment["is_bot"] and any(bot in lowered for bot in STATUS_BOTS))
         ):
             continue
-        events.emit(f"c:{comment['id']}", f"comment from {login}: {_snippet(comment['body'])}")
+        events.emit(
+            f"c:{comment['id']}",
+            f"comment from {login}: {_snippet(comment['body'])}",
+            created=comment["created"],
+        )
     for review in pr["reviews"]:
         login = review["login"]
         # A gating bot's review is its bot: event; roboomp posts from a user account.
@@ -728,6 +768,7 @@ def _talk_events(pr: Json, events: _Events, known_bots: tuple[str, ...], mine: s
                 f"c:{review['id']}",
                 f"review from {login} ({state}): {_snippet(review['body'])}",
                 rest=True,
+                created=review.get("created"),
             )
     for thread in pr["threads"]:
         for index, comment in enumerate(thread["comments"]):
@@ -738,6 +779,7 @@ def _talk_events(pr: Json, events: _Events, known_bots: tuple[str, ...], mine: s
             events.emit(
                 f"c:{comment['id']}",
                 f"{kind} from {login} on {thread['where']}: {_snippet(comment['body'])}",
+                created=comment["created"],
             )
 
 
@@ -807,8 +849,12 @@ def _check_release(
             except GhError as error:
                 if error.transient or "HTTP 404" not in str(error):
                     raise
-                compared[tag] = "unrelated"
-        status = compared[tag]
+                # Not cached: a tag pushed after its release was published compares later.
+                status = "unrelated"
+            else:
+                status = compared[tag]
+        else:
+            status = compared[tag]
         if release.get("prerelease"):
             if prerelease is None and status in ("ahead", "identical"):
                 prerelease = tag
@@ -840,7 +886,7 @@ def _check_release(
 def _gates_open(pr: Json, gate: set[str], open_threads: int) -> bool:
     """Everything `ready` needs except a bot's review. BEHIND and DIRTY block it,
     because neither can be merged."""
-    if not pr["full"] or open_threads or pr["merge_state"] in ("BEHIND", "DIRTY"):
+    if not pr["full"] or open_threads or pr["draft"] or pr["merge_state"] in ("BEHIND", "DIRTY", "DRAFT"):
         return False
     return all(pr["checks"].get(name, {}).get("bucket", "pending") in GREEN for name in gate)
 
@@ -862,7 +908,8 @@ def _fire_on_activity(pr: Json, result: Json, events: _Events) -> None:
         result["fire_text"] = f"{len(new)} new, first {new[0]['text']}"
 
 
-def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: float) -> None:
+def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: float) -> Json | None:
+    """The PR it read, or None when it read none."""
     repo, number, until = cond["repo"], cond["number"], cond["until"]
     merged = memo.get("merged") or {}
     if until == "released" and merged.get("sha"):
@@ -880,10 +927,10 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
         if until == "merged":
             result["fired"] = True
             result["fire_text"] = f"PR#{number} merged"
-            return
+            return pr
         if until == "released":
             _check_release(repo, number, memo["merged"], memo, result, events, run)
-            return
+            return pr
 
     head = pr["head"]
     short = head[:7]
@@ -968,6 +1015,10 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
             )
         memo["merge_state"] = f"{head}:{merge_state}"
 
+    if until == "ready" and is_open and pr["draft"]:
+        # A state, not news: the first poll must say why nothing fires.
+        events.emit(f"draft:{head}", f"{short} is a draft: mark it ready for review", always=True)
+
     memo["rest_baselined"] = True
     if pr["full"]:
         memo["baselined"] = True
@@ -982,14 +1033,14 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
         result["next_poll_s"] = ENDED_POLL_S
         if until == "activity":
             _fire_on_activity(pr, result, events)
-        return
+        return pr
 
     if until == "activity":
         if pr["state"] == "MERGED":
             events.emit(f"merged:{memo['merged']['sha']}", f"PR#{number} merged", always=True)
             result["next_poll_s"] = ENDED_POLL_S
         _fire_on_activity(pr, result, events)
-        return
+        return pr
 
     fire_text = None
     if until == "review_on_head" and reviewed and not bot_pending:
@@ -1008,7 +1059,7 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
                     f"{', '.join(every_push)} hasn't reviewed {short} in an hour",
                     on_me=True,
                 )
-        elif reviewed:
+        elif reviewed and is_open:
             bots = f"{', '.join(reviewed)} reviewed"
         elif is_open and age >= BOT_SETTLE_S:
             where = f" ({', '.join(earlier_bots)} reviewed an earlier head)" if earlier_bots else ""
@@ -1041,6 +1092,7 @@ def _poll(cond: Json, memo: Json, result: Json, events: _Events, run: Run, now: 
         result["fire_text"] = fire_text
         # The fire text says the same thing as the bots' own events.
         events.drop({f"bot:{bot}:{head}" for bot in reviewed})
+    return pr
 
 
 def _invalid(cond: Json) -> str | None:
@@ -1090,9 +1142,12 @@ def pr_status(repo: str, number: int, *, run: Run = subprocess.run) -> Json:
     }
 
 
-def poll(cond: Json, memo: Json, *, run: Run = subprocess.run, now: float | None = None) -> Json:
+def poll(
+    cond: Json, memo: Json, *, run: Run = subprocess.run, now: float | None = None, snapshot: bool = False
+) -> Json:
     """One poll of a PR condition. Never raises for gh failures: `error` and
-    `transient` report them, and events found before the failure are kept."""
+    `transient` report them, and events found before the failure are kept.
+    `snapshot`: a fired poll also carries verify_fix's snapshot of the PR it read."""
     now = time.time() if now is None else now
     result: Json = {
         "memo": memo,
@@ -1110,34 +1165,47 @@ def poll(cond: Json, memo: Json, *, run: Run = subprocess.run, now: float | None
         result["error"] = invalid
         return result
     events = _Events(memo, result["events"])
+    memo.setdefault("since", now)
+    pr = None
     try:
-        _poll(cond, memo, result, events, run, now)
+        pr = _poll(cond, memo, result, events, run, now)
     except GhError as error:
         events.whole = False
         result["error"] = str(error)
         result["transient"] = error.transient
+        result["auth"] = error.auth
         # A hiccup on a slow path (REST fallback, a release check) still retries soon;
         # running out of budget doesn't.
         if error.transient and not RATE_LIMITED.search(str(error)):
             result["next_poll_s"] = min(result["next_poll_s"], RETRY_POLL_S)
     events.save()
+    if snapshot and result["fired"]:
+        # REST shows no threads, so it builds none.
+        result["snapshot"] = _snapshot(pr) if pr and pr["full"] else None
     return result
 
 
-def snapshot(repo: str, number: int, *, run: Run = subprocess.run) -> Json:
-    """The PR's head and review threads, for verify_fix. Raises GhError."""
-    pr = _fetch_graphql(repo, number, run)
+def _snapshot(pr: Json) -> Json:
+    """The head and review threads verify_fix compares, from a GraphQL read. A
+    reply counts only from you or the PR's author: a bot's own follow-up answers
+    nothing."""
+    answerers = {pr["viewer"], pr["author"]}
     return {
         "head": pr["head"],
         "threads": [
             {
                 "id": thread["id"],
                 "resolved": thread["resolved"],
-                "replies": max(len(thread["comments"]) - 1, 0),
+                "replies": sum(1 for comment in thread["comments"][1:] if comment["login"] in answerers),
             }
             for thread in pr["threads"]
         ],
     }
+
+
+def snapshot(repo: str, number: int, *, run: Run = subprocess.run) -> Json:
+    """The PR's head and review threads, for verify_fix. Raises GhError."""
+    return _snapshot(_fetch_graphql(repo, number, run))
 
 
 def verify_fix(repo: str, number: int, before: Json, *, run: Run = subprocess.run) -> tuple[bool, str]:

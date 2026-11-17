@@ -40,8 +40,9 @@ def bot_review(oid: str = HEAD, login: str = "greptile-apps", rid: str = "PRR_bo
     }
 
 
-def comment(cid: str, login: str, body: str = "hello", typename: str = "User") -> dict:
-    return {"id": cid, "body": body, "author": {"login": login, "__typename": typename}}
+def comment(cid: str, login: str, body: str = "hello", typename: str = "User", created: str | None = None) -> dict:
+    node = {"id": cid, "body": body, "author": {"login": login, "__typename": typename}}
+    return {**node, "createdAt": created} if created else node
 
 
 def thread(
@@ -240,6 +241,12 @@ class ParsePrTest(unittest.TestCase):
     def test_rejects_the_rest(self) -> None:
         for text in ("42", "#42", "acme/widget", "https://github.com/acme/widget/issues/42", "acme/widget#0"):
             self.assertIsNone(github.parse_pr(text), text)
+
+    def test_rejects_non_ascii_and_dot_names(self) -> None:
+        for text in ("ö/ä#1", "../..#1", "./x#1", "x/..#1", "https://github.com/../x/pull/1"):
+            self.assertIsNone(github.parse_pr(text), text)
+        self.assertIsNone(github.REPO_RE.fullmatch("a/.."))
+        self.assertIsNotNone(github.REPO_RE.fullmatch("a.b/.github"))
 
 
 class ReviewOnHeadTest(PollTestCase):
@@ -778,6 +785,15 @@ class ReadyTest(PollTestCase):
     def test_behind_blocks(self) -> None:
         self.assert_ready(FakeGh(pr_answer(reviews=[bot_review()], merge_state="BEHIND")), False)
 
+    def test_draft_blocks_and_says_so_once_per_head(self) -> None:
+        gh = FakeGh(pr_answer(merge_state="DRAFT", reviews=[bot_review()]))
+        result = self.assert_ready(gh, False)
+        self.assertEqual([event["key"] for event in result["events"]], [f"draft:{HEAD}"])
+        self.assertEqual(self.assert_ready(gh, False)["events"], [])
+
+    def test_merged_with_a_review_on_its_head_does_not_fire(self) -> None:
+        self.assert_ready(FakeGh(pr_answer(state="MERGED", reviews=[bot_review()])), False)
+
     def test_merged_before_ready_says_so_and_does_not_fire(self) -> None:
         gh = FakeGh(pr_answer(state="MERGED", reviews=[bot_review(OLD_HEAD)]))
         result = self.assert_ready(gh, False)
@@ -940,6 +956,22 @@ class ActivityTest(PollTestCase):
         self.assertTrue(result["fired"])
         self.assertEqual(result["fire_text"], "PR#7 closed without merging")
 
+    def test_a_comment_before_the_graphql_baseline_is_reported(self) -> None:
+        gh = FakeGh(remaining=100)
+        gh.rest_pr = RateLimitTest.rest(self)  # type: ignore[arg-type]
+        self.assertFalse(self.poll(gh, until="activity")["fired"])
+        gh.remaining = 4000
+        self.clock += github.RATE_CHECK_S
+        gh.pr = pr_answer(
+            comments=[
+                comment("C1", "old", created="1970-01-01T00:00:00Z"),
+                comment("C2", "maintainer", "needs a test", created="2026-11-17T10:00:00Z"),
+            ]
+        )
+        result = self.poll(gh, until="activity")
+        self.assertTrue(result["fired"])
+        self.assertEqual(result["fire_text"], "comment from maintainer: needs a test")
+
 
 class ReleasedTest(PollTestCase):
     def test_open_pr_does_not_look_at_releases(self) -> None:
@@ -1049,6 +1081,13 @@ class ReleasedTest(PollTestCase):
         result = self.poll(gh, until="released")
         self.assertIsNone(result["error"])
         self.assertTrue(result["confirm"])
+
+    def test_compare_404_is_asked_again(self) -> None:
+        gh = FakeGh(pr_answer(state="MERGED"))
+        gh.releases = [release("v1", "2026-11-02T00:00:00Z")]
+        self.assertFalse(self.poll(gh, until="released")["fired"])
+        gh.compare = {"v1": "ahead"}
+        self.assertTrue(self.poll(gh, until="released")["fired"])
 
     def test_merged_without_a_merge_commit_compares_the_head(self) -> None:
         gh = FakeGh(pr_answer(state="MERGED", merge_commit=False))
@@ -1186,6 +1225,22 @@ class ErrorsTest(PollTestCase):
         result = self.poll(run)  # type: ignore[arg-type]
         self.assertTrue(result["transient"])
 
+    def test_logged_out_gh_is_transient_and_says_how_to_fix_it(self) -> None:
+        def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
+            return ok(code=4, stderr="To get started with GitHub CLI, please run:  gh auth login\n")
+
+        with self.assertRaises(github.GhError) as caught:
+            github._gh(run, ["api", "user"])
+        self.assertTrue(caught.exception.transient)
+        self.assertTrue(caught.exception.auth)
+        result = self.poll(run)  # type: ignore[arg-type]
+        self.assertTrue(result["transient"])
+        self.assertEqual(result["error"], "gh is not logged in: run `gh auth login`")
+        self.assertTrue(result["auth"])
+
+    def test_stale_check_is_a_cancel(self) -> None:
+        self.assertEqual(github._bucket({"status": "COMPLETED", "conclusion": "STALE"}), "cancel")
+
     def test_missing_gh_is_fatal(self) -> None:
         def run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
             raise FileNotFoundError("gh")
@@ -1287,8 +1342,15 @@ class RateLimitTest(PollTestCase):
         result = self.poll(gh, until="merged")
         self.assertEqual(result["events"][0]["text"], "PR#7 closed without merging")
 
-    def test_rate_limit_is_read_at_most_every_ten_minutes(self) -> None:
+    def test_a_healthy_budget_is_not_read_again(self) -> None:
         gh = FakeGh()
+        for _ in range(8):
+            self.poll(gh)
+        self.assertEqual(gh.count("rate_limit"), 1)
+
+    def test_a_low_budget_is_read_at_most_every_ten_minutes(self) -> None:
+        gh = FakeGh(remaining=100)
+        gh.rest_pr = self.rest()
         self.poll(gh)  # 1180
         self.poll(gh)  # 1360
         self.poll(gh)  # 1540
@@ -1369,6 +1431,7 @@ class RateLimitTest(PollTestCase):
         gh = FakeGh(pr_answer(author="someone"))
         self.poll(gh, until="activity")
         gh.remaining = 100
+        self.memo["rate"]["remaining"] = 100  # a low reading, so the budget is read again
         self.clock += github.RATE_CHECK_S
         gh.rest_pr = {**self.rest(), "user": {"login": "someone"}, "head": {"sha": NEW_HEAD}}
         self.memo.pop("viewer")
@@ -1419,19 +1482,43 @@ class RateLimitTest(PollTestCase):
         self.assertEqual((result["fired"], result["events"]), (False, []))
 
 
+def answered(tid: str = "T1", login: str = "me") -> dict:
+    """A bot's thread with one reply by `login`."""
+    node = thread(tid)
+    node["comments"]["nodes"].append(comment(f"{tid}-reply", login, "fixed"))
+    return node
+
+
 class VerifyFixTest(unittest.TestCase):
     def test_snapshot_shape(self) -> None:
-        gh = FakeGh(pr_answer(threads=[thread("T1", comments=3), thread("T2", resolved=True)]))
+        gh = FakeGh(pr_answer(threads=[answered("T1"), thread("T2", resolved=True)]))
         self.assertEqual(
             github.snapshot(REPO, 7, run=gh),
             {
                 "head": HEAD,
                 "threads": [
-                    {"id": "T1", "resolved": False, "replies": 2},
+                    {"id": "T1", "resolved": False, "replies": 1},
                     {"id": "T2", "resolved": True, "replies": 0},
                 ],
             },
         )
+
+    def test_a_bots_own_follow_up_is_not_an_answer(self) -> None:
+        before = github.snapshot(REPO, 7, run=FakeGh(pr_answer(threads=[thread("T1")])))
+        after = FakeGh(pr_answer(threads=[thread("T1", comments=2)]))
+        self.assertFalse(github.verify_fix(REPO, 7, before, run=after)[0])
+        self.assertTrue(github.verify_fix(REPO, 7, before, run=FakeGh(pr_answer(threads=[answered("T1")])))[0])
+
+    def test_a_fired_fix_poll_carries_the_snapshot(self) -> None:
+        gh = FakeGh(pr_answer(reviews=[bot_review()], threads=[answered("T1")]))
+        result = github.poll(
+            {"repo": REPO, "number": 7, "until": "review_on_head"}, {}, run=gh, now=1000.0, snapshot=True
+        )
+        self.assertTrue(result["fired"])
+        self.assertEqual(
+            result["snapshot"], {"head": HEAD, "threads": [{"id": "T1", "resolved": False, "replies": 1}]}
+        )
+        self.assertEqual(gh.count("query="), 1)
 
     def test_snapshot_raises_on_failure(self) -> None:
         with self.assertRaises(github.GhError):
@@ -1458,14 +1545,14 @@ class VerifyFixTest(unittest.TestCase):
         before = github.snapshot(
             REPO, 7, run=FakeGh(pr_answer(threads=[thread("T1"), thread("T2"), thread("T3", resolved=True)]))
         )
-        after = FakeGh(pr_answer(threads=[thread("T1", comments=2), thread("T2", resolved=True)]))
+        after = FakeGh(pr_answer(threads=[answered("T1"), thread("T2", resolved=True)]))
         passed, reason = github.verify_fix(REPO, 7, before, run=after)
         self.assertTrue(passed)
         self.assertEqual(reason, "all 2 open threads answered or resolved")
 
     def test_unanswered_thread_fails(self) -> None:
         before = github.snapshot(REPO, 7, run=FakeGh(pr_answer(threads=[thread("T1"), thread("T2")])))
-        after = FakeGh(pr_answer(threads=[thread("T1", comments=2), thread("T2")]))
+        after = FakeGh(pr_answer(threads=[answered("T1"), thread("T2")]))
         passed, reason = github.verify_fix(REPO, 7, before, run=after)
         self.assertFalse(passed)
         self.assertEqual(reason, "head unchanged at aaaaaaa, 1 of 2 open threads unanswered")
@@ -1488,7 +1575,7 @@ class VerifyFixTest(unittest.TestCase):
         gh = FakeGh(pr_answer(threads=[long_thread]))
         gh.more_comments = {"k1": []}
         before = github.snapshot(REPO, 7, run=gh)
-        self.assertEqual(before["threads"][0]["replies"], 99)
+        self.assertEqual(before["threads"][0]["replies"], 0)  # the bot's own comments
         gh.more_comments = {"k1": [comment("T1-100", "me", "fixed")]}
         self.assertEqual(
             github.verify_fix(REPO, 7, before, run=gh), (True, "all 1 open threads answered or resolved")
