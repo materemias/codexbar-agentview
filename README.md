@@ -593,8 +593,8 @@ kpackagetool6 -t Plasma/Applet -r io.github.materemias.codexbaragentview
 
 Build and test with `cmake -S . -B build -DCODEXBAR_BUILD_TESTS=ON`,
 `cmake --build build` and `ctest --test-dir build`, and run the Python tests
-with `python tests/run.py` (parallel; `-j N` sets the workers, names narrow
-it). Re-render the films with
+with `python tests/run.py` (parallel, slowest tests first; `-j N` sets the
+workers, `--durations N` lists the slowest, names narrow it). Re-render the films with
 `uv run film/take_kde.py && uv run film/compose.py kde`, or `take_tern.py` and
 `compose.py tern`, or `take_waiting.py` and `compose.py waiting`; the Tern takes
 open a window on a scratch daemon for about a minute.

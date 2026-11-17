@@ -4,18 +4,22 @@
     python tests/run.py              every test, a worker per CPU
     python tests/run.py -j 4 -v      four workers, one line per test
     python tests/run.py test_codexbar_waiting test_codexbar_fetch.FetchTests
+    python tests/run.py --durations 10    then the ten slowest tests
 
 Workers are long-lived, so each imports a module once, and they pull tests one
 by one, so a slow one (a QML test runs `qml` for over a second) never holds
-up a queue of others. Tests already isolate their state in temporary
-directories, so they may run side by side; a module's or class's fixtures run
-around each test. Same names and output shape as `python -m unittest discover
--s tests`, which still works.
+up a queue of others. Each run saves every test's time to tests/.durations.json
+and the next dispatches the slowest first (unknown ones before them), so no
+slow test starts last and stretches the wall time. Tests already isolate their
+state in temporary directories, so they may run side by side; a module's or
+class's fixtures run around each test. Same names and output shape as
+`python -m unittest discover -s tests`, which still works.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import multiprocessing
 import os
 import sys
@@ -25,6 +29,7 @@ import unittest
 from pathlib import Path
 
 TESTS = Path(__file__).resolve().parent
+DURATIONS = TESTS / ".durations.json"
 # A result's lists, worst first, with the summary's names for their counts.
 OUTCOMES = {"failures": "failures", "errors": "errors", "unexpectedSuccesses": "unexpected successes",
             "skipped": "skipped", "expectedFailures": "expected failures"}
@@ -93,11 +98,32 @@ def _selected(names: list[str]) -> tuple[list[str], list[str]]:
     return found, errors
 
 
+def _load_durations() -> dict[str, float]:
+    """Each test's seconds in earlier runs; none when the file is missing or unreadable."""
+    try:
+        saved = json.loads(DURATIONS.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return {k: v for k, v in saved.items() if isinstance(v, (int, float))} if isinstance(saved, dict) else {}
+
+
+def _save_durations(durations: dict[str, float]) -> None:
+    """Writes the durations whole or not at all: a parallel run never reads half a file."""
+    fd, temp = tempfile.mkstemp(dir=TESTS, prefix=".durations.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            json.dump(dict(sorted(durations.items())), out, indent=0)
+        os.replace(temp, DURATIONS)
+    except OSError:
+        Path(temp).unlink(missing_ok=True)
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("names", nargs="*", help="modules, classes or tests (default: discover tests/)")
     parser.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1, help="worker processes")
     parser.add_argument("-v", "--verbose", action="store_true", help="a line per test")
+    parser.add_argument("--durations", type=int, default=0, metavar="N", help="print the N slowest tests")
     args = parser.parse_args(argv)
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     # A test's output may hold what the console's code page lacks (Windows' cp1252).
@@ -106,13 +132,18 @@ def main(argv: list[str]) -> int:
 
     started = time.monotonic()
     names, load_errors = _selected(args.names)
+    known = _load_durations()
+    # Slowest first, and unknown ones before all, as they may be slow too.
+    names.sort(key=lambda name: -known.get(name, float("inf")))
+    timed: dict[str, float] = {}
     counts = dict.fromkeys(OUTCOMES, 0)
     reports = [("ERROR", "loading tests", detail) for detail in load_errors]
     counts["errors"] = len(load_errors)
     jobs = max(1, min(args.jobs, len(names)))
     # spawn, not fork: a worker starts clean of the parent's threads and imports.
     with multiprocessing.get_context("spawn").Pool(jobs) as pool:
-        for name, outcome, detail, seconds in pool.imap_unordered(_run, names):
+        for name, outcome, detail, seconds in pool.imap_unordered(_run, names, chunksize=1):
+            timed[name] = seconds
             if outcome != "ok":
                 counts[outcome] += 1
             if outcome in ("failures", "errors", "unexpectedSuccesses"):
@@ -130,6 +161,14 @@ def main(argv: list[str]) -> int:
     failed = sum(counts[key] for key in FAILING)
     extras = ", ".join(f"{OUTCOMES[key]}={count}" for key, count in counts.items() if count)
     print(("FAILED" if failed else "OK") + (f" ({extras})" if extras else ""))
+    if args.durations > 0:
+        print(f"\nSlowest {min(args.durations, len(timed))} tests:")
+        for name, seconds in sorted(timed.items(), key=lambda item: -item[1])[:args.durations]:
+            print(f"{seconds:8.2f}s  {name}")
+    # A full run drops tests that no longer exist; a narrowed one keeps the others' times.
+    if not args.names and not load_errors:
+        known = {name: known[name] for name in names if name in known}
+    _save_durations(known | timed)
     return 1 if failed else 0
 
 
