@@ -1,5 +1,16 @@
+"""codexbar_waiting.py end to end: real state files, commands, verifiers and gh.
+
+Most CLI calls run main() in this process: each is still a separate call that
+reads and writes the state on disk, without a Python start. A call spawns the
+real CLI where a separate process is the point: an event caller that must
+return within a deadline, a tick that owns slow work after its caller exited,
+or state that must persist from one process to the next.
+"""
+
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -9,6 +20,7 @@ import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 from fakes import WINDOWS, fake_program, kill_tree
 
@@ -19,6 +31,9 @@ SCRIPT_PATH = (
     / "scripts"
     / "codexbar_waiting.py"
 )
+sys.path.insert(0, str(SCRIPT_PATH.parent))
+import codexbar_waiting as waiting  # noqa: E402  (after the path insert above)
+
 SID = "01a1abf1-15c8-748b-b9fa-126ebc0b88e5"
 CALLER_DEADLINE_S = 5
 PROCESS_DEADLINE_S = 5
@@ -52,6 +67,10 @@ class WaitingRuntimeTests(unittest.TestCase):
             # Path.home(), and what Python and cmd.exe need to start at all.
             self.env.update(USERPROFILE=str(self.home), SYSTEMROOT=os.environ["SYSTEMROOT"],
                             COMSPEC=os.environ["COMSPEC"])
+        # In-process calls, and what they start, see only the spawned CLI's environment.
+        environment = mock.patch.dict(os.environ, self.env, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
         # Tick after all creation timestamps, independent of second boundaries.
         self.now = datetime.now().astimezone().replace(microsecond=0) + timedelta(minutes=1)
         self.processes: list[subprocess.Popen] = []
@@ -75,10 +94,10 @@ class WaitingRuntimeTests(unittest.TestCase):
             for pid in set(pids) - completed:
                 kill_tree(int(pid))
 
-    def start_cli(self, *argv: str, cwd: Path | None = None) -> subprocess.Popen:
+    def start_cli(self, *argv: str) -> subprocess.Popen:
         process = subprocess.Popen(
             [sys.executable, str(SCRIPT_PATH), *argv],
-            cwd=cwd or self.helper, env=self.env, stdin=subprocess.DEVNULL,
+            cwd=self.helper, env=self.env, stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             start_new_session=True,
         )
@@ -86,8 +105,7 @@ class WaitingRuntimeTests(unittest.TestCase):
         return process
 
     def answer(
-        self, process: subprocess.Popen, *, expect: int = 0,
-        timeout: float = PROCESS_DEADLINE_S,
+        self, process: subprocess.Popen, *, timeout: float = PROCESS_DEADLINE_S,
     ) -> dict:
         try:
             stdout, stderr = process.communicate(timeout=timeout)
@@ -96,13 +114,23 @@ class WaitingRuntimeTests(unittest.TestCase):
                 f"waiting CLI exceeded {timeout} s; turn_finished must queue "
                 "verification instead of executing it in the event caller"
             )
-        self.assertEqual(process.returncode, expect, stdout + stderr)
+        self.assertEqual(process.returncode, 0, stdout + stderr)
         answer = json.loads(stdout)
-        self.assertEqual(answer["ok"], expect == 0, answer)
+        self.assertTrue(answer["ok"], answer)
         return answer
 
+    def spawn(self, *argv: str) -> dict:
+        return self.answer(self.start_cli(*argv))
+
     def cli(self, *argv: str, expect: int = 0, cwd: Path | None = None) -> dict:
-        return self.answer(self.start_cli(*argv, cwd=cwd), expect=expect)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.chdir(cwd or self.helper), contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            code = waiting.main(list(argv))
+        self.assertEqual(code, expect, stdout.getvalue() + stderr.getvalue())
+        answer = json.loads(stdout.getvalue())
+        self.assertEqual(answer["ok"], expect == 0, answer)
+        return answer
 
     def tick(self, seconds: int = 0) -> dict:
         now = self.now + timedelta(seconds=seconds)
@@ -192,6 +220,7 @@ class WaitingRuntimeTests(unittest.TestCase):
     def check_deferred_command_verification(self, exit_code: int) -> None:
         verify, release, started, finished = self.blocking_verifier(exit_code)
         wait, following = self.delivered_prompt(verify)
+        # Spawned: an event that ran the verifier would block, and the deadline fails it at once.
         event = self.start_cli("event", "--type", "turn_finished", "--session", SID)
         answer = self.answer(event, timeout=CALLER_DEADLINE_S)
         self.assertEqual(answer["view"]["sessions"][0]["waits"][0]["state"], "acting")
@@ -205,7 +234,8 @@ class WaitingRuntimeTests(unittest.TestCase):
         self.assertEqual(self.saved_wait(wait)["state"], "acting")
         self.assertTrue(self.saved_wait(wait)["verify_pending"])
         self.assertIsNotNone(self.saved_wait(wait)["verify_claim_until"])
-        self.tick()
+        # Spawned too: a second run of the verifier would block until the release.
+        self.spawn("tick", "--now", self.now.isoformat())
         self.assertEqual(len(started.read_text().splitlines()), 1, "concurrent ticks ran the verifier twice")
         release.touch()
         self.answer(tick)
@@ -257,8 +287,7 @@ class WaitingRuntimeTests(unittest.TestCase):
         wait, following = self.delivered_prompt({
             "type": "pr", "repo": "fixture/repo", "number": 7, "until": "merged",
         })
-        event = self.start_cli("event", "--type", "turn_finished", "--session", SID)
-        self.answer(event, timeout=CALLER_DEADLINE_S)
+        self.cli("event", "--type", "turn_finished", "--session", SID)
         self.assertFalse(calls.exists(), "turn_finished queried GitHub instead of leaving work for tick")
         self.assert_verification_queued(wait, following)
         self.tick()
@@ -279,9 +308,36 @@ class WaitingRuntimeTests(unittest.TestCase):
         (self.project / "status").write_text("pending")
         (self.helper / "status").write_text("ready")
 
+    def add_status_check(self, *target: str, cwd: Path | None = None) -> str:
+        """A wait on a command that fires once ./status reads ready."""
+        return self.cli(
+            "add", *target, "--kind", "command", "--argv", json.dumps(self.status_argv()),
+            "--predicate", 'json_eq:status="ready"', "--interval", "1s", "--no-toast", cwd=cwd,
+        )["wait"]["id"]
+
+    def assert_failed_without_running(self, wait: str, first: dict, *, pane: int | None = None) -> None:
+        """The first tick counted the command as failed: run nowhere, fired nothing."""
+        saved = self.saved_wait(wait, pane=pane)
+        self.assertEqual(saved["state"], "waiting", "the command fired on the helper project's ready file")
+        self.assertEqual(saved["errors"], 1, "a missing saved cwd is a command error, not a new execution context")
+        self.assertIsNone(saved["fired_at"])
+        self.assertEqual(first["actions"], [])
+        self.assertFalse((self.helper / "checked").exists(), "the command ran in the helper project")
+
+    def gave_up_after_five_failures(self, wait: str, *, pane: int | None = None) -> dict:
+        for seconds in range(1, 5):
+            self.tick(seconds=seconds)
+        saved = self.saved_wait(wait, pane=pane)
+        self.assertEqual(saved["state"], "needs_attention")
+        self.assertEqual(saved["errors"], 5)
+        self.assertIn("Command failed 5 times", saved["reason"])
+        self.assertIsNone(saved["fired_at"])
+        self.assertFalse((self.helper / "checked").exists())
+        return saved
+
     def test_pane_command_persists_explicit_cwd_across_cli_processes(self) -> None:
         self.project_statuses()
-        wait = self.cli(
+        wait = self.spawn(
             "add", "--pane", "72", "--kind", "command", "--cwd", str(self.project),
             "--argv", json.dumps(self.status_argv()), "--predicate", 'json_eq:status="ready"',
             "--interval", "1s", "--no-toast",
@@ -330,8 +386,7 @@ class WaitingRuntimeTests(unittest.TestCase):
             "predicate": 'json_eq:status="ready"',
         }
         wait, following = self.delivered_prompt(verify, "--cwd", str(declared))
-        event = self.start_cli("event", "--type", "turn_finished", "--session", SID)
-        self.answer(event, timeout=CALLER_DEADLINE_S)
+        self.cli("event", "--type", "turn_finished", "--session", SID)
         self.assertFalse((declared / "checked").exists())
         self.tick()
         self.assertEqual(self.saved_wait(wait)["state"], "done")
@@ -343,49 +398,24 @@ class WaitingRuntimeTests(unittest.TestCase):
     def test_missing_saved_session_cwd_never_falls_back_to_helper_project(self) -> None:
         self.project_statuses()
         self.live_session()
-        wait = self.cli(
-            "add", "--session", SID, "--kind", "command", "--argv", json.dumps(self.status_argv()),
-            "--predicate", 'json_eq:status="ready"', "--interval", "1s", "--no-toast",
-        )["wait"]["id"]
+        wait = self.add_status_check("--session", SID)
         self.assertEqual(self.saved_wait(wait)["condition"]["cwd"], str(self.project))
         moved = self.root / "renamed project"
         self.project.rename(moved)
-        first = self.tick()
-        saved = self.saved_wait(wait)
-        self.assertEqual(saved["state"], "waiting", "the missing cwd fired on the helper project's ready file")
-        self.assertEqual(saved["errors"], 1, "a missing saved cwd is a command error, not a new execution context")
-        self.assertIsNone(saved["fired_at"])
-        self.assertEqual(first["actions"], [])
-        self.assertFalse((self.helper / "checked").exists(), "the command ran in the helper project")
+        self.assert_failed_without_running(wait, self.tick())
         self.assertFalse((moved / "checked").exists())
-        for seconds in range(1, 5):
-            self.tick(seconds=seconds)
-        saved = self.saved_wait(wait)
-        self.assertEqual(saved["state"], "needs_attention")
-        self.assertEqual(saved["errors"], 5)
-        self.assertIn("Command failed 5 times", saved["reason"])
+        saved = self.gave_up_after_five_failures(wait)
         self.assertIn(str(self.project), saved["reason"])
-        self.assertIsNone(saved["fired_at"])
         self.assertEqual(self.cli("list")["sessions"][0]["outcome"], "attention")
-        self.assertFalse((self.helper / "checked").exists())
 
     def test_session_cwd_missing_before_registration_never_uses_helper_project(self) -> None:
         self.project_statuses()
         self.live_session()
         moved = self.root / "renamed project"
         self.project.rename(moved)
-        wait = self.cli(
-            "add", "--session", SID, "--kind", "command", "--argv", json.dumps(self.status_argv()),
-            "--predicate", 'json_eq:status="ready"', "--interval", "1s", "--no-toast",
-        )["wait"]["id"]
+        wait = self.add_status_check("--session", SID)
         self.assertEqual(self.saved_wait(wait)["condition"]["cwd"], str(self.project))
-        first = self.tick()
-        saved = self.saved_wait(wait)
-        self.assertEqual(saved["state"], "waiting")
-        self.assertEqual(saved["errors"], 1)
-        self.assertIsNone(saved["fired_at"])
-        self.assertEqual(first["actions"], [])
-        self.assertFalse((self.helper / "checked").exists())
+        self.assert_failed_without_running(wait, self.tick())
         self.assertFalse((moved / "checked").exists())
 
     def test_explicit_cwd_rejects_empty_relative_missing_and_file_paths(self) -> None:
@@ -405,11 +435,7 @@ class WaitingRuntimeTests(unittest.TestCase):
 
     def test_pane_command_without_cwd_captures_registration_directory(self) -> None:
         self.project_statuses()
-        wait = self.cli(
-            "add", "--pane", "72", "--kind", "command",
-            "--argv", json.dumps(self.status_argv()), "--predicate", 'json_eq:status="ready"',
-            "--interval", "1s", "--no-toast", cwd=self.project,
-        )["wait"]["id"]
+        wait = self.add_status_check("--pane", "72", cwd=self.project)
         first = self.tick()
         saved = self.saved_wait(wait, pane=72)
         self.assertEqual(
@@ -428,11 +454,7 @@ class WaitingRuntimeTests(unittest.TestCase):
 
     def test_legacy_pane_command_without_saved_cwd_reports_error_without_running(self) -> None:
         self.project_statuses()
-        wait = self.cli(
-            "add", "--pane", "72", "--kind", "command", "--cwd", str(self.project),
-            "--argv", json.dumps(self.status_argv()), "--predicate", 'json_eq:status="ready"',
-            "--interval", "1s", "--no-toast",
-        )["wait"]["id"]
+        wait = self.add_status_check("--pane", "72", "--cwd", str(self.project))
         # Older versions legitimately persisted pane commands without a cwd.
         # No writer is running while this isolated fixture becomes that state.
         state = self.state()
@@ -442,28 +464,12 @@ class WaitingRuntimeTests(unittest.TestCase):
         del condition["cwd"]
         (self.state_dir / "waiting.json").write_text(json.dumps(state))
 
-        first = self.tick()
-        saved = self.saved_wait(wait, pane=72)
-        self.assertEqual(
-            saved["state"], "waiting",
-            "a legacy command without a saved cwd fired on the helper project's ready file",
-        )
-        self.assertEqual(saved["errors"], 1)
-        self.assertIsNone(saved["fired_at"])
-        self.assertEqual(first["actions"], [])
-        self.assertFalse((self.helper / "checked").exists())
+        self.assert_failed_without_running(wait, self.tick(), pane=72)
         self.assertFalse((self.project / "checked").exists())
-        for seconds in range(1, 5):
-            self.tick(seconds=seconds)
-        saved = self.saved_wait(wait, pane=72)
-        self.assertEqual(saved["state"], "needs_attention")
-        self.assertEqual(saved["errors"], 5)
-        self.assertIn("Command failed 5 times", saved["reason"])
+        saved = self.gave_up_after_five_failures(wait, pane=72)
         self.assertIn("cwd", saved["reason"].casefold())
         self.assertIn("recreate", saved["reason"].casefold())
-        self.assertIsNone(saved["fired_at"])
         self.assertEqual(self.cli("list")["panes"][0]["outcome"], "attention")
-        self.assertFalse((self.helper / "checked").exists())
         self.assertFalse((self.project / "checked").exists())
 
     def test_legacy_command_verification_without_saved_cwd_never_uses_helper_project(self) -> None:
@@ -479,8 +485,7 @@ class WaitingRuntimeTests(unittest.TestCase):
         del verify["cwd"]
         (self.state_dir / "waiting.json").write_text(json.dumps(state))
 
-        event = self.start_cli("event", "--type", "turn_finished", "--session", SID)
-        self.answer(event, timeout=CALLER_DEADLINE_S)
+        self.cli("event", "--type", "turn_finished", "--session", SID)
         self.assert_verification_queued(wait, following)
         self.tick()
         saved = self.saved_wait(wait)

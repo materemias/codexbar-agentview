@@ -79,7 +79,8 @@ let result = null;
 if (call.tool) result = await tool.execute("t", call.tool, null, null, ctx).then(() => null, (error) => error.message);
 if (call.line) await commands.wait.handler(call.line, ctx);
 if (call.prompts) for (let i = 0; i < 200 && acks().length < call.prompts; i++) await Bun.sleep(50);
-await Bun.sleep(300);
+// A tool call's answer is final; a line or prompts wait for the panel's refresh and any late send.
+if (!call.tool) await Bun.sleep(300);
 const panel = widgets["waitingfor-panel"]?.(null, { fg: (_tone, text) => text })?.render(200).join("\n") ?? null;
 handlers.session_shutdown();
 console.log(JSON.stringify({ panel, result, sent, acks: acks() }));
@@ -123,10 +124,11 @@ console.log(JSON.stringify(["2026-11-07 10:30am standup", "snooze 2026-11-07 9.3
         self.assertIn("Check: grep -q · prompt: x f -- tell me", answer["panel"] or "", answer)
 
     def test_a_cli_timeout_says_the_change_may_have_been_saved(self) -> None:
-        answer = self.drive({"tool": {"action": "stop", "wait": "w1"}}, timeout_ms=1500, FAKE_SLOW="stop")
+        # The fake answers `stop` after 5 s; the other calls, a fresh Python each, finish well within 0.5 s.
+        answer = self.drive({"tool": {"action": "stop", "wait": "w1"}}, timeout_ms=500, FAKE_SLOW="stop")
         self.assertEqual(
             answer["result"],
-            "codexbar_waiting.py timed out after 1.5 s; the change may have been saved: call list before retrying",
+            "codexbar_waiting.py timed out after 0.5 s; the change may have been saved: call list before retrying",
         )
 
     def test_a_resent_prompt_already_in_the_transcript_is_acked_without_a_second_send(self) -> None:

@@ -135,7 +135,7 @@ NOT_FOUND = ok(code=1, stderr="gh: Not Found (HTTP 404)\n")
 class FakeGh:
     """Answers gh by what it was asked, and records every call."""
 
-    def __init__(self, pr: dict | None = None, remaining: int = 5000) -> None:
+    def __init__(self, pr: dict | None = None, remaining: Any = 5000, **answers: Any) -> None:
         self.pr: Any = pr or pr_answer()
         self.remaining: Any = remaining
         self.calls: list[list[str]] = []
@@ -152,6 +152,10 @@ class FakeGh:
         # The head's workflow runs, newest first: (name, status, conclusion[, workflow]),
         # or a gh answer.
         self.runs: Any = []
+        # Any of the answers above, by name.
+        for name, answer in answers.items():
+            assert hasattr(self, name), name
+            setattr(self, name, answer)
 
     def count(self, needle: str) -> int:
         return sum(1 for call in self.calls if any(needle in arg for arg in call))
@@ -217,6 +221,29 @@ def release(tag: str, published: str, body: str = "", draft: bool = False,
             "prerelease": prerelease}
 
 
+def rest_pr(state: str = "open", merged: bool = False, **fields: Any) -> dict:
+    """The REST answer for PR 7, which the poller reads when GraphQL's budget is low."""
+    return {
+        "state": state,
+        "merged": merged,
+        "merged_at": MERGED_AT if merged else None,
+        "closed_at": MERGED_AT if state == "closed" else None,
+        "merge_commit_sha": MERGE_SHA,
+        "mergeable_state": "clean",
+        "head": {"sha": HEAD},
+        "base": {"ref": "main", "sha": "e" * 40},
+        "user": {"login": "me"},
+        **fields,
+    }
+
+
+def rest_review(
+    oid: str = HEAD, login: str = "greptile-apps[bot]", kind: str = "Bot", state: str = "COMMENTED",
+    body: str = "", rid: str = "PRR_bot",
+) -> dict:
+    return {"node_id": rid, "state": state, "body": body, "commit_id": oid, "user": {"login": login, "type": kind}}
+
+
 class PollTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.memo: dict = {}
@@ -239,12 +266,14 @@ class ParsePrTest(unittest.TestCase):
         self.assertEqual(github.parse_pr("acme/widget#42"), (REPO, 42))
 
     def test_rejects_the_rest(self) -> None:
-        for text in ("42", "#42", "acme/widget", "https://github.com/acme/widget/issues/42", "acme/widget#0"):
-            self.assertIsNone(github.parse_pr(text), text)
+        for text in (
+            "42", "#42", "acme/widget", "https://github.com/acme/widget/issues/42", "acme/widget#0",
+            "ö/ä#1", "../..#1", "./x#1", "x/..#1", "https://github.com/../x/pull/1",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(github.parse_pr(text))
 
-    def test_rejects_non_ascii_and_dot_names(self) -> None:
-        for text in ("ö/ä#1", "../..#1", "./x#1", "x/..#1", "https://github.com/../x/pull/1"):
-            self.assertIsNone(github.parse_pr(text), text)
+    def test_repo_names_may_hold_dots_but_not_be_dots(self) -> None:
         self.assertIsNone(github.REPO_RE.fullmatch("a/.."))
         self.assertIsNotNone(github.REPO_RE.fullmatch("a.b/.github"))
 
@@ -658,6 +687,13 @@ class ReadyTest(PollTestCase):
         self.assertEqual(result["fired"], ready, result)
         return result
 
+    def first_polls(self, ready: bool, cases: dict[str, FakeGh]) -> None:
+        """Each case as a new wait's first poll."""
+        for name, gh in cases.items():
+            with self.subTest(name):
+                self.memo, self.clock = {}, 1000.0
+                self.assert_ready(gh, ready)
+
     def test_green_reviewed_and_no_threads_fires(self) -> None:
         gh = FakeGh(
             pr_answer(
@@ -671,17 +707,43 @@ class ReadyTest(PollTestCase):
             result["fire_text"], "ready on aaaaaaa: 2 checks green, greptile reviewed, no open threads"
         )
 
-    def test_open_thread_blocks(self) -> None:
-        self.assert_ready(FakeGh(pr_answer(reviews=[bot_review()], threads=[thread()])), False)
+    def test_one_unmet_condition_blocks(self) -> None:
+        reviewed = [bot_review()]
+        self.first_polls(False, {
+            "an open thread": FakeGh(pr_answer(reviews=reviewed, threads=[thread()])),
+            "an open thread on an older page": FakeGh(
+                pr_answer(reviews=reviewed, threads=[thread(resolved=True)], older_cursor="c1"),
+                older_threads={"c1": threads_page([thread("T0")])},
+            ),
+            "a pending required check": FakeGh(
+                pr_answer(reviews=reviewed, checks=[check("ci", conclusion=None, status="QUEUED", required=True)])
+            ),
+            "a required check that has not started": FakeGh(
+                pr_answer(reviews=reviewed, checks=[check("other")]), rules=["ci"]
+            ),
+            "a gating bot's pending check": FakeGh(pr_answer(
+                reviews=reviewed,
+                checks=[check("ci", required=True), check("Cursor Bugbot", conclusion=None, status="IN_PROGRESS")],
+            )),
+            "behind the base": FakeGh(pr_answer(reviews=reviewed, merge_state="BEHIND")),
+            "merged, with a review on its head": FakeGh(pr_answer(state="MERGED", reviews=reviewed)),
+            "a workflow still running, no required checks": FakeGh(
+                pr_answer(reviews=reviewed), runs=[("CI", "queued", "")]
+            ),
+        })
 
-    def test_pending_required_check_blocks(self) -> None:
-        pending = check("ci", conclusion=None, status="QUEUED", required=True)
-        self.assert_ready(FakeGh(pr_answer(reviews=[bot_review()], checks=[pending])), False)
-
-    def test_required_check_that_has_not_started_blocks(self) -> None:
-        gh = FakeGh(pr_answer(reviews=[bot_review()], checks=[check("other")]))
-        gh.rules = ["ci"]
-        self.assert_ready(gh, False)
+    def test_what_does_not_block(self) -> None:
+        reviewed = [bot_review()]
+        self.first_polls(True, {
+            "a failed optional check": FakeGh(
+                pr_answer(reviews=reviewed, checks=[check("ci", required=True), check("lint", "FAILURE")])
+            ),
+            "a run cancelled for a newer one": FakeGh(pr_answer(reviews=reviewed), runs=[
+                ("CI", "completed", "success", "1/pull_request"), ("CI", "completed", "cancelled", "1/pull_request"),
+            ]),
+            # The rollup is then in charge.
+            "unreadable workflow runs": FakeGh(pr_answer(reviews=reviewed), runs=NOT_FOUND),
+        })
 
     def test_unknown_required_checks_never_read_as_none(self) -> None:
         gh = FakeGh(pr_answer(reviews=[bot_review()]))
@@ -689,11 +751,6 @@ class ReadyTest(PollTestCase):
         result = self.assert_ready(gh, False)
         self.assertTrue(result["transient"])
         self.assertEqual(result["events"], [])
-
-    def test_open_thread_on_an_older_page_blocks(self) -> None:
-        gh = FakeGh(pr_answer(reviews=[bot_review()], threads=[thread(resolved=True)], older_cursor="c1"))
-        gh.older_threads = {"c1": threads_page([thread("T0")])}
-        self.assert_ready(gh, False)
 
     def test_head_without_a_bot_gets_the_settle_time(self) -> None:
         gh = FakeGh()
@@ -712,10 +769,6 @@ class ReadyTest(PollTestCase):
         result = self.assert_ready(gh, True)
         self.assertIn("no bot reviewed aaaaaaa in 15 min (copilot reviewed an earlier head)", result["fire_text"])
 
-    def test_settle_time_never_outruns_a_pending_bot_check(self) -> None:
-        pending = check("CodeRabbit", None, status="IN_PROGRESS", app="coderabbitai")
-        self.assert_ready(FakeGh(pr_answer(checks=[pending])), False)
-
     def test_settle_time_runs_from_the_push_not_the_commit(self) -> None:
         # The poller can't see when a commit was pushed, only when it first saw it.
         gh = FakeGh()
@@ -733,7 +786,10 @@ class ReadyTest(PollTestCase):
         self.assertIn(f"fail:{HEAD}:slow", [event["key"] for event in result["events"]])
 
     def test_settle_time_does_not_apply_to_review_on_head(self) -> None:
-        self.assertFalse(self.poll(FakeGh())["fired"])
+        gh = FakeGh()
+        self.poll(gh)
+        self.clock += github.BOT_SETTLE_S
+        self.assertFalse(self.poll(gh)["fired"])
 
     def test_check_pending_over_an_hour_is_reported_once_per_head(self) -> None:
         pending = check("CodeRabbit", None, status="IN_PROGRESS", app="coderabbitai")
@@ -753,46 +809,21 @@ class ReadyTest(PollTestCase):
             [event["key"] for event in self.assert_ready(gh, False)["events"]], [f"head:{NEW_HEAD}"]
         )
 
-    def test_review_on_a_fresh_push_needs_no_settling(self) -> None:
-        gh = FakeGh(pr_answer(reviews=[bot_review()]))
-        self.assert_ready(gh, True)
-
     def test_poll_with_an_empty_memo_fires_on_a_settled_head(self) -> None:
         # The core verifies a `pr` postcondition this way.
         gh = FakeGh(pr_answer(reviews=[bot_review()]))
         result = github.poll({"repo": REPO, "number": 7, "until": "ready"}, {}, run=gh, now=9999.0)
         self.assertTrue(result["fired"])
 
-    def test_failed_optional_check_does_not_block(self) -> None:
-        gh = FakeGh(
-            pr_answer(reviews=[bot_review()], checks=[check("ci", required=True), check("lint", "FAILURE")])
-        )
-        self.assert_ready(gh, True)
-
-    def test_review_on_old_head_blocks_a_young_head(self) -> None:
-        gh = FakeGh(pr_answer(reviews=[bot_review(OLD_HEAD)]))
-        self.assert_ready(gh, False)
-
-    def test_gating_bots_pending_check_blocks(self) -> None:
-        pending = check("Cursor Bugbot", conclusion=None, status="IN_PROGRESS")
-        checks = [check("ci", required=True), pending]
-        self.assert_ready(FakeGh(pr_answer(reviews=[bot_review()], checks=checks)), False)
-
     def test_coderabbit_satisfies_the_review(self) -> None:
         result = self.assert_ready(FakeGh(pr_answer(reviews=[bot_review(login="coderabbitai")])), True)
         self.assertIn("coderabbit reviewed", result["fire_text"])
-
-    def test_behind_blocks(self) -> None:
-        self.assert_ready(FakeGh(pr_answer(reviews=[bot_review()], merge_state="BEHIND")), False)
 
     def test_draft_blocks_and_says_so_once_per_head(self) -> None:
         gh = FakeGh(pr_answer(merge_state="DRAFT", reviews=[bot_review()]))
         result = self.assert_ready(gh, False)
         self.assertEqual([event["key"] for event in result["events"]], [f"draft:{HEAD}"])
         self.assertEqual(self.assert_ready(gh, False)["events"], [])
-
-    def test_merged_with_a_review_on_its_head_does_not_fire(self) -> None:
-        self.assert_ready(FakeGh(pr_answer(state="MERGED", reviews=[bot_review()])), False)
 
     def test_merged_before_ready_says_so_and_does_not_fire(self) -> None:
         gh = FakeGh(pr_answer(state="MERGED", reviews=[bot_review(OLD_HEAD)]))
@@ -813,38 +844,17 @@ class ReadyTest(PollTestCase):
         gh.runs = [("CI", "completed", "success")]
         self.assert_ready(gh, True)
 
-    def test_a_workflow_still_running_blocks_without_required_checks(self) -> None:
-        gh = FakeGh(pr_answer(reviews=[bot_review()]))
-        gh.runs = [("CI", "queued", "")]
-        self.assert_ready(gh, False)
-
-    def test_a_failed_run_blocks_and_needs_me_beside_green_checks(self) -> None:
-        gh = FakeGh(pr_answer(reviews=[bot_review()], checks=[check("lint")]))
-        gh.runs = [("CI", "completed", "failure")]
-        result = self.assert_ready(gh, False)
-        self.assertEqual(
-            [(event["text"], event["on_me"]) for event in result["events"]],
-            [("CI failed on aaaaaaa (CI)", True)],
-        )
-
-    def test_a_run_cancelled_for_a_newer_one_does_not_block(self) -> None:
-        gh = FakeGh(pr_answer(reviews=[bot_review()]))
-        gh.runs = [("CI", "completed", "success", "1/pull_request"), ("CI", "completed", "cancelled", "1/pull_request")]
-        self.assert_ready(gh, True)
-
-    def test_a_ci_run_that_failed_before_any_job_blocks_and_needs_me(self) -> None:
-        gh = FakeGh(pr_answer(reviews=[bot_review()]))
-        gh.runs = [("CI", "completed", "failure")]
-        result = self.assert_ready(gh, False)
-        self.assertEqual(
-            [(event["text"], event["on_me"]) for event in result["events"]],
-            [("CI failed on aaaaaaa (CI)", True)],
-        )
-
-    def test_unreadable_workflow_runs_leave_the_rollup_in_charge(self) -> None:
-        gh = FakeGh(pr_answer(reviews=[bot_review()]))
-        gh.runs = NOT_FOUND
-        self.assert_ready(gh, True)
+    def test_a_failed_ci_run_blocks_and_needs_me(self) -> None:
+        # Beside green checks, or failed before any job reached the rollup.
+        for checks in ([check("lint")], []):
+            with self.subTest(checks=checks):
+                self.memo, self.clock = {}, 1000.0
+                gh = FakeGh(pr_answer(reviews=[bot_review()], checks=checks), runs=[("CI", "completed", "failure")])
+                result = self.assert_ready(gh, False)
+                self.assertEqual(
+                    [(event["text"], event["on_me"]) for event in result["events"]],
+                    [("CI failed on aaaaaaa (CI)", True)],
+                )
 
     def test_a_once_bot_on_the_head_does_not_stand_in_for_an_every_push_bot(self) -> None:
         reviews = [bot_review(OLD_HEAD, "roboomp", "PRR_old"), bot_review(login="copilot-pull-request-reviewer")]
@@ -957,8 +967,7 @@ class ActivityTest(PollTestCase):
         self.assertEqual(result["fire_text"], "PR#7 closed without merging")
 
     def test_a_comment_before_the_graphql_baseline_is_reported(self) -> None:
-        gh = FakeGh(remaining=100)
-        gh.rest_pr = RateLimitTest.rest(self)  # type: ignore[arg-type]
+        gh = FakeGh(remaining=100, rest_pr=rest_pr())
         self.assertFalse(self.poll(gh, until="activity")["fired"])
         gh.remaining = 4000
         self.clock += github.RATE_CHECK_S
@@ -974,15 +983,20 @@ class ActivityTest(PollTestCase):
 
 
 class ReleasedTest(PollTestCase):
+    def merged(self, *releases: dict, compare: dict | None = None, **pr: Any) -> FakeGh:
+        """A merged PR beside its repo's releases, newest first; compare: tag -> status."""
+        return FakeGh(pr_answer(state="MERGED", **pr), releases=list(releases), compare=compare or {})
+
     def test_open_pr_does_not_look_at_releases(self) -> None:
         gh = FakeGh()
         self.assertFalse(self.poll(gh, until="released")["fired"])
         self.assertEqual(gh.count("/releases"), 0)
 
     def test_compare_ahead_fires(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [release("v2", "2026-11-03T00:00:00Z"), release("v1", "2026-11-02T00:00:00Z")]
-        gh.compare = {"v1": "ahead", "v2": "ahead"}
+        gh = self.merged(
+            release("v2", "2026-11-03T00:00:00Z"), release("v1", "2026-11-02T00:00:00Z"),
+            compare={"v1": "ahead", "v2": "ahead"},
+        )
         result = self.poll(gh, until="released")
         self.assertTrue(result["fired"])
         self.assertFalse(result["confirm"])
@@ -991,15 +1005,11 @@ class ReleasedTest(PollTestCase):
         self.assertEqual(gh.count(f"compare/{MERGE_SHA}...v2"), 0)
 
     def test_identical_fires(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [release("v1", "2026-11-02T00:00:00Z")]
-        gh.compare = {"v1": "identical"}
+        gh = self.merged(release("v1", "2026-11-02T00:00:00Z"), compare={"v1": "identical"})
         self.assertTrue(self.poll(gh, until="released")["fired"])
 
     def test_diverged_with_notes_reference_asks_to_confirm(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [release("v1.1", "2026-11-02T00:00:00Z", "Fixes (#7), thanks")]
-        gh.compare = {"v1.1": "diverged"}
+        gh = self.merged(release("v1.1", "2026-11-02T00:00:00Z", "Fixes (#7), thanks"), compare={"v1.1": "diverged"})
         first = self.poll(gh, until="released")
         self.assertFalse(first["fired"])
         self.assertTrue(first["confirm"])
@@ -1013,86 +1023,72 @@ class ReleasedTest(PollTestCase):
         self.assertEqual(gh.count("query="), 1)
 
     def test_diverged_without_reference_keeps_waiting(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [release("v1", "2026-11-02T00:00:00Z", "See #70 and other/repo#7")]
-        gh.compare = {"v1": "behind"}
+        gh = self.merged(release("v1", "2026-11-02T00:00:00Z", "See #70 and other/repo#7"), compare={"v1": "behind"})
         result = self.poll(gh, until="released")
         self.assertFalse(result["fired"])
         self.assertFalse(result["confirm"])
         self.assertEqual(result["events"], [])
 
     def test_later_release_containing_the_merge_wins_over_a_reference(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [
-            release("v2", "2026-11-03T00:00:00Z"),
-            release("v1.1", "2026-11-02T00:00:00Z", "backport of #7"),
-        ]
-        gh.compare = {"v1.1": "diverged", "v2": "ahead"}
+        gh = self.merged(
+            release("v2", "2026-11-03T00:00:00Z"), release("v1.1", "2026-11-02T00:00:00Z", "backport of #7"),
+            compare={"v1.1": "diverged", "v2": "ahead"},
+        )
         result = self.poll(gh, until="released")
         self.assertTrue(result["fired"])
         self.assertFalse(result["confirm"])
 
     def test_waiting_for_a_release_polls_slowly(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        self.assertEqual(self.poll(gh, until="released")["next_poll_s"], github.RELEASE_POLL_S)
+        self.assertEqual(self.poll(self.merged(), until="released")["next_poll_s"], github.RELEASE_POLL_S)
 
     def test_release_past_the_first_page_is_found(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
         maintenance = [
             release(f"maint-{i}", f"2026-11-20T00:{i // 60:02d}:{i % 60:02d}Z")
             for i in range(github.RELEASE_PAGE)
         ]
-        gh.releases = maintenance + [release("v1", "2026-11-02T00:00:00Z")]
-        gh.compare = {"v1": "ahead", **{item["tag_name"]: "diverged" for item in maintenance}}
+        gh = self.merged(
+            *maintenance, release("v1", "2026-11-02T00:00:00Z"),
+            compare={"v1": "ahead", **{item["tag_name"]: "diverged" for item in maintenance}},
+        )
         result = self.poll(gh, until="released")
         self.assertEqual(result["fire_text"], "PR#7 released in v1")
         self.assertEqual(gh.count("page=2"), 1)
 
     def test_paging_stops_at_the_first_release_older_than_the_merge(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [release(f"old-{i}", "2026-10-01T00:00:00Z") for i in range(github.RELEASE_PAGE + 1)]
+        gh = self.merged(*(release(f"old-{i}", "2026-10-01T00:00:00Z") for i in range(github.RELEASE_PAGE + 1)))
         self.poll(gh, until="released")
         self.assertEqual(gh.count("/releases"), 1)
 
-    def test_link_to_another_repo_is_not_a_reference(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [release("v1", "2026-11-02T00:00:00Z", "https://github.com/other/project/pull/7")]
-        gh.compare = {"v1": "diverged"}
-        self.assertFalse(self.poll(gh, until="released")["confirm"])
-
-    def test_link_to_this_repo_is_a_reference(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [release("v1", "2026-11-02T00:00:00Z", "https://github.com/acme/widget/pull/7")]
-        gh.compare = {"v1": "diverged"}
-        self.assertTrue(self.poll(gh, until="released")["confirm"])
+    def test_only_a_link_to_this_repo_is_a_reference(self) -> None:
+        for link, confirm in (
+            ("https://github.com/other/project/pull/7", False),
+            ("https://github.com/acme/widget/pull/7", True),
+        ):
+            with self.subTest(link=link):
+                self.memo = {}
+                gh = self.merged(release("v1", "2026-11-02T00:00:00Z", link), compare={"v1": "diverged"})
+                self.assertEqual(self.poll(gh, until="released")["confirm"], confirm)
 
     def test_old_and_draft_releases_are_skipped(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [
-            release("draft", "2026-11-02T00:00:00Z", draft=True),
-            release("old", "2026-10-01T00:00:00Z"),
-        ]
+        gh = self.merged(
+            release("draft", "2026-11-02T00:00:00Z", draft=True), release("old", "2026-10-01T00:00:00Z"),
+        )
         self.assertFalse(self.poll(gh, until="released")["fired"])
         self.assertEqual(gh.count("compare/"), 0)
 
     def test_tag_missing_from_compare_is_not_an_error(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [release("v1", "2026-11-02T00:00:00Z", "#7")]
-        result = self.poll(gh, until="released")
+        result = self.poll(self.merged(release("v1", "2026-11-02T00:00:00Z", "#7")), until="released")
         self.assertIsNone(result["error"])
         self.assertTrue(result["confirm"])
 
     def test_compare_404_is_asked_again(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [release("v1", "2026-11-02T00:00:00Z")]
+        gh = self.merged(release("v1", "2026-11-02T00:00:00Z"))
         self.assertFalse(self.poll(gh, until="released")["fired"])
         gh.compare = {"v1": "ahead"}
         self.assertTrue(self.poll(gh, until="released")["fired"])
 
     def test_merged_without_a_merge_commit_compares_the_head(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED", merge_commit=False))
-        gh.releases = [release("v1", "2026-11-02T00:00:00Z")]
-        gh.compare = {"v1": "ahead"}
+        gh = self.merged(release("v1", "2026-11-02T00:00:00Z"), compare={"v1": "ahead"}, merge_commit=False)
         result = self.poll(gh, until="released")
         self.assertIsNone(result["error"])
         self.assertTrue(result["fired"])
@@ -1100,33 +1096,29 @@ class ReleasedTest(PollTestCase):
 
     def test_unknown_merge_time_reads_one_page(self) -> None:
         self.memo = {"merged": {"sha": MERGE_SHA, "at": None}}
-        gh = FakeGh()
-        gh.releases = [release(f"r{i}", "2026-11-02T00:00:00Z") for i in range(github.RELEASE_PAGE + 1)]
-        gh.compare = {item["tag_name"]: "behind" for item in gh.releases}
+        releases = [release(f"r{i}", "2026-11-02T00:00:00Z") for i in range(github.RELEASE_PAGE + 1)]
+        gh = FakeGh(releases=releases, compare={item["tag_name"]: "behind" for item in releases})
         self.poll(gh, until="released")
         self.assertEqual(gh.count("/releases"), 1)
 
     def test_transient_release_failure_retries_soon(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [release("v1", "2026-11-02T00:00:00Z")]
-        gh.compare = {"v1": ok(code=1, stderr="gh: Bad Gateway (HTTP 502)\n")}
+        gh = self.merged(
+            release("v1", "2026-11-02T00:00:00Z"), compare={"v1": ok(code=1, stderr="gh: Bad Gateway (HTTP 502)\n")},
+        )
         result = self.poll(gh, until="released")
         self.assertTrue(result["transient"])
         self.assertEqual(result["next_poll_s"], github.RETRY_POLL_S)
 
     def test_tag_is_escaped_in_the_compare_path(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [release("v1+build/x", "2026-11-02T00:00:00Z")]
-        gh.compare = {"v1%2Bbuild/x": "ahead"}
+        gh = self.merged(release("v1+build/x", "2026-11-02T00:00:00Z"), compare={"v1%2Bbuild/x": "ahead"})
         self.assertTrue(self.poll(gh, until="released")["fired"])
 
     def test_a_prerelease_with_the_merge_is_news_not_the_release(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [
+        gh = self.merged(
             release("v2-rc2", "2026-11-03T00:00:00Z", prerelease=True),
             release("v2-rc1", "2026-11-02T00:00:00Z", "#7", prerelease=True),
-        ]
-        gh.compare = {"v2-rc1": "ahead", "v2-rc2": "ahead"}
+            compare={"v2-rc1": "ahead", "v2-rc2": "ahead"},
+        )
         first = self.poll(gh, until="released")
         self.assertFalse(first["fired"])
         self.assertFalse(first["confirm"])
@@ -1145,9 +1137,7 @@ class ReleasedTest(PollTestCase):
         self.assertEqual(third["fire_text"], "PR#7 released in v2")
 
     def test_a_prerelease_without_the_merge_says_nothing(self) -> None:
-        gh = FakeGh(pr_answer(state="MERGED"))
-        gh.releases = [release("v2-rc1", "2026-11-02T00:00:00Z", prerelease=True)]
-        gh.compare = {"v2-rc1": "behind"}
+        gh = self.merged(release("v2-rc1", "2026-11-02T00:00:00Z", prerelease=True), compare={"v2-rc1": "behind"})
         result = self.poll(gh, until="released")
         self.assertFalse(result["fired"])
         self.assertEqual(result["events"], [])
@@ -1270,35 +1260,13 @@ class ErrorsTest(PollTestCase):
 
 
 class RateLimitTest(PollTestCase):
-    def rest(self, state: str = "open", merged: bool = False) -> dict:
-        return {
-            "state": state,
-            "merged": merged,
-            "merged_at": MERGED_AT if merged else None,
-            "closed_at": MERGED_AT if state == "closed" else None,
-            "merge_commit_sha": MERGE_SHA,
-            "mergeable_state": "clean",
-            "head": {"sha": HEAD},
-            "base": {"ref": "main", "sha": "e" * 40},
-            "user": {"login": "me"},
-        }
-
-    def rest_review(self, oid: str = HEAD) -> dict:
-        return {
-            "node_id": "PRR_bot",
-            "state": "COMMENTED",
-            "body": "",
-            "commit_id": oid,
-            "user": {"login": "greptile-apps[bot]", "type": "Bot"},
-        }
-
     def test_a_rest_poll_forgets_none_of_a_big_prs_talk(self) -> None:
         talk = [thread("T1", comments=github.SEEN_KEPT + 100, author="someone")]
         gh = FakeGh(pr_answer(threads=talk))
         self.poll(gh, until="activity")
         gh.remaining = 100
         self.clock += github.RATE_CHECK_S
-        gh.rest_pr = self.rest()
+        gh.rest_pr = rest_pr()
         self.assertFalse(self.poll(gh, until="activity")["fired"])
         gh.remaining = 5000
         self.clock += github.RATE_CHECK_S
@@ -1306,29 +1274,22 @@ class RateLimitTest(PollTestCase):
         self.assertEqual((result["fired"], result["events"]), (False, []))
 
     def test_review_on_rest_waits_for_the_checks_graphql_shows(self) -> None:
-        gh = FakeGh(remaining=100)
-        gh.rest_pr = self.rest()
-        gh.rest_reviews = [self.rest_review()]
+        gh = FakeGh(remaining=100, rest_pr=rest_pr(), rest_reviews=[rest_review()])
         result = self.poll(gh)
         self.assertFalse(result["fired"])
         self.assertEqual(result["next_poll_s"], github.RATE_LIMITED_POLL_S)
         self.assertEqual(gh.count("query="), 0)
 
     def test_review_on_old_head_does_not_fire_on_rest(self) -> None:
-        gh = FakeGh(remaining=100)
-        gh.rest_pr = self.rest()
-        gh.rest_reviews = [self.rest_review(OLD_HEAD)]
+        gh = FakeGh(remaining=100, rest_pr=rest_pr(), rest_reviews=[rest_review(OLD_HEAD)])
         self.assertFalse(self.poll(gh)["fired"])
 
     def test_ready_cannot_fire_on_rest(self) -> None:
-        gh = FakeGh(remaining=100)
-        gh.rest_pr = self.rest()
-        gh.rest_reviews = [self.rest_review()]
+        gh = FakeGh(remaining=100, rest_pr=rest_pr(), rest_reviews=[rest_review()])
         self.assertFalse(self.poll(gh, until="ready")["fired"])
 
     def test_merged_and_released_work_on_rest(self) -> None:
-        gh = FakeGh(remaining=100)
-        gh.rest_pr = self.rest("closed", merged=True)
+        gh = FakeGh(remaining=100, rest_pr=rest_pr("closed", merged=True))
         self.assertTrue(self.poll(gh, until="merged")["fired"])
 
         self.memo = {}
@@ -1337,9 +1298,7 @@ class RateLimitTest(PollTestCase):
         self.assertTrue(self.poll(gh, until="released")["fired"])
 
     def test_closed_on_rest(self) -> None:
-        gh = FakeGh(remaining=100)
-        gh.rest_pr = self.rest("closed")
-        result = self.poll(gh, until="merged")
+        result = self.poll(FakeGh(remaining=100, rest_pr=rest_pr("closed")), until="merged")
         self.assertEqual(result["events"][0]["text"], "PR#7 closed without merging")
 
     def test_a_healthy_budget_is_not_read_again(self) -> None:
@@ -1349,8 +1308,7 @@ class RateLimitTest(PollTestCase):
         self.assertEqual(gh.count("rate_limit"), 1)
 
     def test_a_low_budget_is_read_at_most_every_ten_minutes(self) -> None:
-        gh = FakeGh(remaining=100)
-        gh.rest_pr = self.rest()
+        gh = FakeGh(remaining=100, rest_pr=rest_pr())
         self.poll(gh)  # 1180
         self.poll(gh)  # 1360
         self.poll(gh)  # 1540
@@ -1361,8 +1319,7 @@ class RateLimitTest(PollTestCase):
         self.assertEqual(gh.count("rate_limit"), 2)
 
     def test_budget_back_returns_to_graphql(self) -> None:
-        gh = FakeGh(remaining=100)
-        gh.rest_pr = self.rest()
+        gh = FakeGh(remaining=100, rest_pr=rest_pr())
         self.poll(gh)
         gh.remaining = 4000
         self.clock += github.RATE_CHECK_S
@@ -1371,8 +1328,7 @@ class RateLimitTest(PollTestCase):
         self.assertEqual(gh.count("query="), 1)
 
     def test_rest_polls_leave_the_rest_of_the_baseline_to_graphql(self) -> None:
-        gh = FakeGh(remaining=100)
-        gh.rest_pr = self.rest()
+        gh = FakeGh(remaining=100, rest_pr=rest_pr())
         self.poll(gh)
         gh.remaining = 4000
         self.clock += github.RATE_CHECK_S
@@ -1380,49 +1336,38 @@ class RateLimitTest(PollTestCase):
         self.assertEqual(self.poll(gh)["events"], [])
 
     def test_viewer_is_read_once_on_a_rest_only_start(self) -> None:
-        gh = FakeGh(remaining=100)
-        gh.rest_pr = {**self.rest(), "user": {"login": "someone-else"}}
-        gh.rest_reviews = [
-            {
-                "node_id": "R1",
-                "state": "APPROVED",
-                "body": "",
-                "commit_id": HEAD,
-                "user": {"login": "me", "type": "User"},
-            }
-        ]
+        gh = FakeGh(
+            remaining=100, rest_pr=rest_pr(user={"login": "someone-else"}),
+            rest_reviews=[rest_review(login="me", kind="User", state="APPROVED", rid="R1")],
+        )
         self.memo["baselined"] = True
         self.assertEqual(self.poll(gh)["events"][0]["key"], f"head:{HEAD}")
         self.assertEqual(self.poll(gh)["events"], [])
         self.assertEqual(gh.count("user"), 1)
 
     def test_failed_rate_limit_read_is_not_retried_every_poll(self) -> None:
-        gh = FakeGh()
-        gh.remaining = ok(code=1, stderr="gh: Bad Gateway (HTTP 502)\n")
+        gh = FakeGh(remaining=ok(code=1, stderr="gh: Bad Gateway (HTTP 502)\n"))
         self.poll(gh)
         self.poll(gh)
         self.assertEqual(gh.count("rate_limit"), 1)
 
     def test_rate_limit_error_from_graphql_falls_back_at_once(self) -> None:
-        gh = FakeGh(ok(code=1, stderr="gh: API rate limit already exceeded for user ID 1.\n"))
-        gh.rest_pr = self.rest()
+        gh = FakeGh(ok(code=1, stderr="gh: API rate limit already exceeded for user ID 1.\n"), rest_pr=rest_pr())
         result = self.poll(gh)
         self.assertIsNone(result["error"])
         self.assertEqual(result["next_poll_s"], github.RATE_LIMITED_POLL_S)
         self.assertEqual(self.memo["rate"]["remaining"], 0)
 
     def test_transient_failure_on_rest_retries_soon(self) -> None:
-        gh = FakeGh(remaining=100)
-        gh.rest_pr = {}
-        result = self.poll(gh)
+        result = self.poll(FakeGh(remaining=100, rest_pr={}))
         self.assertTrue(result["transient"])
         self.assertEqual(result["next_poll_s"], github.RETRY_POLL_S)
 
     def test_rate_limited_rest_keeps_the_long_interval(self) -> None:
-        gh = FakeGh(remaining=100)
-        gh.rest_pr = {"head": {"sha": HEAD}}
-        gh.rest_reviews = []
-        gh.user = ok(code=1, stderr="gh: API rate limit exceeded (HTTP 403)\n")
+        gh = FakeGh(
+            remaining=100, rest_pr={"head": {"sha": HEAD}}, rest_reviews=[],
+            user=ok(code=1, stderr="gh: API rate limit exceeded (HTTP 403)\n"),
+        )
         result = self.poll(gh)
         self.assertTrue(result["transient"])
         self.assertEqual(result["next_poll_s"], github.RATE_LIMITED_POLL_S)
@@ -1433,7 +1378,7 @@ class RateLimitTest(PollTestCase):
         gh.remaining = 100
         self.memo["rate"]["remaining"] = 100  # a low reading, so the budget is read again
         self.clock += github.RATE_CHECK_S
-        gh.rest_pr = {**self.rest(), "user": {"login": "someone"}, "head": {"sha": NEW_HEAD}}
+        gh.rest_pr = rest_pr(user={"login": "someone"}, head={"sha": NEW_HEAD})
         self.memo.pop("viewer")
         gh.user = ok(code=1, stderr="gh: Bad Gateway (HTTP 502)\n")
         result = self.poll(gh, until="activity")
@@ -1441,32 +1386,16 @@ class RateLimitTest(PollTestCase):
         self.assertTrue(result["transient"])
 
     def test_a_review_during_a_rest_only_start_is_not_lost(self) -> None:
-        gh = FakeGh(remaining=100)
-        gh.rest_pr = {**self.rest(), "user": {"login": "someone"}}
+        gh = FakeGh(remaining=100, rest_pr=rest_pr(user={"login": "someone"}))
         self.assertFalse(self.poll(gh, until="activity")["fired"])
-        gh.rest_reviews = [
-            {
-                "node_id": "R1",
-                "state": "CHANGES_REQUESTED",
-                "body": "no",
-                "commit_id": HEAD,
-                "user": {"login": "alice", "type": "User"},
-            }
-        ]
+        gh.rest_reviews = [rest_review(login="alice", kind="User", state="CHANGES_REQUESTED", body="no", rid="R1")]
         result = self.poll(gh, until="activity")
         self.assertTrue(result["fired"])
         self.assertEqual(result["fire_text"], "review from alice (changes requested): no")
 
     def test_rest_ignores_reviews_older_than_graphqls_window(self) -> None:
         reviews = [
-            {
-                "node_id": f"R{index}",
-                "state": "COMMENTED",
-                "body": "looks fine",
-                "commit_id": HEAD,
-                "user": {"login": "alice", "type": "User"},
-            }
-            for index in range(101)
+            rest_review(login="alice", kind="User", body="looks fine", rid=f"R{index}") for index in range(101)
         ]
         # A whole GraphQL poll saw R1..R100 and has since forgotten R0.
         self.memo = {
@@ -1475,9 +1404,7 @@ class RateLimitTest(PollTestCase):
             "rest_baselined": True,
             "viewer": "me",
         }
-        gh = FakeGh(remaining=100)
-        gh.rest_pr = self.rest()
-        gh.rest_reviews = reviews
+        gh = FakeGh(remaining=100, rest_pr=rest_pr(), rest_reviews=reviews)
         result = self.poll(gh, until="activity")
         self.assertEqual((result["fired"], result["events"]), (False, []))
 
