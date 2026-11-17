@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -72,13 +73,24 @@ def fake_github(**overrides) -> types.SimpleNamespace:
             "memo": memo, "events": [], "fired": False, "fire_text": None,
             "confirm": False, "error": None, "transient": False, "next_poll_s": 180,
         },
-        snapshot=lambda repo, number: {"head": "abc123", "threads": []},
         verify_fix=lambda repo, number, before: (True, "new head"),
         pr_status=lambda repo, number, run=None: {
             "title": f"PR {number}", "state": "open", "review": None, "checks": None,
         },
+        REPO_RE=re.compile(r"(?!\.\.?/)[A-Za-z0-9_.-]+/(?!\.\.?$)[A-Za-z0-9_.-]+"),
     )
-    return types.SimpleNamespace(**{**defaults, **overrides})
+    fake = types.SimpleNamespace(**{**defaults, **overrides})
+    poll = fake.poll
+
+    def poll_with_snapshot(cond, memo, **kwargs):
+        # A fired poll asked for a snapshot carries the PR it fetched.
+        result = poll(cond, memo, **kwargs)
+        if kwargs.get("snapshot") and result.get("fired"):
+            result.setdefault("snapshot", {"head": "abc123", "threads": []})
+        return result
+
+    fake.poll = poll_with_snapshot
+    return fake
 
 
 def poll_result(memo: dict, **overrides) -> dict:
@@ -1078,13 +1090,7 @@ class PrTests(Case):
         self.assertEqual((seen["ball"], seen["reason"]), ("on_machine", None))
 
     def test_fix_without_a_snapshot_goes_to_review(self) -> None:
-        def snapshot(repo, number):
-            raise RuntimeError("gh down")
-
-        self.github(
-            poll=lambda cond, memo, **kwargs: poll_result(memo, fired=True),
-            snapshot=snapshot,
-        )
+        self.github(poll=lambda cond, memo, **kwargs: poll_result(memo, fired=True, snapshot=None))
         self.agents(SID)
         self.heartbeat()
         first = self.run_cli(
@@ -2303,6 +2309,69 @@ class TickTests(Case):
             record["waits"].append(wait)
         with mock.patch.object(waiting, "MAX_CHECKS_PER_TICK", 1):
             self.assertEqual(len(waiting._claim_checks(state, T0)), 1)
+
+    def test_a_tick_claims_no_more_than_its_workers_finish_in_the_claim(self) -> None:
+        rounds = -(-waiting.MAX_CHECKS_PER_TICK // waiting.CHECK_WORKERS)
+        self.assertLessEqual(rounds * waiting.JOB_WORST_S, waiting.CHECK_CLAIM_S)
+        self.assertLessEqual(waiting.COMMAND_TIMEOUT_S + 5, waiting.JOB_WORST_S)
+        # A PR poll's six `gh` calls at 30 s each.
+        self.assertLessEqual(6 * 30, waiting.JOB_WORST_S)
+
+    def test_a_fix_poll_asks_for_its_snapshot_and_no_second_fetch(self) -> None:
+        asked = []
+
+        def poll(cond, memo, **kwargs):
+            asked.append(kwargs.get("snapshot"))
+            return poll_result(memo, fired=True, snapshot={"head": "def456", "threads": []})
+
+        def snapshot(repo, number):
+            raise AssertionError("fetched the PR again")
+
+        self.github(poll=poll, snapshot=snapshot)
+        condition = {"type": "pr", "repo": "o/r", "number": 7, "until": "review_on_head"}
+        job = {"type": "pr", "fix": True, "condition": condition, "memo": {}}
+        result = waiting._run_job(job, T0)["result"]
+        self.assertEqual((asked, result["snapshot"]), ([True], {"head": "def456", "threads": []}))
+        waiting._run_job({**job, "fix": False}, T0)
+        self.assertEqual(asked, [True, False])
+
+    def test_a_recheck_keeps_the_polls_caches_but_not_its_seen(self) -> None:
+        state = waiting._empty_state()
+        record = state["sessions"][SID] = waiting._new_record(SID, None)
+        wait = waiting._new_wait(
+            state, T0, kind="pr",
+            condition={"type": "pr", "repo": "o/r", "number": 7, "until": "ready"}, by="user", label="x",
+        )
+        wait.update(state="fired", fired_head="a" * 40, memo={"seen": ["old"]})
+        record["waits"].append(wait)
+        memo = {"seen": ["new"], "rate": {"at": 1}, "required": {"names": ["ci"]}, "viewer": "me"}
+        waiting._apply_recheck(state, record, wait, poll_result(memo, head="a" * 40), T0)
+        self.assertEqual(wait["memo"], {
+            "seen": ["old"], "rate": {"at": 1}, "required": {"names": ["ci"]}, "viewer": "me",
+        })
+
+    def test_refused_claims_leave_the_view_alone(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        view = self.state_dir / "waiting_view.json"
+        before = (view.stat().st_mtime_ns, view.read_text(encoding="utf-8"))
+        for _ in range(3):
+            self.advance(seconds=5)
+            time.sleep(0.01)
+            # Pane 40 runs SID; another pane's claim is refused.
+            self.assertEqual(self.run_cli("claim-prompts", "--session", SID, "--pane", "99")["prompts"], [])
+        self.assertEqual((view.stat().st_mtime_ns, view.read_text(encoding="utf-8")), before)
+
+    def test_a_heartbeat_alone_is_saved_without_fsync(self) -> None:
+        self.agents(SID)
+        self.heartbeat()
+        self.advance(seconds=30)
+        with mock.patch.object(os, "fsync") as fsync, \
+                mock.patch.object(state_paths, "fsync_dir") as fsync_dir:
+            self.heartbeat()
+            self.assertEqual((fsync.call_count, fsync_dir.call_count), (0, 0))
+            self.add("--kind", "later")
+            self.assertTrue(fsync.called and fsync_dir.called)
 
     def test_result_of_a_changed_wait_is_dropped(self) -> None:
         # Overdue, it is on me: Snooze 1d moves its deadline while the check runs.
@@ -5878,6 +5947,26 @@ class StaleAgentsTests(Case):
 
 
 class TransientTests(Case):
+    def test_a_logged_out_gh_says_to_log_in_and_a_success_clears_it(self) -> None:
+        down = [True]
+        self.github(poll=lambda cond, memo, **kwargs: poll_result(
+            memo, error="gh is not logged in: run `gh auth login`", transient=True, auth=True,
+            next_poll_s=60,
+        ) if down[0] else poll_result(memo))
+        wait = self.add("--kind", "pr", "--repo", "o/r", "--number", "7")["id"]
+        self.tick()
+        self.tick_through(minutes=60)
+        self.assertEqual(
+            self.wait_of(wait)["progress"], "gh is not logged in since 12:00: run `gh auth login`",
+        )
+        told = [line["text"] for line in self.session()["history"] if "gh auth login" in line["text"]]
+        self.assertEqual(len(told), 1)
+        self.assertTrue(told[0].endswith("gh is not logged in since 12:00: run `gh auth login`"), told)
+        down[0] = False
+        self.tick_through(minutes=2)
+        self.assertIsNone(self.wait_of(wait)["progress"])
+        self.assertFalse(self.state()["sessions"][SID]["waits"][0].get("transient_auth"))
+
     def test_an_outage_is_told_once_after_an_hour_and_a_success_clears_it(self) -> None:
         down = [True]
         self.github(poll=lambda cond, memo, **kwargs: poll_result(

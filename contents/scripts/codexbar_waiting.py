@@ -28,7 +28,6 @@ import socket
 import sqlite3
 import subprocess
 import sys
-import tempfile
 import time
 import traceback
 import uuid
@@ -56,7 +55,11 @@ TRANSIENT_REPORT_S = 60 * 60
 # claimed again, and the claim's new `rev` drops the older result.
 CHECK_CLAIM_S = 5 * 60
 CHECK_WORKERS = 6
-MAX_CHECKS_PER_TICK = CHECK_WORKERS * CHECK_CLAIM_S // (COMMAND_TIMEOUT_S + 5)
+# The longest one check may take: a PR poll runs up to six `gh` calls one after
+# another, each bounded at 30 s. A tick takes no more checks than its workers
+# finish within the claim, so none is claimed again while it still runs.
+JOB_WORST_S = 180
+MAX_CHECKS_PER_TICK = CHECK_WORKERS * (CHECK_CLAIM_S // JOB_WORST_S)
 # A `sending` prompt older than this was left by a crash: offer it again.
 SENDING_FRESH_S = 2 * 60
 EXTENSION_FRESH_S = 15 * 60
@@ -236,7 +239,6 @@ SNOOZE_BACK = "Back from snooze"
 SNOOZE_ACTIONS = ("park", "close_pane", "unpark", "resume")
 
 _SESSION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,255}")
-_REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 # The negative lookahead keeps `/pull/12abc` out; `/files` or `#issuecomment-1`
 # after the number stay the same PR.
 _PR_URL = re.compile(
@@ -338,31 +340,6 @@ def _stamp_path() -> Path:
     return state_paths.state_dir() / "waiting.stamp"
 
 
-def _write_file(path: Path, text: str, durable: bool) -> None:
-    """Replace `path` atomically; `durable` also fsyncs it and its folder."""
-    with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.",
-        suffix=".tmp", delete=False,
-    ) as output:
-        temporary = Path(output.name)
-        try:
-            state_paths.make_private(output.fileno())
-            output.write(text)
-            if durable:
-                output.flush()
-                os.fsync(output.fileno())
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
-    try:
-        state_paths.replace(temporary, path)
-    except BaseException:
-        temporary.unlink(missing_ok=True)
-        raise
-    if durable:
-        state_paths.fsync_dir(path.parent)
-
-
 def _empty_state() -> dict:
     return {
         "version": STATE_VERSION, "wait_seq": 0, "action_seq": 0, "boot_id": "",
@@ -403,16 +380,28 @@ def _writer_lock():
 
 @contextlib.contextmanager
 def _transaction():
-    """The state under the writer lock, saved on a clean exit if it changed."""
+    """The state under the writer lock, saved on a clean exit if it changed. A
+    save that only moves extension heartbeats skips fsync: losing one costs a
+    heartbeat, while every other save holds waits that must survive a crash."""
     with _writer_lock():
         state = _load_state()
         before = json.dumps(state)
+        before_lasting = json.dumps(_lasting(state))
         yield state
         after = json.dumps(state)
         if after != before:
+            durable = json.dumps(_lasting(state)) != before_lasting
             state["save_seq"] += 1
-            _write_file(_state_path(), json.dumps(state, indent=1), durable=True)
-            _write_file(_stamp_path(), f"{state['save_seq']}\n", durable=False)
+            state_paths.write_file(_state_path(), json.dumps(state, indent=1), durable=durable)
+            state_paths.write_file(_stamp_path(), f"{state['save_seq']}\n", durable=False)
+
+
+# What an extension's heartbeat changes: cheap to lose, as the next one says it again.
+HEARTBEAT_KEYS = ("extensions", "extension_activity", "extension_features", "extension_panes")
+
+
+def _lasting(state: dict) -> dict:
+    return {key: value for key, value in state.items() if key not in HEARTBEAT_KEYS}
 
 
 def _publish(
@@ -421,8 +410,22 @@ def _publish(
 ) -> dict:
     """Build the view and write waiting_view.json; callers hold the lock."""
     view = _build_view(state, now, agents or _read_agents(), omp=omp, ticked=ticked, problems=problems)
-    _write_file(_view_path(), json.dumps(view), durable=False)
+    if ticked or _view_changed(view):
+        state_paths.write_file(_view_path(), json.dumps(view), durable=False)
     return view
+
+
+def _view_changed(view: dict) -> bool:
+    """Whether `view` says more than the file already does besides its `now`:
+    a claim or heartbeat that changed nothing seen leaves the file, and its
+    watchers, alone. Ticks still write, so `now` stays fresh."""
+    try:
+        current = json.loads(_view_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    if not isinstance(current, dict):
+        return True
+    return {**current, "now": None} != {**view, "now": None}
 
 
 def _error_line(error: BaseException) -> str:
@@ -484,7 +487,7 @@ def _report_tick_failure(error: BaseException) -> None:
                 error_kind="failed",
             )
             view["health"] = health
-            _write_file(path, json.dumps(view), durable=False)
+            state_paths.write_file(path, json.dumps(view), durable=False)
 
 
 def _mutate(
@@ -1237,7 +1240,7 @@ class PrCache:
         if self.dirty:
             with contextlib.suppress(OSError):
                 self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                _write_file(self.path, json.dumps({
+                state_paths.write_file(self.path, json.dumps({
                     "version": PR_CACHE_VERSION, "sessions": self.sessions,
                     "statuses": self.statuses,
                 }), durable=False)
@@ -1585,7 +1588,8 @@ def _new_wait(state: dict, now: datetime, daemon: str | None = None, **fields: o
         "event_flag": False, "armed_at": None, "fired_text": None, "fired_at": None,
         "snoozed_from": None, "repeat": None,
         # Since when checks fail for a reason that passes (`_note_transient`).
-        "transient_since": None, "transient_logged": False,
+        # `transient_auth`: the failure is gh logged out, which only `gh auth login` fixes.
+        "transient_since": None, "transient_logged": False, "transient_auth": False,
         # What `retry` restores of a wait check errors put on me (`_attention`).
         "retry_as": None,
         "done_at": None, "snooze_s": None,
@@ -1846,7 +1850,7 @@ def _fire(
     wait.update(
         on_me=False, overdue=False, reason=None, refire_at=None,
         fired_text=fired or text, fired_at=_iso(now),
-        transient_since=None, transient_logged=False,
+        transient_since=None, transient_logged=False, transient_auth=False,
     )
     _touch(wait)
     _log(record, now, wait, text, "fired")
@@ -2450,6 +2454,7 @@ def _run_verify(job: dict) -> dict:
             return {
                 "ok": False, "reason": str(error) or type(error).__name__, "error": True,
                 "transient": isinstance(error, github.GhError) and bool(error.transient),
+                "auth": bool(getattr(error, "auth", False)),
             }
         return {"ok": ok, "reason": reason, "transient": False}
     polled = github.poll(verify, job["memo"])
@@ -2457,7 +2462,7 @@ def _run_verify(job: dict) -> dict:
     if polled.get("error"):
         return {
             "ok": False, "reason": polled["error"], "memo": memo, "error": True,
-            "transient": bool(polled.get("transient")),
+            "transient": bool(polled.get("transient")), "auth": bool(polled.get("auth")),
         }
     held = bool(polled.get("fired"))
     return {
@@ -2474,15 +2479,12 @@ def _run_job(job: dict, now: datetime) -> dict:
         if job["type"] == "verify":
             return {**job, "result": _run_verify(job)}
         github = _github()
-        result = github.poll(job["condition"], job["memo"], now=now.timestamp())
-        if result.get("fired") and job["fix"] and job["type"] == "pr":
-            try:
-                result["snapshot"] = github.snapshot(
-                    job["condition"]["repo"], job["condition"]["number"]
-                )
-            except Exception:
-                # Without a snapshot the fix ends in `review`, not lost.
-                result["snapshot"] = None
+        # A fired fix carries the PR as the poll saw it; without one (None) the
+        # fix ends in `review`, not lost.
+        result = github.poll(
+            job["condition"], job["memo"], now=now.timestamp(),
+            snapshot=job["fix"] and job["type"] == "pr",
+        )
         return {**job, "result": result}
     except Exception as error:
         if job["type"] == "verify":
@@ -2573,6 +2575,8 @@ def _transient_text(wait: dict, now: datetime) -> str:
         argv = wait["condition"]["argv"]
         program = ((_windows_command(argv) or "").split() or argv)[0]
         return f"{Path(program).name} failing since {since}"
+    if wait.get("transient_auth"):
+        return f"gh is not logged in since {since}: run `gh auth login`"
     return f"GitHub unreachable since {since}"
 
 
@@ -2581,8 +2585,9 @@ def _transient_reported(wait: dict, now: datetime) -> bool:
     return since is not None and now.timestamp() - since >= TRANSIENT_REPORT_S
 
 
-def _note_transient(record: dict, wait: dict, now: datetime) -> None:
+def _note_transient(record: dict, wait: dict, now: datetime, auth: bool = False) -> None:
     """A failure that passes: retried, and told once when it has lasted."""
+    wait["transient_auth"] = auth
     if wait.get("transient_since") is None:
         wait["transient_since"] = _iso(now)
     elif not wait.get("transient_logged") and _transient_reported(wait, now):
@@ -2591,7 +2596,7 @@ def _note_transient(record: dict, wait: dict, now: datetime) -> None:
 
 
 def _checks_work(wait: dict) -> None:
-    wait.update(transient_since=None, transient_logged=False)
+    wait.update(transient_since=None, transient_logged=False, transient_auth=False)
 
 
 def _rearm(record: dict, wait: dict, now: datetime) -> None:
@@ -2703,6 +2708,11 @@ def _apply_recheck(state: dict, record: dict, wait: dict, result: dict, now: dat
     the base moves. A PR closed without merging ends its waits (`_pr_closed`).
     Other events are left to the poll that runs next."""
     wait["next_check_at"] = _iso(now + timedelta(seconds=result.get("next_poll_s") or PR_POLL_S))
+    # The poll's caches outlive the recheck; `seen` stays with the wait's own polls.
+    memo = result.get("memo") or {}
+    for key in ("rate", "required", "viewer"):
+        if key in memo:
+            wait["memo"][key] = memo[key]
     if result.get("merged"):
         _pr_merged(state, wait["condition"], now)
         return
@@ -2848,7 +2858,7 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
     error = result.get("error")
     if error:
         if result.get("transient"):
-            _note_transient(record, wait, now)
+            _note_transient(record, wait, now, bool(result.get("auth")))
             return
         wait["errors"] += 1
         if wait["errors"] >= MAX_ERRORS:
@@ -2876,7 +2886,7 @@ def _apply_verify(state: dict, record: dict, wait: dict, result: dict, now: date
         # Not counted, like a transient poll error; the next try backs off.
         wait["verify_memo"] = result.get("memo", wait["verify_memo"])
         wait["verify_claim_until"] = _iso(now + timedelta(seconds=PR_POLL_S))
-        _note_transient(record, wait, now)
+        _note_transient(record, wait, now, bool(result.get("auth")))
         return
     _checks_work(wait)
     if result["ok"]:
@@ -4177,7 +4187,7 @@ def _pr_reference(args: argparse.Namespace) -> tuple[str, int]:
         return parsed
     if args.repo is None or args.number is None:
         raise BadInput("a PR needs --pr, or --repo with --number")
-    if not _REPO.fullmatch(args.repo) or args.number <= 0:
+    if not _github().REPO_RE.fullmatch(args.repo) or args.number <= 0:
         raise BadInput("bad --repo or --number")
     return args.repo, args.number
 
@@ -4197,7 +4207,7 @@ def _parse_verify(text: str) -> dict:
         return {"type": "command", "argv": _check_argv(verify.get("argv")), "predicate": predicate}
     if verify.get("type") == "pr":
         repo, number, until = verify.get("repo"), verify.get("number"), verify.get("until")
-        valid_repo = isinstance(repo, str) and _REPO.fullmatch(repo)
+        valid_repo = isinstance(repo, str) and _github().REPO_RE.fullmatch(repo)
         if not valid_repo or type(number) is not int or number <= 0:
             raise BadInput("a pr verify needs repo and number")
         # A verify reads the PR once, and `activity` needs a poll before it.
@@ -4273,7 +4283,7 @@ def _condition(args: argparse.Namespace) -> dict:
             "predicate": _validate_predicate(args.predicate or "exit0"),
         }
     if kind == "release":
-        if args.repo is None or not _REPO.fullmatch(args.repo):
+        if args.repo is None or not _github().REPO_RE.fullmatch(args.repo):
             raise BadInput("release needs --repo owner/repo")
         return {
             "type": "command",
