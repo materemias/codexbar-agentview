@@ -282,8 +282,8 @@ card, the Plasma Agents section and tern-awui.
 
 | Says | Means |
 |---|---|
-| `closable` | every wait still to come has a prompt, so Tern reopens the session when one fires; waits already on you (fired, "ran, take a look") don't count, since they wait on the Waiting tab either way |
-| `closable · you reopen` | some wait still to come has no prompt, or is `later`: it comes back to you, and you resume it |
+| `closable` | every wait still to come has a prompt, so Tern reopens the session when one fires, or is a babysat PR's step after the review (ready, merged, released), which only brings news; waits already on you (fired, "ran, take a look") don't count, since they wait on the Waiting tab either way |
+| `closable · you reopen` | some other wait still to come has no prompt, or is `later`: it comes back to you, and you resume it |
 | `park only: job runs in this pane` | closing the shell pane ends the job the wait watches |
 | `park only: its waits end with the pane` | another wait on a shell pane: a shell can't be reopened, so closing the pane ends its waits |
 | `park only: turn cut off once already` | the prompt's turn was cut off before; a second cut would come to you |

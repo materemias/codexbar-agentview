@@ -210,6 +210,9 @@ CLOSE_REASONS = {
     "unresumable": ("park", "park only: it can't be resumed"),
     "manual": ("manual", "closable · you reopen"),
     "prompt": ("safe", "closable"),
+    # A babysit's later step without a prompt (ready, merged, released) only
+    # brings news: nothing is left for the session to do.
+    "news": ("safe", "closable"),
     # Every open wait is already on me: closing loses nothing, and nothing is to come.
     "seen": ("safe", "closable"),
 }
@@ -3894,10 +3897,16 @@ def _on_me_already(wait: dict) -> bool:
     return bool(wait["on_me"]) or state in ("fired", "review", "needs_attention")
 
 
-def _comes_back_alone(wait: dict) -> bool:
-    """A closed session is reopened for this wait's prompt, each repeat run, or
-    its snooze's wake."""
-    return wait["kind"] == "snooze" or (bool(wait["prompt"] or wait.get("repeat")) and wait["kind"] != "later")
+def _close_reason(wait: dict, linked: set[str]) -> str:
+    """What a wait still to come says about closing: `prompt`, a closed session
+    is reopened for its prompt, each repeat run, or its snooze's wake; `news`, a
+    babysat PR's step past the review, which only tells me; else `manual`."""
+    if wait["kind"] == "snooze" or (bool(wait["prompt"] or wait.get("repeat")) and wait["kind"] != "later"):
+        return "prompt"
+    chained = bool(wait["next"]) or wait["id"] in linked
+    if wait["kind"] == "pr" and chained and wait["condition"]["until"] != "review_on_head":
+        return "news"
+    return "manual"
 
 
 def _activity(state: dict, session: str, live: bool, now: datetime) -> dict:
@@ -3922,9 +3931,8 @@ def _session_close(
     waits = _open_waits(record) if record else []
     if not waits:
         return None
-    reasons = {
-        "prompt" if _comes_back_alone(wait) else "manual" for wait in waits if not _on_me_already(wait)
-    } or {"seen"}
+    linked = {wait["next"] for wait in record["waits"] if wait["next"]}
+    reasons = {_close_reason(wait, linked) for wait in waits if not _on_me_already(wait)} or {"seen"}
     if pinned:
         reasons.add("manual")
     if not resumable:

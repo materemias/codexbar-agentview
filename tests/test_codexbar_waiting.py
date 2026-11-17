@@ -5281,6 +5281,13 @@ class CloseTests(Case):
             self.close(), {"verdict": "manual", "reason": "manual", "text": "closable · you reopen"},
         )
 
+    def test_a_babysits_steps_after_the_review_only_bring_news(self) -> None:
+        self.run_cli("babysit-pr", "--session", SID, "--repo", "o/r", "--number", "7")
+        self.assertEqual(self.close()["verdict"], "safe")
+        # Without the fix prompt, a review comes to me to act on.
+        self.run_cli("babysit-pr", "--session", SID, "--repo", "o/r", "--number", "7", "--no-fix")
+        self.assertEqual(self.close()["verdict"], "manual")
+
     def test_later_and_a_pin_come_back_to_me(self) -> None:
         self.add("--kind", "later")
         self.assertEqual(self.close()["verdict"], "manual")

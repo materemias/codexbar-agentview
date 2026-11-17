@@ -302,8 +302,8 @@ whether that's safe, with the same words:
 
 | Says | Means |
 |---|---|
-| `closable` | every wait still to come has a prompt, so Tern reopens the session when one fires |
-| `closable · you reopen` | something still to come has no prompt: it comes back to you, and you resume it |
+| `closable` | every wait still to come has a prompt, so Tern reopens the session when one fires, or is a babysat PR's ready, merged or released step, which only brings news |
+| `closable · you reopen` | something else still to come has no prompt: it comes back to you, and you resume it |
 | `park only: …` | closing would lose something, and the reason follows: a job runs in the pane, the agent is mid-turn, there's no transcript to resume from, or nothing is checking the waits |
 
 Parking only takes the pane out of its tab, so it's always safe.
