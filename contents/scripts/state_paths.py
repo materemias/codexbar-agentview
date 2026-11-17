@@ -9,6 +9,7 @@ rename.
 """
 from __future__ import annotations
 
+import contextlib
 import errno
 import os
 import shutil
@@ -95,24 +96,24 @@ def write_file(path: str | os.PathLike, text: str, durable: bool) -> None:
     """Replace `path` atomically through a private, uniquely named temporary file
     beside it; `durable` also fsyncs the file and its folder."""
     path = Path(path)
-    with tempfile.NamedTemporaryFile(
+    output = tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.",
         suffix=".tmp", delete=False,
-    ) as output:
-        temporary = Path(output.name)
-        try:
+    )
+    temporary = Path(output.name)
+    try:
+        # Closed before any cleanup: Windows can't delete a file still open.
+        with output:
             make_private(output.fileno())
             output.write(text)
             if durable:
                 output.flush()
                 os.fsync(output.fileno())
-        except BaseException:
-            temporary.unlink(missing_ok=True)
-            raise
-    try:
         replace(temporary, path)
     except BaseException:
-        temporary.unlink(missing_ok=True)
+        # A failed cleanup must not hide the write's own error.
+        with contextlib.suppress(OSError):
+            temporary.unlink(missing_ok=True)
         raise
     if durable:
         fsync_dir(path.parent)

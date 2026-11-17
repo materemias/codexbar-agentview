@@ -1273,6 +1273,31 @@ class UsageCacheTests(IsolatedUsageTestCase):
         self.assertNotEqual(moved, original)
 
 
+class WriteFileTests(IsolatedUsageTestCase):
+    def test_a_failed_write_closes_its_temp_file_before_deleting_it(self) -> None:
+        # Windows can't delete a file still open: deleting it then would hide the
+        # write's own error and leave the temp file behind. Model that here.
+        opened = []
+        real_temp = fetch.state_paths.tempfile.NamedTemporaryFile
+        real_unlink = Path.unlink
+
+        def temp(*args, **kwargs):
+            opened.append(real_temp(*args, **kwargs))
+            return opened[-1]
+
+        def unlink(path, *args, **kwargs):
+            if any(not handle.closed and Path(handle.name) == path for handle in opened):
+                raise PermissionError("in use")
+            return real_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(fetch.state_paths.tempfile, "NamedTemporaryFile", temp), \
+                mock.patch.object(Path, "unlink", unlink), \
+                mock.patch.object(fetch.state_paths.os, "fsync", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                fetch.state_paths.write_file(self.home / "out.json", "{}", durable=True)
+        self.assertEqual(list(self.home.glob(".out.json.*")), [])
+
+
 class StateMigrationTests(IsolatedUsageTestCase):
     def test_first_run_moves_our_legacy_files_and_keeps_the_cli_files(self) -> None:
         legacy = self.home / ".codexbar"
