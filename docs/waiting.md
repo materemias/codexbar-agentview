@@ -131,9 +131,11 @@ and release waits need `gh`, logged in.
 waits until a review bot has looked at the latest push, then asks the agent to
 fix what's real in the findings and answer the rest. Code then checks that the
 agent pushed or answered every thread, waits for the PR to be ready (checks
-green, no open thread), and finally for the merge. A failed check, a conflict
-or a closed PR comes straight back to you. If the PR is merged early, the steps
-it skipped close and the merge step fires at once.
+green, no open thread), and finally for the merge. The review and ready steps
+come round again for every new push, so a PR that takes several review and fix
+rounds is fixed each time. A failed check or a conflict comes straight back to
+you. The merge ends the review and ready steps and fires the merge step; a
+close without merging ends every step and comes back to you once.
 
 The review bots it knows are Greptile, Macroscope, CodeRabbit, Codex, Copilot,
 Gemini, Cursor Bugbot, Sourcery and roboomp. Without a number, it takes the PR

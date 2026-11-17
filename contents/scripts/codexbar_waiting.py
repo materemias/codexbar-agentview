@@ -1596,8 +1596,9 @@ def _new_wait(state: dict, now: datetime, daemon: str | None = None, **fields: o
         # (`_back_early`); a resume may be bringing it up, to hide on arrival.
         # Waits from before these have none: read them with `.get`.
         "wake": False, "closed_seen": False, "arriving_at": None,
-        # A step `babysit-pr` chained (`_close_reason`); read it with `.get` too.
-        "babysit": False,
+        # A step `babysit-pr` chained (`_close_reason`, `_rounds`) and the head
+        # its last round fired on (`_next_round`); read them with `.get` too.
+        "babysit": False, "round_head": None,
     }
     wait.update(fields)
     if wait.get("kind") == "job":
@@ -1745,6 +1746,41 @@ def _settle(state: dict, record: dict, now: datetime) -> None:
 def _complete(state: dict, record: dict, wait: dict, now: datetime) -> None:
     _finish(record, wait, now)
     _settle(state, record, now)
+
+
+def _rounds(wait: dict) -> bool:
+    """A babysat PR's review and ready steps come round again: a PR can take
+    several review and fix rounds before it merges."""
+    return bool(wait.get("babysit")) and wait["condition"]["until"] in ("review_on_head", "ready")
+
+
+def _next_round(record: dict, wait: dict, now: datetime) -> None:
+    """A round step whose round is over moves its chain on and waits again, for
+    a head it hasn't fired on, until the PR merges or closes (`_pr_merged`,
+    `_pr_closed`)."""
+    if wait["state"] == "waiting":
+        # Seen on news it flagged (a failed check, say): it watches on.
+        wait.update(on_me=False, reason=None, event_flag=False)
+        _touch(wait)
+        return
+    wait["round_head"] = wait.get("fired_head") or wait.get("round_head")
+    _cancel_prompts(record, wait)
+    _activate_next(record, wait, now)
+    wait.update(
+        state="waiting", on_me=False, overdue=False, reason=None, verify_pending=False,
+        fired_text=None, fired_at=None, fired_head=None, snapshot=None, event_flag=False,
+        errors=0, retry_as=None, refire_at=None, review_since=None, next_check_at=_iso(now),
+    )
+    _checks_work(wait)
+    _touch(wait)
+    _log(record, now, wait, f"Next round: {wait['label']}")
+
+
+def _step_done(state: dict, record: dict, wait: dict, now: datetime) -> None:
+    if _rounds(wait):
+        _next_round(record, wait, now)
+    else:
+        _complete(state, record, wait, now)
 
 
 def _finish(record: dict, wait: dict, now: datetime, activate: bool = True) -> None:
@@ -2654,21 +2690,25 @@ def _revocable(wait: dict) -> bool:
     )
 
 
+def _closed_event(result: dict) -> dict | None:
+    return next((
+        event for event in result.get("events") or []
+        if str(event.get("key", "")).startswith("closed:")
+    ), None)
+
+
 def _apply_recheck(state: dict, record: dict, wait: dict, result: dict, now: datetime) -> None:
     """Take a fired wait back when the PR moved under it: a new head, or, for
     `ready`, a branch that can't merge. A review stays true of its head however
-    the base moves. A PR closed without merging brings the wait back to me.
+    the base moves. A PR closed without merging ends its waits (`_pr_closed`).
     Other events are left to the poll that runs next."""
     wait["next_check_at"] = _iso(now + timedelta(seconds=result.get("next_poll_s") or PR_POLL_S))
     if result.get("merged"):
         _pr_merged(state, wait["condition"], now)
         return
-    closed = next((
-        event for event in result.get("events") or []
-        if str(event.get("key", "")).startswith("closed:")
-    ), None)
+    closed = _closed_event(result)
     if closed is not None:
-        _attention(state, record, wait, now, closed["text"])
+        _pr_closed(state, wait["condition"], now, closed["text"])
         return
     if result.get("error") or not result.get("head"):
         return
@@ -2703,6 +2743,29 @@ def _apply_recheck(state: dict, record: dict, wait: dict, result: dict, now: dat
 
 def _merge_ends(wait: dict) -> bool:
     return wait["condition"]["until"] in ("review_on_head", "ready")
+
+
+def _pr_closed(state: dict, pr: dict, now: datetime, text: str) -> None:
+    """A PR closed without merging ends every wait on it but `activity`, in any
+    session: nothing is left to review, get ready, merge or release. In each
+    session one wait comes to me saying so, its chain's end if it has one;
+    the rest close without moving their chains on."""
+    key = _pr_key(pr)
+    for record in _records(state):
+        waits = [
+            wait for wait in _open_waits(record)
+            if wait["kind"] == "pr" and _pr_key(wait["condition"]) == key
+            and wait["condition"]["until"] != "activity"
+        ]
+        if not waits:
+            continue
+        waits.sort(key=lambda wait: wait["condition"]["until"] not in ("merged", "released"))
+        told, *needless = waits
+        for wait in needless:
+            _log(record, now, wait, f"{text}: {wait['label']} no longer needed")
+            _finish(record, wait, now, activate=False)
+        told["babysit"] = False  # no round is left: Seen ends it
+        _attention(state, record, told, now, text)
 
 
 def _pr_merged(state: dict, pr: dict, now: datetime) -> None:
@@ -2748,6 +2811,10 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
         _pr_merged(state, wait["condition"], now)
         if wait["state"] != "waiting":
             return
+    closed = _closed_event(result)
+    if closed is not None and wait["condition"]["until"] != "activity":
+        _pr_closed(state, wait["condition"], now, closed["text"])
+        return
     for event in result.get("events") or []:
         if str(event.get("key", "")).startswith("head:") and wait["event_flag"]:
             # What the event said was about the old head.
@@ -2775,6 +2842,8 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
     # `confirm` needs nothing here: its on_me event told me, and the wait stays
     # watched, so a compare that later proves the release fires it.
     if result.get("fired"):
+        if wait.get("round_head") and result.get("head") == wait["round_head"]:
+            return  # its last round was on this head (`_next_round`)
         wait["snapshot"] = result.get("snapshot", wait["snapshot"])
         wait["fired_head"] = result.get("head")
         text = result.get("fire_text") or wait["label"]
@@ -2794,7 +2863,7 @@ def _apply_verify(state: dict, record: dict, wait: dict, result: dict, now: date
         _log(record, now, wait, f"Verified: {result['reason']}", "fired")
         record["unseen"] = True
         _toast(state, record, wait, now, "success", wait["label"])
-        _complete(state, record, wait, now)
+        _step_done(state, record, wait, now)
     else:
         # A check that couldn't run can run again; a fix that didn't hold can't.
         retry_as = "verify" if result.get("error") else None
@@ -4699,7 +4768,10 @@ def _end_by_hand(
                 wait["next"] = None
             if stop_chain:
                 _stop_behind(record, wait, now)
-            _finish(record, wait, now, activate=not stop_chain)
+            if not stop_chain and _rounds(wait):
+                _next_round(record, wait, now)
+            else:
+                _finish(record, wait, now, activate=not stop_chain)
         if record:
             _settle(state, record, now)
         if args.wait:
@@ -4969,7 +5041,7 @@ def _settle_turn(state: dict, record: dict, now: datetime) -> None:
         ), None)
         if after is not None:
             _log(record, now, wait, f"{wait['label']}: ran; superseded by {after['label']}")
-            _complete(state, record, wait, now)
+            _step_done(state, record, wait, now)
             return
         wait.update(
             state="review", reason=REASON_REVIEW,

@@ -1023,8 +1023,33 @@ class PrTests(Case):
         self.assertEqual(before, [{"head": "abc123", "threads": []}])
         self.assertEqual(
             [(wait["label"], wait["state"]) for wait in view["sessions"][0]["waits"]],
-            [("Ready", "waiting"), ("Merged", "pending")],
+            [("Review on head", "waiting"), ("Ready", "waiting"), ("Merged", "pending")],
         )
+
+    def test_the_review_step_comes_round_again_for_a_new_head(self) -> None:
+        head = ["abc123"]
+        self.github(
+            poll=lambda cond, memo, **kwargs: poll_result(
+                memo, fired=cond["until"] == "review_on_head", fire_text="review landed", head=head[0],
+            ),
+            verify_fix=lambda repo, number, snapshot: (True, "new head"),
+        )
+        self.agents(SID)
+        self.heartbeat()
+        review = self.run_cli("babysit-pr", "--session", SID, "--repo", "o/r", "--number", "7")["waits"][0]["id"]
+        for _ in range(2):
+            self.tick()
+            prompt = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]
+            self.run_cli("ack", "--action", prompt["action"], "--result", "delivered")
+            self.run_cli("event", "--type", "turn_finished", "--session", SID)
+            self.tick()
+            self.assertEqual(self.wait_of(review)["state"], "waiting")
+            # Its review on the head it handled doesn't fire it again.
+            self.advance(minutes=4)
+            self.tick()
+            self.assertEqual(self.wait_of(review)["state"], "waiting")
+            head[0] = "def456"
+            self.advance(minutes=4)
 
     def test_failed_fix_needs_attention_and_the_chain_stops(self) -> None:
         first = self.fix_chain(lambda repo, number, snapshot: (False, "head did not move"))
@@ -1118,7 +1143,8 @@ class PrTests(Case):
         self.assertEqual(self.wait_of(first)["state"], "acting")
         self.advance(minutes=4)
         self.tick()
-        self.assertEqual(self.session()["waits"][0]["label"], "Ready")
+        self.assertEqual(self.wait_of(first)["state"], "waiting")  # the next round
+        self.assertEqual(self.session()["waits"][1]["label"], "Ready")
 
     def test_an_old_verify_can_not_settle_a_new_attempt(self) -> None:
         self.agents(SID)
@@ -3840,24 +3866,27 @@ class MergedPrTests(Case):
         self.tick()
         self.assertEqual(self.waits()[review]["state"], "waiting")
 
-    def test_closed_without_merge_needs_me_and_stays_watched(self) -> None:
+    def test_closed_without_merge_ends_every_wait_on_it_and_tells_me_once(self) -> None:
         closed = {"key": "closed:x", "text": "PR#7 closed without merging", "on_me": True}
         self.github()
         review, ready, merged = self.chain("--no-fix")
         lone = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "merged")["id"]
+        activity = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "activity")["id"]
         self.github(poll=lambda cond, memo, **kwargs: poll_result(memo, events=[closed], next_poll_s=3600))
         self.tick()
         waits = self.waits()
         self.assertEqual(
             [waits[wait]["state"] for wait in (review, ready, merged, lone)],
-            ["waiting", "pending", "pending", "waiting"],
+            ["done", "done", "needs_attention", "done"],
         )
-        for wait in (review, lone):
-            self.assertEqual(self.wait_of(wait)["outcome"], "attention")
+        self.assertNotEqual(waits[activity]["state"], "done")
+        self.assertEqual(self.wait_of(merged)["outcome"], "attention")
         seen = self.session()
         self.assertEqual(
             (seen["outcome"], seen["headline"]), ("attention", "⚠️ PR#7 closed without merging"),
         )
+        self.run_cli("mark-seen", "--session", SID, "--wait", merged)
+        self.assertEqual(self.waits()[merged]["state"], "done")
 
     def test_a_merged_wait_back_on_me_after_its_prompt_is_not_fired_again(self) -> None:
         self.agents(SID)
@@ -5947,7 +5976,7 @@ class TransientTests(Case):
         self.run_cli("retry", "--session", SID, "--wait", first)
         self.assertEqual(self.wait_of(first)["state"], "acting")
         self.tick()
-        self.assertEqual(self.session()["waits"][0]["label"], "Ready")
+        self.assertEqual(self.session()["waits"][1]["label"], "Ready")
 
 
 class RetryTests(Case):

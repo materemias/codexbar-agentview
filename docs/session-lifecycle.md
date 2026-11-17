@@ -124,15 +124,18 @@ latest push. `merged` and `released` do what they say; `released` compares
 the merge commit with the release tags, and a prerelease that holds it is
 only reported once: the wait keeps waiting for a release. `activity` fires on the next comment,
 review, merge or close from someone other than you, and on a push when the PR
-isn't yours. Failed checks, conflicts and a PR closed without merging bring
-the wait back to you at once.
+isn't yours. Failed checks and conflicts bring the wait back to you at once. A
+PR closed without merging ends every wait on it but `activity`, in every
+session; one per session comes back to you saying so.
 
 A fulfilled `ready` holds for one push. A new push, a conflict or a branch
 behind its base takes it back; a fulfilled `review` is taken back only by a
 new push. The wait is watched again, the history says why
 (`PR#42 no longer ready: new head 1a2b3c4`), and in a chain the next step
 waits for it again, counting its time from when the chain gets back to it.
-A fulfilled one on a PR closed without merging comes back to you.
+A babysat PR's review and ready steps don't end when their round does: Seen,
+or a verified fix, sends them back to watching, and they fire again only for a
+push they haven't fired on.
 
 The review bots are Greptile, Macroscope, CodeRabbit, Codex, Copilot, Gemini,
 Cursor Bugbot, Sourcery and roboomp. Copilot, Codex and Gemini review a PR once
@@ -232,8 +235,8 @@ Each wait under "Waiting for" carries its mark, and the fulfilling line in
 then ✅. A tab holding a session that's on you turns green when all of them
 are fulfilled and yellow when one needs you.
 
-When a babysat PR is merged early, the steps it skipped (review, ready) are
-closed and the merged step fires at once.
+A babysat PR's merge, early or not, closes its review and ready steps and
+fires the merged step at once.
 
 ## Follow-up prompts
 
