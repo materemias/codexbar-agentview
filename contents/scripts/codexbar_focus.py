@@ -5,9 +5,8 @@ relaunch a history record in a new kitty window or Tern tab.
 Invoked as a URL handler via Qt.openUrlExternally() from the plasmoid:
   codexbar-agentview://focus/<sessionId>
 
-It looks up the matching sentinel in the state directory's agents/ folder or
-the agents.json aggregate, walks the agent's process ancestry, and tries (in
-order):
+It looks up the matching record in the state directory's agents.json
+aggregate, walks the agent's process ancestry, and tries (in order):
   1. kitty's remote control if kitty is somewhere up the tree, or Tern's
      `tern focus` for the session's pane
   2. KWin scripting to activate any window owned by an ancestor pid
@@ -62,12 +61,11 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
 import codexbar_agents as agents
 import state_paths
 
-AGENTS_DIR = state_paths.STATE_DIR / "agents"
 AGGREGATE_PATH = state_paths.STATE_DIR / "agents.json"
 # Darwin and Windows have neither KWin nor systemd; --tern also disables KWin on Linux.
 USE_KWIN = sys.platform not in ("darwin", "win32")
@@ -75,18 +73,6 @@ T3_DIR = Path.home() / ".t3" / "userdata"
 
 
 def _find_sentinel(session_id: str) -> dict | None:
-    # Per-session sentinel files (Claude with hooks installed).
-    if AGENTS_DIR.is_dir():
-        for entry in AGENTS_DIR.glob("*.json"):
-            if entry.name.endswith(".tmp.json"):
-                continue
-            try:
-                rec = json.loads(entry.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            if isinstance(rec, dict) and rec.get("sessionId") == session_id:
-                return rec
-    # Virtual records (Codex, untracked Claude) only live in the aggregate file.
     if AGGREGATE_PATH.is_file():
         try:
             agg = json.loads(AGGREGATE_PATH.read_text())
@@ -191,6 +177,7 @@ def _tern_focus(pid: int) -> bool:
 
 
 KWIN_SCRIPT_TEMPLATE = """
+const name = "%NAME%";
 const targets = new Set([%PIDS%]);
 const captionHint = "%HINT%".toLowerCase();
 const wins = workspace.windowList ? workspace.windowList() : workspace.clientList();
@@ -233,6 +220,9 @@ if (target) {
     } catch (e) {}
     try { workspace.activeWindow = target; } catch (e) {}
     try { if (workspace.raiseWindow) workspace.raiseWindow(target); } catch (e) {}
+    // Unloading itself tells the launcher a window matched.
+    callDBus("org.kde.KWin", "/Scripting", "org.kde.kwin.Scripting",
+             "unloadScript", name);
 }
 """
 
@@ -250,29 +240,32 @@ def _caption_hint(record: dict) -> str:
     return "".join(ch for ch in base if ch.isalnum() or ch in ("-", "_", ".", " "))
 
 
-def _load_kwin_script(script: str, name: str | None = None) -> str:
-    """Load and start a KWin script; return its id, or "" on failure."""
+def _qdbus_scripting(method: str, *args: str) -> str:
+    return subprocess.run(
+        ["qdbus6", "org.kde.KWin", "/Scripting", f"org.kde.kwin.Scripting.{method}", *args],
+        capture_output=True, text=True, timeout=4.0, check=False,
+    ).stdout.strip()
+
+
+def _run_kwin_script(script: str, name: str, timeout: float) -> bool:
+    """Load and start a KWin script that unloads itself once it did its work;
+    True when it did within timeout, else unload it. KWin may read the file
+    any time while the script loads, so it goes only after that."""
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".js", delete=False)
     tmp.write(script)
     tmp.close()
     try:
-        load = subprocess.run(
-            ["qdbus6", "org.kde.KWin", "/Scripting",
-             "org.kde.kwin.Scripting.loadScript", tmp.name,
-             *([name] if name else [])],
-            capture_output=True, text=True, timeout=4.0, check=False,
-        )
-        sid = (load.stdout or "").strip()
-        if not sid.isdigit():
-            return ""
-        subprocess.run(
-            ["qdbus6", "org.kde.KWin", "/Scripting",
-             "org.kde.kwin.Scripting.start"],
-            capture_output=True, timeout=4.0, check=False,
-        )
-        return sid
+        if not _qdbus_scripting("loadScript", tmp.name, name).isdigit():
+            return False
+        _qdbus_scripting("start")
+        for _ in range(max(1, round(timeout / 0.2))):
+            time.sleep(0.2)
+            if _qdbus_scripting("isScriptLoaded", name) == "false":
+                return True
+        _qdbus_scripting("unloadScript", name)
+        return False
     except (FileNotFoundError, subprocess.TimeoutExpired):
-        return ""
+        return False
     finally:
         try:
             os.unlink(tmp.name)
@@ -280,37 +273,23 @@ def _load_kwin_script(script: str, name: str | None = None) -> str:
             pass
 
 
-def _stop_kwin_script(sid: str, name: str | None = None) -> None:
-    try:
-        subprocess.run(
-            ["qdbus6", "org.kde.KWin", f"/Scripting/Script{sid}", "stop"],
-            capture_output=True, timeout=2.0, check=False,
-        )
-        if name:
-            subprocess.run(
-                ["qdbus6", "org.kde.KWin", "/Scripting",
-                 "org.kde.kwin.Scripting.unloadScript", name],
-                capture_output=True, timeout=2.0, check=False,
-            )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
+# The activation script runs once on start; this only covers a slow KWin.
+ACTIVATE_TIMEOUT = 2.0
 
 
 def _kwin_activate(candidate_pids: list[int], record: dict | None = None) -> bool:
     """Use KWin scripting to activate the right window. Pid-only match isn't
     enough for Electron apps where many windows share one main pid; we also
-    pass a cwd-basename caption hint and prefer matches containing it."""
+    pass a cwd-basename caption hint and prefer matches containing it.
+    False when no window matched."""
     if not candidate_pids:
         return False
+    name = f"codexbar-focus-{os.getpid()}"
     script = (KWIN_SCRIPT_TEMPLATE
               .replace("%PIDS%", ",".join(str(p) for p in candidate_pids))
-              .replace("%HINT%", _caption_hint(record or {})))
-    sid = _load_kwin_script(script)
-    if not sid:
-        return False
-    # Run + immediately stop so kwin doesn't keep the script registered.
-    _stop_kwin_script(sid)
-    return True
+              .replace("%HINT%", _caption_hint(record or {}))
+              .replace("%NAME%", name))
+    return _run_kwin_script(script, name, ACTIVATE_TIMEOUT)
 
 
 # Keeps the window of one new pid on a saved desktop and activates it there,
@@ -375,24 +354,7 @@ def _kwin_place(pid: int, desktop: str) -> bool:
               .replace("%PID%", str(pid))
               .replace("%DESKTOP%", desktop)
               .replace("%NAME%", name))
-    sid = _load_kwin_script(script, name)
-    if not sid:
-        return False
-    deadline = time.monotonic() + PLACE_TIMEOUT
-    while time.monotonic() < deadline:
-        time.sleep(0.2)
-        try:
-            loaded = subprocess.run(
-                ["qdbus6", "org.kde.KWin", "/Scripting",
-                 "org.kde.kwin.Scripting.isScriptLoaded", name],
-                capture_output=True, text=True, timeout=2.0, check=False,
-            ).stdout.strip()
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            break
-        if loaded == "false":
-            return True
-    _stop_kwin_script(sid, name)
-    return False
+    return _run_kwin_script(script, name, PLACE_TIMEOUT)
 
 
 # A terminal can accept a command before its agent becomes discoverable.
@@ -631,7 +593,7 @@ def _session_operation(
             "bootId": boot_id, "cwd": cwd,
             "expiresAt": time.monotonic() + SESSION_START_RESERVATION_SECONDS,
         }
-        agents._write_file(reservation, json.dumps(owner), durable=True)
+        state_paths.write_file(reservation, json.dumps(owner), durable=True)
         # An exception may follow dispatch; leave its bounded reservation
         # intact, just as when the helper is killed at that boundary.
         try:
@@ -643,7 +605,7 @@ def _session_operation(
                 reservation.unlink(missing_ok=True)
                 return result
         owner["expiresAt"] = time.monotonic() + SESSION_START_RESERVATION_SECONDS
-        agents._write_file(reservation, json.dumps(owner), durable=True)
+        state_paths.write_file(reservation, json.dumps(owner), durable=True)
         if print_token and result == 0:
             print(json.dumps(owner["expiresAt"]))
         return result
@@ -762,7 +724,7 @@ def _launch(provider: str, session_id: str, payload: dict, cwd: str) -> int:
         return 8
     # An interactive shell loads the user's PATH; the trailing shell keeps
     # the window open after the agent exits, like the original terminal.
-    executable = _kitty_bin() if sys.platform == "darwin" else "kitty"
+    executable = _kitty_bin()
     if not executable:
         sys.stderr.write("codexbar_focus: Kitty is not installed\n")
         return 8
@@ -793,6 +755,12 @@ def _launch(provider: str, session_id: str, payload: dict, cwd: str) -> int:
     except OSError as exc:
         sys.stderr.write(f"codexbar_focus: launch failed: {exc}\n")
         return 8
+    # A missing kitty or a bad scope fails at once; a running window stays.
+    for _ in range(5):
+        time.sleep(0.1)
+        if proc.poll() not in (None, 0):
+            sys.stderr.write(f"codexbar_focus: launch failed: exit status {proc.returncode}\n")
+            return 8
     if desktop and not _kwin_place(proc.pid, desktop):
         sys.stderr.write("codexbar_focus: launched, but could not move window\n")
     return 0
@@ -805,12 +773,20 @@ def _user_shell() -> str:
     return os.environ.get("SHELL") or pwd.getpwuid(os.getuid()).pw_shell or "/bin/sh"
 
 
+# Shells that take `-ic` and run `exec <shell> -i`; others run the command in sh.
+POSIX_SHELLS = {"sh", "bash", "zsh", "fish", "dash", "ksh", "mksh"}
+
+
 def _resume_shell_argv(shell: str, command: str) -> list[str]:
     if state_paths.WINDOWS:
         # A PowerShell line (agents._resume_command); -NoExit keeps the tab
         # open after the agent exits, like the trailing shell below.
         return [shell, "-NoExit", "-Command", command]
-    argv = [shell, "-ic", f"{command}; exec {shlex.quote(shell)} -i"]
+    if Path(shell).name in POSIX_SHELLS:
+        argv = [shell, "-ic", f"{command}; exec {shlex.quote(shell)} -i"]
+    else:
+        # The resume command is POSIX shell syntax, which nu or tcsh don't read.
+        argv = ["/bin/sh", "-c", f'{command}; exec "$0" -i', shell]
     if sys.platform == "darwin":
         # Mac terminals customize direct-shell startup. Keep the helper's
         # home even when a daemon supplies its own shell environment.
@@ -922,9 +898,14 @@ def _teleport(provider: str, session_id: str, payload: dict, _cwd: str) -> int:
         if not _wait_exit(pid, TELEPORT_TERM_WAIT):
             sys.stderr.write("codexbar_focus: teleport failed: the agent did not exit\n")
             return 10
+    launched = _launch_tern(cwd, _user_shell(), command)
+    if launched != 0:
+        sys.stderr.write(f"codexbar_focus: resume it by hand: {command}\n")
+        return launched
+    # Close the kitty window only once Tern holds the session.
     if window_shell:
         _signal(window_shell, signal.SIGHUP)
-    return _launch_tern(cwd, _user_shell(), command)
+    return 0
 
 
 def _tern_ready() -> bool:
@@ -1150,7 +1131,7 @@ def main(argv: list[str]) -> int:
     for sep in ("/", "?", "#"):
         if sep in session_id:
             session_id = session_id.split(sep, 1)[0]
-    return focus(session_id.strip())
+    return focus(unquote(session_id.strip()))
 
 
 if __name__ == "__main__":

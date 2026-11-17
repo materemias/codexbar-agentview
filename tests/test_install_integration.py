@@ -28,25 +28,58 @@ class IntegrationPlatformTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.home = Path(directory.name)
-        spec = importlib.util.spec_from_file_location("isolated_install_integration", SCRIPT_PATH)
-        assert spec is not None and spec.loader is not None
-        self.installer = importlib.util.module_from_spec(spec)
-        with mock.patch.object(Path, "home", return_value=self.home):
-            spec.loader.exec_module(self.installer)
-        commands = mock.patch.object(self.installer.subprocess, "run")
-        self.commands = commands.start()
-        self.addCleanup(commands.stop)
+        # The paths are built at import, from HOME and the XDG variables.
         environment = mock.patch.dict(os.environ)
         environment.start()
         self.addCleanup(environment.stop)
-        os.environ.pop("OMP_AGENT_DIR", None)
-        os.environ.pop("PI_CODING_AGENT_DIR", None)
+        for name in ("OMP_AGENT_DIR", "PI_CODING_AGENT_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"):
+            os.environ.pop(name, None)
+        self.installer = self.load_installer()
+        commands = mock.patch.object(self.installer.subprocess, "run")
+        self.commands = commands.start()
+        self.addCleanup(commands.stop)
         self.omp_link = self.home / ".omp/agent/extensions/codexbar-waitingfor.ts"
-        self.installer.CLAUDE_SETTINGS.parent.mkdir(parents=True)
-        self.installer.CLAUDE_SETTINGS.write_text(json.dumps({
-            "hooks": {"Stop": [{"hooks": [{"command": "codexbar_agent_hook"}]}]},
-            "model": "keep-this-setting",
-        }))
+
+    def load_installer(self):
+        spec = importlib.util.spec_from_file_location("isolated_install_integration", SCRIPT_PATH)
+        assert spec is not None and spec.loader is not None
+        installer = importlib.util.module_from_spec(spec)
+        with mock.patch.object(Path, "home", return_value=self.home):
+            spec.loader.exec_module(installer)
+        return installer
+
+    def test_config_and_data_paths_follow_xdg(self) -> None:
+        config, data = self.home / "cfg", self.home / "data"
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(config), "XDG_DATA_HOME": str(data)}):
+            installer = self.load_installer()
+        self.assertEqual(installer.PLASMA_ENV_DIR, config / "plasma-workspace/env")
+        self.assertEqual(installer.SYSTEMD_ENV_DIR, config / "environment.d")
+        self.assertEqual(installer.MIMEAPPS_FILE, config / "mimeapps.list")
+        self.assertEqual(installer.DESKTOP_DIR, data / "applications")
+        # A relative value is invalid and ignored, as the spec says.
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": "cfg", "XDG_DATA_HOME": "data"}):
+            installer = self.load_installer()
+        self.assertEqual(installer.MIMEAPPS_FILE, self.home / ".config/mimeapps.list")
+        self.assertEqual(installer.DESKTOP_DIR, self.home / ".local/share/applications")
+
+    @unittest.skipIf(sys.platform == "win32", LINUX_DESKTOP)
+    def test_desktop_exec_quotes_the_script_path(self) -> None:
+        script = self.home / "my dir" / 'a"b$c%d.py'
+        script.parent.mkdir()
+        script.write_text("")
+        with mock.patch.object(self.installer, "FOCUS_SCRIPT_PATH", script), \
+                mock.patch.object(self.installer, "_set_mimeapps_default"):
+            self.installer.install_focus_url_handler()
+        # Quoting escapes " and $ with a backslash; the string level doubles it.
+        expected = 'Exec="' + str(self.home) + '/my dir/a\\\\"b\\\\$c%%d.py" %u\n'
+        self.assertIn(expected, self.installer.DESKTOP_FILE.read_text())
+
+    @unittest.skipIf(sys.platform == "win32", LINUX_DESKTOP)
+    def test_env_reports_systemd_only_when_set(self) -> None:
+        with mock.patch.object(self.installer, "_systemctl", return_value=(1, "no bus")):
+            self.assertNotIn("set in current", self.installer.install_env_script())
+        with mock.patch.object(self.installer, "_systemctl", return_value=(0, "")):
+            self.assertIn("set in current", self.installer.install_env_script())
 
     def snapshot(self) -> dict:
         return {
@@ -63,7 +96,6 @@ class IntegrationPlatformTests(unittest.TestCase):
             self.installer.SYSTEMD_ENV_FILE,
             self.installer.DESKTOP_FILE,
             self.installer.LEGACY_DESKTOP_FILE,
-            self.installer.LEGACY_SYSTEMD_FILE,
             *self.installer.LEGACY_ENV_FILES,
         ):
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -123,14 +155,11 @@ class IntegrationPlatformTests(unittest.TestCase):
                              self.installer.SYSTEMD_ENV_CONTENTS)
             self.assertIn("focus url handler:           yes", self.installer.status_all())
             desktop = self.installer.DESKTOP_FILE.read_text()
-            self.assertIn(f"Exec={self.installer.FOCUS_SCRIPT_PATH} %u", desktop)
+            self.assertIn(f'Exec="{self.installer.FOCUS_SCRIPT_PATH}" %u', desktop)
             self.assertIn("x-scheme-handler/codexbar-agentview", desktop)
             self.assertIn("x-scheme-handler/codexbar-agentview=codexbar-agentview-focus.desktop;",
                           self.installer.MIMEAPPS_FILE.read_text())
             self.assertFalse(self.installer.LEGACY_DESKTOP_FILE.exists())
-            self.assertFalse(self.installer.LEGACY_SYSTEMD_FILE.exists())
-            settings = json.loads(self.installer.CLAUDE_SETTINGS.read_text())
-            self.assertEqual(settings, {"model": "keep-this-setting"})
             self.assertEqual(self.installer.main(["--uninstall"]), 0)
         self.assertFalse(self.installer.PLASMA_ENV_FILE.exists())
         self.assertFalse(self.installer.SYSTEMD_ENV_FILE.exists())
@@ -317,6 +346,7 @@ class IntegrationPlatformTests(unittest.TestCase):
 @unittest.skipIf(sys.platform == "win32", LINUX_DESKTOP)
 class MimeappsReplacementTests(unittest.TestCase):
     setUp = IntegrationPlatformTests.setUp
+    load_installer = IntegrationPlatformTests.load_installer
 
     def test_updates_preserve_symlink_and_target_mode(self) -> None:
         target = self.home / "associations.list"

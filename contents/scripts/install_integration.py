@@ -8,8 +8,6 @@ script handles the bits the widget can't:
     on every login, no matter how it's restarted.
   * codexbar-agentview:// URL scheme: registers a desktop entry so the
     widget's click-to-focus action can launch codexbar_focus.py.
-  * Legacy hook cleanup: strips any old Claude Code hooks left over from
-    pre-hookless versions of the plasmoid.
   * Legacy identity cleanup: removes the codexbar:// handler and
     codexbar-xhr env files earlier versions installed.
   * omp extension: symlinks omp-extension/waitingfor.ts into omp's
@@ -30,11 +28,9 @@ import argparse
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -49,12 +45,18 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 AGGREGATOR_PATH = SCRIPT_DIR / "codexbar_agents.py"
 FOCUS_SCRIPT_PATH = SCRIPT_DIR / "codexbar_focus.py"
 
-# Legacy: earlier versions added hooks here. We strip them on install/uninstall.
-CLAUDE_SETTINGS = Path.home() / ".claude" / "settings.json"
-HOOK_MARKER = "codexbar_agent_hook"
+
+def _xdg_dir(variable: str, default: str) -> Path:
+    # The spec ignores a relative value.
+    value = os.environ.get(variable, "")
+    return Path(value) if os.path.isabs(value) else Path.home() / default
+
+
+CONFIG_DIR = _xdg_dir("XDG_CONFIG_HOME", ".config")
+DATA_DIR = _xdg_dir("XDG_DATA_HOME", ".local/share")
 
 # Sourced by plasmashell at session start (KDE-specific path).
-PLASMA_ENV_DIR = Path.home() / ".config" / "plasma-workspace" / "env"
+PLASMA_ENV_DIR = CONFIG_DIR / "plasma-workspace" / "env"
 PLASMA_ENV_FILE = PLASMA_ENV_DIR / "codexbar-agentview-xhr.sh"
 PLASMA_ENV_CONTENTS = (
     "#!/bin/sh\n"
@@ -68,7 +70,7 @@ PLASMA_ENV_CONTENTS = (
 # and user service. Covers manual restart paths like `kstart plasmashell`
 # or `plasmashell --replace` from an existing terminal that the plasma-
 # workspace/env script doesn't reach.
-SYSTEMD_ENV_DIR = Path.home() / ".config" / "environment.d"
+SYSTEMD_ENV_DIR = CONFIG_DIR / "environment.d"
 SYSTEMD_ENV_FILE = SYSTEMD_ENV_DIR / "codexbar-agentview-xhr.conf"
 SYSTEMD_ENV_CONTENTS = (
     "# Installed by CodexBar AgentView. Keeps QML_XHR_ALLOW_FILE_READ in the\n"
@@ -79,9 +81,9 @@ SYSTEMD_ENV_CONTENTS = (
 )
 
 # URL handler for the focus-on-click action.
-DESKTOP_DIR = Path.home() / ".local" / "share" / "applications"
+DESKTOP_DIR = DATA_DIR / "applications"
 DESKTOP_FILE = DESKTOP_DIR / "codexbar-agentview-focus.desktop"
-MIMEAPPS_FILE = Path.home() / ".config" / "mimeapps.list"
+MIMEAPPS_FILE = CONFIG_DIR / "mimeapps.list"
 SCHEME = "codexbar-agentview"
 SCHEME_KEY = f"x-scheme-handler/{SCHEME}"
 
@@ -90,65 +92,12 @@ LEGACY_DESKTOP_FILE = DESKTOP_DIR / "org.codexbar.focus.desktop"
 LEGACY_SCHEME_KEY = "x-scheme-handler/codexbar"
 LEGACY_ENV_FILES = (PLASMA_ENV_DIR / "codexbar-xhr.sh", SYSTEMD_ENV_DIR / "codexbar-xhr.conf")
 
-# Legacy: earlier versions shipped a systemd user service that ran the
-# aggregator. The widget now drives the refresh itself, so we just clean
-# up the old unit on install if it's still around.
-LEGACY_SYSTEMD_FILE = Path.home() / ".config" / "systemd" / "user" / "codexbar-agents.service"
-LEGACY_SYSTEMD_NAME = "codexbar-agents.service"
-
 # Symlinked into omp's extensions directory from a checkout or applet package;
 # on Windows a loader file (OMP_LOADER_MARKER, then re-exports of its file URL).
 OMP_EXTENSION_SOURCE = SCRIPT_DIR.parents[1] / "omp-extension" / "waitingfor.ts"
 OMP_EXTENSION_NAME = "codexbar-waitingfor.ts"
 OMP_LOADER_MARKER = "// codexbar-agentview: loads its omp extension from the checkout (a Windows symlink needs extra rights).\n"
 DEFAULT_OMP_AGENT_DIR = Path.home() / ".omp" / "agent"
-
-
-# ---------------------------------------------------------------------------
-# Legacy hook cleanup (removes the entries earlier versions wrote)
-# ---------------------------------------------------------------------------
-
-def _is_our_hook_entry(entry: dict) -> bool:
-    hooks = entry.get("hooks") if isinstance(entry, dict) else None
-    if not isinstance(hooks, list):
-        return False
-    return any(HOOK_MARKER in str(h.get("command") or "") for h in hooks if isinstance(h, dict))
-
-
-def _strip_our_hooks(events: dict) -> dict:
-    cleaned: dict = {}
-    for ev, lst in (events or {}).items():
-        if not isinstance(lst, list):
-            cleaned[ev] = lst
-            continue
-        kept = [e for e in lst if not _is_our_hook_entry(e)]
-        if kept:
-            cleaned[ev] = kept
-    return cleaned
-
-
-def remove_legacy_hooks() -> str:
-    if not CLAUDE_SETTINGS.is_file():
-        return "no claude settings file — nothing to remove"
-    try:
-        settings = json.loads(CLAUDE_SETTINGS.read_text())
-    except (OSError, json.JSONDecodeError):
-        return f"couldn't parse {CLAUDE_SETTINGS} — left it alone"
-    hooks = settings.get("hooks") if isinstance(settings.get("hooks"), dict) else None
-    if not hooks:
-        return "no hooks block in claude settings"
-    cleaned = _strip_our_hooks(hooks)
-    if cleaned == hooks:
-        return "no legacy codexbar hooks to remove"
-    # Back up then write.
-    backup = CLAUDE_SETTINGS.with_suffix(CLAUDE_SETTINGS.suffix + f".bak-{int(time.time())}")
-    shutil.copy2(CLAUDE_SETTINGS, backup)
-    if cleaned:
-        settings["hooks"] = cleaned
-    else:
-        settings.pop("hooks", None)
-    CLAUDE_SETTINGS.write_text(json.dumps(settings, indent=2))
-    return f"removed legacy hooks (backup: {backup.name})"
 
 
 # ---------------------------------------------------------------------------
@@ -179,8 +128,8 @@ def install_env_script() -> str:
     # 3. Push into the running systemd-user manager so subsequent restarts
     # (kquitapp6/kstart, plasmashell --replace, etc) from the current session
     # see the var without waiting for next login.
-    _systemctl("set-environment", "QML_XHR_ALLOW_FILE_READ=1")
-    msgs.append("set in current systemd-user environment")
+    if _systemctl("set-environment", "QML_XHR_ALLOW_FILE_READ=1")[0] == 0:
+        msgs.append("set in current systemd-user environment")
 
     return "env: " + ("; ".join(msgs) if msgs else "already current")
 
@@ -209,6 +158,14 @@ def remove_env_script() -> str:
 # URL scheme handler
 # ---------------------------------------------------------------------------
 
+def _desktop_exec_arg(path: Path) -> str:
+    """Quote an Exec argument per the Desktop Entry spec: backslash-escape
+    the quoting's reserved characters, then the string level's backslashes;
+    a literal % is %%."""
+    quoted = re.sub(r'(["`$\\])', r"\\\1", str(path)).replace("%", "%%")
+    return '"' + quoted.replace("\\", "\\\\") + '"'
+
+
 def install_focus_url_handler() -> str:
     if not FOCUS_SCRIPT_PATH.is_file():
         return f"skipped url handler (focus script missing: {FOCUS_SCRIPT_PATH})"
@@ -219,7 +176,7 @@ def install_focus_url_handler() -> str:
     desktop_contents = (
         "[Desktop Entry]\n"
         "Name=CodexBar AgentView Focus Agent\n"
-        f"Exec={FOCUS_SCRIPT_PATH} %u\n"
+        f"Exec={_desktop_exec_arg(FOCUS_SCRIPT_PATH)} %u\n"
         "Type=Application\n"
         "NoDisplay=true\n"
         f"MimeType={SCHEME_KEY};\n"
@@ -353,21 +310,6 @@ def _systemctl(*args: str) -> tuple[int, str]:
     return proc.returncode, out
 
 
-def remove_legacy_systemd_service() -> str:
-    """Earlier versions shipped a systemd --user service to run the
-    aggregator. The widget drives the refresh itself now, so the service is
-    dead weight — scrub it on install/uninstall if it's still around."""
-    if not LEGACY_SYSTEMD_FILE.is_file():
-        return ""
-    _systemctl("disable", "--now", LEGACY_SYSTEMD_NAME)
-    try:
-        LEGACY_SYSTEMD_FILE.unlink()
-    except OSError:
-        return f"failed to remove {LEGACY_SYSTEMD_NAME}"
-    _systemctl("daemon-reload")
-    return f"removed legacy {LEGACY_SYSTEMD_NAME}"
-
-
 # ---------------------------------------------------------------------------
 # omp extension
 # ---------------------------------------------------------------------------
@@ -478,16 +420,13 @@ def _require_linux() -> None:
 
 def install_all() -> str:
     """Install: env scripts so plasmashell gets QML_XHR_ALLOW_FILE_READ on
-    every launch, URL scheme handler for click-to-focus, and legacy cleanup
-    (Claude Code hooks, the systemd service we used to ship, and the
-    pre-rename codexbar:// handler and env files)."""
+    every launch, URL scheme handler for click-to-focus, and cleanup of the
+    pre-rename codexbar:// handler and env files."""
     _require_linux()
     parts = [
         remove_legacy_identity(),
         install_env_script(),
         install_focus_url_handler(),
-        remove_legacy_hooks(),
-        remove_legacy_systemd_service(),
     ]
     # Seed the aggregate so the widget has something to read on first open.
     # An existing one is left alone: this sweep would trim History to the
@@ -512,8 +451,6 @@ def install_all() -> str:
 def uninstall_all() -> str:
     _require_linux()
     parts = [
-        remove_legacy_systemd_service(),
-        remove_legacy_hooks(),
         remove_legacy_identity(),
         remove_focus_url_handler(),
         remove_env_script(),

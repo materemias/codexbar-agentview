@@ -95,6 +95,8 @@ class LaunchTests(unittest.TestCase):
                     mock.patch.object(focus, "_desktop_count", return_value=desktops),
                     mock.patch.object(focus, "_set_current_desktop"),
                     mock.patch.object(focus, "_kwin_place", return_value=True),
+                    mock.patch.object(focus, "_kitty_bin", return_value="kitty"),
+                    mock.patch.object(focus.time, "sleep"),
                     # Windows launches as itself: its helper never has KWin or systemd.
                     *(() if WINDOWS else (mock.patch.object(focus.sys, "platform", "linux"),
                                           mock.patch.object(focus, "USE_KWIN", True))),
@@ -861,7 +863,7 @@ class TeleportTests(unittest.TestCase):
     AGENT, SHELL, KITTY = 500, 400, 300
 
     def teleport(self, info: dict | None = None, tern_ready: bool = True,
-                 exits: bool = True, host: str = "kitty"):
+                 exits: bool = True, host: str = "kitty", launched: int = 0):
         live = {"provider": "omp", "sessionId": "sid-1", "pid": self.AGENT, "host": "kitty"}
         info = {"sessionId": "sid-1", "identityExact": True, "state": "idle",
                 "cwd": "/work/project", **(info or {})}
@@ -884,10 +886,11 @@ class TeleportTests(unittest.TestCase):
                 mock.patch.object(focus, "_wait_exit", return_value=exits),
                 mock.patch.object(focus.os, "kill",
                                   side_effect=lambda p, s: signals.append((p, s))),
-                mock.patch.object(focus, "_launch_tern", return_value=0) as launch,
-                mock.patch.object(focus.sys, "stderr", io.StringIO()),
+                mock.patch.object(focus, "_launch_tern", return_value=launched) as launch,
+                mock.patch.object(focus.sys, "stderr", io.StringIO()) as stderr,
             ):
                 code = focus.teleport("omp", "sid-1")
+                self.stderr = stderr.getvalue()
         return code, signals, launch
 
     def test_idle_session_hangs_up_then_closes_window_then_resumes_in_tern(self) -> None:
@@ -920,6 +923,95 @@ class TeleportTests(unittest.TestCase):
         self.assertEqual([s for _, s in signals],
                          [focus.signal.SIGHUP, focus.signal.SIGTERM])
         launch.assert_not_called()
+
+    def test_failed_tern_launch_leaves_the_kitty_window_open(self) -> None:
+        code, signals, launch = self.teleport(launched=8)
+        self.assertEqual(code, 8)
+        launch.assert_called_once()
+        self.assertEqual(signals, [(self.AGENT, focus.signal.SIGHUP)])
+        self.assertIn("cd -- /work/project && omp --resume sid-1", self.stderr)
+
+
+class KWinScriptTests(unittest.TestCase):
+    def qdbus(self, unloads: bool):
+        """A fake qdbus6: loadScript answers an id; the script unloads itself
+        only when `unloads` (it matched a window)."""
+        calls: list[list[str]] = []
+        scripts: list[Path] = []
+
+        def run(argv, **_kwargs):
+            calls.append(argv)
+            method = argv[3] if len(argv) > 3 else ""
+            out = ""
+            if method == "org.kde.kwin.Scripting.loadScript":
+                scripts.append(Path(argv[4]))
+                out = "7"
+            elif method == "org.kde.kwin.Scripting.isScriptLoaded":
+                # The script file must outlive the running script.
+                self.assertTrue(scripts[0].exists())
+                out = "false" if unloads else "true"
+            return focus.subprocess.CompletedProcess(argv, 0, out, "")
+        return run, calls, scripts
+
+    def activate(self, unloads: bool):
+        run, calls, scripts = self.qdbus(unloads)
+        with (
+            mock.patch.object(focus.subprocess, "run", side_effect=run),
+            mock.patch.object(focus.time, "sleep"),
+        ):
+            result = focus._kwin_activate([42], {"cwd": "/work/project"})
+        self.assertFalse(scripts[0].exists())
+        return result, calls, scripts
+
+    def test_activate_reports_a_matched_window(self) -> None:
+        result, calls, _ = self.activate(unloads=True)
+        self.assertTrue(result)
+        self.assertFalse(any(c[2].startswith("/Scripting/Script") for c in calls))
+
+    def test_activate_without_a_match_is_false_and_unloads(self) -> None:
+        result, calls, _ = self.activate(unloads=False)
+        self.assertFalse(result)
+        self.assertTrue(any(c[3:4] == ["org.kde.kwin.Scripting.unloadScript"] for c in calls))
+
+    def test_activate_script_unloads_itself_only_on_match(self) -> None:
+        run, _, _ = self.qdbus(True)
+        texts = []
+        original = run
+
+        def capture(argv, **kwargs):
+            if argv[3:4] == ["org.kde.kwin.Scripting.loadScript"]:
+                texts.append(Path(argv[4]).read_text())
+            return original(argv, **kwargs)
+        with (
+            mock.patch.object(focus.subprocess, "run", side_effect=capture),
+            mock.patch.object(focus.time, "sleep"),
+        ):
+            focus._kwin_activate([42])
+        script = texts[0]
+        self.assertIn("unloadScript", script[script.index("if (target)"):])
+
+    def test_caption_hint_cannot_break_out_of_the_js_string(self) -> None:
+        hint = focus._caption_hint({"cwd": "/x/a\"b\\c');workspace.x("})
+        self.assertEqual(hint, "abcworkspace.x")
+
+
+class ResumeShellTests(unittest.TestCase):
+    @unittest.skipIf(WINDOWS, "POSIX shells")
+    def test_non_posix_shell_runs_the_command_in_sh_then_execs_it(self) -> None:
+        with (
+            mock.patch.object(focus.sys, "platform", "linux"),
+            mock.patch.dict(focus.os.environ, {"SHELL": "/usr/bin/nu"}),
+        ):
+            argv = focus._resume_shell_argv(focus._user_shell(), "omp --resume x")
+        self.assertEqual(argv, ["/bin/sh", "-c", 'omp --resume x; exec "$0" -i', "/usr/bin/nu"])
+
+    def test_focus_url_decodes_the_session_id(self) -> None:
+        with (
+            mock.patch.object(focus.state_paths, "migrate"),
+            mock.patch.object(focus, "focus", return_value=0) as action,
+        ):
+            self.assertEqual(focus.main(["codexbar-agentview://focus/sid%20one%2Fx/?q#f"]), 0)
+        action.assert_called_once_with("sid one/x")
 
 
 class PlatformFocusTests(unittest.TestCase):
@@ -1044,6 +1136,28 @@ class MacFocusTests(unittest.TestCase):
             spawn.assert_not_called()
 
     @unittest.skipIf(WINDOWS, "kitty doesn't exist on Windows")
+    def test_linux_missing_or_failed_kitty_is_a_failure(self) -> None:
+        self.payload([entry(desktop="")])
+        with (
+            mock.patch.object(focus.sys, "platform", "linux"),
+            mock.patch.object(focus.time, "sleep"),
+        ):
+            with (
+                mock.patch.object(focus.shutil, "which", return_value=None),
+                mock.patch.object(focus.subprocess, "Popen") as spawn,
+            ):
+                self.assertEqual(focus.launch("omp", "sid-1"), 8)
+                spawn.assert_not_called()
+            # systemd-run starts, but kitty exits at once.
+            with (
+                mock.patch.object(focus.shutil, "which", return_value="/usr/bin/kitty"),
+                mock.patch.object(focus.subprocess, "Popen") as spawn,
+            ):
+                spawn.return_value.poll.return_value = 1
+                self.assertEqual(focus.launch("omp", "sid-1"), 8)
+                self.assertIn("/usr/bin/kitty", spawn.call_args.args[0])
+
+    @unittest.skipIf(WINDOWS, "kitty doesn't exist on Windows")
     def test_restore_reports_only_selected_verified_successful_rows(self) -> None:
         rows = [entry(sessionId=sid, closedBy="reboot",
                       resumeCommand=f"cd -- /work/project && omp --resume {sid}")
@@ -1054,11 +1168,12 @@ class MacFocusTests(unittest.TestCase):
         def spawn(argv, **kwargs):
             if "omp --resume failed;" in argv[-1]:
                 raise OSError("cannot launch")
-            return mock.Mock(pid=42)
+            return mock.Mock(pid=42, **{"poll.return_value": None})
         with (
             mock.patch.object(focus, "_kitty_bin", return_value="/bundle/kitty"),
             mock.patch.object(focus.subprocess, "Popen", side_effect=spawn) as started,
             mock.patch.object(focus.sys, "stdout", stdout),
+            mock.patch.object(focus.time, "sleep"),
         ):
             self.assertEqual(focus.launch_all({("omp", sid) for sid in
                                               ("good", "bad", "live", "failed")}), 0)
