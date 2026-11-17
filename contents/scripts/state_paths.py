@@ -12,6 +12,7 @@ from __future__ import annotations
 import errno
 import os
 import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import IO
@@ -88,6 +89,33 @@ def fsync_dir(path: str | os.PathLike) -> None:
         os.fsync(directory)
     finally:
         os.close(directory)
+
+
+def write_file(path: str | os.PathLike, text: str, durable: bool) -> None:
+    """Replace `path` atomically through a private, uniquely named temporary file
+    beside it; `durable` also fsyncs the file and its folder."""
+    path = Path(path)
+    with tempfile.NamedTemporaryFile(
+        mode="w", encoding="utf-8", dir=path.parent, prefix=f".{path.name}.",
+        suffix=".tmp", delete=False,
+    ) as output:
+        temporary = Path(output.name)
+        try:
+            make_private(output.fileno())
+            output.write(text)
+            if durable:
+                output.flush()
+                os.fsync(output.fileno())
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            raise
+    try:
+        replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    if durable:
+        fsync_dir(path.parent)
 
 
 # Earlier versions kept these in ~/.codexbar/ next to the CLI's own files.
