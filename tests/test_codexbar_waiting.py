@@ -3872,6 +3872,10 @@ class MergedPrTests(Case):
         review, ready, merged = self.chain("--no-fix")
         lone = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "merged")["id"]
         activity = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "activity")["id"]
+        first = self.add("--kind", "time", "--in", "1h")["id"]
+        behind = self.add(
+            "--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "activity", "--after", first,
+        )["id"]
         self.github(poll=lambda cond, memo, **kwargs: poll_result(memo, events=[closed], next_poll_s=3600))
         self.tick()
         waits = self.waits()
@@ -3879,7 +3883,7 @@ class MergedPrTests(Case):
             [waits[wait]["state"] for wait in (review, ready, merged, lone)],
             ["done", "done", "needs_attention", "done"],
         )
-        self.assertNotEqual(waits[activity]["state"], "done")
+        self.assertEqual((waits[activity]["state"], waits[behind]["state"]), ("fired", "done"))
         self.assertEqual(self.wait_of(merged)["outcome"], "attention")
         seen = self.session()
         self.assertEqual(
@@ -3887,6 +3891,19 @@ class MergedPrTests(Case):
         )
         self.run_cli("mark-seen", "--session", SID, "--wait", merged)
         self.assertEqual(self.waits()[merged]["state"], "done")
+
+    def test_a_merge_fires_a_watched_activity_wait_and_ends_one_not_reached(self) -> None:
+        self.github()
+        self.chain("--no-fix")
+        activity = self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "activity")["id"]
+        first = self.add("--kind", "time", "--in", "1h")["id"]
+        behind = self.add(
+            "--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "activity", "--after", first,
+        )["id"]
+        self.merged()
+        self.tick()
+        waits = self.waits()
+        self.assertEqual((waits[activity]["state"], waits[behind]["state"]), ("fired", "done"))
 
     def test_a_merged_wait_back_on_me_after_its_prompt_is_not_fired_again(self) -> None:
         self.agents(SID)

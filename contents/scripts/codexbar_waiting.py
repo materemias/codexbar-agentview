@@ -2745,18 +2745,36 @@ def _merge_ends(wait: dict) -> bool:
     return wait["condition"]["until"] in ("review_on_head", "ready")
 
 
+def _activity_ends(wait: dict) -> bool:
+    return wait["condition"]["until"] == "activity" and wait["state"] in ("pending", "waiting")
+
+
+def _end_activity(state: dict, record: dict, wait: dict, now: datetime, text: str) -> None:
+    """A merge or close is the last activity a PR has: a watched `activity`
+    wait fires on it, one its chain never reached closes."""
+    if wait["state"] == "waiting":
+        _fire(state, record, wait, now, text)
+    else:
+        _log(record, now, wait, f"{text}: {wait['label']} no longer needed")
+        _finish(record, wait, now, activate=False)
+
+
 def _pr_closed(state: dict, pr: dict, now: datetime, text: str) -> None:
-    """A PR closed without merging ends every wait on it but `activity`, in any
-    session: nothing is left to review, get ready, merge or release. In each
-    session one wait comes to me saying so, its chain's end if it has one;
-    the rest close without moving their chains on."""
+    """A PR closed without merging ends every wait on it, in any session:
+    nothing is left to review, get ready, merge or release. A watched
+    `activity` wait fires on it; else in each session one wait comes to me
+    saying so, its chain's end if it has one, and the rest close without
+    moving their chains on."""
     key = _pr_key(pr)
     for record in _records(state):
         waits = [
             wait for wait in _open_waits(record)
             if wait["kind"] == "pr" and _pr_key(wait["condition"]) == key
-            and wait["condition"]["until"] != "activity"
         ]
+        for wait in waits:
+            if _activity_ends(wait):
+                _end_activity(state, record, wait, now, text)
+        waits = [wait for wait in waits if wait["condition"]["until"] != "activity"]
         if not waits:
             continue
         waits.sort(key=lambda wait: wait["condition"]["until"] not in ("merged", "released"))
@@ -2780,6 +2798,8 @@ def _pr_merged(state: dict, pr: dict, now: datetime) -> None:
     for record, wait in waits:
         if _merge_fires(wait):
             _fire(state, record, wait, now, text)
+        elif _activity_ends(wait):
+            _end_activity(state, record, wait, now, text)
     needless = [item for item in waits if _merge_ends(item[1])]
     # A pending step goes first: closing the step before it would arm it.
     needless.sort(key=lambda item: item[1]["state"] != "pending")
@@ -2798,7 +2818,7 @@ def _merged_prs(cache: PrCache, state: dict) -> list[dict]:
     return [
         wait["condition"]
         for record in _records(state) for wait in _open_waits(record)
-        if wait["kind"] == "pr" and (_merge_fires(wait) or _merge_ends(wait))
+        if wait["kind"] == "pr" and (_merge_fires(wait) or _merge_ends(wait) or _activity_ends(wait))
         and cache.statuses.get(_pr_key(wait["condition"]), {}).get("state") == "merged"
     ]
 
@@ -2812,7 +2832,7 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
         if wait["state"] != "waiting":
             return
     closed = _closed_event(result)
-    if closed is not None and wait["condition"]["until"] != "activity":
+    if closed is not None:
         _pr_closed(state, wait["condition"], now, closed["text"])
         return
     for event in result.get("events") or []:

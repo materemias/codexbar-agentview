@@ -125,8 +125,10 @@ the merge commit with the release tags, and a prerelease that holds it is
 only reported once: the wait keeps waiting for a release. `activity` fires on the next comment,
 review, merge or close from someone other than you, and on a push when the PR
 isn't yours. Failed checks and conflicts bring the wait back to you at once. A
-PR closed without merging ends every wait on it but `activity`, in every
-session; one per session comes back to you saying so.
+merge or a close without merging ends every wait on the PR, in every session,
+but a `released` one after a merge: a watched `activity` wait fires on it, one
+its chain hasn't reached closes, and after a close one wait per session comes
+back to you saying so.
 
 A fulfilled `ready` holds for one push. A new push, a conflict or a branch
 behind its base takes it back; a fulfilled `review` is taken back only by a
