@@ -41,6 +41,16 @@ local function paneInfo(cx: WindowCx, pane: number): PaneInfo?
 	return nil
 end
 
+-- Whether the window shows this machine's host. The waits' pane ids name the
+-- local daemon's panes; a window on a remote host shows that host's, whose ids
+-- may repeat them. A Tern without `cx.hosts` shows no remote host.
+local function onLocalHost(cx: WindowCx): boolean
+	local ok, host = pcall(function()
+		return cx.hosts:current()
+	end)
+	return not (ok and type(host) == "table" and host.kind == "remote")
+end
+
 -- The dashboard this window opened, with the layout from before it opened.
 type Popup = {
 	pane: number, tab: number?, snap: LayoutSnapshot,
@@ -1665,6 +1675,16 @@ local function runActions(cx: WindowCx, leader: boolean)
 		end
 	end
 	local resumesChanged = false
+	-- A toast a leader showed stays shown when the lead moves on before its ack
+	-- lands: `waitingToasts` keeps its id until its action leaves the outbox.
+	local storedToasts = tern.kv.get("waitingToasts")
+	local toasts: { [string]: boolean } = {}
+	for id, shown in (if type(storedToasts) == "table" then storedToasts else {}) do
+		if shown == true then
+			toasts[id] = true
+		end
+	end
+	local toastsChanged = false
 	local listed: { [string]: boolean } = {}
 	for _, a in (if type(actions) == "table" then actions else {}) do
 		local id = tostring(a.id)
@@ -1693,8 +1713,14 @@ local function runActions(cx: WindowCx, leader: boolean)
 			local ok, result, err = true, nil, nil
 			if before then
 				result, err = before.result, before.error
+			elseif a.type == "toast" and toasts[id] then
+				result = "done" -- a window that led before showed it
 			else
 				ok, result, err = pcall(carryOut, cx, a, info)
+				if a.type == "toast" then
+					toasts[id] = true
+					toastsChanged = true
+				end
 			end
 			state = {
 				result = if ok then result else "failed",
@@ -1743,14 +1769,23 @@ local function runActions(cx: WindowCx, leader: boolean)
 			resumesChanged = true
 		end
 	end
+	for id in (if leader and type(actions) == "table" then toasts else {}) do
+		if not listed[id] then
+			toasts[id] = nil
+			toastsChanged = true
+		end
+	end
 	if resumesChanged then
 		tern.kv.set("waitingResumes", if next(resumes) then resumes else nil)
+	end
+	if toastsChanged then
+		tern.kv.set("waitingToasts", if next(toasts) then toasts else nil)
 	end
 end
 
 -- This window's tabs holding `on_me` panes turn green when all of those are
 -- fulfilled, else yellow. Tabs the user colored stay theirs; the ones colored
--- here are kept per window in `waitingTabs:<key>` and cleared here.
+-- here are kept per window in `waitingTabs:<key>` (none: no key) and cleared here.
 local function colorTabs(cx: WindowCx)
 	local tabsKey = "waitingTabs:" .. cx:window_key()
 	local entries = waitingEntries()
@@ -1771,6 +1806,9 @@ local function colorTabs(cx: WindowCx)
 		mine[id] = true
 	end
 	if next(want) == nil and next(mine) == nil then
+		if stored ~= nil then
+			tern.kv.set(tabsKey, nil) -- an older build's empty list
+		end
 		return
 	end
 	local keep = tern.json.array()
@@ -1788,12 +1826,19 @@ local function colorTabs(cx: WindowCx)
 		end
 	end
 	table.sort(keep)
-	if tern.json.encode(keep) ~= tern.json.encode(if type(stored) == "table" then stored else tern.json.array()) then
-		tern.kv.set(tabsKey, keep)
+	local keptSig = if #keep > 0 then tern.json.encode(keep) else nil
+	if keptSig ~= (if stored ~= nil then tern.json.encode(stored) else nil) then
+		tern.kv.set(tabsKey, if #keep > 0 then keep else nil)
 	end
 end
 
+-- A window on a remote host shows none of this daemon's panes, and a tab it
+-- opened for a resume would run there: it leaves the outbox and the tab
+-- colors to a window on this machine.
 local function lead(cx: WindowCx)
+	if not onLocalHost(cx) then
+		return
+	end
 	runActions(cx, leading(cx))
 	colorTabs(cx)
 end
@@ -1801,13 +1846,14 @@ end
 -- Parked is the window's alone (`PaneInfo.parked`), and windows don't share
 -- panes, so every window publishes its own under its key in `waitingPanes`, for
 -- the host's Waiting rows: { [window key] = { at = os.clock(), panes = { id },
--- parked = { id } } }. It writes when they change and renews every LEASE_S / 2;
--- the host reads an entry older than LEASE_S as a closed window's, and the next
--- writer drops it. Two windows writing at once may lose one entry: the next
--- poll finds it missing and writes it again.
+-- parked = { id } } }; a window on a remote host has none of this daemon's. It
+-- writes when they change and renews every LEASE_S / 2; the host reads an entry
+-- older than LEASE_S as a closed window's, and the next writer drops it. Two
+-- windows writing at once may lose one entry: the next poll finds it missing
+-- and writes it again.
 local function publishPanes(cx: WindowCx)
 	local panes, parked = {}, {}
-	for _, p in cx.session:panes() do
+	for _, p in (if onLocalHost(cx) then cx.session:panes() else {}) do
 		table.insert(panes, p.pane)
 		if p.parked then
 			table.insert(parked, p.pane)

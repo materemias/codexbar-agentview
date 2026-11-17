@@ -218,10 +218,6 @@ local function str(x: any): string
 	return tostring(x)
 end
 
-local function nowMs(): number
-	return os.time() * 1000
-end
-
 -- Seconds since the epoch of an ISO 8601 time; without an offset it counts as UTC.
 local function epoch(iso: any): number?
 	if type(iso) ~= "string" then
@@ -465,6 +461,10 @@ local store = {
 	-- shows as running next was unparked, which ends a snooze early (tick).
 	parkedSeen = {} :: { [number]: boolean },
 	jobEventAt = {} :: { [number]: number }, -- pane -> os.clock() when its last job event went to the CLI
+	-- A `job_finished` the CLI didn't take, by pane: jobEvent sends it again from
+	-- reconcilePanes (`sending` while one is under way).
+	jobPending = {} :: { [number]: { status: number, sending: boolean } },
+	scanRetryAt = 0, -- os.clock() before which no agents scan runs: the last one failed
 	waitingMemo = nil :: any, -- waitingGroups' last answer, for one view and filter
 	lastPoke = nil :: any,
 	menuRetryAt = nil :: number?, -- os.clock() when a failed `menu` load runs again
@@ -1403,8 +1403,25 @@ local function firstDue(r: any): (any, any)
 	return first, retry
 end
 
--- Per Tern pane, what the window half needs: the status segment, the session
--- card, and which panes its events matter for.
+-- Whether a waits row (with `w`, one of its waits) is this daemon's. Pane ids
+-- name the panes of the daemon a wait carries (`daemon`, the wait's else the
+-- row's): while another daemon ticks, only ours count; while this one ticks,
+-- rows without the field count too, as the CLI takes them for the ticker's.
+-- With no id to be had (`daemonKnown` without `daemonId`) every row counts
+-- unless another daemon ticks: the event goes without `--daemon`, and the CLI
+-- scopes it by the daemon it runs under if it can tell, else not at all. Until
+-- the id is known, a stamped one doesn't: such an unscoped event could end
+-- another daemon's wait on a pane of the same number.
+local function ours(r: any, w: any?): boolean
+	local stamp = (if w then val(w.daemon) else nil) or val(r.daemon)
+	if stamp ~= nil and (store.daemonId or not store.daemonKnown) then
+		return stamp == store.daemonId
+	end
+	return not store.waitingSkipped
+end
+
+-- Per Tern pane of this daemon, what the window half needs: the status
+-- segment, the session card, and which panes its events matter for.
 local function waitingPanes(): { [string]: any }
 	local panes: { [string]: any } = {}
 	local function add(pane: number?, r: any, session: string?, record: boolean)
@@ -1424,35 +1441,28 @@ local function waitingPanes(): { [string]: any }
 	end
 	local records: { [string]: boolean } = {}
 	for _, p in waitingList("panes") do
-		records[str(p.pane)] = true
-		add(tonumber(val(p.pane)), p, nil, true)
+		if ours(p) then
+			records[str(p.pane)] = true
+			add(tonumber(val(p.pane)), p, nil, true)
+		end
 	end
 	-- A session in a pane that also has a pane record speaks for that pane.
 	for _, s in waitingList("sessions") do
-		if val(s.live) == true then
+		if val(s.live) == true and ours(s) then
 			add(tonumber(val(s.pane)), s, str(s.session_id), records[str(s.pane)] == true)
 		end
 	end
 	return panes
 end
 
--- Panes whose next command ends a job wait of this daemon's: the condition's,
--- else the record's own. Pane ids name the panes of the daemon a wait carries
--- (`daemon`): while another daemon ticks, only ours count; while this one ticks,
--- waits without the field count too, as the CLI takes them for the ticker's.
--- With no id to be had (`daemonKnown` without `daemonId`) every wait counts
--- unless another daemon ticks: the event goes without `--daemon`, and the CLI
--- scopes it by the daemon it runs under if it can tell, else not at all. Until
--- the id is known, a stamped one doesn't: such an unscoped event could end
--- another daemon's wait on a pane of the same number.
+-- Panes whose next command ends a job wait of this daemon's (`ours`): the
+-- condition's, else the record's own.
 local function jobPanes(view: any): { [number]: boolean }
 	local out: { [number]: boolean } = {}
 	for _, field in { "sessions", "panes" } do
 		for _, r in val(view[field]) or {} do
 			for _, w in val(r.waits) or {} do
-				local stamp = val(w.daemon) or val(r.daemon)
-				local ours = if stamp ~= nil and (store.daemonId or not store.daemonKnown) then stamp == store.daemonId else not store.waitingSkipped
-				if ours and w.kind == "job" and w.state == "waiting" then
+				if ours(r, w) and w.kind == "job" and w.state == "waiting" then
 					local cond = val(w.condition)
 					local pane = (if type(cond) == "table" then tonumber(val(cond.pane)) else nil) or tonumber(val(r.pane))
 					if pane then
@@ -1517,10 +1527,9 @@ local function publishSummary()
 		usageOff = if setting("usage") then nil else true,
 		counts = counts,
 		restore = restore,
-		-- While another daemon ticks, the view's pane ids are its panes: none of ours.
 		waiting = {
 			on_me = tonumber(val(waitingCounts().on_me)) or 0,
-			panes = if store.waitingSkipped then {} else waitingPanes(),
+			panes = waitingPanes(),
 			health = line,
 		},
 		-- Which daemon this is, for the window half's pane events and adds (`--daemon`).
@@ -1550,15 +1559,18 @@ end
 
 -- Pollers -------------------------------------------------------------------
 
-local function scanAgents(force: boolean)
-	if store.scanning then
+local function scanAgents()
+	if store.scanning or os.clock() < store.scanRetryAt then
 		return
 	end
 	store.scanning = true
 	renderAll()
-	python("codexbar_agents.py", { "--once", "--history-limit", tostring(setting("historyLimit")) }, 30000, function(res)
+	-- The helper keeps 1000 exits; historyRecords shows the setting's share.
+	python("codexbar_agents.py", { "--once" }, 30000, function(res)
 		store.scanning = false
 		if res.status ~= 0 then
+			-- Not again on every poll: a sweep that fails is a Python process each time.
+			store.scanRetryAt = os.clock() + 60
 			tern.log.warn("codexbar: agent sweep failed", firstLine(res.stderr))
 		end
 		store.agentsRaw = "" -- reread
@@ -1676,65 +1688,71 @@ local function waitingTick()
 	python(WAITING_CLI, args, WAITING_TIMEOUT_MS, function(res)
 		store.waitingTicking = false
 		local okj, data = pcall(tern.json.decode, res.stdout)
-		local nextIn = WAITING_RETRY_S
 		local ticked = res.status == 0 and okj and type(data) == "table" and type(val(data.view)) == "table"
-		local skipped = if ticked then str(data.skipped) else ""
-		if ticked then
-			-- Before the view goes out: while skipped, the summary leaves out the
-			-- other daemon's panes (publishSummary).
-			local wasSkipped, hadError = store.waitingSkipped, store.waitingError ~= nil
-			store.waitingSkipped = if skipped ~= "" then skipped else nil
-			store.waitingError = nil
-			applyWaiting(val(data.view))
-			-- Another daemon's windows carry the outbox out; ours would do it twice.
-			publishActions(if skipped == "" and type(val(data.actions)) == "table" then val(data.actions) else tern.json.array())
-			nextIn = tonumber(val(data.next_tick_s)) or nextIn
-			if skipped ~= "" and wasSkipped == nil then
-				tern.log.warn("codexbar: waiting tick skipped", skipped)
-			end
-			if (wasSkipped == nil) ~= (store.waitingSkipped == nil) or hadError then
-				-- The Waiting tab's line about the other daemon, or the warning
-				-- line going, though the view may be the same.
-				publishSummary()
-				renderAll()
-			end
-		else
-			local detail = if okj and type(data) == "table" then str(data.error) else ""
-			detail = if detail ~= "" then detail else firstLine(res.stderr)
-			store.waitingError = if detail ~= "" then detail else "exit " .. res.status
-			tern.log.warn("codexbar: waiting tick failed", store.waitingError)
-			publishSummary()
-			renderAll() -- the warning line, or the Waiting tab's empty state without a view
-		end
-		store.waitingRaw = readWaiting()
-		-- Another writer (the omp extension, tern-awui) may have written after the
-		-- tick's last transaction: the poll would take that change as seen, and a
-		-- window action it queued would wait for the next timed tick. Its view or
-		-- an action the tick didn't return tells; one recheck, so no tick loop.
-		-- A skipped tick publishes no action, so it doesn't look.
-		local recheck = false
-		if ticked and skipped == "" and not store.waitingAgain and not store.waitingRecheck then
-			local okv, file = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
-			if okv and type(file) == "table" then
-				file.now = nil
-				if type(file.health) == "table" then
-					file.health.checked_at = nil
-				end
-				recheck = tern.json.encode(file) ~= store.waitingSig
-			end
-			local listed: { [string]: boolean } = {}
-			for _, a in (if type(store.waitingActions) == "table" then store.waitingActions else {}) do
-				listed[str(a.id)] = true
-			end
-			local okr, state = pcall(tern.json.decode, readWaiting(WAITING_FILE))
-			for _, a in (if okr and type(state) == "table" then val(state.actions) else nil) or {} do
-				recheck = recheck or not listed[str(a.id)]
-			end
-			store.waitingAgain = recheck
-		end
-		store.waitingRecheck = recheck
+		-- The next timed tick is due first: an answer that fails to apply
+		-- mustn't stop the timed ticks.
+		local nextIn = (if ticked then tonumber(val(data.next_tick_s)) else nil) or WAITING_RETRY_S
 		store.waitingAt = os.time() + nextIn
 		store.waitingAtMono = os.clock() + nextIn
+		local ok, err = pcall(function()
+			local skipped = if ticked then str(data.skipped) else ""
+			if ticked then
+				-- Before the view goes out: while skipped, the summary leaves out the
+				-- other daemon's panes (waitingPanes).
+				local wasSkipped, hadError = store.waitingSkipped, store.waitingError ~= nil
+				store.waitingSkipped = if skipped ~= "" then skipped else nil
+				store.waitingError = nil
+				applyWaiting(val(data.view))
+				-- Another daemon's windows carry the outbox out; ours would do it twice.
+				publishActions(if skipped == "" and type(val(data.actions)) == "table" then val(data.actions) else tern.json.array())
+				if skipped ~= "" and wasSkipped == nil then
+					tern.log.warn("codexbar: waiting tick skipped", skipped)
+				end
+				if (wasSkipped == nil) ~= (store.waitingSkipped == nil) or hadError then
+					-- The Waiting tab's line about the other daemon, or the warning
+					-- line going, though the view may be the same.
+					publishSummary()
+					renderAll()
+				end
+			else
+				local detail = if okj and type(data) == "table" then str(data.error) else ""
+				detail = if detail ~= "" then detail else firstLine(res.stderr)
+				store.waitingError = if detail ~= "" then detail else "exit " .. res.status
+				tern.log.warn("codexbar: waiting tick failed", store.waitingError)
+				publishSummary()
+				renderAll() -- the warning line, or the Waiting tab's empty state without a view
+			end
+			store.waitingRaw = readWaiting()
+			-- Another writer (the omp extension, tern-awui) may have written after the
+			-- tick's last transaction: the poll would take that change as seen, and a
+			-- window action it queued would wait for the next timed tick. Its view or
+			-- an action the tick didn't return tells; one recheck, so no tick loop.
+			-- A skipped tick publishes no action, so it doesn't look.
+			local recheck = false
+			if ticked and skipped == "" and not store.waitingAgain and not store.waitingRecheck then
+				local okv, file = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
+				if okv and type(file) == "table" then
+					file.now = nil
+					if type(file.health) == "table" then
+						file.health.checked_at = nil
+					end
+					recheck = tern.json.encode(file) ~= store.waitingSig
+				end
+				local listed: { [string]: boolean } = {}
+				for _, a in (if type(store.waitingActions) == "table" then store.waitingActions else {}) do
+					listed[str(a.id)] = true
+				end
+				local okr, state = pcall(tern.json.decode, readWaiting(WAITING_FILE))
+				for _, a in (if okr and type(state) == "table" then val(state.actions) else nil) or {} do
+					recheck = recheck or not listed[str(a.id)]
+				end
+				store.waitingAgain = recheck
+			end
+			store.waitingRecheck = recheck
+		end)
+		if not ok then
+			tern.log.error("codexbar: applying a waiting tick failed", err)
+		end
 		if store.waitingAgain then
 			waitingTick()
 		end
@@ -1771,16 +1789,51 @@ local function waitingRun(cx: BlockCx?, what: string, args: { string }, done: ((
 	end)
 end
 
+-- Sends `job_finished` for `pane` while a job wait of this daemon's watches it,
+-- else does nothing and answers false. When the last tick's view doesn't watch
+-- the pane, the view file decides, but only if waiting.json changed since that
+-- tick (or a tick runs): most panes watch nothing, so this decides before a
+-- Python process starts. A send that fails stays in `jobPending`, and
+-- reconcilePanes sends it again: a job's one event must not be lost.
+local function jobEvent(pane: number, status: number): boolean
+	local watched = type(store.waiting) == "table" and jobPanes(store.waiting)[pane] == true
+	if not watched and (store.waitingTicking or readWaiting() ~= store.waitingRaw) then
+		local okj, view = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
+		watched = okj and type(view) == "table" and jobPanes(view)[pane] == true
+	end
+	if not watched then
+		return false
+	end
+	local entry = { status = status, sending = true }
+	store.jobPending[pane] = entry
+	local args = { "event", "--type", "job_finished", "--pane", tostring(pane), "--status", tostring(status) }
+	if store.daemonId then
+		table.insert(args, "--daemon")
+		table.insert(args, store.daemonId)
+	end
+	waitingRun(nil, "job event", args, function(data)
+		if store.jobPending[pane] == entry then
+			if data then
+				store.jobPending[pane] = nil
+			else
+				entry.sending = false
+			end
+		end
+	end)
+	return true
+end
+
 -- A window sees only its own panes; this half alone can tell that a pane is
 -- gone from every window. A pane action's target gone: the outbox is the last
 -- tick's, so an ack that landed stays marked until a tick drops its action, and
 -- a failed one waits before the next try (while another daemon ticks, the outbox
 -- here is empty). A watched job's pane gone without the event that ends its wait
 -- (`tern close`, no window, a plugin reload): after 10 s, time for a
--- `pane_exited` in flight to land, the CLI hears `pane_closed`. Only this
--- daemon's job waits count (jobPanes). An empty listing is no evidence until
--- this daemon has listed a pane, as while it starts; after that, every pane is
--- gone, the last one closed too.
+-- `pane_exited` in flight to land, the CLI hears `pane_closed`. A
+-- `job_finished` the CLI didn't take goes again, until it does or no wait of
+-- ours watches the pane. Only this daemon's job waits count (jobPanes). An
+-- empty listing is no evidence until this daemon has listed a pane, as while
+-- it starts; after that, every pane is gone, the last one closed too.
 local function reconcilePanes()
 	local live: { [number]: boolean } = {}
 	for _, p in tern.pane.list() do
@@ -1807,6 +1860,11 @@ local function reconcilePanes()
 	-- A tick under way may be ending these waits already; its view decides after.
 	if store.waitingTicking or type(store.waiting) ~= "table" then
 		return
+	end
+	for pane, entry in store.jobPending do
+		if not entry.sending and not jobEvent(pane, entry.status) then
+			store.jobPending[pane] = nil
+		end
 	end
 	local watched = jobPanes(store.waiting)
 	for pane in store.paneGoneAt do
@@ -1860,29 +1918,16 @@ local function noteAgents()
 end
 
 -- `pane_exited` reaches only this half, which also runs with no window open.
--- A job can end right after its `add`, and its one event must not be lost: when
--- the last tick's view doesn't watch the pane, the view file decides, but only
--- if waiting.json changed since that tick. Most panes watch nothing, so this
--- decides before a Python process starts. A pane ending with its job sends
--- both events; the CLI took the first.
+-- A job can end right after its `add`, and its one event must not be lost
+-- (jobEvent). A pane ending with its job sends both events; the CLI took the
+-- first.
 local function jobFinished(pane: number, status: number, exited: boolean)
 	local now = os.clock()
 	if exited and now - (store.jobEventAt[pane] or -math.huge) <= 2 then
 		return
 	end
-	local watched = type(store.waiting) == "table" and jobPanes(store.waiting)[pane] == true
-	if not watched and (store.waitingTicking or readWaiting() ~= store.waitingRaw) then
-		local okj, view = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
-		watched = okj and type(view) == "table" and jobPanes(view)[pane] == true
-	end
-	if watched then
+	if jobEvent(pane, status) then
 		store.jobEventAt[pane] = now
-		local args = { "event", "--type", "job_finished", "--pane", tostring(pane), "--status", tostring(status) }
-		if store.daemonId then
-			table.insert(args, "--daemon")
-			table.insert(args, store.daemonId)
-		end
-		waitingRun(nil, "job event", args)
 	end
 end
 
@@ -1894,29 +1939,37 @@ tern.on("pane_exited", function(ev: PaneExitedEvent)
 	store.jobEventAt[ev.pane] = nil
 end)
 
--- Newest measurement in a snapshot, in epoch seconds.
-local function measuredAt(snap: any): number
-	local newest = 0
+-- Newest measurement in a snapshot, in epoch seconds. With `oldest`, each
+-- enabled provider's newest, and of those the oldest (0 for one without any):
+-- how stale the snapshot is, as one provider gone unmeasured makes it stale.
+local function measuredAt(snap: any, oldest: boolean?): number
+	local newest: { [string]: number } = {}
+	local all = 0
 	for _, rec in (if type(snap) == "table" then val(snap.providers) else nil) or {} do
-		newest = math.max(newest, epoch(val(rec.cachedAt) or val(rec.updatedAt)) or 0)
+		local at = epoch(val(rec.cachedAt) or val(rec.updatedAt)) or 0
+		newest[str(rec.id)] = math.max(newest[str(rec.id)] or 0, at)
+		all = math.max(all, at)
 	end
-	return newest
-end
-
--- The applet's poll interval as the plugin knows it (applet setting `refreshSeconds`).
-local function refreshSeconds(): number
-	return setting("refreshSeconds")
+	if not oldest then
+		return all
+	end
+	local least = math.huge
+	for _, id in setting("providers") do
+		least = math.min(least, newest[id] or 0)
+	end
+	return if least == math.huge then 0 else least
 end
 
 -- Usage is polled by the applet. The plugin fetches on its own only when no
--- process measured usage for two intervals, so it never adds requests while
+-- process measured usage for two intervals (the applet's poll interval, as the
+-- plugin's `refreshSeconds` setting knows it), so it never adds requests while
 -- the applet runs; every fetch is a Claude OAuth call, and when that one is
 -- rate-limited the fetcher falls back to starting a Claude Code session.
 -- `--min-interval` makes the fetcher's claim allow one fetch per provider per
 -- interval across every daemon and the applet; a provider claimed within it is
 -- answered from the cache.
 local function staleAfter(): number
-	return 2 * refreshSeconds()
+	return 2 * setting("refreshSeconds")
 end
 
 -- `--cache-only` marks every record last-known. A record measured recently
@@ -1951,7 +2004,11 @@ local function applyUsage(res: ProcessResult)
 		store.usage = data
 		store:noteFatal(data)
 	else
-		store.usageError = if res.timed_out then "CodexBar AgentView did not answer in time" else firstLine(res.stderr)
+		local line = firstLine(res.stderr)
+		store.usageError = if res.timed_out then "CodexBar AgentView did not answer in time"
+			elseif line ~= "" then line
+			elseif res.status ~= 0 then "exit " .. res.status
+			else "unreadable answer"
 		store.usageSetup = nil
 	end
 end
@@ -1970,7 +2027,7 @@ local function fetchUsage(automatic: boolean?)
 	local args = providerArgs()
 	if automatic then
 		table.insert(args, "--min-interval")
-		table.insert(args, tostring(refreshSeconds()))
+		table.insert(args, tostring(setting("refreshSeconds")))
 	end
 	if setting("forecast") then
 		table.insert(args, "--forecast-url")
@@ -2084,7 +2141,7 @@ local function readUsageCache(allowFetch: boolean?, reclassify: boolean?, inputs
 				store.usage.providers = kept
 			end
 		end
-		if allowFetch ~= false and (replaced or os.time() - math.max(store.usageAt, measuredAt(store.usage)) >= staleAfter()) then
+		if allowFetch ~= false and (replaced or os.time() - math.max(store.usageAt, measuredAt(store.usage, true)) >= staleAfter()) then
 			fetchUsage(true)
 		end
 		publishSummary()
@@ -2168,8 +2225,8 @@ local function tick()
 				renderAll()
 			end
 			local updated = if type(store.agents) == "table" then tonumber(val(store.agents.updatedAt)) else nil
-			if not updated or nowMs() - updated > AGENTS_STALE_MS then
-				scanAgents(false)
+			if not updated or os.time() * 1000 - updated > AGENTS_STALE_MS then
+				scanAgents()
 			end
 			reconcilePanes()
 			-- Another writer (the omp extension, tern-awui) may have queued a window
@@ -2231,8 +2288,8 @@ local function tick()
 			-- the deck, or opened it): its snooze ends early. A pane still counts
 			-- as parked while no window says (open). One coming back at its time
 			-- has no snooze left by then: the tick that ended it queued the unpark.
-			-- Pane ids name this daemon's panes: a row stamped with another
-			-- daemon's (`daemon`, as in jobPanes) isn't the pane unparked here.
+			-- Pane ids name this daemon's panes: another daemon's row (`ours`)
+			-- isn't the pane unparked here.
 			local parked: { [number]: boolean } = {}
 			for pane, state in states do
 				parked[pane] = state == "parked" or (state == "open" and store.parkedSeen[pane]) or nil
@@ -2241,9 +2298,7 @@ local function tick()
 				for _, r in waitingList(field) do
 					local pane = tonumber(val(r.pane))
 					local session = str(r.session_id)
-					local stamp = val(r.daemon)
-					local ours = if stamp ~= nil and (store.daemonId or not store.daemonKnown) then stamp == store.daemonId else not store.waitingSkipped
-					if ours and pane and val(r.snoozed_until) ~= nil and (session == "" or val(r.live) == true)
+					if ours(r) and pane and val(r.snoozed_until) ~= nil and (session == "" or val(r.live) == true)
 						and store.parkedSeen[pane] and states[pane] == "running" then
 						waitingRun(nil, "wake", { "wake", if session ~= "" then "--session" else "--pane", if session ~= "" then session else tostring(pane) })
 					end
@@ -2260,7 +2315,7 @@ local function tick()
 			local inputs = if now - store.cacheSpawnAt >= CACHE_FORCE_S then nil else usageInputs()
 			if inputs == nil or inputs ~= store.cacheInputs then
 				readUsageCache(nil, nil, inputs)
-			elseif os.time() - math.max(store.usageAt, measuredAt(store.usage)) >= staleAfter() then
+			elseif os.time() - math.max(store.usageAt, measuredAt(store.usage, true)) >= staleAfter() then
 				-- What the skipped read would have done after reading.
 				fetchUsage(true)
 			end
@@ -2948,13 +3003,14 @@ local function waitingGroups(q: string): { { ball: any, rows: { any }, states: {
 			return "closed"
 		elseif session and not pane then
 			return "elsewhere"
+		elseif not ours(r) then
+			return "open"
 		end
 		local state = if pane then store.paneStates[pane] else nil
 		if state then
 			return state
 		end
-		local daemon = val(r.daemon)
-		if not session and store.panesListed and (daemon == nil or daemon == store.daemonId) then
+		if not session and store.panesListed then
 			return "closed"
 		end
 		return "open"
@@ -3027,10 +3083,10 @@ local function selected(b: Block): Row?
 end
 
 -- The pane a row's session card floats over, nil when the row has no Card button:
--- a live omp session in Tern on Agents, a live row with a pane on Waiting.
+-- a live omp session in Tern on Agents, a live row with a pane of this daemon's on Waiting.
 local function cardPane(r: any, waiting: boolean): number?
 	if waiting then
-		return if waitLive(r) then tonumber(val(r.pane)) else nil
+		return if waitLive(r) and ours(r) then tonumber(val(r.pane)) else nil
 	end
 	return if r.provider == "omp" then tonumber(val(r.ternPane)) else nil
 end
@@ -3758,7 +3814,7 @@ local function launchRecord(b: Block, r: any)
 		if res.status ~= 0 then
 			b.launched[key] = nil
 		end
-		scanAgents(true)
+		scanAgents()
 		b.cx:render()
 	end)
 end
@@ -3811,7 +3867,7 @@ local function restoreAll(b: Block)
 			end
 		end
 		report(b.cx, "restore", res)
-		scanAgents(true)
+		scanAgents()
 		b.cx:render()
 	end)
 end
@@ -3825,7 +3881,7 @@ local function teleport(b: Block, r: any)
 	python("codexbar_focus.py", { "--tern", "--teleport", str(r.provider), str(r.sessionId) }, 60000, function(res)
 		b.busy = nil
 		report(b.cx, "teleport", res)
-		scanAgents(true)
+		scanAgents()
 		b.cx:render()
 	end)
 end
@@ -3851,8 +3907,9 @@ end
 -- session as live, a second press would start a second writer of its file.
 -- Opening a session snoozed until later wakes it first: its snooze ends, so it
 -- neither hides again nor comes back by itself; a failed wake still opens it.
+-- Another daemon's pane is none of this one's, whatever its number.
 local function waitingOpen(b: Block, r: any, woken: boolean?)
-	local pane = tonumber(val(r.pane))
+	local pane = if ours(r) then tonumber(val(r.pane)) else nil
 	local key = waitKey(r)
 	if not waitLive(r) and (b.busy == key or (b.launched[key] and os.clock() - b.launched[key] < 60)) then
 		return
@@ -3865,8 +3922,10 @@ local function waitingOpen(b: Block, r: any, woken: boolean?)
 	end
 	if waitLive(r) and pane then
 		waitingRequest(b, { op = "open", target = pane })
-	elseif waitLive(r) then -- running outside Tern
+	elseif waitLive(r) and str(r.session_id) ~= "" then -- running outside Tern, or in another daemon
 		focusRecord(b, { sessionId = r.session_id })
+	elseif waitLive(r) then
+		b.cx:toast("info", "CodexBar AgentView: that pane is another Tern daemon's")
 	else
 		b.busy = key
 		b.cx:render()
@@ -3957,7 +4016,8 @@ local function act(b: Block, name: string)
 	local row = selected(b)
 	if name == "refresh" then
 		fetchUsage()
-		scanAgents(true)
+		store.scanRetryAt = 0 -- the user asks now, a failed scan's wait or not
+		scanAgents()
 	elseif name == "settings" then
 		b.settings = b.settings or prefs.new(b.cx)
 	elseif name == "setup_settings" then
@@ -4278,11 +4338,11 @@ for _, row in {
 	{ id = "includeUntracked", page = "agents", section = "Live sessions", label = "Include untracked agents",
 		hint = "Show processes without a hook sentinel." },
 	{ id = "historyLimit", page = "agents", section = "History", label = "Recently closed sessions",
-		hint = "Keep 10 to 1000 same-boot exits. Sessions ended by a reboot are not limited.", kind = "number" },
+		hint = "Show 10 to 1000 same-boot exits. Sessions ended by a reboot are not limited.", kind = "number" },
 	{ id = "usage", page = "general", section = "Usage", label = "Usage tracking",
 		hint = "Fetch and show provider usage: the Usage tab and the usage widgets. Off runs no CodexBar fetch; Agents, Waiting and History stay." },
 	{ id = "refreshSeconds", page = "general", section = "Polling", label = "Usage refresh interval",
-		hint = "60 to 3600 seconds. Match the applet's interval; fallback waits twice this interval.", kind = "number", unit = "s" },
+		hint = "60 to 3600 seconds. Set the applet's interval: the plugin fetches after twice this without a reading, and the shared fetch claim allows one fetch per provider per interval.", kind = "number", unit = "s" },
 	{ id = "cliPath", page = "general", section = "CLI", label = "CodexBar executable",
 		hint = "Empty selects the installed CLI automatically. Enter saves, Escape cancels; Ctrl+A clears the draft.", kind = "text" },
 	{ id = "about.kde", page = "about", section = "Projects", label = "CodexBar AgentView",
