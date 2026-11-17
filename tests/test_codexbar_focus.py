@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 import io
 import json
 import os
@@ -23,16 +23,35 @@ import state_paths  # noqa: E402
 
 WINDOWS = state_paths.WINDOWS
 
-_PGREP = mock.patch.object(focus.agents, "_pgrep", return_value=[])
+# launch() looks for processes writing the session; keep the user's out:
+# none runs, and no log under the real ~/.omp names one.
+_ISOLATION = (
+    mock.patch.object(focus.agents, "_pgrep", return_value=[]),
+    mock.patch.object(focus.agents, "_omp_log_files", return_value={}),
+)
 
 
 def setUpModule() -> None:
-    # launch() looks for processes writing the session; keep the real ones out.
-    _PGREP.start()
+    for patch in _ISOLATION:
+        patch.start()
 
 
 def tearDownModule() -> None:
-    _PGREP.stop()
+    for patch in reversed(_ISOLATION):
+        patch.stop()
+
+
+def pgrep(found: list[int], background: list[int] | None = None):
+    """agents._pgrep finding `found` interactive processes and `background` services."""
+    services_found = background or []
+    return mock.patch.object(focus.agents, "_pgrep", side_effect=lambda _name, services=False:
+                             services_found if services else found)
+
+
+def reservation_expired():
+    """A clock past every startup reservation taken so far."""
+    later = focus.time.monotonic() + focus.SESSION_START_RESERVATION_SECONDS + 1
+    return mock.patch.object(focus.time, "monotonic", return_value=later)
 
 
 def entry(**changes: object) -> dict:
@@ -118,13 +137,11 @@ class LaunchTests(unittest.TestCase):
         ):
             with (
                 self.subTest(message),
-                mock.patch.object(focus.agents, "_pgrep", side_effect=lambda _n, services=False:
-                                  [] if services else [77]),
+                pgrep([77]),
                 mock.patch.object(focus.agents, "_open_jsonl_under", return_value=(held, bool(held))),
                 mock.patch.object(focus.agents, "_cwd_of", return_value=cwd),
-                # Off the real /proc and ~/.omp/logs: no argv or log names a session.
+                # Off the real /proc: no argv names a session.
                 mock.patch.object(focus.agents, "_argv_of", return_value=["omp"]),
-                mock.patch.object(focus.agents, "_omp_log_files", return_value={}),
             ):
                 code, popen, *_rest, stderr = self.launch({"agents": [], "history": [entry()]})
             self.assertEqual(code, expected)
@@ -211,17 +228,14 @@ class LaunchTests(unittest.TestCase):
         else:
             activate.assert_called_once_with([77])
 
-    def test_tern_record_starts_tern_first_when_none_runs(self) -> None:
-        code, popen, _, _, _, calls = self.tern_launch(daemon=False)
-        self.assertEqual(code, 0)
-        self.assertEqual(popen.call_args.args[0][-2:], ["tern"] if WINDOWS else ["--", "tern"])
-        self.assertEqual(calls[-2][:2], ["new", "tab"])
-
-    def test_tern_daemon_without_window_opens_a_window_before_the_tab(self) -> None:
-        code, popen, _, _, _, calls = self.tern_launch(window=False)
-        self.assertEqual(code, 0)
-        self.assertEqual(popen.call_args.args[0][-2:], ["tern"] if WINDOWS else ["--", "tern"])
-        self.assertEqual(calls[-2][:2], ["new", "tab"])
+    def test_tern_record_opens_a_tern_window_before_the_tab_when_none_shows(self) -> None:
+        # No daemon answers, or one answers with no window to show the tab in.
+        for missing in ({"daemon": False}, {"window": False}):
+            with self.subTest(**missing):
+                code, popen, _, _, _, calls = self.tern_launch(**missing)
+                self.assertEqual(code, 0)
+                self.assertEqual(popen.call_args.args[0][-2:], ["tern"] if WINDOWS else ["--", "tern"])
+                self.assertEqual(calls[-2][:2], ["new", "tab"])
 
     def test_launch_all_restores_reboot_rows_in_desktop_order(self) -> None:
         def row(sid: str, **changes: object) -> dict:
@@ -326,15 +340,17 @@ class SessionOperationOwnershipTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(focus, "_tern_ready", return_value=True))
             stack.enter_context(mock.patch.object(focus, "_tern", side_effect=terminal))
             stack.enter_context(mock.patch.object(focus, "_user_shell", return_value="/bin/sh"))
-            stack.enter_context(mock.patch.object(focus.agents, "_pgrep", return_value=[]))
+            # One interactive process of the provider runs where a case needs
+            # it: the one teleport moves, or one whose session can't be named.
+            running = [424242] if mode.startswith("unresolved") or action == "--teleport" else []
+            stack.enter_context(mock.patch.object(
+                focus.agents, "_pgrep",
+                side_effect=lambda _provider, services=False: [] if services else running))
+            stack.enter_context(mock.patch.object(focus.agents, "_resume_arg", return_value=""))
             stack.enter_context(mock.patch.object(focus.agents, "tern_bin", return_value="/unused/tern"))
-            # A listed writer runs unless the test says it exited after the scan.
-            stack.enter_context(mock.patch.object(focus, "_exited", return_value=mode == "writer-exited"))
+            # A listed writer still runs.
+            stack.enter_context(mock.patch.object(focus, "_exited", return_value=False))
             if mode in ("unresolved-empty-cwd", "unresolved-same-cwd"):
-                stack.enter_context(mock.patch.object(
-                    focus.agents, "_pgrep",
-                    side_effect=lambda _provider, services=False: [] if services else [424242]))
-                stack.enter_context(mock.patch.object(focus.agents, "_resume_arg", return_value=""))
                 stack.enter_context(mock.patch.object(focus.agents, "_shell_resume_arg", return_value=""))
                 stack.enter_context(mock.patch.object(
                     focus.agents, "_cwd_of",
@@ -347,10 +363,6 @@ class SessionOperationOwnershipTests(unittest.TestCase):
                         "state": "idle", "cwd": str(root)}
                 stack.enter_context(mock.patch.dict(
                     focus.agents._INFO_FN, {provider: lambda pid: info}))
-                stack.enter_context(mock.patch.object(
-                    focus.agents, "_pgrep",
-                    side_effect=lambda _provider, services=False: [] if services else [424242]))
-                stack.enter_context(mock.patch.object(focus.agents, "_resume_arg", return_value=""))
                 stack.enter_context(mock.patch.object(focus.agents, "_held_rollouts", return_value=set()))
                 stack.enter_context(mock.patch.object(focus.agents, "_codex_home", return_value=str(root)))
                 stack.enter_context(mock.patch.object(focus.agents, "_cwd_of", return_value=str(root)))
@@ -375,6 +387,10 @@ class SessionOperationOwnershipTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        # main() --tern turns KWin off for the rest of the process.
+        kwin = mock.patch.object(focus, "USE_KWIN", focus.USE_KWIN)
+        kwin.start()
+        self.addCleanup(kwin.stop)
         self.env = {
             "HOME": str(self.root / "home"),
             "XDG_STATE_HOME": str(self.root / "state"),
@@ -451,6 +467,13 @@ class SessionOperationOwnershipTests(unittest.TestCase):
     def dispatches(self) -> list[dict]:
         return [event for event in self.events() if event["kind"] == "dispatch"]
 
+    def reset(self) -> None:
+        """Start a case over: no events, reservations or startup locks."""
+        (self.root / "events.jsonl").unlink(missing_ok=True)
+        for path in self.path.parent.glob("agents.json.*.startup.*"):
+            path.unlink()
+        self.snapshot()
+
     def test_competing_launch_helpers_dispatch_one_resume(self) -> None:
         first, barrier = self.start_helper(mode="hold")
         self.assertEqual(barrier.recv(1), b"D")
@@ -477,61 +500,26 @@ class SessionOperationOwnershipTests(unittest.TestCase):
                          "helper exit released ownership before writer discovery")
         self.assertEqual(result[0], 5, result[1])
 
-    def test_a_reserve_and_a_launch_never_both_start_the_session(self) -> None:
-        reserved, _ = self.start_helper(action="--reserve")
-        self.assertEqual(self.finish_helper(reserved)[0], 0)
-        launched, _ = self.start_helper()
-        self.assertEqual(self.finish_helper(launched)[0], 5)
-        self.assertEqual(self.dispatches(), [], "a launch dispatched while a reopen owned the startup")
-
-    def test_a_reserve_after_a_launch_is_refused(self) -> None:
-        launched, _ = self.start_helper()
-        self.assertEqual(self.finish_helper(launched)[0], 0)
-        reserved, _ = self.start_helper(action="--reserve")
-        self.assertEqual(self.finish_helper(reserved)[0], 5)
-
-    def test_a_reserve_refuses_a_running_session(self) -> None:
-        self.snapshot(live=True)
-        reserved, _ = self.start_helper(action="--reserve")
-        self.assertEqual(self.finish_helper(reserved)[0], 5)
-
-    def test_a_reserve_ignores_a_listed_writer_that_exited(self) -> None:
-        # A stale scan still lists the session after its writer exited.
-        self.snapshot(live=True)
-        reserved, _ = self.start_helper(action="--reserve", mode="writer-exited")
-        result = self.finish_helper(reserved)
-        self.assertEqual(result[0], 0, result[1])
-
     @unittest.skipIf(WINDOWS, "teleport moves kitty sessions; Windows has no kitty")
-    def test_first_teleport_after_successful_launch_reconciles_discovered_writer(self) -> None:
-        launched, _ = self.start_helper()
-        result = self.finish_helper(launched)
-        self.assertEqual(result[0], 0, result[1])
-        self.snapshot(live=True)
-        teleport, _ = self.start_helper(action="--teleport")
-        result = self.finish_helper(teleport)
-        self.assertEqual(result[0], 0, result[1])
-        self.assertEqual([event["action"] for event in self.dispatches()],
-                         ["--launch", "--teleport"])
-        kinds = [event["kind"] for event in self.events()]
-        self.assertEqual(kinds, ["dispatch", "signal", "dispatch"])
-        self.assertEqual(json.loads(self.path.read_text())["agents"], [],
-                         "teleport must observe the old writer exit before dispatch")
-
-    @unittest.skipIf(WINDOWS, "teleport moves kitty sessions; Windows has no kitty")
-    def test_teleport_after_successful_launch_still_requires_old_writer_exit(self) -> None:
-        launched, _ = self.start_helper()
-        result = self.finish_helper(launched)
-        self.assertEqual(result[0], 0, result[1])
-        self.snapshot(live=True)
-        teleport, _ = self.start_helper(action="--teleport", mode="writer-stuck")
-        result = self.finish_helper(teleport)
-        self.assertEqual(result[0], 10, result[1])
-        self.assertIn("agent did not exit", result[1])
-        self.assertEqual(len(self.dispatches()), 1)
-        self.assertEqual([event["kind"] for event in self.events()],
-                         ["dispatch", "signal", "signal"])
-        self.assertTrue(json.loads(self.path.read_text())["agents"])
+    def test_teleport_after_a_launch_resumes_only_once_the_discovered_writer_exits(self) -> None:
+        # The launch's reservation stays until a sweep lists its writer.
+        for mode, code, kinds, message in (
+            ("normal", 0, ["dispatch", "signal", "dispatch"], ""),
+            ("writer-stuck", 10, ["dispatch", "signal", "signal"], "agent did not exit"),
+        ):
+            with self.subTest(mode):
+                self.reset()
+                launched, _ = self.start_helper()
+                result = self.finish_helper(launched)
+                self.assertEqual(result[0], 0, result[1])
+                self.snapshot(live=True)
+                teleport, _ = self.start_helper(action="--teleport", mode=mode)
+                result = self.finish_helper(teleport)
+                self.assertEqual(result[0], code, result[1])
+                self.assertIn(message, result[1])
+                self.assertEqual([event["kind"] for event in self.events()], kinds)
+                # Teleport dispatches only after it saw the old writer exit.
+                self.assertEqual(json.loads(self.path.read_text())["agents"] == [], code == 0)
 
     def test_accepted_terminal_timeout_keeps_reservation_for_retry(self) -> None:
         ambiguous, _ = self.start_helper(mode="accepted-timeout")
@@ -545,33 +533,21 @@ class SessionOperationOwnershipTests(unittest.TestCase):
                          "an ambiguous terminal reply dispatched a second writer")
         self.assertEqual(result[0], 5, result[1])
 
-    def test_expired_reservation_ignores_unresolved_process_without_cwd(self) -> None:
+    def test_expired_reservation_refuses_only_an_unresolved_process_in_the_same_cwd(self) -> None:
         self.record.update(
             provider="pi", resumeCommand=focus.agents._resume_command(
                 "pi", "same-session", str(self.root), True))
-        self.snapshot()
-        launched, _ = self.start_helper(provider="pi")
-        result = self.finish_helper(launched)
-        self.assertEqual(result[0], 0, result[1])
-        retry, _ = self.start_helper(provider="pi", mode="unresolved-empty-cwd")
-        result = self.finish_helper(retry)
-        self.assertEqual(result[0], 0, result[1])
-        self.assertEqual(len(self.dispatches()), 2,
-                         "a disappeared process with no cwd blocked an unrelated session")
-
-    def test_expired_reservation_refuses_unresolved_process_in_same_cwd(self) -> None:
-        self.record.update(
-            provider="pi", resumeCommand=focus.agents._resume_command(
-                "pi", "same-session", str(self.root), True))
-        self.snapshot()
-        launched, _ = self.start_helper(provider="pi")
-        result = self.finish_helper(launched)
-        self.assertEqual(result[0], 0, result[1])
-        retry, _ = self.start_helper(provider="pi", mode="unresolved-same-cwd")
-        result = self.finish_helper(retry)
-        self.assertEqual(result[0], 11, result[1])
-        self.assertEqual(len(self.dispatches()), 1,
-                         "an unresolved writer in the same cwd must still prevent dispatch")
+        # A disappeared process with no cwd must not block an unrelated session.
+        for mode, code, dispatched in (("unresolved-empty-cwd", 0, 2), ("unresolved-same-cwd", 11, 1)):
+            with self.subTest(mode):
+                self.reset()
+                launched, _ = self.start_helper(provider="pi")
+                result = self.finish_helper(launched)
+                self.assertEqual(result[0], 0, result[1])
+                retry, _ = self.start_helper(provider="pi", mode=mode)
+                result = self.finish_helper(retry)
+                self.assertEqual(result[0], code, result[1])
+                self.assertEqual(len(self.dispatches()), dispatched)
 
     def test_failed_terminal_start_releases_reservation_for_retry(self) -> None:
         failed, _ = self.start_helper(mode="fail")
@@ -660,14 +636,11 @@ class SessionOperationOwnershipTests(unittest.TestCase):
                     mock.patch.object(focus.agents, "_cwd_of", return_value=str(self.root)),
                 ):
                     self.assertEqual(focus.launch(provider, "same-session"), 0)
-                    expired = focus.time.monotonic() + focus.SESSION_START_RESERVATION_SECONDS + 1
                     info = {"sessionId": "same-session", "cwd": str(self.root),
                             "identityExact": exact}
                     with (
-                        mock.patch.object(focus.time, "monotonic", return_value=expired),
-                        mock.patch.object(
-                            focus.agents, "_pgrep",
-                            side_effect=lambda _provider, services=False: [77] if services == service else []),
+                        reservation_expired(),
+                        pgrep([], [77]) if service else pgrep([77]),
                         mock.patch.dict(focus.agents._INFO_FN, {provider: lambda _pid: info}),
                     ):
                         self.assertEqual(focus.launch(provider, "same-session"), 5)
@@ -684,12 +657,9 @@ class SessionOperationOwnershipTests(unittest.TestCase):
             mock.patch.object(focus.sys, "stderr", io.StringIO()),
         ):
             self.assertEqual(focus.launch("codex", "same-session"), 0)
-            expired = focus.time.monotonic() + focus.SESSION_START_RESERVATION_SECONDS + 1
             with (
-                mock.patch.object(focus.time, "monotonic", return_value=expired),
-                mock.patch.object(
-                    focus.agents, "_pgrep",
-                    side_effect=lambda _provider, services=False: [77] if services else []),
+                reservation_expired(),
+                pgrep([], [77]),
                 mock.patch.object(focus.agents, "_codex_home", return_value=str(self.root)),
                 mock.patch.object(focus.agents, "_held_rollouts", return_value={
                     str(self.root / "sessions" / "other.jsonl"),
@@ -715,14 +685,12 @@ class SessionOperationOwnershipTests(unittest.TestCase):
             mock.patch.object(focus, "_fds_visible", return_value=files_visible),
         ):
             self.assertEqual(focus.launch("codex", "same-session"), 0)
-            expired = focus.time.monotonic() + focus.SESSION_START_RESERVATION_SECONDS + 1
             for info in ({}, {"sessionId": "other", "identityExact": False}):
                 with (
                     self.subTest(info=info),
-                    mock.patch.object(focus.time, "monotonic", return_value=expired),
+                    reservation_expired(),
                     # A TUI and the app-server holding another session's rollout.
-                    mock.patch.object(focus.agents, "_pgrep",
-                                      side_effect=lambda _provider, services=False: [78] if services else [77]),
+                    pgrep([77], [78]),
                     mock.patch.object(focus.agents, "_held_rollouts", side_effect=lambda pid, _needle: (
                         {str(self.root / "sessions" / "rollout-other.jsonl")} if pid == 78 else set())),
                     mock.patch.object(focus.agents, "_cwd_of", return_value=str(self.root)),
@@ -767,9 +735,8 @@ class SessionOperationOwnershipTests(unittest.TestCase):
             mock.patch.object(focus.sys, "stderr", io.StringIO()),
         ):
             self.assertEqual(focus.launch("codex", "same-session"), 0)
-            expired = focus.time.monotonic() + focus.SESSION_START_RESERVATION_SECONDS + 1
             with (
-                mock.patch.object(focus.time, "monotonic", return_value=expired),
+                reservation_expired(),
                 mock.patch.dict(focus.agents._INFO_FN, {}, clear=True),
             ):
                 self.assertEqual(focus.launch("codex", "same-session"), 11)
@@ -782,10 +749,8 @@ class SessionOperationOwnershipTests(unittest.TestCase):
         with (
             mock.patch.object(focus, "AGGREGATE_PATH", self.path),
             mock.patch.object(focus.sys, "stderr", io.StringIO()) as stderr,
-            mock.patch.object(focus.agents, "_pgrep",
-                              side_effect=lambda _name, services=False: [] if services else [77]),
+            pgrep([77]),
             mock.patch.object(focus.agents, "_open_jsonl_under", return_value=("", False)),
-            mock.patch.object(focus.agents, "_omp_log_files", return_value={}),
             mock.patch.object(focus.agents, "_argv_of", return_value=["omp"]),
             mock.patch.object(focus.agents, "_cwd_of", return_value="/work/project"),
             mock.patch.object(focus.state_paths, "migrate"),
@@ -793,17 +758,37 @@ class SessionOperationOwnershipTests(unittest.TestCase):
             self.assertEqual(focus.main(["--tern", "--reserve", "omp", "sid-1", "/work/project"]), 11)
         self.assertIn("a running omp in /work/project may be writing this session", stderr.getvalue())
 
-    def reserve(self) -> str:
+    def reserve(self, code: int = 0) -> str:
         with (
             mock.patch.object(focus.sys, "stdout", io.StringIO()) as stdout,
             mock.patch.object(focus.state_paths, "migrate"),
         ):
-            self.assertEqual(focus.main(["--tern", "--reserve", "codex", "same-session"]), 0)
+            self.assertEqual(focus.main(["--tern", "--reserve", "codex", "same-session"]), code)
         return stdout.getvalue().strip()
 
     def release(self, token: str) -> int:
         with mock.patch.object(focus.state_paths, "migrate"):
             return focus.main(["--tern", "--release", "codex", "same-session", token])
+
+    def test_a_reserve_refuses_a_listed_writer_until_it_exited(self) -> None:
+        # A stale scan still lists the session after its writer exited.
+        self.snapshot(live=True)
+        with (
+            mock.patch.object(focus, "AGGREGATE_PATH", self.path),
+            mock.patch.object(focus.sys, "stderr", io.StringIO()),
+        ):
+            for exited, code in ((False, 5), (True, 0)):
+                with self.subTest(exited=exited), mock.patch.object(focus, "_exited", return_value=exited):
+                    self.reserve(code)
+
+    def test_a_reserve_after_a_launch_is_refused(self) -> None:
+        with (
+            mock.patch.object(focus, "AGGREGATE_PATH", self.path),
+            mock.patch.object(focus, "_launch_tern", return_value=0),
+            mock.patch.object(focus.sys, "stderr", io.StringIO()),
+        ):
+            self.assertEqual(focus.launch("codex", "same-session"), 0)
+            self.reserve(5)
 
     def test_release_by_its_owner_lets_the_session_launch(self) -> None:
         with (
@@ -829,20 +814,16 @@ class SessionOperationOwnershipTests(unittest.TestCase):
             token = self.reserve()
             reservation = focus._reservation_path("codex", "same-session")
             owner = json.loads(reservation.read_text())
-            later = focus.time.monotonic() + focus.SESSION_START_RESERVATION_SECONDS + 1
             cases = {
-                "another launcher's": ({**owner, "expiresAt": owner["expiresAt"] + 1}, None),
-                "another boot's": ({**owner, "bootId": "another-boot"}, None),
-                "expired": (owner, later),
-                "not a reservation": ([owner], None),
+                "another launcher's": ({**owner, "expiresAt": owner["expiresAt"] + 1}, False),
+                "another boot's": ({**owner, "bootId": "another-boot"}, False),
+                "expired": (owner, True),
+                "not a reservation": ([owner], False),
             }
-            for name, (written, now) in cases.items():
+            for name, (written, expired) in cases.items():
                 with self.subTest(name):
                     reservation.write_text(json.dumps(written))
-                    with ExitStack() as stack:
-                        if now is not None:
-                            stack.enter_context(
-                                mock.patch.object(focus.time, "monotonic", return_value=now))
+                    with reservation_expired() if expired else nullcontext():
                         self.assertEqual(self.release(token), 0)
                     self.assertEqual(json.loads(reservation.read_text()), written)
 
@@ -933,11 +914,13 @@ class TeleportTests(unittest.TestCase):
 
 
 class KWinScriptTests(unittest.TestCase):
-    def qdbus(self, unloads: bool):
-        """A fake qdbus6: loadScript answers an id; the script unloads itself
-        only when `unloads` (it matched a window)."""
+    def activate(self, unloads: bool):
+        """_kwin_activate against a fake qdbus6: loadScript answers an id; the
+        script unloads itself only when `unloads` (it matched a window).
+        Returns the result, the qdbus calls and the loaded script."""
         calls: list[list[str]] = []
         scripts: list[Path] = []
+        texts: list[str] = []
 
         def run(argv, **_kwargs):
             calls.append(argv)
@@ -945,54 +928,49 @@ class KWinScriptTests(unittest.TestCase):
             out = ""
             if method == "org.kde.kwin.Scripting.loadScript":
                 scripts.append(Path(argv[4]))
+                texts.append(scripts[0].read_text())
                 out = "7"
             elif method == "org.kde.kwin.Scripting.isScriptLoaded":
                 # The script file must outlive the running script.
                 self.assertTrue(scripts[0].exists())
                 out = "false" if unloads else "true"
             return focus.subprocess.CompletedProcess(argv, 0, out, "")
-        return run, calls, scripts
 
-    def activate(self, unloads: bool):
-        run, calls, scripts = self.qdbus(unloads)
         with (
             mock.patch.object(focus.subprocess, "run", side_effect=run),
             mock.patch.object(focus.time, "sleep"),
         ):
             result = focus._kwin_activate([42], {"cwd": "/work/project"})
         self.assertFalse(scripts[0].exists())
-        return result, calls, scripts
+        return result, calls, texts[0]
 
-    def test_activate_reports_a_matched_window(self) -> None:
-        result, calls, _ = self.activate(unloads=True)
-        self.assertTrue(result)
-        self.assertFalse(any(c[2].startswith("/Scripting/Script") for c in calls))
-
-    def test_activate_without_a_match_is_false_and_unloads(self) -> None:
-        result, calls, _ = self.activate(unloads=False)
-        self.assertFalse(result)
-        self.assertTrue(any(c[3:4] == ["org.kde.kwin.Scripting.unloadScript"] for c in calls))
+    def test_activate_is_true_only_when_the_script_matched_and_unloaded_itself(self) -> None:
+        for unloads in (True, False):
+            with self.subTest(unloads=unloads):
+                result, calls, _ = self.activate(unloads)
+                self.assertIs(result, unloads)
+                # Without a match the script stays loaded until we unload it.
+                unloaded = any(c[3:4] == ["org.kde.kwin.Scripting.unloadScript"] for c in calls)
+                self.assertIs(unloaded, not unloads)
 
     def test_activate_script_unloads_itself_only_on_match(self) -> None:
-        run, _, _ = self.qdbus(True)
-        texts = []
-        original = run
-
-        def capture(argv, **kwargs):
-            if argv[3:4] == ["org.kde.kwin.Scripting.loadScript"]:
-                texts.append(Path(argv[4]).read_text())
-            return original(argv, **kwargs)
-        with (
-            mock.patch.object(focus.subprocess, "run", side_effect=capture),
-            mock.patch.object(focus.time, "sleep"),
-        ):
-            focus._kwin_activate([42])
-        script = texts[0]
+        script = self.activate(unloads=True)[2]
         self.assertIn("unloadScript", script[script.index("if (target)"):])
 
-    def test_caption_hint_cannot_break_out_of_the_js_string(self) -> None:
-        hint = focus._caption_hint({"cwd": "/x/a\"b\\c');workspace.x("})
-        self.assertEqual(hint, "abcworkspace.x")
+    def test_caption_hint_is_the_cwd_basename_stripped_for_a_js_string(self) -> None:
+        cases = [
+            # Quotes and backslashes must not break out of the JS string.
+            ({"cwd": "/x/a\"b\\c');workspace.x("}, "abcworkspace.x"),
+            # A trailing slash leaves an empty last part; skip to the real name.
+            ({"cwd": "/x/proj/"}, "proj"),
+            # No non-empty part at all: no hint rather than a crash.
+            ({"cwd": "/"}, ""),
+            ({}, ""),
+            (None, ""),
+        ]
+        for record, expected in cases:
+            with self.subTest(record=record):
+                self.assertEqual(focus._caption_hint(record), expected)
 
 
 class ResumeShellTests(unittest.TestCase):
@@ -1120,42 +1098,29 @@ class MacFocusTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), str(home))
 
     @unittest.skipIf(WINDOWS, "kitty doesn't exist on Windows")
-    def test_failed_kitty_start_and_missing_installation_are_failures(self) -> None:
-        self.payload([entry()])
-        with (
-            mock.patch.object(focus, "_kitty_bin", return_value="/bad/kitty"),
-            mock.patch.object(focus.subprocess, "Popen", side_effect=OSError("cannot execute")) as spawn,
-        ):
-            self.assertEqual(focus.launch("omp", "sid-1"), 8)
-            self.assertEqual(spawn.call_count, 1)
-        with (
-            mock.patch.object(focus, "_kitty_bin", return_value=""),
-            mock.patch.object(focus.subprocess, "Popen") as spawn,
-        ):
-            self.assertEqual(focus.launch("omp", "sid-1"), 8)
-            spawn.assert_not_called()
-
-    @unittest.skipIf(WINDOWS, "kitty doesn't exist on Windows")
-    def test_linux_missing_or_failed_kitty_is_a_failure(self) -> None:
+    def test_missing_unstartable_or_exiting_kitty_is_a_failure(self) -> None:
         self.payload([entry(desktop="")])
-        with (
-            mock.patch.object(focus.sys, "platform", "linux"),
-            mock.patch.object(focus.time, "sleep"),
-        ):
-            with (
-                mock.patch.object(focus.shutil, "which", return_value=None),
-                mock.patch.object(focus.subprocess, "Popen") as spawn,
-            ):
-                self.assertEqual(focus.launch("omp", "sid-1"), 8)
-                spawn.assert_not_called()
+        exiting = mock.Mock(**{"poll.return_value": 1})
+        cases = {
+            "not installed": ("linux", None, {}),
+            "cannot execute": ("darwin", "/bad/kitty", {"side_effect": OSError("cannot execute")}),
             # systemd-run starts, but kitty exits at once.
+            "exits at once": ("linux", "/usr/bin/kitty", {"return_value": exiting}),
+        }
+        for name, (platform, kitty, popen) in cases.items():
             with (
-                mock.patch.object(focus.shutil, "which", return_value="/usr/bin/kitty"),
-                mock.patch.object(focus.subprocess, "Popen") as spawn,
+                self.subTest(name),
+                mock.patch.object(focus.sys, "platform", platform),
+                mock.patch.object(focus.shutil, "which", return_value=kitty),
+                mock.patch.object(focus.time, "sleep"),
+                mock.patch.object(focus.subprocess, "Popen", **popen) as spawn,
             ):
-                spawn.return_value.poll.return_value = 1
                 self.assertEqual(focus.launch("omp", "sid-1"), 8)
-                self.assertIn("/usr/bin/kitty", spawn.call_args.args[0])
+            if kitty is None:
+                spawn.assert_not_called()
+            else:
+                spawn.assert_called_once()
+                self.assertIn(kitty, spawn.call_args.args[0])
 
     @unittest.skipIf(WINDOWS, "kitty doesn't exist on Windows")
     def test_restore_reports_only_selected_verified_successful_rows(self) -> None:
@@ -1230,30 +1195,27 @@ class MacFocusTests(unittest.TestCase):
     def test_other_daemon_window_does_not_make_target_ready(self) -> None:
         self.payload([entry(host="tern")])
         calls = []
+
         def tern(args, socket=""):
             calls.append(args)
             return focus.subprocess.CompletedProcess(args, 0, '{"block": 9}', "")
-        with (
-            mock.patch.dict(focus.os.environ, {"TERN_DAEMON_SOCKET": "/tmp/target.sock"}),
-            mock.patch.object(focus.agents, "tern_window_pids", return_value=[77]),
-            mock.patch.object(focus.agents, "_environ_value", return_value="/tmp/unrelated.sock"),
-            mock.patch.object(focus, "_tern", side_effect=tern),
-            mock.patch.object(focus, "_start_tern", return_value=False) as start,
-        ):
-            self.assertEqual(focus.launch("omp", "sid-1"), 8)
-            start.assert_called_once()
-        self.assertEqual(calls, [])  # No hidden tab in the answering target daemon.
-        with (
-            mock.patch.dict(focus.os.environ, {"TERN_DAEMON_SOCKET": "/tmp/target.sock"}),
-            mock.patch.object(focus.agents, "tern_window_pids", return_value=[77]),
-            mock.patch.object(focus.agents, "_environ_value", return_value="/tmp/target.sock"),
-            mock.patch.object(focus, "_tern", side_effect=tern),
-            mock.patch.object(focus, "_start_tern") as start,
-        ):
-            self.assertEqual(focus.launch("omp", "sid-1"), 0)
-            start.assert_not_called()
-        self.assertEqual(calls[-2][:2], ["new", "tab"])
-        self.assertEqual(calls[-1], ["focus", "9"])
+
+        # The one Tern window shows another daemon's sessions, then the target's.
+        for window_socket, code in (("/tmp/unrelated.sock", 8), ("/tmp/target.sock", 0)):
+            calls.clear()
+            with (
+                self.subTest(window_socket),
+                mock.patch.dict(focus.os.environ, {"TERN_DAEMON_SOCKET": "/tmp/target.sock"}),
+                mock.patch.object(focus.agents, "tern_window_pids", return_value=[77]),
+                mock.patch.object(focus.agents, "_environ_value", return_value=window_socket),
+                mock.patch.object(focus, "_tern", side_effect=tern),
+                mock.patch.object(focus, "_start_tern", return_value=False) as start,
+            ):
+                self.assertEqual(focus.launch("omp", "sid-1"), code)
+            self.assertEqual(start.called, code != 0)
+            # No hidden tab in the answering target daemon.
+            self.assertEqual([call[:2] for call in calls[-2:]],
+                             [["new", "tab"], ["focus", "9"]] if code == 0 else [])
 
     def test_tern_focus_failure_does_not_claim_success(self) -> None:
         with (
@@ -1287,14 +1249,6 @@ class MacFocusTests(unittest.TestCase):
             self.assertNotIn("env", spawn.call_args.kwargs)
             spawn.return_value.poll.return_value = 1
             self.assertFalse(focus._start_tern())
-        self.payload([entry(host="tern")])
-        with (
-            mock.patch.object(focus, "_tern_ready", return_value=False),
-            mock.patch.object(focus, "_start_tern", return_value=False),
-            mock.patch.object(focus, "_tern") as tern,
-        ):
-            self.assertEqual(focus.launch("omp", "sid-1"), 8)
-            tern.assert_not_called()
 
 
 class StartupLockTests(unittest.TestCase):
