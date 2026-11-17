@@ -41,7 +41,7 @@ class MainLifecycleTest(unittest.TestCase):
                 popup = ("FullRepresentation.qml", "ProviderSection.qml", "HistorySection.qml",
                          "UsageSetup.qml") if views == "popup" else ()
                 for name in ("CompactRepresentation.qml", "AgentsSection.qml", "SectionCard.qml",
-                             "AgentTitle.qml", "TurnBubble.qml") + popup:
+                             "AgentTitle.qml", "TurnBubble.qml", "configTray.qml") + popup:
                     shutil.copy2(ROOT / "contents/ui" / name, root / "ui" / name)
                 if not popup:
                     put("ui/FullRepresentation.qml", "import QtQuick\nItem {\n"
@@ -52,6 +52,12 @@ class MainLifecycleTest(unittest.TestCase):
                     put(f"ui/{name}.qml", "import QtQuick\nItem { property bool tooltipHovered: false }\n")
             if helper_case and "waitingView" in helper_case:
                 put("state/codexbar-agentview/waiting_view.json", json.dumps(helper_case["waitingView"]))
+            if helper_case and "agentsJson" in helper_case:
+                put("state/codexbar-agentview/agents.json", json.dumps(helper_case["agentsJson"]))
+                # The scan only succeeds: agents.json above is what it wrote.
+                put("scripts/codexbar_agents.py", "import sys\n"
+                    "if '--history-limit' in sys.argv:\n"
+                    "    sys.exit('the helper keeps its own history cap: ' + ' '.join(sys.argv[1:]))\n")
             # Replace desktop integration only; root bindings, callbacks, reducers,
             # command construction, and native subprocess execution remain real.
             module = "imports/org/kde/plasma/plasmoid/"
@@ -210,7 +216,7 @@ state = pathlib.Path(os.environ["XDG_STATE_HOME"]) / "codexbar-agentview"
             put("test.qml", '''import QtQuick
 import org.kde.plasma.plasmoid
 import "ui/process" as Process
-Item {
+''' + ("import QtTest\n" if views == "popup" else "") + '''Item {
     id: fixture
     property int stage: 0
     property int ticks: 0
@@ -266,7 +272,12 @@ Item {
             }
         }
     }
-}
+''' + ('''    TestCase {
+        id: keyboard
+        name: "PopupKeyboard"
+        when: false
+    }
+''' if views == "popup" else "") + '''}
 ''')
             env = dict(os.environ, QT_QPA_PLATFORM="offscreen",
                        QT_FORCE_STDERR_LOGGING="1", QT_LOGGING_TO_CONSOLE="1",
@@ -277,6 +288,9 @@ Item {
                        CODEX_HOME=str(root / ".codex"), CLAUDE_CONFIG_DIR=str(root / ".claude"),
                        OMP_AGENT_DIR=str(root / ".omp/agent"),
                        PATH=str(root / "bin") + os.pathsep + os.environ["PATH"])
+            if (helper_case or {}).get("noXhrFileRead"):
+                # plasmashell without install_integration.py's env script.
+                del env["QML_XHR_ALLOW_FILE_READ"]
             if real_fetch:
                 seed_percent = (helper_case or {}).get("seedPercent", 42)
                 put("provider-percent", str(seed_percent))
@@ -1410,6 +1424,158 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
 ''')
         self.assertEqual([call["cache"] for call in calls], [True, False, True, False])
         self.assertEqual(notifications, [])
+
+    def test_history_trims_to_the_setting_and_the_scan_keeps_its_own_cap(self):
+        exited = [{"provider": "omp", "sessionId": f"e{i}", "closedBy": "exit", "lastSeenAt": 1000 + i}
+                  for i in range(12)]
+        reboot = {"provider": "omp", "sessionId": "r", "closedBy": "reboot", "lastSeenAt": 1}
+        self.applet('''
+                check(!app.agentsError, "agent scan failed: " + app.agentsError)
+                if (app.agentHistory.length === 0) return
+                var ids = app.agentHistory.map(function(r) { return r.sessionId })
+                check(JSON.stringify(ids) === JSON.stringify(["r", "e11", "e10", "e9", "e8", "e7",
+                    "e6", "e5", "e4", "e3", "e2"]),
+                    "every restart row and the newest exits up to the setting: " + ids)
+                console.log("PASS actual main history limit")
+                Qt.exit(0)
+''', {"agentsJson": {"agents": [], "history": [reboot] + exited},
+      "configuration": {"showAgents": True, "agentHistoryLimit": 10}})
+
+    def test_a_file_read_that_never_finishes_times_out_with_the_fix(self):
+        self.applet('''
+                if (fixture.stage === 0) {
+                    app.fileReadTimeoutMs = 300
+                    Plasmoid.configuration.ternIntegration = true
+                    fixture.stage = 1
+                } else if (fixture.stage === 1) {
+                    // The first scan fails (no helper here); then read.
+                    app.refreshAgents()
+                    if (app.agentsLoading && app.waitingRequest) fixture.stage = 2
+                } else {
+                    if (app.agentsLoading || app.waitingRequest) return
+                    check(app.agentsError.indexOf("QML_XHR_ALLOW_FILE_READ=1") >= 0,
+                        "a stalled read names its fix: " + app.agentsError)
+                    console.log("PASS actual main stalled read")
+                    Qt.exit(0)
+                }
+''', {"noXhrFileRead": True, "configuration": {"showAgents": True}})
+
+    def test_blocked_agents_share_one_notification_that_retries_after_failing(self):
+        _, notifications = self.applet('''
+                if (fixture.stage === 0) {
+                    var a = JSON.stringify(["codex", "a"]), b = JSON.stringify(["claude", "b"])
+                    var sessions = {}
+                    sessions[a] = "blocked"
+                    sessions[b] = "blocked"
+                    app.agentNotificationState = { enabled: true, sessions: sessions, retry: {} }
+                    app.dispatchNotifications([
+                        { kind: "agent", sessionKey: a, title: "t", body: "Codex is waiting for your input." },
+                        { kind: "agent", sessionKey: b, title: "t", body: "Claude is waiting for your input." }])
+                    fixture.stage = 1
+                } else if (Object.keys(app.pendingNotifications).length === 0) {
+                    var retry = app.agentNotificationState.retry || {}
+                    check(Object.keys(retry).length === 2, "both failed sessions retry: " + JSON.stringify(retry))
+                    check(app.notificationError.indexOf("synthetic service failure") >= 0,
+                        "the failure shows: " + app.notificationError)
+                    console.log("PASS actual main agent batch")
+                    Qt.exit(0)
+                }
+''', {"notifyFails": True})
+        self.assertEqual(len(notifications), 1, notifications)
+        self.assertIn("CodexBar AgentView: 2 agents waiting for input", notifications[0])
+
+    def test_tray_skips_windows_a_working_provider_does_not_report(self):
+        self.applet('''
+                if (app.cacheRestoring || app.loading) return
+                var compact = app.compactRepresentation.createObject(fixture, { width: 400, height: 24 })
+                app.snapshot = { updatedAt: "", fatal: null, forecast: null, providers: [
+                    { id: "kilo", ok: true },
+                    { id: "openrouter", ok: true, primary: { usedPercent: 3 } },
+                    { id: "zai", ok: false, error: { message: "down" } }] }
+                var ids = compact.groups.map(function(g) { return g.providerId })
+                check(ids.indexOf("kilo") < 0, "a balance-only Kilo reading has no meter: " + ids)
+                check(ids.indexOf("openrouter") >= 0 && ids.indexOf("zai") >= 0 && ids.indexOf("codex") >= 0,
+                    "measured, failed and not yet read providers keep theirs: " + ids)
+                console.log("PASS actual main tray skips unreported windows")
+                Qt.exit(0)
+''', views=True)
+
+    def test_account_over_pace_box_reads_and_migrates_the_all_accounts_flag(self):
+        self.applet('''
+                function find(item, test, out) {
+                    out = out || []
+                    if (test(item)) out.push(item)
+                    var kids = item.children || []
+                    for (var i = 0; i < kids.length; i++) find(kids[i], test, out)
+                    return out
+                }
+                function overPaceBox(key) {
+                    var meter = find(fixture.popup, function(i) { return i.key === key && i.isOn !== undefined })[0]
+                    check(meter, "no meter " + key)
+                    return find(meter, function(i) { return i.text === "only if proj > 100%" })[0]
+                }
+                if (fixture.stage === 0) {
+                    var page = Qt.createComponent(Qt.resolvedUrl("ui/configTray.qml"))
+                    fixture.popup = page.createObject(fixture, {
+                        cfg_trayIndicators: ["claude:primary"], cfg_trayOverPaceOnly: ["claude:primary"] })
+                    check(fixture.popup, "configTray: " + page.errorString())
+                    fixture.stage = 1
+                } else if (fixture.stage === 1) {
+                    if (fixture.popup.accountsLoading) return
+                    function account(email) {
+                        return { id: "claude", ok: true, accountEmail: email, primary: { usedPercent: 5 } }
+                    }
+                    fixture.popup.accountsError = ""
+                    fixture.popup.accounts = { claude: [account("a@example.invalid"), account("b@example.invalid")],
+                                               codex: [] }
+                    fixture.stage = 2
+                } else {
+                    var a = "claude:a%40example.invalid:primary", b = "claude:b%40example.invalid:primary"
+                    var boxA = overPaceBox(a)
+                    check(boxA.visible && boxA.checked && overPaceBox(b).checked,
+                        "the all-accounts flag shows on every account's box")
+                    boxA.toggle()
+                    boxA.toggled()
+                    check(JSON.stringify(fixture.popup.cfg_trayOverPaceOnly) === JSON.stringify([b]),
+                        "unchecking one account keeps the flag on the other: "
+                        + JSON.stringify(fixture.popup.cfg_trayOverPaceOnly))
+                    check(!overPaceBox(a).checked && overPaceBox(b).checked, "boxes follow the migration")
+                    boxA.toggle()
+                    boxA.toggled()
+                    check(JSON.stringify(fixture.popup.cfg_trayOverPaceOnly) === JSON.stringify([b, a]),
+                        "checking it again adds its own key: " + JSON.stringify(fixture.popup.cfg_trayOverPaceOnly))
+                    console.log("PASS actual main tray over-pace migration")
+                    Qt.exit(0)
+                }
+''', views=True)
+
+    def test_typing_after_a_manual_tab_click_returns_to_agents(self):
+        self.applet('''
+                function find(item, test, out) {
+                    out = out || []
+                    if (test(item)) out.push(item)
+                    var kids = item.children || []
+                    for (var i = 0; i < kids.length; i++) find(kids[i], test, out)
+                    return out
+                }
+                if (fixture.stage === 0) {
+                    if (app.cacheRestoring || app.loading) return
+                    fixture.popup = app.fullRepresentation.createObject(fixture, { width: 600, height: 400 })
+                    app.requestedTab = "agents"
+                    fixture.stage = 1
+                    fixture.since = fixture.ticks
+                } else if (fixture.stage === 1) {
+                    if (fixture.ticks - fixture.since < 10) return
+                    var bar = find(fixture.popup, function(i) { return String(i).indexOf("TabBar") >= 0 })[0]
+                    check(bar.currentIndex === 1, "Super+A opens Agents")
+                    bar.currentIndex = 0
+                    fixture.popup.forceActiveFocus()
+                    keyboard.keyClick(Qt.Key_A)
+                    check(bar.currentIndex === 1, "typing after clicking Usage shows the filtered Agents")
+                    console.log("PASS actual main typing returns to agents")
+                    Qt.exit(0)
+                }
+''', {"configuration": {"showAgents": True}}, views="popup")
 
 
 if __name__ == "__main__":

@@ -326,25 +326,10 @@ PlasmoidItem {
         return anyData || waitingWarning ? html : ""
     }
 
-    // One notification per poll for usage alerts: Plasma refuses a burst of
-    // similar ones from one app ("ExcessNotificationGeneration").
-    function batchUsage(events) {
-        var usage = events.filter(function(event) { return event.kind === "usage" })
-        if (usage.length < 2) return events
-        var critical = usage.some(function(event) { return event.level === 3 })
-        var batch = { kind: "usageBatch", events: usage,
-            title: "CodexBar AgentView: " + usage.length + " usage "
-                + (critical ? "alerts, critical among them" : "warnings"),
-            body: usage.map(function(event) {
-                return (event.level === 3 ? "Critical: " : "") + event.body
-            }).join("\n") }
-        return [batch].concat(events.filter(function(event) { return event.kind !== "usage" }))
-    }
-
     function dispatchNotifications(events) {
         if (events.length === 0) return
         root.notificationError = ""
-        events = batchUsage(events)
+        events = Notifications.batch(events)
         for (var i = 0; i < events.length; i++) {
             var event = events[i]
             var cmd = "if ! command -v notify-send >/dev/null 2>&1; then "
@@ -365,13 +350,18 @@ PlasmoidItem {
 
     Process.CommandRunner {
         id: notificationRunner
+        timeoutMs: 30000
         onFinished: function(command, exitCode, standardOutput, standardError) {
             var pending = root.pendingNotifications[command]
             delete root.pendingNotifications[command]
             if (!pending) return
             var event = pending.event
-            if (event.kind !== "agent"
-                    && pending.backendGeneration !== root.backendGeneration) return
+            if (event.kind === "agent" || event.kind === "agentBatch") {
+                root.agentNotificationState = Notifications.agentDelivery(
+                    root.agentNotificationState, event, exitCode === 0, Date.now())
+            } else if (pending.backendGeneration !== root.backendGeneration) {
+                return
+            }
             var delivered = event.kind === "usageBatch" ? event.events
                 : event.kind === "usage" ? [event] : []
             for (var d = 0; d < delivered.length; d++) {
@@ -392,6 +382,8 @@ PlasmoidItem {
 
     Process.CommandRunner {
         id: runner
+        // Above the helper's own deadlines; a Claude OAuth fetch alone takes about 16 s.
+        timeoutMs: 90000
 
         onFinished: function(command, exitCode, standardOutput, standardError) {
             // Anchor the next poll to completion, not the previous timer tick.
@@ -475,6 +467,7 @@ PlasmoidItem {
     // Read the aggregate only after its writer exits successfully.
     Process.CommandRunner {
         id: aggregatorRunner
+        timeoutMs: 30000
 
         onFinished: function(command, exitCode, standardOutput, standardError) {
             root.aggregatorLoading = false
@@ -642,6 +635,7 @@ PlasmoidItem {
 
     Process.CommandRunner {
         id: dismissRunner
+        timeoutMs: 30000
         onFinished: function(command, exitCode, standardOutput, standardError) {
             if (exitCode !== 0) {
                 root.historyLaunchError = standardError.trim()
@@ -844,7 +838,6 @@ PlasmoidItem {
         var cmd = "python3 " + Command.shellQuote(root.aggregatorScriptPath) + " --once"
             + " --desktop-map " + Command.shellQuote(desktopMap)
             + " --requested-at " + requestedAt
-            + " --history-limit " + Plasmoid.configuration.agentHistoryLimit
         aggregatorRunner.run(cmd)
     }
 
@@ -877,7 +870,8 @@ PlasmoidItem {
                 var history = Array.isArray(parsed.history) ? parsed.history : []
                 delete parsed.history
                 var transition = Notifications.agents(root.agentNotificationState,
-                    Array.isArray(parsed.agents) ? parsed.agents : [], root.agentNotificationsEnabled)
+                    Array.isArray(parsed.agents) ? parsed.agents : [], root.agentNotificationsEnabled,
+                    Date.now())
                 root.agentNotificationState = transition.state
                 root.dispatchNotifications(transition.events)
                 parsed.agents = Array.isArray(parsed.agents) ? parsed.agents : []
@@ -902,6 +896,13 @@ PlasmoidItem {
                         parsed.counts[state]++
                     }
                 }
+                // The helper keeps up to 1000 ended sessions for every reader;
+                // History shows every restart row and the newest exits the
+                // setting allows.
+                var exited = history.filter(function(r) { return r && r.closedBy !== "reboot" })
+                exited.sort(function(a, b) { return (Number(b.lastSeenAt) || 0) - (Number(a.lastSeenAt) || 0) })
+                history = history.filter(function(r) { return r && r.closedBy === "reboot" })
+                    .concat(exited.slice(0, Plasmoid.configuration.agentHistoryLimit || 100))
                 var historyKey = JSON.stringify(history)
                 if (historyKey !== root._agentHistoryKey) {
                     root._agentHistoryKey = historyKey
@@ -922,6 +923,27 @@ PlasmoidItem {
         }
         xhr.open("GET", root.agentsFileUrl)
         xhr.send()
+        fileReadTimeout.restart()
+    }
+
+    // Without QML_XHR_ALLOW_FILE_READ a file:// read never finishes, which
+    // would keep agents.json and waiting_view.json from ever being read again.
+    property int fileReadTimeoutMs: 5000
+    Timer {
+        id: fileReadTimeout
+        interval: root.fileReadTimeoutMs
+        onTriggered: {
+            var agents = root.agentsRequest
+            var waiting = root.waitingRequest
+            if (!agents && !waiting) return
+            root.agentsRequest = null
+            root.agentsLoading = false
+            root.waitingRequest = null
+            if (agents) agents.abort()
+            if (waiting) waiting.abort()
+            root.agentsError = "Reading the agent state file timed out. Plasmashell needs "
+                + "QML_XHR_ALLOW_FILE_READ=1: click Install under Agents settings, then log in again."
+        }
     }
 
     function clearAgentSnapshot() {
@@ -965,6 +987,7 @@ PlasmoidItem {
         }
         xhr.open("GET", root.waitingViewFileUrl)
         xhr.send()
+        fileReadTimeout.restart()
     }
 
     // Replaced only on change: the CLI restamps `now` on every rewrite.
@@ -1085,10 +1108,7 @@ PlasmoidItem {
         running: root.usageEnabled; repeat: true
         onTriggered: root.refresh(true)
     }
-    onRefreshMsChanged: {
-        poll.interval = root.refreshMs
-        if (!root.loading && root.usageEnabled) poll.restart()
-    }
+    onRefreshMsChanged: if (!root.loading && root.usageEnabled) poll.restart()
 
     // One scan timer; completion triggers the file read.
     Timer {

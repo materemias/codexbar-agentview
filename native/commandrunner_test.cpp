@@ -107,5 +107,46 @@ int main(int argc, char **argv)
     QCoreApplication::processEvents();
     require(!cancelledDelivered, "Destroyed runner delivered a completion");
     require(failures == 1, "Failed startup delivered more than once");
+
+    // A command past its timeout fails with a message, and its whole process
+    // group goes: helpers start grandchildren (the CLI, Claude) of their own.
+    CommandRunner slow;
+    slow.setTimeoutMs(200);
+    int slowCompletions = 0;
+    int slowCode = 0;
+    QString slowOut;
+    QString slowErr;
+    QObject::connect(&slow, &CommandRunner::finished, &app,
+                     [&](const QString &, int exitCode, const QString &out, const QString &err) {
+        ++slowCompletions;
+        slowCode = exitCode;
+        slowOut = out;
+        slowErr = err;
+    });
+    const QString grandchildPath = directory.filePath("grandchild");
+    QString quotedGrandchild = grandchildPath;
+    quotedGrandchild.replace('\'', "'\\''");
+    slow.run("sleep 60 & printf '%s' $! > '" + quotedGrandchild + "'; wait");
+    waitUntil([&] { return slowCompletions != 0; });
+    require(slowCode != 0 && slowOut.isEmpty() && slowErr.contains("timed out"),
+            "A command past its timeout did not report a timeout");
+    QFile grandchildFile(grandchildPath);
+    require(grandchildFile.open(QIODevice::ReadOnly), "Timed-out command wrote no PID");
+    const qint64 grandchild = grandchildFile.readAll().toLongLong();
+    require(grandchild > 0, "Timed-out command wrote an empty PID");
+    // The killed grandchild lingers as a zombie until its new parent reaps it.
+    waitUntil([&] {
+        return kill(static_cast<pid_t>(grandchild), 0) == -1 && errno == ESRCH;
+    });
+
+    // A command that ends in time completes once; its timer never fires.
+    slow.run("printf fast");
+    waitUntil([&] { return slowCompletions == 2; });
+    require(slowCode == 0 && slowOut == "fast" && slowErr.isEmpty(),
+            "A command within its timeout did not succeed");
+    QEventLoop settle;
+    QTimer::singleShot(400, &settle, &QEventLoop::quit);
+    settle.exec();
+    require(slowCompletions == 2, "A finished command's timer delivered a second result");
     qInfo("CommandRunner lifecycle checks passed");
 }

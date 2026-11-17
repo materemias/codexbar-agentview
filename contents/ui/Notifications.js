@@ -170,9 +170,14 @@ function ompModeDelivery(previous, event, succeeded) {
         transition: succeeded ? null : previous.transition, pending: false }
 }
 
-function agents(previous, records, enabled) {
-    var old = previous || { enabled: false, sessions: {} }
+// `retry` maps a session key to when a failed notification is tried again;
+// a notification is in flight while its blocked session has no entry.
+function agents(previous, records, enabled, now) {
+    var old = previous || { enabled: false, sessions: {}, retry: {} }
+    var oldRetry = enabled && old.enabled ? old.retry || {} : {}
+    var at = now === undefined ? Date.now() : now
     var sessions = {}
+    var retry = {}
     var events = []
     for (var i = 0; i < records.length; i++) {
         var record = records[i]
@@ -183,12 +188,60 @@ function agents(previous, records, enabled) {
         var key = JSON.stringify([record.provider, record.sessionId])
         if (sessions[key] !== undefined) continue
         sessions[key] = record.state
-        if (enabled && old.enabled && old.sessions[key] !== undefined
-                && old.sessions[key] !== "blocked" && record.state === "blocked") {
-            events.push({ kind: "agent",
+        if (!enabled || !old.enabled || old.sessions[key] === undefined
+                || record.state !== "blocked") continue
+        var due = old.sessions[key] !== "blocked"
+        if (!due && oldRetry[key] !== undefined) {
+            // A session that stays blocked keeps its retry until it is due.
+            if (at < oldRetry[key]) retry[key] = oldRetry[key]
+            else due = true
+        }
+        if (due) {
+            events.push({ kind: "agent", sessionKey: key,
                 title: "CodexBar AgentView agent waiting for input",
                 body: providerName(record.provider) + " is waiting for your input." })
         }
     }
-    return { state: { enabled: enabled, sessions: sessions }, events: events }
+    return { state: { enabled: enabled, sessions: sessions, retry: retry }, events: events }
+}
+
+function agentDelivery(previous, event, succeeded, now) {
+    if (succeeded || !previous || !previous.enabled) return previous
+    var delivered = event.kind === "agentBatch" ? event.events : [event]
+    var retry = Object.assign({}, previous.retry || {})
+    for (var i = 0; i < delivered.length; i++) {
+        // Only a session still blocked is worth another notification.
+        if (previous.sessions[delivered[i].sessionKey] === "blocked")
+            retry[delivered[i].sessionKey] = (now || Date.now()) + RETRY_MS
+    }
+    return { enabled: previous.enabled, sessions: previous.sessions, retry: retry }
+}
+
+// One notification per kind and poll: Plasma refuses a burst of similar
+// ones from one app ("ExcessNotificationGeneration").
+function batch(events) {
+    var usage = events.filter(function(event) { return event.kind === "usage" })
+    var blocked = events.filter(function(event) { return event.kind === "agent" })
+    var out = []
+    if (usage.length > 1) {
+        var critical = usage.some(function(event) { return event.level === 3 })
+        out.push({ kind: "usageBatch", events: usage,
+            title: "CodexBar AgentView: " + usage.length + " usage "
+                + (critical ? "alerts, critical among them" : "warnings"),
+            body: usage.map(function(event) {
+                return (event.level === 3 ? "Critical: " : "") + event.body
+            }).join("\n") })
+    } else {
+        out = out.concat(usage)
+    }
+    if (blocked.length > 1) {
+        out.push({ kind: "agentBatch", events: blocked,
+            title: "CodexBar AgentView: " + blocked.length + " agents waiting for input",
+            body: blocked.map(function(event) { return event.body }).join("\n") })
+    } else {
+        out = out.concat(blocked)
+    }
+    return out.concat(events.filter(function(event) {
+        return event.kind !== "usage" && event.kind !== "agent"
+    }))
 }

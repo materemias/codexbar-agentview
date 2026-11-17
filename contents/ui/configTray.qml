@@ -68,6 +68,8 @@ Item {
         property string text
         property bool isOn: root._has(key)
         property var setOn: function (on) { root._toggle(meter.key, on) }
+        property bool overPaceOn: root._overPaceOnly(key)
+        property var setOverPace: function (on) { root._toggleOverPaceOnly(meter.key, on) }
         spacing: Kirigami.Units.smallSpacing
         enabled: root.usageEnabled
 
@@ -81,8 +83,8 @@ Item {
             text: "only if proj > 100%"
             opacity: 0.7
             font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-            checked: root._overPaceOnly(meter.key)
-            onToggled: root._toggleOverPaceOnly(meter.key, checked)
+            checked: meter.overPaceOn
+            onToggled: meter.setOverPace(checked)
             QQC2.ToolTip.text: "Hide this meter from the tray unless the current rate projects above 100% at reset"
             QQC2.ToolTip.visible: hovered
             QQC2.ToolTip.delay: Kirigami.Units.toolTipDelay
@@ -139,6 +141,12 @@ Item {
                             accountGroup.modelData, accountWindow.modelData.id)
                         setOn: function (on) {
                             root._toggleAccount(
+                                accountGroup.modelData, accountWindow.modelData.id, on)
+                        }
+                        overPaceOn: root._accountOverPace(
+                            accountGroup.modelData, accountWindow.modelData.id)
+                        setOverPace: function (on) {
+                            root._toggleAccountOverPace(
                                 accountGroup.modelData, accountWindow.modelData.id, on)
                         }
                     }
@@ -204,6 +212,11 @@ Item {
         return _has(_accountKey(account, slot)) || _has(account.id + ":" + slot)
     }
 
+    // The legacy all-accounts over-pace flag covers every account's meter.
+    function _accountOverPace(account, slot) {
+        return _overPaceOnly(_accountKey(account, slot)) || _overPaceOnly(account.id + ":" + slot)
+    }
+
     // The slot of a `<provider>:<window>` or `<provider>:<account>:<window>`
     // key of `providerId`, else "".
     function _keySlot(providerId, key) {
@@ -247,35 +260,48 @@ Item {
         cfg_trayIndicators = current
     }
 
-    // A legacy all-accounts key turns into one key per account that has the
-    // window before the toggled account changes.
-    function _toggleAccount(account, slot, on) {
-        var current = cfg_trayIndicators ? cfg_trayIndicators.slice() : []
+    // A legacy all-accounts key in `keys` turns into one key per account
+    // that has the window, before the toggled account changes.
+    function _migrateLegacy(keys, account, slot) {
+        var current = keys ? keys.slice() : []
         var legacyIndex = current.indexOf(account.id + ":" + slot)
-        if (legacyIndex >= 0) {
-            current.splice(legacyIndex, 1)
-            var siblings = accounts[account.id] || []
-            for (var i = 0; i < siblings.length; i++) {
-                var windows = _accountWindows(siblings[i])
-                for (var w = 0; w < windows.length; w++) {
-                    if (windows[w].id !== slot) continue
-                    var migrated = _accountKey(siblings[i], slot)
-                    if (current.indexOf(migrated) < 0) current.push(migrated)
-                    break
-                }
+        if (legacyIndex < 0) return current
+        current.splice(legacyIndex, 1)
+        var siblings = accounts[account.id] || []
+        for (var i = 0; i < siblings.length; i++) {
+            var windows = _accountWindows(siblings[i])
+            for (var w = 0; w < windows.length; w++) {
+                if (windows[w].id !== slot) continue
+                var migrated = _accountKey(siblings[i], slot)
+                if (current.indexOf(migrated) < 0) current.push(migrated)
+                break
             }
         }
+        return current
+    }
+
+    function _setAccountKey(keys, account, slot, on) {
+        var current = _migrateLegacy(keys, account, slot)
         var key = _accountKey(account, slot)
         var index = current.indexOf(key)
         if (on && index < 0) current.push(key)
         if (!on && index >= 0) current.splice(index, 1)
-        cfg_trayIndicators = current
+        return current
+    }
+
+    function _toggleAccount(account, slot, on) {
+        cfg_trayIndicators = _setAccountKey(cfg_trayIndicators, account, slot, on)
+    }
+
+    function _toggleAccountOverPace(account, slot, on) {
+        cfg_trayOverPaceOnly = _setAccountKey(cfg_trayOverPaceOnly, account, slot, on)
     }
 
     // Accounts come from the last saved usage: reading it runs no CLI and no
     // OAuth call, so opening this page never starts a fetch.
     Process.CommandRunner {
         id: accountsRunner
+        timeoutMs: 30000
         onFinished: function(command, exitCode, standardOutput, standardError) {
             if (command !== root.activeCommand) return
             root.activeCommand = ""

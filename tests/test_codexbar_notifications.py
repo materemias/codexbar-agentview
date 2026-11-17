@@ -431,6 +431,53 @@ Item {
             check(result.events.length === 0, "unknown session identities must not alert")
         ''')
 
+    def test_agent_events_share_one_notification_and_failures_retry(self):
+        self.policy('''
+            function session(id, provider, state) {
+                return { provider: provider, sessionId: id, state: state }
+            }
+            function scan(state, states, at) {
+                return Notifications.agents(state, [session("a", "codex", states[0]),
+                    session("b", "claude", states[1])], true, at)
+            }
+            var result = scan(null, ["working", "working"], now)
+            result = scan(result.state, ["blocked", "blocked"], now)
+            check(result.events.length === 2, "both sessions block")
+            var batched = Notifications.batch(result.events)
+            check(batched.length === 1 && batched[0].kind === "agentBatch"
+                && batched[0].events.length === 2, "blocked agents share one notification")
+            check(batched[0].title === "CodexBar AgentView: 2 agents waiting for input"
+                && batched[0].body === "Codex is waiting for your input.\\nClaude is waiting for your input.",
+                "batch text: " + batched[0].title + " / " + batched[0].body)
+            check(Notifications.batch([result.events[0]])[0] === result.events[0],
+                "a single agent event stays as it is")
+            var usage = Notifications.usage({}, [record(95, "x@example.invalid"),
+                record(80, "y@example.invalid")], now, true)
+            var mixed = Notifications.batch(usage.events.concat(result.events))
+            check(mixed.length === 2 && mixed[0].kind === "usageBatch" && mixed[1].kind === "agentBatch",
+                "usage and agent batches stay apart: " + JSON.stringify(mixed.map(function(e) { return e.kind })))
+
+            var state = Notifications.agentDelivery(result.state, batched[0], false, now)
+            check(scan(state, ["blocked", "blocked"], now + 5000).events.length === 0,
+                "a failed notification is not tried again on the next scan")
+            var retry = scan(state, ["blocked", "blocked"], retryTime)
+            check(retry.events.length === 2, "a failed notification is tried again later")
+            check(scan(retry.state, ["blocked", "blocked"], retryTime + 5000).events.length === 0,
+                "a retry in flight is not repeated")
+            state = Notifications.agentDelivery(retry.state, retry.events[0], true, retryTime)
+            state = Notifications.agentDelivery(state, retry.events[1], false, retryTime)
+            var again = scan(state, ["blocked", "blocked"], retryTime + Notifications.RETRY_MS)
+            check(again.events.length === 1 && again.events[0].body.indexOf("Claude") === 0,
+                "only the failed session is retried")
+            state = Notifications.agentDelivery(result.state, result.events[0], false, now)
+            var moved = scan(state, ["working", "blocked"], now + 5000)
+            var back = scan(moved.state, ["blocked", "blocked"], now + 6000)
+            check(back.events.length === 1, "blocking again alerts as a new transition")
+            state = Notifications.agentDelivery(back.state, back.events[0], true, now + 6000)
+            check(scan(state, ["blocked", "blocked"], retryTime).events.length === 0,
+                "a session that stopped waiting drops its old retry")
+        ''')
+
 
 if __name__ == "__main__":
     unittest.main()

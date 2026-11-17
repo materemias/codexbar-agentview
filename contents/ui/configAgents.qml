@@ -11,8 +11,8 @@ Item {
 
     property bool cfg_showAgents: true
     property bool cfg_agentNotifications: false
-    property bool cfg_agentBlockedBadge: true
-    property bool cfg_showAgentPrompts: false
+    property bool cfg_agentBlockedBadge: false
+    property bool cfg_showAgentPrompts: true
     property bool cfg_includeUntrackedAgents: true
     property int  cfg_agentsRefreshSeconds: 5
     property int  cfg_agentHistoryLimit: 100

@@ -134,6 +134,7 @@ Item {
                 }
                 visible: root.usageEnabled && text.length > 0
                 font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                textFormat: Text.PlainText
                 opacity: 0.55
                 Layout.alignment: Qt.AlignBaseline
             }
@@ -168,6 +169,7 @@ Item {
             objectName: "headerError"
             Layout.fillWidth: true
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
             color: Kirigami.Theme.negativeTextColor
             visible: text.length > 0
             text: {
@@ -366,6 +368,7 @@ Item {
                                     text: groupHeader.rotationState
                                         ? "omp · " + groupHeader.rotationState.operatingMode : ""
                                     font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                                    textFormat: Text.PlainText
                                     opacity: 0.6
                                 }
                                 Rectangle {
@@ -383,6 +386,7 @@ Item {
                                         text: groupHeader.stalled ? "STALLED"
                                             : groupHeader.rotationState ? groupHeader.rotationState.mode : ""
                                         color: groupHeader.stateColor
+                                        textFormat: Text.PlainText
                                         font.weight: Font.DemiBold
                                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize - 2
                                     }
@@ -489,7 +493,9 @@ Item {
     // Keyboard navigation: up/down moves the selection of the Agents list,
     // or of History while that tab is shown. Space peeks, Enter activates:
     // focus a live agent, or launch a History row. Outside History, Enter
-    // and Space switch to Agents so the user sees what they activated.
+    // and Space switch to Agents so the user sees what they activated. They
+    // set the tab directly: after a tab click requestedTab may already read
+    // "agents", and setting it again changes nothing.
     focus: true
     Keys.onPressed: function(event) {
         if (!agentsSection) return
@@ -509,7 +515,7 @@ Item {
             if (onHistory) {
                 historySection.togglePeek()
             } else {
-                root.requestedTab = "agents"
+                tabBar.currentIndex = 1
                 agentsSection.togglePeek()
             }
             event.accepted = true
@@ -517,7 +523,7 @@ Item {
             if (onHistory) {
                 historySection.activateSelected()
             } else {
-                root.requestedTab = "agents"
+                tabBar.currentIndex = 1
                 agentsSection.activateSelected()
             }
             event.accepted = true
@@ -554,7 +560,7 @@ Item {
             && (event.modifiers & ~Qt.ShiftModifier) === Qt.NoModifier) {
             // Type-to-filter: any printable key starts/extends the query,
             // which filters both the Agents and History tabs.
-            if (tabHost.activeTab !== 2) root.requestedTab = "agents"
+            if (tabHost.activeTab !== 2) tabBar.currentIndex = 1
             agentsSection.filterText += event.text
             event.accepted = true
         }

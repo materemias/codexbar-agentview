@@ -320,7 +320,7 @@ ColumnLayout {
         if (index < 0) return
         var a = flatAgents[index]
         if (a && a.sessionId) {
-            Qt.openUrlExternally("codexbar-agentview://focus/" + a.sessionId)
+            Qt.openUrlExternally("codexbar-agentview://focus/" + encodeURIComponent(a.sessionId))
         }
     }
 
@@ -403,6 +403,7 @@ ColumnLayout {
 
         PC3.Label {
             text: "filter: " + agents.filterText
+            textFormat: Text.PlainText
             font.pixelSize: Kirigami.Theme.smallFont.pixelSize
             opacity: 0.85
             Layout.fillWidth: true
@@ -422,6 +423,7 @@ ColumnLayout {
         wrapMode: Text.WordWrap
         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
         color: Kirigami.Theme.negativeTextColor
+        textFormat: Text.PlainText
         text: root.agentsError
     }
 
@@ -592,6 +594,7 @@ ColumnLayout {
 
                     PC3.Label {
                         text: rowItem.record.host || ""
+                        textFormat: Text.PlainText
                         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
                         opacity: 0.55
                         elide: Text.ElideRight
@@ -874,9 +877,8 @@ ColumnLayout {
                 acceptedButtons: Qt.LeftButton
                 onClicked: {
                     if (!rowItem.record.sessionId) return
-                    Qt.openUrlExternally(
-                        "codexbar-agentview://focus/" + rowItem.record.sessionId
-                    )
+                    Qt.openUrlExternally("codexbar-agentview://focus/"
+                        + encodeURIComponent(rowItem.record.sessionId))
                 }
             }
 
@@ -948,27 +950,6 @@ ColumnLayout {
                 && (record.cwd || "").length > 0
             PC3.ToolTip.text: cwdHoverText
             PC3.ToolTip.delay: 600
-        }
-    }
-
-    // Untracked summary row — shown only when untracked count > 0 since these
-    // sessions have no per-record info.
-    RowLayout {
-        visible: (agents.counts.untracked || 0) > 0
-        Layout.fillWidth: true
-        Layout.topMargin: 2
-        spacing: Kirigami.Units.smallSpacing
-
-        Rectangle {
-            width: 10; height: 10; radius: 5
-            color: root.agentStateColor("untracked")
-            Layout.alignment: Qt.AlignVCenter
-        }
-        PC3.Label {
-            text: (agents.counts.untracked || 0) + " more running (no hook sentinel)"
-            font.pixelSize: Kirigami.Theme.smallFont.pixelSize
-            opacity: 0.7
-            Layout.fillWidth: true
         }
     }
 }

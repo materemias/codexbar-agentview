@@ -102,6 +102,7 @@ ColumnLayout {
 
         PC3.Label {
             visible: text.length > 0
+            textFormat: Text.PlainText
             opacity: 0.55
             font.pixelSize: Kirigami.Theme.smallFont.pixelSize
             verticalAlignment: Text.AlignVCenter
@@ -119,6 +120,7 @@ ColumnLayout {
 
         PC3.Label {
             visible: text.length > 0
+            textFormat: Text.PlainText
             font.pixelSize: Kirigami.Theme.smallFont.pixelSize
             opacity: 0.75
             verticalAlignment: Text.AlignVCenter
@@ -153,6 +155,7 @@ ColumnLayout {
         }
         PC3.Label {
             Layout.fillWidth: true
+            textFormat: Text.PlainText
             elide: Text.ElideRight
             font.pixelSize: Kirigami.Theme.smallFont.pixelSize
             font.weight: Font.DemiBold
@@ -172,6 +175,7 @@ ColumnLayout {
         visible: !!(section.record && section.record.error)
         Layout.fillWidth: true
         wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
         color: Kirigami.Theme.negativeTextColor
         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
         text: section.record && section.record.error ? section.record.error.message : ""
@@ -181,6 +185,7 @@ ColumnLayout {
         visible: section.stale
         Layout.fillWidth: true
         wrapMode: Text.WordWrap
+        textFormat: Text.PlainText
         color: Kirigami.Theme.neutralTextColor
         font.pixelSize: Kirigami.Theme.smallFont.pixelSize
         text: {
@@ -350,6 +355,7 @@ ColumnLayout {
                                                    rowItem.modelData.slot, rowItem.rec,
                                                    rowItem.modelData.extraTitle)
                             font.pixelSize: Kirigami.Theme.smallFont.pixelSize
+                            textFormat: Text.PlainText
                             Layout.minimumWidth: section.labelColumnWidth
                             opacity: 0.85
                         }
@@ -521,6 +527,7 @@ ColumnLayout {
                 Layout.fillWidth: true
                 text: forecastLine.forecastText
                 wrapMode: Text.WordWrap
+                textFormat: Text.PlainText
                 font.pixelSize: Kirigami.Theme.smallFont.pixelSize - 1
                 opacity: 0.72
             }
@@ -530,6 +537,7 @@ ColumnLayout {
             text: forecastLine.incidentText
             visible: text.length > 0
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
             color: Kirigami.Theme.negativeTextColor
             font.pixelSize: Kirigami.Theme.smallFont.pixelSize - 1
         }
@@ -538,6 +546,7 @@ ColumnLayout {
             text: forecastLine.alertText
             visible: text.length > 0
             wrapMode: Text.WordWrap
+            textFormat: Text.PlainText
             maximumLineCount: 3
             elide: Text.ElideRight
             font.pixelSize: Kirigami.Theme.smallFont.pixelSize - 1

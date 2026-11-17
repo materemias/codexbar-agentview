@@ -94,6 +94,10 @@ Item {
                         win.projected = Math.max(win.projected, root.projectedPercent(w, now))
                 }
             }
+            // A provider that answers without this window (Kilo or OpenRouter
+            // with only a balance) would show a permanent "—"; the key stays
+            // saved so the meter returns once the window is reported.
+            if (win.ok && !win.hasData) return
             if (win.stale) {
                 win.pace = -1
                 win.projected = -1
@@ -456,6 +460,7 @@ Item {
 
             PC3.Label {
                 text: compact.featuredTopic
+                textFormat: Text.PlainText
                 color: "#9ca3af"
                 font.pixelSize: Math.max(9, Math.floor(compact.ringSize * 0.45))
                 font.italic: true
