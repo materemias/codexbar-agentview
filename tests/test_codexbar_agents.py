@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import importlib.util
 import json
 import os
@@ -125,86 +126,79 @@ def resume_line(cwd: str, program: str, flag: str, session_id: str, home: str = 
     return f"{shlex.join(['cd', '--', cwd])} && {command}" if cwd else command
 
 
+def jsonl(rows) -> str:
+    return "".join(json.dumps(row) + "\n" for row in rows)
+
+
+def write_jsonl(path: Path, rows) -> Path:
+    path.write_text(jsonl(rows))
+    return path
+
+
+def iso(ms: int) -> str:
+    return datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat()
+
+
+def zulu(seconds: int) -> str:
+    return iso(seconds * 1000).replace("+00:00", "Z")
+
+
+def codex_meta_info(path: str, _provider: str) -> dict:
+    """Stands in for _transcript_info: the thread a Codex rollout names."""
+    return {"sessionId": agents._codex_meta(path)[0], "cwd": "/work", "windowTitle": "",
+            "lastPrompt": "", "state": "idle", "model": ""}
+
+
+@contextlib.contextmanager
+def fake_processes(argv: dict, ppid: dict, comm: dict | None = None, exe: dict | None = None,
+                   pids: list[int] | None = None):
+    """Stands in for /proc: each fake pid's argv and parent. Its name defaults
+    to argv[0]'s base name and its executable to argv[0]; a pid missing from
+    a table has none, so the real processes never leak in."""
+    def first(pid: int) -> str:
+        return (argv.get(pid) or [""])[0]
+
+    with contextlib.ExitStack() as stack:
+        for name, effect in (
+            ("_argv_of", lambda p: argv.get(p, [])),
+            ("_ppid_of", lambda p: ppid.get(p, 0)),
+            ("_comm_of", lambda p: Path(first(p)).name if comm is None else comm.get(p, "")),
+            ("_exe_of", lambda p: first(p) if exe is None else exe.get(p, "")),
+        ):
+            stack.enter_context(mock.patch.object(agents, name, side_effect=effect))
+        if pids is not None:
+            stack.enter_context(mock.patch.object(agents, "_all_pids", return_value=pids))
+        yield
+
+
 class ModelExtractionTests(unittest.TestCase):
     def test_model_text_is_bounded_and_whitespace_normalized(self) -> None:
         self.assertEqual(agents._model_text("  provider/model\n"), "provider/model")
         self.assertEqual(agents._model_text("x" * 200), "x" * 160)
         self.assertEqual(agents._model_text({"model": "bad"}), "")
 
-    def test_claude_uses_latest_assistant_model(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "claude.jsonl"
-            rows = [
-                {
-                    "type": "assistant",
-                    "message": {
-                        "role": "assistant",
-                        "model": "anthropic/claude-sonnet-4",
-                        "content": "first",
-                    },
-                },
-                {
-                    "type": "assistant",
-                    "message": {
-                        "role": "assistant",
-                        "model": "anthropic/claude-opus-5",
-                        "content": "latest",
-                    },
-                },
-            ]
-            path.write_text("\n".join(
-                json.dumps(row, separators=(",", ":")) for row in rows
-            ) + "\n")
+    def test_transcripts_name_their_latest_model(self) -> None:
+        def assistant(model: str) -> dict:
+            return {"type": "assistant", "message": {"role": "assistant", "model": model, "content": "x"}}
 
-            model = agents._transcript_info(str(path), "claude")["model"]
-
-        self.assertEqual(model, "anthropic/claude-opus-5")
-
-    def test_codex_reads_model_from_turn_context(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "codex.jsonl"
-            path.write_text("\n".join([
-                json.dumps({
-                    "type": "session_meta",
-                    "payload": {"id": "codex-id", "cwd": "/work"},
-                }),
-                json.dumps({
-                    "type": "turn_context",
-                    "payload": {"model": "openai-codex/gpt-5.6-sol"},
-                }),
-            ]) + "\n")
-            with mock.patch.object(
-                agents, "_open_jsonl_under", return_value=(str(path), True)
-            ):
-                info = agents._codex_info(42)
-
-        self.assertEqual(info["model"], "openai-codex/gpt-5.6-sol")
-
-    def test_pi_uses_latest_model_change_or_assistant_model(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "pi.jsonl"
-            path.write_text("\n".join([
-                json.dumps({
-                    "type": "session", "id": "pi-id", "cwd": "/work"
-                }),
-                json.dumps({
-                    "type": "model_change", "model": "zai/glm-5.3-flash"
-                }),
-                json.dumps({
-                    "type": "message",
-                    "message": {
-                        "role": "assistant",
-                        "model": "anthropic/claude-opus-5",
-                        "content": "done",
-                    },
-                }),
-            ]) + "\n")
-            with mock.patch.object(
-                agents, "_open_jsonl_under", return_value=(str(path), True)
-            ):
-                info = agents._pi_info(42)
-
-        self.assertEqual(info["model"], "anthropic/claude-opus-5")
+        cases = (
+            ("claude", [assistant("anthropic/claude-sonnet-4"), assistant("anthropic/claude-opus-5")],
+             "anthropic/claude-opus-5"),
+            # Codex names its model in each turn's context.
+            ("codex", [{"type": "session_meta", "payload": {"id": "codex-id", "cwd": "/work"}},
+                       {"type": "turn_context", "payload": {"model": "openai-codex/gpt-5.6-sol"}}],
+             "openai-codex/gpt-5.6-sol"),
+            # A later assistant model wins over an earlier model change.
+            ("pi", [{"type": "session", "id": "pi-id", "cwd": "/work"},
+                    {"type": "model_change", "model": "zai/glm-5.3-flash"},
+                    {"type": "message", "message": {"role": "assistant", "model": "anthropic/claude-opus-5",
+                                                    "content": "done"}}],
+             "anthropic/claude-opus-5"),
+        )
+        for provider, rows, expected in cases:
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
+                path = write_jsonl(Path(directory) / "session.jsonl", rows)
+                self.assertEqual(agents._transcript_info(str(path), provider)["model"], expected)
 
     def test_opencode_reads_latest_assistant_model_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -660,65 +654,32 @@ class ResumeAndIdentityTests(unittest.TestCase):
             self.assertEqual(agents._resume_command("claude", "s", "C:\\w", False), "")
 
     def test_heuristic_untracked_and_invalid_identities_have_no_command(self) -> None:
-        self.assertEqual(agents._resume_command("omp", "heuristic", "/tmp", False), "")
-        self.assertEqual(
-            agents._resume_command("omp", "untracked-omp-42", "/tmp", False), ""
-        )
-        self.assertEqual(agents._resume_command("unknown", "sid", "/tmp", True), "")
-        self.assertEqual(agents._resume_command("omp", "", "/tmp", True), "")
-        self.assertEqual(agents._resume_command("omp", "x" * 257, "/tmp", True), "")
-        self.assertEqual(agents._resume_command("omp", "bad\0id", "/tmp", True), "")
+        cases = [
+            ("omp", "heuristic", "/tmp", False), ("omp", "untracked-omp-42", "/tmp", False),
+            ("unknown", "sid", "/tmp", True), ("omp", "", "/tmp", True),
+            ("omp", "x" * 257, "/tmp", True), ("omp", "bad\0id", "/tmp", True),
+        ]
+        # A leading dash would read as an option to the agent's CLI.
+        cases += [(provider, sid, cwd, True) for provider in ("claude", "codex", "omp")
+                  for sid, cwd in (("--help", "/tmp"), ("-p", ""))]
+        for provider, session_id, cwd, exact in cases:
+            with self.subTest(provider=provider, session_id=session_id):
+                self.assertEqual(agents._resume_command(provider, session_id, cwd, exact), "")
 
         snapshot = agents._merge_snapshot(
-            [
-                active("opencode", "heuristic", identityExact=False),
-                active(
-                    "omp",
-                    "untracked-omp-42",
-                    identityExact=False,
-                    cwd="/tmp",
-                ),
-            ],
-            {"bootId": "boot-a", "agents": [], "history": []},
-            "boot-a",
-            100,
+            [active("opencode", "heuristic", identityExact=False),
+             active("omp", "untracked-omp-42", identityExact=False, cwd="/tmp")],
+            {"bootId": "boot-a", "agents": [], "history": []}, "boot-a", 100,
         )
-        self.assertEqual(
-            [row["resumeCommand"] for row in snapshot["agents"]], ["", ""]
-        )
+        self.assertEqual([row["resumeCommand"] for row in snapshot["agents"]], ["", ""])
 
     def test_saved_history_command_must_match_canonical_command(self) -> None:
-        valid = history(
-            "omp",
-            "safe-session",
-            cwd="/work/project",
-            resumeCommand=resume_line("/work/project", "omp", "--resume", "safe-session"),
-        )
-        tampered = history(
-            "omp",
-            "tampered-session",
-            cwd="/work/project",
-            resumeCommand="rm -rf /",
-        )
-        snapshot = agents._merge_snapshot(
-            [],
-            {
-                "bootId": "boot-a",
-                "agents": [],
-                "history": [valid, tampered],
-            },
-            "boot-a",
-            100,
-        )
-        commands = {
-            row["sessionId"]: row["resumeCommand"]
-            for row in snapshot["history"]
-        }
-        self.assertEqual(
-            commands["safe-session"],
-            resume_line("/work/project", "omp", "--resume", "safe-session"),
-        )
-        self.assertEqual(commands["tampered-session"], "")
+        canonical = resume_line("/work/project", "omp", "--resume", "safe-session")
+        saved = [history("omp", "safe-session", cwd="/work/project", resumeCommand=canonical),
+                 history("omp", "tampered-session", cwd="/work/project", resumeCommand="rm -rf /")]
+        snapshot = agents._merge_snapshot([], {"bootId": "boot-a", "agents": [], "history": saved}, "boot-a", 100)
+        self.assertEqual({row["sessionId"]: row["resumeCommand"] for row in snapshot["history"]},
+                         {"safe-session": canonical, "tampered-session": ""})
 
     @unittest.skipIf(sys.platform == "win32", "Windows lists no process's open files")
     def test_open_rollout_reports_direct_and_sidecar_provenance(self) -> None:
@@ -747,193 +708,31 @@ class ResumeAndIdentityTests(unittest.TestCase):
                 )
 
     def test_provider_extractors_set_identity_exact_only_from_direct_sources(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, fake_processes({}, {}):
             home = Path(directory)
-            claude_state = home / ".claude" / "sessions"
-            claude_state.mkdir(parents=True)
-            (claude_state / "42.json").write_text(json.dumps({
-                "sessionId": "claude-id", "cwd": "/work", "status": "idle"
-            }))
+            (home / ".claude" / "sessions").mkdir(parents=True)
+            (home / ".claude" / "sessions" / "42.json").write_text(
+                json.dumps({"sessionId": "claude-id", "cwd": "/work", "status": "idle"}))
             with mock.patch.object(agents.Path, "home", return_value=home):
                 self.assertTrue(agents._claude_info(42)["identityExact"])
                 self.assertFalse(agents._opencode_info(42)["identityExact"])
 
-            codex_rollout = home / "codex.jsonl"
-            codex_rollout.write_text(json.dumps({
-                "type": "session_meta",
-                "payload": {"id": "codex-id", "cwd": "/work"},
-            }) + "\n")
-            with mock.patch.object(
-                agents, "_open_jsonl_under", return_value=(str(codex_rollout), True)
-            ):
-                self.assertTrue(agents._codex_info(42)["identityExact"])
-            with mock.patch.object(
-                agents, "_open_jsonl_under", return_value=(str(codex_rollout), False)
-            ):
+            codex = write_jsonl(home / "codex.jsonl", [{"type": "session_meta", "payload": {"id": "codex-id", "cwd": "/work"}}])
+            pi = write_jsonl(home / "pi.jsonl", [{"type": "session", "id": "pi-id", "cwd": "/work"}])
+            for extract, rollout in ((agents._codex_info, codex), (agents._pi_info, pi)):
+                with self.subTest(extract=extract.__name__), \
+                        mock.patch.object(agents, "_open_jsonl_under", return_value=(str(rollout), True)):
+                    self.assertTrue(extract(42)["identityExact"])
+            with mock.patch.object(agents, "_open_jsonl_under", return_value=(str(codex), False)):
                 self.assertFalse(agents._codex_info(42)["identityExact"])
-
-            pi_rollout = home / "pi.jsonl"
-            pi_rollout.write_text(json.dumps({
-                "type": "session", "id": "pi-id", "cwd": "/work"
-            }) + "\n")
-            with mock.patch.object(
-                agents, "_open_jsonl_under", return_value=(str(pi_rollout), True)
-            ):
-                self.assertTrue(agents._pi_info(42)["identityExact"])
+            # pi found by its folder alone is a guess.
             with (
                 mock.patch.object(agents, "_open_jsonl_under", return_value=("", False)),
                 mock.patch.object(agents, "_session_dir_of", return_value=""),
-                mock.patch.object(agents, "_find_pi_rollout", return_value=str(pi_rollout)),
+                mock.patch.object(agents, "_find_pi_rollout", return_value=str(pi)),
                 mock.patch.object(agents, "_cwd_of", return_value="/work"),
             ):
                 self.assertFalse(agents._pi_info(42)["identityExact"])
-
-    def test_resuming_omp_is_named_by_argv_before_it_opens_its_rollout(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            slug = home / ".omp" / "agent" / "sessions" / "-work"
-            slug.mkdir(parents=True)
-            resumed = slug / "2026-09-28T10-00-00-000Z_01a0-resumed.jsonl"
-            resumed.write_text(json.dumps({"type": "session", "id": "01a0-resumed", "cwd": "/work"}) + "\n")
-            other = slug / "2026-09-28T11-00-00-000Z_01a0-other.jsonl"
-            other.write_text(json.dumps({"type": "session", "id": "01a0-other", "cwd": "/work"}) + "\n")
-            with (
-                mock.patch.object(agents.Path, "home", return_value=home),
-                mock.patch.object(agents, "_open_jsonl_under", return_value=("", False)),
-                mock.patch.object(agents, "_argv_of", return_value=["omp", "--resume", "01a0-resumed"]),
-                mock.patch.object(agents, "_find_pi_rollout", return_value=str(other)),
-                mock.patch.object(agents, "_cwd_of", return_value="/work"),
-            ):
-                info = agents._pi_info(42)
-        self.assertEqual(info["sessionId"], "01a0-resumed")
-        self.assertTrue(info["identityExact"])
-
-    def test_omp_resumed_by_transcript_path_is_named_by_argv(self) -> None:
-        # Tern resumes omp by transcript path; omp closes the file between
-        # writes, and the folder lookup would pick another session.
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            slug = home / ".omp" / "agent" / "sessions" / "-work"
-            slug.mkdir(parents=True)
-            resumed = slug / "2026-09-28T10-00-00-000Z_01a0-resumed.jsonl"
-            resumed.write_text(json.dumps({"type": "session", "id": "01a0-resumed", "cwd": "/work"}) + "\n")
-            other = slug / "2026-09-28T11-00-00-000Z_01a0-other.jsonl"
-            other.write_text(json.dumps({"type": "session", "id": "01a0-other", "cwd": "/work"}) + "\n")
-            with (
-                mock.patch.object(agents.Path, "home", return_value=home),
-                mock.patch.object(agents, "_open_jsonl_under", return_value=("", False)),
-                mock.patch.object(agents, "_argv_of", return_value=["omp", "--resume", str(resumed)]),
-                mock.patch.object(agents, "_find_pi_rollout", return_value=str(other)),
-                mock.patch.object(agents, "_cwd_of", return_value="/work"),
-            ):
-                info = agents._pi_info(42)
-        self.assertEqual(info["sessionId"], "01a0-resumed")
-        self.assertTrue(info["identityExact"])
-
-    def _continuation_folder(self, home: Path) -> Path:
-        slug = home / ".omp" / "agent" / "sessions" / "-work"
-        slug.mkdir(parents=True)
-        return slug
-
-    @staticmethod
-    def _rollout(slug: Path, name: str, sid: str, turns: list[tuple[str, str]],
-                 continuation_of: str = "") -> Path:
-        header = {"type": "session", "id": sid, "cwd": "/work",
-                  "timestamp": "2026-09-28T10:00:00.000Z"}
-        if continuation_of:
-            header["continuationOf"] = continuation_of
-            header["parentSession"] = continuation_of
-        lines = [{"type": "title", "title": "t"}, header] + [
-            {"type": "message", "id": entry_id, "timestamp": stamp,
-             "message": {"role": "user", "content": "hi"}}
-            for entry_id, stamp in turns
-        ]
-        path = slug / f"{name}_{sid}.jsonl"
-        path.write_text("".join(json.dumps(line) + "\n" for line in lines))
-        return path
-
-    def _resumed_info(self, home: Path, argv: list[str], held: str = "") -> dict:
-        with (
-            mock.patch.object(agents.Path, "home", return_value=home),
-            mock.patch.object(agents, "_open_jsonl_under", return_value=(held, bool(held))),
-            mock.patch.object(agents, "_argv_of", return_value=argv),
-            mock.patch.object(agents, "_ppid_of", return_value=0),
-            mock.patch.object(agents, "_cwd_of", return_value="/work"),
-        ):
-            return agents._pi_info(42)
-
-    def test_omp_restored_into_a_fork_is_named_by_the_copy_it_went_on_in(self) -> None:
-        # /restart re-runs omp with --restore <parent>; omp resumes the fork
-        # whose header continues the parent and holds no file open meanwhile.
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            slug = self._continuation_folder(home)
-            parent = self._rollout(slug, "2026-09-28T10-00-00-000Z", "01a0-parent",
-                                   [("a1", "2026-09-28T10:01:00.000Z")])
-            self._rollout(slug, "2026-09-28T11-00-00-000Z", "01a0-fork",
-                          [("a1", "2026-09-28T10:01:00.000Z"), ("b1", "2026-09-28T11:05:00.000Z")],
-                          continuation_of="01a0-parent")
-            info = self._resumed_info(home, ["omp", "--restore", str(parent)])
-        self.assertEqual(info["sessionId"], "01a0-fork")
-        self.assertFalse(info["identityExact"])
-
-    def test_omp_follows_a_copy_chain_to_its_newest_leaf(self) -> None:
-        # A copy written because another process held the file continues the
-        # fork with the same turns, so the fork is superseded by it.
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            slug = self._continuation_folder(home)
-            self._rollout(slug, "2026-09-28T10-00-00-000Z", "01a0-parent",
-                          [("a1", "2026-09-28T10:01:00.000Z")])
-            turns = [("a1", "2026-09-28T10:01:00.000Z"), ("b1", "2026-09-28T11:05:00.000Z")]
-            self._rollout(slug, "2026-09-28T11-00-00-000Z", "01a0-fork", turns,
-                          continuation_of="01a0-parent")
-            self._rollout(slug, "2026-09-28T12-00-00-000Z", "01a0-copy", turns,
-                          continuation_of="01a0-fork")
-            info = self._resumed_info(home, ["omp", "--resume", "01a0-parent"])
-        self.assertEqual(info["sessionId"], "01a0-copy")
-        self.assertFalse(info["identityExact"])
-
-    def test_omp_parent_with_the_newest_turn_stays_itself(self) -> None:
-        # The fork branched off and went quiet; the parent's last turn is in
-        # no child and is the newest, so it is resumed as named.
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            slug = self._continuation_folder(home)
-            self._rollout(slug, "2026-09-28T10-00-00-000Z", "01a0-parent",
-                          [("a1", "2026-09-28T10:01:00.000Z"), ("p2", "2026-09-28T13:00:00.000Z")])
-            self._rollout(slug, "2026-09-28T11-00-00-000Z", "01a0-fork",
-                          [("a1", "2026-09-28T10:01:00.000Z"), ("b1", "2026-09-28T11:05:00.000Z")],
-                          continuation_of="01a0-parent")
-            info = self._resumed_info(home, ["omp", "--resume", "01a0-parent"])
-        self.assertEqual(info["sessionId"], "01a0-parent")
-        self.assertTrue(info["identityExact"])
-
-    def test_omp_without_continuations_keeps_the_named_session(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            slug = self._continuation_folder(home)
-            self._rollout(slug, "2026-09-28T10-00-00-000Z", "01a0-parent",
-                          [("a1", "2026-09-28T10:01:00.000Z")])
-            self._rollout(slug, "2026-09-28T11-00-00-000Z", "01a0-unrelated",
-                          [("z1", "2026-09-28T12:00:00.000Z")])
-            info = self._resumed_info(home, ["omp", "--resume", "01a0-parent"])
-        self.assertEqual(info["sessionId"], "01a0-parent")
-        self.assertTrue(info["identityExact"])
-
-    def test_omp_holding_its_file_ignores_continuations(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            slug = self._continuation_folder(home)
-            parent = self._rollout(slug, "2026-09-28T10-00-00-000Z", "01a0-parent",
-                                   [("a1", "2026-09-28T10:01:00.000Z")])
-            fork = self._rollout(slug, "2026-09-28T11-00-00-000Z", "01a0-fork",
-                                 [("a1", "2026-09-28T10:01:00.000Z"), ("b1", "2026-09-28T11:05:00.000Z")],
-                                 continuation_of="01a0-parent")
-            held_fork = self._resumed_info(home, ["omp", "--restore", str(parent)], held=str(fork))
-            held_parent = self._resumed_info(home, ["omp", "--restore", str(parent)], held=str(parent))
-        self.assertEqual((held_fork["sessionId"], held_fork["identityExact"]), ("01a0-fork", True))
-        self.assertEqual((held_parent["sessionId"], held_parent["identityExact"]), ("01a0-parent", True))
 
     def test_omp_without_its_transcript_open_holds_every_session_its_log_names(self) -> None:
         started = 1_790_000_000_000
@@ -975,11 +774,8 @@ class ResumeAndIdentityTests(unittest.TestCase):
             day.mkdir(parents=True)
 
             def thread(sid: str, cwd: str, created: int) -> str:
-                path = day / f"rollout-x-{sid}.jsonl"
-                iso = datetime.fromtimestamp(created / 1000, timezone.utc).isoformat()
-                path.write_text(json.dumps({"type": "session_meta", "payload": {
-                    "id": sid, "cwd": cwd, "timestamp": iso}}) + "\n")
-                return str(path)
+                return str(write_jsonl(day / f"rollout-x-{sid}.jsonl", [{"type": "session_meta", "payload": {
+                    "id": sid, "cwd": cwd, "timestamp": iso(created)}}]))
 
             pool = {
                 thread("mine", "/work", start + 5000),
@@ -987,11 +783,10 @@ class ResumeAndIdentityTests(unittest.TestCase):
                 thread("stale", "/work", start - 60_000),
                 thread("elsewhere", "/other", start + 1000),
             }
-            (home / "session_index.jsonl").write_text(
-                json.dumps({"id": "mine", "thread_name": "First"}) + "\n"
-                + json.dumps({"id": "other", "thread_name": "Nope"}) + "\n"
-                + json.dumps({"id": "mine", "thread_name": "Renamed"}) + "\n"
-            )
+            write_jsonl(home / "session_index.jsonl", [
+                {"id": "mine", "thread_name": "First"}, {"id": "other", "thread_name": "Nope"},
+                {"id": "mine", "thread_name": "Renamed"},
+            ])
             argv = {42: ["codex"], 43: ["codex"], 44: ["codex", "resume", "stale"]}
             tuis = [42, 44]
 
@@ -1010,9 +805,7 @@ class ResumeAndIdentityTests(unittest.TestCase):
                     mock.patch.object(agents, "_ppid_of", return_value=1),
                     mock.patch.object(agents, "_cwd_of", return_value="/work"),
                     mock.patch.object(agents, "_start_ms", return_value=start),
-                    mock.patch.object(agents, "_transcript_info", side_effect=lambda path, _p: {
-                        "sessionId": agents._codex_meta(path)[0], "cwd": "/work",
-                        "windowTitle": "", "lastPrompt": "", "state": "idle", "model": ""}),
+                    mock.patch.object(agents, "_transcript_info", side_effect=codex_meta_info),
                 ):
                     return agents._codex_info(pid)
 
@@ -1048,8 +841,7 @@ class ResumeAndIdentityTests(unittest.TestCase):
         start = 1_790_000_000_000
 
         def header(sid: str, at_ms: int) -> str:
-            iso = datetime.fromtimestamp(at_ms / 1000, timezone.utc).isoformat()
-            return json.dumps({"type": "session", "id": sid, "timestamp": iso, "cwd": "/work"}) + "\n"
+            return json.dumps({"type": "session", "id": sid, "timestamp": iso(at_ms), "cwd": "/work"}) + "\n"
 
         with tempfile.TemporaryDirectory() as directory:
             slug = Path(directory)
@@ -1064,23 +856,6 @@ class ResumeAndIdentityTests(unittest.TestCase):
                 # makes the pick ambiguous.
                 (slug / "c_twin.jsonl").write_text(header("twin", start + 4000))
                 self.assertFalse(agents._created_by(42, str(mine)))
-
-    def test_pi_resumed_with_session_flag_is_named_by_argv(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            home = Path(directory)
-            slug = home / ".pi" / "agent" / "sessions" / "--work--"
-            slug.mkdir(parents=True)
-            resumed = slug / "2026-09-28T10-00-00-000Z_01a0-resumed.jsonl"
-            resumed.write_text(json.dumps({"type": "session", "id": "01a0-resumed", "cwd": "/work"}) + "\n")
-            with (
-                mock.patch.object(agents.Path, "home", return_value=home),
-                mock.patch.object(agents, "_open_jsonl_under", return_value=("", False)),
-                mock.patch.object(agents, "_argv_of", return_value=["pi", "--session", "01a0-resumed"]),
-                mock.patch.object(agents, "_cwd_of", return_value="/work"),
-            ):
-                info = agents._INFO_FN["pi"](42)
-        self.assertEqual(info["sessionId"], "01a0-resumed")
-        self.assertTrue(info["identityExact"])
 
     def test_live_dedup_identity_remains_session_id_only(self) -> None:
         info = lambda _pid: {
@@ -1125,12 +900,81 @@ class ResumeAndIdentityTests(unittest.TestCase):
             ("untracked-omp-10", "untracked", False, "", "", "/proc-cwd"),
         )
 
-    def test_session_id_starting_with_a_dash_has_no_resume_command(self) -> None:
-        # It would read as an option to the agent's CLI.
-        for provider in ("claude", "codex", "omp"):
-            with self.subTest(provider=provider):
-                self.assertEqual(agents._resume_command(provider, "--help", "/tmp", True), "")
-                self.assertEqual(agents._resume_command(provider, "-p", "", True), "")
+
+class OmpResumeTests(unittest.TestCase):
+    """A resumed omp or pi names its session in argv before it opens the
+    transcript; omp may go on in a continuation of that session."""
+
+    def setUp(self) -> None:
+        self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+
+    def rollout(self, hour: int, sid: str, turns: tuple[tuple[str, str], ...],
+                continuation_of: str = "", tool: str = "omp") -> Path:
+        """A transcript created at `hour` with user turns (entry id, "HH:MM")."""
+        folder = self.home / f".{tool}" / "agent" / "sessions" / "-work"
+        folder.mkdir(parents=True, exist_ok=True)
+        header = {"type": "session", "id": sid, "cwd": "/work", "timestamp": "2026-09-28T10:00:00.000Z"}
+        if continuation_of:
+            header |= {"continuationOf": continuation_of, "parentSession": continuation_of}
+        messages = [{"type": "message", "id": entry_id, "timestamp": f"2026-09-28T{at}:00.000Z",
+                     "message": {"role": "user", "content": "hi"}} for entry_id, at in turns]
+        return write_jsonl(folder / f"2026-09-28T{hour:02d}-00-00-000Z_{sid}.jsonl",
+                           [{"type": "title", "title": "t"}, header, *messages])
+
+    def info(self, argv: list[str], held: str = "", provider: str = "omp") -> tuple[str, bool]:
+        with (
+            mock.patch.object(agents.Path, "home", return_value=self.home),
+            mock.patch.object(agents, "_open_jsonl_under", return_value=(held, bool(held))),
+            mock.patch.object(agents, "_argv_of", return_value=argv),
+            mock.patch.object(agents, "_ppid_of", return_value=0),
+            mock.patch.object(agents, "_cwd_of", return_value="/work"),
+            mock.patch.object(agents, "_extension_session", return_value=""),
+        ):
+            info = agents._INFO_FN[provider](42)
+        return info["sessionId"], info["identityExact"]
+
+    def test_resumed_session_is_named_by_argv_before_it_opens_its_rollout(self) -> None:
+        # pi and omp close the file between writes, and the folder lookup
+        # would pick another session. Tern resumes omp by transcript path.
+        for provider, flag, by_path in (("omp", "--resume", False), ("omp", "--resume", True),
+                                        ("pi", "--session", False)):
+            with self.subTest(provider=provider, by_path=by_path):
+                self.home = Path(self.enterContext(tempfile.TemporaryDirectory()))
+                named = self.rollout(10, "01a0-named", (("a1", "10:01"),), tool=provider)
+                other = self.rollout(11, "01a0-other", (("z1", "12:00"),), tool=provider)
+                argv = [provider, flag, str(named) if by_path else "01a0-named"]
+                with mock.patch.object(agents, "_find_pi_rollout", return_value=str(other)):
+                    self.assertEqual(self.info(argv, provider=provider), ("01a0-named", True))
+
+    def test_omp_restored_into_a_fork_is_named_by_the_copy_it_went_on_in(self) -> None:
+        # /restart re-runs omp with --restore <parent>; omp resumes the fork
+        # whose header continues the parent and holds no file open meanwhile.
+        parent = self.rollout(10, "01a0-parent", (("a1", "10:01"),))
+        self.rollout(11, "01a0-fork", (("a1", "10:01"), ("b1", "11:05")), "01a0-parent")
+        self.assertEqual(self.info(["omp", "--restore", str(parent)]), ("01a0-fork", False))
+
+    def test_omp_follows_a_copy_chain_to_its_newest_leaf(self) -> None:
+        # A copy written because another process held the file continues the
+        # fork with the same turns, so the fork is superseded by it.
+        turns = (("a1", "10:01"), ("b1", "11:05"))
+        self.rollout(10, "01a0-parent", turns[:1])
+        self.rollout(11, "01a0-fork", turns, "01a0-parent")
+        self.rollout(12, "01a0-copy", turns, "01a0-fork")
+        self.assertEqual(self.info(["omp", "--resume", "01a0-parent"]), ("01a0-copy", False))
+
+    def test_omp_parent_with_the_newest_turn_stays_itself(self) -> None:
+        # The fork branched off and went quiet; the parent's last turn is in
+        # no child and is the newest, so it is resumed as named.
+        self.rollout(10, "01a0-parent", (("a1", "10:01"), ("p2", "13:00")))
+        self.rollout(11, "01a0-fork", (("a1", "10:01"), ("b1", "11:05")), "01a0-parent")
+        self.assertEqual(self.info(["omp", "--resume", "01a0-parent"]), ("01a0-parent", True))
+
+    def test_omp_holding_its_file_ignores_continuations(self) -> None:
+        parent = self.rollout(10, "01a0-parent", (("a1", "10:01"),))
+        fork = self.rollout(11, "01a0-fork", (("a1", "10:01"), ("b1", "11:05")), "01a0-parent")
+        for held, expected in ((fork, "01a0-fork"), (parent, "01a0-parent")):
+            with self.subTest(held=expected):
+                self.assertEqual(self.info(["omp", "--restore", str(parent)], held=str(held)), (expected, True))
 
 
 class HeadlessArgvTests(unittest.TestCase):
@@ -1193,14 +1037,7 @@ class MacBundleHostTests(unittest.TestCase):
                     5: [f"/Applications/{bundle}.app/Contents/Frameworks/{helper}.app/Contents/MacOS/{helper}", "--type=renderer"],
                     4: [f"/Applications/{bundle}.app/Contents/MacOS/{binary}"],
                 }
-                with (
-                    self.subTest(bundle=bundle, helper=helper),
-                    mock.patch.object(agents, "_comm_of", side_effect=lambda p: Path(argv.get(p, [""])[0]).name),
-                    mock.patch.object(agents, "_argv_of", side_effect=lambda p: argv.get(p, [])),
-                    mock.patch.object(agents, "_ppid_of", side_effect=lambda p: {10: 5, 5: 4, 4: 1}.get(p, 0)),
-                    mock.patch.object(agents, "_exe_of", side_effect=lambda p: argv.get(p, [""])[0]),
-                    mock.patch.object(agents, "_all_pids", return_value=[5, 4]),
-                ):
+                with self.subTest(bundle=bundle, helper=helper), fake_processes(argv, {10: 5, 5: 4, 4: 1}, pids=[5, 4]):
                     self.assertEqual(agents._parent_walk_for_host(10), (expected, [10, 5, 4]))
                     self.assertEqual(agents._under_t3(10), expected == "t3code")
                     if expected == "t3code":
@@ -1214,14 +1051,9 @@ class MacBundleHostTests(unittest.TestCase):
             "/Applications/T3 Code.app/Contents/Frameworks/Other Helper.app/Contents/MacOS/Other Helper",
             "/Applications/Visual Studio Code.app/Contents/MacOS/Other",
         ):
-            with (
-                self.subTest(path=path),
-                mock.patch.object(agents, "_comm_of", side_effect=lambda p: "claude" if p == 10 else Path(path).name),
-                mock.patch.object(agents, "_argv_of", side_effect=lambda p: ["claude"] if p == 10 else [path]),
-                mock.patch.object(agents, "_exe_of", side_effect=lambda p: "claude" if p == 10 else path),
-                mock.patch.object(agents, "_ppid_of", side_effect=lambda p: 5 if p == 10 else 1),
-                mock.patch.object(agents, "_all_pids", return_value=[5]),
-            ):
+            # pid 1 looks alike too, so the walk can't stop on the wrong process.
+            with self.subTest(path=path), \
+                    fake_processes({10: ["claude"], 5: [path], 1: [path]}, {10: 5, 5: 1, 1: 1}, pids=[5]):
                 self.assertEqual(agents._parent_walk_for_host(10), ("", []))
                 self.assertFalse(agents._under_t3(10))
                 self.assertEqual(agents.t3_window_pids(), [])
@@ -1233,13 +1065,7 @@ class MacBundleHostTests(unittest.TestCase):
             4: ["/Applications/Tern.app/Contents/MacOS/tern"],
             3: ["/Applications/kitty.app/Contents/MacOS/kitty"],
         }
-        with (
-            mock.patch.object(agents, "_comm_of", side_effect=lambda p: Path(argv[p][0]).name),
-            mock.patch.object(agents, "_argv_of", side_effect=lambda p: argv.get(p, [])),
-            mock.patch.object(agents, "_ppid_of", side_effect=lambda p: 5 if p == 10 else 1),
-            mock.patch.object(agents, "_exe_of", return_value=""),
-            mock.patch.object(agents, "_all_pids", return_value=[5, 4, 3]),
-        ):
+        with fake_processes(argv, {10: 5, 5: 1, 4: 1, 3: 1}, exe={}, pids=[5, 4, 3]):
             self.assertEqual(agents.tern_window_pids(), [4])
             self.assertEqual(agents._parent_walk_for_host(10), ("tern", [10, 5, 4]))
             self.assertEqual(agents._parent_walk_for_host(3), ("kitty", [3]))
@@ -1312,24 +1138,17 @@ class T3CodeTests(unittest.TestCase):
         3: ["/usr/lib/systemd/systemd", "--user"],
     }
 
-    def _patch(self):
-        return (
-            mock.patch.object(agents, "_comm_of", side_effect=lambda p: self.COMM.get(p, "")),
-            mock.patch.object(agents, "_ppid_of", side_effect=lambda p: self.PPID.get(p, 0)),
-            mock.patch.object(agents, "_argv_of", side_effect=lambda p: self.ARGV.get(p, [])),
-            mock.patch.object(agents, "_exe_of", side_effect=lambda p: self.ARGV.get(p, [""])[0]),
-        )
+    def _patch(self, **kwargs):
+        return fake_processes(self.ARGV, self.PPID, comm=self.COMM, **kwargs)
 
     def test_pgrep_keeps_t3_sessions_interactive(self) -> None:
-        a, b, c, d = self._patch()
-        with a, b, c, d, mock.patch.object(agents, "_all_pids", return_value=list(self.COMM)):
+        with self._patch(pids=list(self.COMM)):
             self.assertEqual(agents._pgrep("claude"), [10])
             self.assertEqual(agents._pgrep("claude", services=True), [11])
             self.assertEqual(agents._pgrep("codex"), [12])
 
     def test_host_walk_stops_at_t3_not_code_in_args(self) -> None:
-        a, b, c, d = self._patch()
-        with a, b, c, d, mock.patch.object(agents, "t3_window_pids", return_value=[4, 9]):
+        with self._patch(), mock.patch.object(agents, "t3_window_pids", return_value=[4, 9]):
             # Window 9 is another T3 window; this session sits under window 4.
             self.assertEqual(agents._parent_walk_for_host(10), ("t3code", [10, 5, 4]))
 
@@ -1348,17 +1167,10 @@ class T3CodeTests(unittest.TestCase):
             4: ["/opt/t3code-bin/t3code"],
         }
 
-        def executable(pid: int) -> str:
-            # The running server's version was deleted by a self-update.
-            return (argv.get(pid, [""])[0]
-                    + (" (deleted)" if pid == 7 else ""))
-
-        with mock.patch.object(agents, "_comm_of", side_effect=lambda p: comm.get(p, "")), \
-                mock.patch.object(agents, "_ppid_of", side_effect=lambda p: ppid.get(p, 0)), \
-                mock.patch.object(agents, "_argv_of", side_effect=lambda p: argv.get(p, [])), \
-                mock.patch.object(agents, "_exe_of", side_effect=executable), \
-                mock.patch.object(agents, "t3_window_pids", return_value=[4]), \
-                mock.patch.object(agents, "_all_pids", return_value=list(comm)):
+        # The running server's version was deleted by a self-update.
+        exe = {pid: args[0] + (" (deleted)" if pid == 7 else "") for pid, args in argv.items()}
+        with fake_processes(argv, ppid, comm=comm, exe=exe, pids=list(comm)), \
+                mock.patch.object(agents, "t3_window_pids", return_value=[4]):
             self.assertEqual(agents._pgrep("claude"), [20])
             self.assertEqual(agents._pgrep("codex"), [21])
             self.assertEqual(agents._parent_walk_for_host(20), ("t3code", [20, 7, 4]))
@@ -1409,11 +1221,10 @@ class OmpRecapTests(unittest.TestCase):
                                               "content": "<command-name>/model</command-name>"}}]
         turn = {"type": "user", "message": {"role": "user", "content": "go on"}}
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "claude.jsonl"
-            path.write_text("".join(json.dumps(r) + "\n" for r in [summary, *aside]))
+            path = write_jsonl(Path(directory) / "claude.jsonl", [summary, *aside])
             info = agents._transcript_info(str(path), "claude")
             self.assertEqual((info["recap"], info["recapStale"]), ("Done. Next: ship.", False))
-            path.write_text("".join(json.dumps(r) + "\n" for r in [summary, *aside, turn]))
+            write_jsonl(path, [summary, *aside, turn])
             info = agents._transcript_info(str(path), "claude")
             self.assertEqual((info["recap"], info["recapStale"]), ("Done. Next: ship.", True))
 
@@ -1430,10 +1241,10 @@ class OmpRecapTests(unittest.TestCase):
             con.close()
             slug = home / ".omp" / "agent" / "sessions" / "-w"
             slug.mkdir(parents=True)
-            (slug / "2026_old.jsonl").write_text(json.dumps({
+            write_jsonl(slug / "2026_old.jsonl", [{
                 "type": "message", "timestamp": 500_000,
                 "message": {"role": "assistant", "content": "later", "stopReason": "stop"},
-            }) + "\n")
+            }])
             saved = home / "agents.json"
             saved.write_text(json.dumps({"bootId": "boot-a", "agents": [], "history": [
                 history("omp", "old", lastState="idle", closedBy="exit",
@@ -1514,9 +1325,6 @@ class HistoryBackfillTests(unittest.TestCase):
         con.execute("CREATE TABLE history (id INTEGER PRIMARY KEY, prompt TEXT UNIQUE,"
                     " created_at INTEGER, cwd TEXT, session_id TEXT)")
         con.execute("CREATE TABLE session_titles (session_id TEXT PRIMARY KEY, title TEXT)")
-        def stamp(seconds: int) -> str:
-            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace("+00:00", "Z")
-
         for sid, (cwd, created_at, *answered) in sessions.items():
             con.execute("INSERT INTO history (prompt, created_at, cwd, session_id)"
                         " VALUES (?, ?, ?, ?)", (f"prompt {sid}", created_at, cwd, sid))
@@ -1525,15 +1333,14 @@ class HistoryBackfillTests(unittest.TestCase):
             slug.mkdir(parents=True)
             lines = [
                 {"type": "session", "id": sid, "cwd": cwd},
-                {"type": "message", "timestamp": stamp(created_at),
+                {"type": "message", "timestamp": zulu(created_at),
                  "message": {"role": "user", "content": f"prompt {sid}"}},
             ] + [
-                {"type": "message", "timestamp": stamp(at),
+                {"type": "message", "timestamp": zulu(at),
                  "message": {"role": "assistant", "content": "done", "stopReason": "stop"}}
                 for at in answered
             ]
-            rollout = slug / f"2026_{sid}.jsonl"
-            rollout.write_text("".join(json.dumps(line) + "\n" for line in lines))
+            rollout = write_jsonl(slug / f"2026_{sid}.jsonl", lines)
             # omp last wrote the transcript at its last turn.
             last = max([created_at, *answered])
             os.utime(rollout, (last, last))
@@ -1544,9 +1351,6 @@ class HistoryBackfillTests(unittest.TestCase):
     def _claude(self, home: Path, sessions: dict[str, tuple], typed: set[str] | None = None) -> None:
         """Claude Code files for sessions {id: (cwd, prompt seconds, answer
         seconds)}; `typed` (default all) are the ones history.jsonl lists."""
-        def stamp(seconds: int) -> str:
-            return datetime.fromtimestamp(seconds, timezone.utc).isoformat().replace("+00:00", "Z")
-
         typed = set(sessions) if typed is None else typed
         history_lines = []
         for sid, (cwd, prompted, answered) in sessions.items():
@@ -1556,24 +1360,21 @@ class HistoryBackfillTests(unittest.TestCase):
             slug = home / ".claude" / "projects" / agents._claude_slug(cwd)
             slug.mkdir(parents=True, exist_ok=True)
             lines = [
-                {"type": "user", "sessionId": sid, "cwd": cwd, "timestamp": stamp(prompted),
+                {"type": "user", "sessionId": sid, "cwd": cwd, "timestamp": zulu(prompted),
                  "message": {"role": "user", "content": f"ask {sid}"}},
-                {"type": "assistant", "sessionId": sid, "cwd": cwd, "timestamp": stamp(answered),
+                {"type": "assistant", "sessionId": sid, "cwd": cwd, "timestamp": zulu(answered),
                  "message": {"role": "assistant", "model": "claude-x", "stop_reason": "end_turn",
                              "content": [{"type": "text", "text": "answered"}]}},
                 {"type": "ai-title", "aiTitle": f"Claude {sid}", "sessionId": sid},
                 # A `cd` in shell mode, then `/exit`: neither changes the
                 # session's folder or ends its turn.
                 {"type": "user", "isMeta": True, "sessionId": sid, "cwd": f"{cwd}/gone-subdir",
-                 "timestamp": stamp(answered),
+                 "timestamp": zulu(answered),
                  "message": {"role": "user", "content": "<local-command-stdout>Bye</local-command-stdout>"}},
             ]
-            rollout = slug / f"{sid}.jsonl"
-            rollout.write_text("".join(json.dumps(line) + "\n" for line in lines))
+            rollout = write_jsonl(slug / f"{sid}.jsonl", lines)
             os.utime(rollout, (answered, answered))
-        (home / ".claude" / "history.jsonl").write_text(
-            "".join(json.dumps(line) + "\n" for line in history_lines) + "{torn\n"
-        )
+        (home / ".claude" / "history.jsonl").write_text(jsonl(history_lines) + "{torn\n")
 
     def _sweep(self, home: Path, saved: Path, records: list[dict], limit: int = 100,
                processes: dict[int, tuple] | None = None,
@@ -1772,16 +1573,11 @@ class HistoryBackfillTests(unittest.TestCase):
 
 
 class TernHostTests(unittest.TestCase):
-    # Tern's session daemon outlived the window that started it and was
-    # reparented to systemd; a later window (pid 7) shows its panes.
-    COMM = {10: "omp", 9: "zsh", 8: "tern", 3: "systemd"}
-    PPID = {10: 9, 9: 8, 8: 3, 3: 1}
-
     def test_daemon_pane_is_a_tern_session_whose_chain_reaches_the_window(self) -> None:
+        # Tern's session daemon outlived the window that started it and was
+        # reparented to systemd; a later window (pid 7) shows its panes.
         with (
-            mock.patch.object(agents, "_comm_of", side_effect=lambda p: self.COMM.get(p, "")),
-            mock.patch.object(agents, "_ppid_of", side_effect=lambda p: self.PPID.get(p, 0)),
-            mock.patch.object(agents, "_argv_of", return_value=[]),
+            fake_processes({}, {10: 9, 9: 8, 8: 3, 3: 1}, comm={10: "omp", 9: "zsh", 8: "tern", 3: "systemd"}),
             mock.patch.object(agents, "tern_window_pids", return_value=[7]),
         ):
             self.assertEqual(agents._parent_walk_for_host(10), ("tern", [10, 9, 8, 7]))
@@ -1972,9 +1768,6 @@ class IncrementalParserTests(unittest.TestCase):
             {"type": "message", "message": {"role": "user", "content": "real prompt"}},
         ]
 
-    def encode(self, rows):
-        return "".join(json.dumps(row) + "\n" for row in rows)
-
     def assert_cold_equal(self, path, provider):
         warm = agents._transcript_info(str(path), provider)
         cache = dict(agents._TRANSCRIPT_CACHE)
@@ -1989,12 +1782,12 @@ class IncrementalParserTests(unittest.TestCase):
         for provider in ("claude", "codex", "pi"):
             with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "session.jsonl"
-                original = self.encode(self.rows(provider))
+                original = jsonl(self.rows(provider))
                 path.write_text(original)
                 first = self.assert_cold_equal(path, provider)
                 self.assertEqual(first["model"], "old-model")
                 with path.open("a") as output:
-                    output.write(self.encode([[], 42, {"type": "response_item", "payload": []}]))
+                    output.write(jsonl([[], 42, {"type": "response_item", "payload": []}]))
                 self.assert_cold_equal(path, provider)
                 partial = json.dumps(self.rows(provider)[-1])
                 with path.open("a") as output:
@@ -2015,32 +1808,25 @@ class IncrementalParserTests(unittest.TestCase):
                 replacement.replace(path)
                 self.assertEqual(self.assert_cold_equal(path, provider)["model"], "old-model")
 
-    def test_tools_are_bounded_online_and_noise_preserves_last_real_prompt(self):
-        state = agents._parser_state()
-        for row in self.rows("claude"):
-            agents._parse_record("claude", state, row)
-        for index in range(5000):
-            agents._parse_record("claude", state, {
-                "type": "assistant", "message": {"content": [{"type": "tool_use", "name": "bash"}]},
-                "timestamp": index + 1,
-            })
-        agents._parse_record("claude", state, {"type": "user", "message": {"content": "<system-reminder> noise"}})
-        self.assertEqual(state["last_real"], "real prompt")
-        self.assertEqual(len(state["peek"]), 3)
-        self.assertEqual(len(state["peek"][-1]["names"]), 10)
-        self.assertTrue(agents._peek_finalize(state["peek"])[-1]["text"].endswith("+4990 more"))
-        self.assertLess(len(json.dumps(state)), 3000)
-        for index in range(20):
-            agents._peek_add(state["peek"], "user", str(index), 1)
-        self.assertEqual(len(state["peek"]), 8)
+    def test_a_long_tool_run_collapses_into_one_turn_and_noise_keeps_the_last_prompt(self):
+        tools = [{"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "bash"}]},
+                  "timestamp": index + 1} for index in range(5000)]
+        noise = {"type": "user", "message": {"content": "<system-reminder> noise"}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_jsonl(Path(directory) / "claude.jsonl", [*self.rows("claude"), *tools, noise])
+            info = agents._transcript_info(str(path), "claude")
+        self.assertEqual(info["lastPrompt"], "real prompt")
+        self.assertEqual([turn["text"] for turn in info["recent"]],
+                         ["real prompt", "answer", ", ".join(["bash"] * 10) + " +4990 more"])
+        # The checkpoint saved between sweeps holds parser state, never rows.
+        self.assertLess(len(json.dumps(agents._TRANSCRIPT_CACHE)), 3000)
 
     def test_collapsed_tool_preview_respects_display_limit(self):
-        peek = []
-        for _ in range(11):
-            agents._peek_add(peek, "assistant", "x" * 320, 1, "tools")
-        recent = agents._peek_finalize(peek)
-        self.assertEqual(len(recent), 1)
-        self.assertEqual(len(recent[0]["text"]), 320)
+        tools = [{"type": "assistant", "message": {"content": [{"type": "tool_use", "name": "x" * 320}]}}] * 11
+        with tempfile.TemporaryDirectory() as directory:
+            path = write_jsonl(Path(directory) / "claude.jsonl", tools)
+            recent = agents._transcript_info(str(path), "claude")["recent"]
+        self.assertEqual([turn["text"] for turn in recent], ["x" * 320])
 
     def test_malformed_fields_do_not_hide_healthy_rows(self):
         for provider in ("claude", "codex", "pi"):
@@ -2050,7 +1836,7 @@ class IncrementalParserTests(unittest.TestCase):
                        {"type": "session_meta", "payload": 4},
                        {"type": "session", "id": [], "cwd": {}, "title": 7},
                        {"type": "assistant", "message": {"content": [{"type": "text", "text": {}}, {"name": []}]}}]
-                path.write_text(self.encode(bad + self.rows(provider)))
+                path.write_text(jsonl(bad + self.rows(provider)))
                 info = agents._transcript_info(str(path), provider)
                 self.assertEqual(info["lastPrompt"], "real prompt")
                 self.assertEqual(info["model"], "old-model")
@@ -2058,13 +1844,13 @@ class IncrementalParserTests(unittest.TestCase):
     def test_pi_header_title_model_and_state_survive_long_append(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "pi.jsonl"
-            path.write_text(self.encode(self.rows("pi")))
+            path.write_text(jsonl(self.rows("pi")))
             agents._transcript_info(str(path), "pi")
             rows = [{"type": "message", "message": {"role": "assistant", "content": "answer", "stopReason": "stop"}}] * 100
             rows += [{"type": "title_change", "id": "not-the-session", "title": "renamed"},
                      {"type": "message", "message": {"role": "user", "content": "<system-reminder> noise"}}]
             with path.open("a") as output:
-                output.write(self.encode(rows))
+                output.write(jsonl(rows))
             info = self.assert_cold_equal(path, "pi")
             self.assertEqual(info["sessionId"], "sid")
             self.assertEqual(info["cwd"], "/old")
@@ -2101,44 +1887,42 @@ class IncrementalParserTests(unittest.TestCase):
             self.assertFalse(row["identityExact"])
             self.assertEqual(row["resumeCommand"], "")
 
-    def test_fresh_process_once_reuses_checkpoint_and_prunes(self):
+    def test_each_once_sweep_resumes_from_the_saved_checkpoint_and_prunes_it(self):
+        # Every --once run is a new process: only the checkpoint file carries
+        # parser state over, so the in-memory cache is emptied before each.
         with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "transcript.jsonl"
+            path = write_jsonl(Path(directory) / "transcript.jsonl", self.rows("claude"))
             aggregate = Path(directory) / "agents.json"
-            path.write_text(self.encode(self.rows("claude")))
-            script = r"""
-import importlib.util, json, sys
-from pathlib import Path
-sys.path.insert(0, str(Path(sys.argv[1]).parent))
-spec = importlib.util.spec_from_file_location("agents", sys.argv[1])
-a = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(a)
-count = [0]
-parse = a._parse_record
-def counted(*args):
-    count[0] += 1
-    return parse(*args)
-a._parse_record = counted
-a._build_records = lambda: (a._transcript_info(sys.argv[2], "claude") and []) if sys.argv[4] != "prune" else []
-sweep = a._locked_sweep
-a._locked_sweep = lambda *args, **kwargs: sweep(*args, **kwargs, aggregate_path=Path(sys.argv[3]))
-a.main(["--once"])
-print(count[0])
-"""
-            # main() migrates the state directory, so keep it inside the sandbox.
-            # Windows finds home through USERPROFILE.
-            environment = dict(os.environ, HOME=directory, USERPROFILE=directory, XDG_STATE_HOME=str(Path(directory) / "state"))
-            def run(mode="scan"):
-                return int(subprocess.check_output([sys.executable, "-c", script, str(SCRIPT_PATH), str(path), str(aggregate), mode], text=True, env=environment))
+            sweep = agents._locked_sweep
+
+            def run(scan: bool = True) -> int:
+                def records() -> list:
+                    if scan:
+                        agents._transcript_info(str(path), "claude")
+                    return []
+
+                agents._TRANSCRIPT_CACHE.clear()
+                with (
+                    # main() migrates the state directory, so keep it inside the sandbox.
+                    mock.patch.dict(agents.os.environ, {"XDG_STATE_HOME": str(Path(directory) / "state")}),
+                    mock.patch.object(agents, "_read_boot_id", return_value="boot"),
+                    mock.patch.object(agents, "_build_records", side_effect=records),
+                    mock.patch.object(agents, "_locked_sweep",
+                                      side_effect=lambda *a, **k: sweep(*a, **k, aggregate_path=aggregate)),
+                    mock.patch.object(agents, "_parse_record", wraps=agents._parse_record) as parse,
+                ):
+                    agents.main(["--once"])
+                return parse.call_count
+
             self.assertEqual(run(), 3)
             self.assertEqual(run(), 0)
             with path.open("a") as output:
-                output.write(self.encode([{"type": "ai-title", "aiTitle": "new title"}]))
+                output.write(jsonl([{"type": "ai-title", "aiTitle": "new title"}]))
             self.assertEqual(run(), 1)
             cache_path = aggregate.with_suffix(".parsers.json")
             if sys.platform != "win32":
                 self.assertEqual(stat.S_IMODE(cache_path.stat().st_mode), 0o600)
-            self.assertEqual(run("prune"), 0)
+            self.assertEqual(run(scan=False), 0)
             self.assertEqual(json.loads(cache_path.read_text())["entries"], {})
 
     def test_stdout_does_not_write_and_scan_timestamp_is_completion_time(self):
@@ -2186,7 +1970,7 @@ class WindowsSessionTests(unittest.TestCase):
             waiting.parent.mkdir()
 
             def run(state: object, pane: str = "7", windows: bool = True) -> str:
-                waiting.write_text(json.dumps(state))
+                waiting.write_text(state if isinstance(state, str) else json.dumps(state))
                 # A rewrite within one clock tick may keep size and mtime.
                 agents._reported_panes.cache_clear()
                 with (
@@ -2220,14 +2004,8 @@ class WindowsSessionTests(unittest.TestCase):
             state["extension_panes"] = {"../escape*": 7}
             state["extensions"]["../escape*"] = stamp(start + 5000)
             self.assertEqual(run(state), "")
-            for broken in ([], {"extension_panes": []}, {"extension_panes": {"mine": 7}}):
+            for broken in ([], {"extension_panes": []}, {"extension_panes": {"mine": 7}}, "{"):
                 self.assertEqual(run(broken), "")
-            waiting.write_text("{")
-            agents._reported_panes.cache_clear()
-            with self.windows(), mock.patch.dict(agents.os.environ, {"XDG_STATE_HOME": directory}), \
-                    mock.patch.object(agents, "_environ_value", return_value="7"), \
-                    mock.patch.object(agents, "_start_ms", return_value=start):
-                self.assertEqual(agents._extension_session(42), "")
 
     def test_omp_rollout_reported_by_the_extension_is_exact(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2236,8 +2014,7 @@ class WindowsSessionTests(unittest.TestCase):
             folder = home / ".omp" / "agent" / "sessions" / "--work--"
             folder.mkdir(parents=True)
             for sid in ("01a0-reported", "01a0-newer"):
-                (folder / f"2026-09-28T10-00-00-000Z_{sid}.jsonl").write_text(
-                    json.dumps({"type": "session", "id": sid, "cwd": "/work"}) + "\n")
+                write_jsonl(folder / f"2026-09-28T10-00-00-000Z_{sid}.jsonl", [{"type": "session", "id": sid, "cwd": "/work"}])
             os.utime(folder / "2026-09-28T10-00-00-000Z_01a0-reported.jsonl", (1, 1))
             with (
                 mock.patch.object(agents.Path, "home", return_value=home),
@@ -2319,9 +2096,8 @@ class WindowsSessionTests(unittest.TestCase):
             home = Path(directory)
             day = home / "sessions" / time.strftime("%Y/%m/%d")
             day.mkdir(parents=True)
-            iso = datetime.fromtimestamp(start / 1000 + 5, timezone.utc).isoformat()
-            (day / "rollout-x-mine.jsonl").write_text(json.dumps(
-                {"type": "session_meta", "payload": {"id": "mine", "cwd": "/work", "timestamp": iso}}) + "\n")
+            write_jsonl(day / "rollout-x-mine.jsonl", [
+                {"type": "session_meta", "payload": {"id": "mine", "cwd": "/work", "timestamp": iso(start + 5000)}}])
 
             def run(argv: list[str]) -> dict:
                 with (
@@ -2332,9 +2108,7 @@ class WindowsSessionTests(unittest.TestCase):
                     mock.patch.object(agents, "_argv_of", return_value=argv),
                     mock.patch.object(agents, "_cwd_of", return_value="/work"),
                     mock.patch.object(agents, "_start_ms", return_value=start),
-                    mock.patch.object(agents, "_transcript_info", side_effect=lambda path, _p: {
-                        "sessionId": agents._codex_meta(path)[0], "cwd": "/work",
-                        "windowTitle": "", "lastPrompt": "", "state": "idle", "model": ""}),
+                    mock.patch.object(agents, "_transcript_info", side_effect=codex_meta_info),
                 ):
                     return agents._codex_info(42)
 
@@ -2344,17 +2118,68 @@ class WindowsSessionTests(unittest.TestCase):
             resumed = run(["codex", "resume", "mine"])
             self.assertEqual((resumed["sessionId"], resumed["identityExact"]), ("mine", True))
 
-    def test_writer_lock_and_private_mode_go_through_state_paths(self) -> None:
+    def test_writer_lock_shuts_out_another_writer_until_released(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "agents.json"
-            with mock.patch.object(agents.state_paths, "lock", wraps=agents.state_paths.lock) as lock, \
-                    mock.patch.object(agents.state_paths, "replace", wraps=agents.state_paths.replace) as replace:
-                with agents._aggregate_lock(path):
-                    agents._write_aggregate({"agents": []}, path)
-            lock.assert_called_once()
-            replace.assert_called_once()
-            self.assertEqual(json.loads(path.read_text()), {"agents": []})
 
+            def free() -> bool:
+                # A second open of the lock file stands in for another process.
+                with open(path.with_suffix(".lock"), "a") as other:
+                    return agents.state_paths.lock(other, blocking=False)
+
+            with agents._aggregate_lock(path):
+                self.assertFalse(free())
+            self.assertTrue(free())
+
+    def test_a_reader_briefly_holding_the_file_delays_the_write(self) -> None:
+        # Windows refuses to replace a file a reader has open; the writer retries.
+        replace, refusals = os.replace, [PermissionError()]
+
+        def refuse_once(source, target) -> None:
+            if refusals:
+                raise refusals.pop()
+            replace(source, target)
+
+        with tempfile.TemporaryDirectory() as directory, self.windows(), \
+                mock.patch.object(agents.state_paths.os, "replace", side_effect=refuse_once), \
+                mock.patch.object(agents.state_paths.time, "sleep"):
+            path = Path(directory) / "agents.json"
+            agents._write_aggregate({"agents": []}, path)
+            self.assertEqual(json.loads(path.read_text()), {"agents": []})
+            self.assertEqual(refusals, [])
+
+
+class ProcReaderTests(unittest.TestCase):
+    """The /proc readers, pointed at this test's own process only."""
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "reads /proc")
+    def test_reads_own_argv_and_exe_and_nothing_for_a_missing_pid(self) -> None:
+        pid = os.getpid()
+        with open("/proc/self/cmdline", "rb") as f:
+            expected = [a.decode("utf-8", "replace") for a in f.read().split(b"\0") if a]
+        self.assertTrue(expected)
+        self.assertEqual(agents._argv_of(pid), expected)
+        self.assertEqual(agents._exe_of(pid), os.readlink("/proc/self/exe"))
+        # No pid can exceed pid_max, so this one never exists.
+        missing = int(Path("/proc/sys/kernel/pid_max").read_text()) + 1
+        self.assertEqual(agents._argv_of(missing), [])
+        self.assertEqual(agents._exe_of(missing), "")
+
+
+class OmpLogFilesTests(unittest.TestCase):
+    def test_groups_omp_day_logs_by_pid_and_skips_other_names(self) -> None:
+        with tempfile.TemporaryDirectory() as home, \
+                mock.patch.object(agents.Path, "home", return_value=Path(home)):
+            self.assertEqual(agents._omp_log_files(), {})  # no ~/.omp/logs yet
+            logs = Path(home) / ".omp" / "logs"
+            logs.mkdir(parents=True)
+            for name in ("omp.2026-11-17.123.log", "omp.2026-11-18.123.log",
+                         "omp.2026-11-17.x.log", "other.txt"):
+                (logs / name).touch()
+            files = agents._omp_log_files()
+            self.assertEqual(list(files), [123])
+            self.assertCountEqual(files[123], [str(logs / "omp.2026-11-17.123.log"),
+                                               str(logs / "omp.2026-11-18.123.log")])
 
 
 if __name__ == "__main__":

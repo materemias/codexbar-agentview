@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import importlib.util
 import os
 import re
@@ -24,6 +26,28 @@ WOW64_CMD = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "SysWOW64" / "cm
 
 def same_path(a: str, b: str | Path) -> bool:
     return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
+def load(name: str, fake_dlls: bool = False) -> types.ModuleType:
+    """A fresh copy of a helper module. With `fake_dlls`, Windows' DLLs are
+    stand-ins, so the module's pure logic runs on any platform."""
+    spec = importlib.util.spec_from_file_location(f"windows_test_{name}", SCRIPTS / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    with mock.patch.object(ctypes, "WinDLL", mock.MagicMock(), create=True) if fake_dlls else contextlib.nullcontext():
+        spec.loader.exec_module(module)
+    return module
+
+
+class WindowsParentTests(unittest.TestCase):
+    def test_a_parent_younger_than_its_child_is_not_its_parent(self) -> None:
+        # Windows keeps an exited parent's pid, which a newer process may reuse.
+        fake = load("proc_windows", fake_dlls=True)
+        parent = types.SimpleNamespace(InheritedFromUniqueProcessId=17)
+        for child_ms, parent_ms, expected in ((2000, 1000, 17), (1000, 2000, 0), (0, 2000, 17)):
+            with self.subTest(child=child_ms, parent=parent_ms), \
+                    mock.patch.object(fake, "_basic_info", return_value=parent), \
+                    mock.patch.object(fake, "_created_ms", side_effect=[child_ms, parent_ms]):
+                self.assertEqual(fake.ppid_of(42), expected)
 
 
 @unittest.skipUnless(sys.platform == "win32", "reads Windows processes through kernel32 and ntdll")
@@ -121,16 +145,6 @@ class WindowsProcessTests(unittest.TestCase):
         self.assertTrue(proc.exited(1 << 40))
         self.assertEqual(proc.argv_of(4), [])
 
-    def test_a_parent_younger_than_its_child_is_not_its_parent(self) -> None:
-        # Windows keeps an exited parent's pid, which a newer process may reuse.
-        me = os.getpid()
-        parent = types.SimpleNamespace(InheritedFromUniqueProcessId=me)
-        for child_ms, parent_ms, expected in ((2000, 1000, me), (1000, 2000, 0), (0, 2000, me)):
-            with self.subTest(child=child_ms, parent=parent_ms), \
-                    mock.patch.object(proc, "_basic_info", return_value=parent), \
-                    mock.patch.object(proc, "_created_ms", side_effect=[child_ms, parent_ms]):
-                self.assertEqual(proc.ppid_of(me), expected)
-
     def test_command_line_splitting(self) -> None:
         self.assertEqual(proc._split_command_line(""), [])
         self.assertEqual(proc._split_command_line("   "), [])
@@ -144,9 +158,7 @@ class WindowsProcessTests(unittest.TestCase):
         self.assertEqual(proc.boot_id(), proc.boot_id())
 
     def test_agents_list_a_tern_pane_process_without_a_tern_ancestor(self) -> None:
-        spec = importlib.util.spec_from_file_location("windows_test_agents", SCRIPTS / "codexbar_agents.py")
-        agents = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(agents)
+        agents = load("codexbar_agents")
         code = "import sys; print('ready', flush=True); sys.stdin.readline()"
         child = self.start([sys.executable, "-c", code], env=dict(os.environ, TERN_PANE="7"))
         self.assertEqual(child.stdout.readline().strip(), b"ready")
@@ -162,9 +174,7 @@ class WindowsProcessTests(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is not installed")
     def test_agents_name_a_node_hosted_agent_by_its_package(self) -> None:
-        spec = importlib.util.spec_from_file_location("windows_test_agents", SCRIPTS / "codexbar_agents.py")
-        agents = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(agents)
+        agents = load("codexbar_agents")
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         cli = root / "node_modules" / "@anthropic-ai" / "claude-code" / "cli.js"
         cli.parent.mkdir(parents=True)
