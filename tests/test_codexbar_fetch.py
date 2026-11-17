@@ -82,6 +82,36 @@ def forecast_server(body: bytes, interval: float = 0):
         thread.join()
 
 
+def utc(*parts: int) -> dt.datetime:
+    return dt.datetime(*parts, tzinfo=dt.timezone.utc)
+
+
+MERIDIAN = "http://127.0.0.1:3456"  # MERIDIAN_PORT in IsolatedUsageTestCase
+
+
+def serve_meridian(responses: dict, other=None):
+    """Patch `_read_http_body` to answer Meridian's endpoints from `responses`
+    and any other URL with `other(url, headers)`. The patch records each call."""
+    def http(url, _timeout, headers=None):
+        if url.startswith(MERIDIAN):
+            return json.dumps(responses[url[len(MERIDIAN):]]).encode()
+        if other is None:
+            raise AssertionError(f"unexpected request: {url}")
+        return other(url, headers)
+
+    return mock.patch.object(fetch, "_read_http_body", side_effect=http)
+
+
+def run_main(*arguments: str, cli: str = TRUE_EXECUTABLE) -> dict:
+    """main's JSON answer; callers patch the sources it reads."""
+    output = io.StringIO()
+    with mock.patch("sys.stdout", output):
+        code = fetch.main(["--cli-path", cli, *arguments])
+    if code != 0:
+        raise AssertionError(f"main exited {code}")
+    return json.loads(output.getvalue())
+
+
 class IsolatedUsageTestCase(unittest.TestCase):
     def setUp(self) -> None:
         directory = tempfile.TemporaryDirectory()
@@ -102,33 +132,14 @@ class IsolatedUsageTestCase(unittest.TestCase):
 
 class ProviderFailureTests(IsolatedUsageTestCase):
     def test_invalid_executable_emits_normalized_snapshot(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            cli = Path(directory) / "invalid-cli"
-            cli.write_text("not an executable format\n", encoding="utf-8")
-            cli.chmod(0o700)
-            result = subprocess.run(
-                [
-                    sys.executable, str(SCRIPT_PATH),
-                    "--cli-path", str(cli), "--providers", "kilo",
-                ],
-                capture_output=True, text=True, timeout=3, check=False,
-            )
-        self.assertEqual(result.returncode, 0, result.stderr)
-        payload = json.loads(result.stdout)
+        cli = self.home / "invalid-cli"
+        cli.write_text("not an executable format\n", encoding="utf-8")
+        cli.chmod(0o700)
+        payload = run_main("--providers", "kilo", cli=str(cli))
         self.assertIsNone(payload["fatal"])
         self.assertIsNone(payload["cliVersion"])
-        self.assertEqual(payload["providers"][0]["id"], "kilo")
-        self.assertFalse(payload["providers"][0]["ok"])
-        self.assertEqual(payload["providers"][0]["error"]["code"], "cli_error")
-
-    def test_process_oserrors_become_provider_errors(self) -> None:
-        for error in (PermissionError("denied"), OSError("I/O error")):
-            with self.subTest(error=type(error).__name__):
-                with mock.patch.object(fetch.subprocess, "run", side_effect=error):
-                    result = fetch._run_cli(TRUE_EXECUTABLE, "kilo", None, 1)[0]
-                self.assertEqual(result["id"], "kilo")
-                self.assertFalse(result["ok"])
-                self.assertEqual(result["error"]["code"], "cli_error")
+        record = payload["providers"][0]
+        self.assertEqual((record["id"], record["ok"], record["error"]["code"]), ("kilo", False, "cli_error"))
 
     def test_malformed_provider_keeps_healthy_results(self) -> None:
         def cli_result(command, **kwargs):
@@ -142,17 +153,14 @@ class ProviderFailureTests(IsolatedUsageTestCase):
                 command, 0, json.dumps({"usage": {"primary": primary}}), ""
             )
 
-        output = io.StringIO()
         with (
             mock.patch.object(fetch.subprocess, "run", side_effect=cli_result),
-            mock.patch("sys.stdout", output),
+            # A running Meridian's ChatGPT seats would add Codex accounts.
+            mock.patch.object(fetch, "_read_http_body", side_effect=OSError("Meridian offline")),
         ):
-            exit_code = fetch.main(
-                ["--cli-path", TRUE_EXECUTABLE, "--providers", "kilo,codex"]
-            )
-        payload = json.loads(output.getvalue())
-        self.assertEqual(exit_code, 0)
+            payload = run_main("--providers", "kilo,codex")
         self.assertIsNone(payload["fatal"])
+        self.assertEqual(payload["cliVersion"], "0.56.3")
         failed, healthy = payload["providers"]
         self.assertEqual(failed["id"], "kilo")
         self.assertFalse(failed["ok"])
@@ -191,12 +199,14 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
         self.profile_urls: list[str] = []
 
     def login(self, name: str, email: str | None = None, cli_email: str | None = None,
-              used: float | None = None) -> Path:
+              used: float | None = None, plan: tuple[str, str] | None = None) -> Path:
+        """A Claude login directory; `plan` is (subscriptionType, rateLimitTier)."""
         directory = self.home / name
         directory.mkdir()
-        expires = int((time.time() + 3600) * 1000)
-        (directory / ".credentials.json").write_text(json.dumps(
-            {"claudeAiOauth": {"accessToken": f"token-{name}", "expiresAt": expires}}))
+        oauth = {"accessToken": f"token-{name}", "expiresAt": int((time.time() + 3600) * 1000)}
+        if plan:
+            oauth.update(subscriptionType=plan[0], rateLimitTier=plan[1])
+        (directory / ".credentials.json").write_text(json.dumps({"claudeAiOauth": oauth}))
         if email:
             (directory / ".claude.json").write_text(json.dumps(
                 {"oauthAccount": {"accountUuid": f"uuid-{email}", "emailAddress": email}}))
@@ -276,19 +286,20 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
                 {"id": "max", "windows": None, "failure": {"reason": "rate_limited"}},
             ]},
         }
-        reset_tokens = []
+        anthropic = []
 
-        def http(url, _timeout, headers=None):
-            if url == fetch.CLAUDE_RESET_URL:
-                reset_tokens.append(headers["Authorization"])
-                return b'{"cedar_ember": {"eligible": true, "grants": [{"resets_left": 2}]}}'
-            return json.dumps(responses[url.split(":3456", 1)[1]]).encode()
+        def ask(url, headers):
+            anthropic.append((url, headers["Authorization"]))
+            return b'{"cedar_ember": {"eligible": true, "grants": [{"resets_left": 2}]}}'
 
         with (
-            mock.patch.object(fetch, "_read_http_body", side_effect=http),
+            serve_meridian(responses, ask),
             mock.patch.object(fetch.subprocess, "run", side_effect=AssertionError("CLI ran")),
         ):
             unavailable, team_record = fetch._fetch_provider(str(self.cli), "claude", 10)
+            # Saved resets share Anthropic's per-token usage limit: the next
+            # refresh within the hour reuses the answer.
+            _, again = fetch._fetch_provider(str(self.cli), "claude", 10)
         self.assertEqual(
             (unavailable["ok"], unavailable["accountEmail"], unavailable["loginMethod"]),
             (False, "max@example.com", "Claude Max 20x"),
@@ -306,18 +317,9 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
             [(extra["id"], extra["title"]) for extra in team_record["extraRateWindows"]],
             [("claude-weekly-scoped-fable", "Fable only"), ("claude-routines", "Daily Routines")],
         )
-        self.assertEqual(team_record["resetCredits"]["count"], 2)
-        self.assertEqual(reset_tokens, ["Bearer token-team"])
+        self.assertEqual((team_record["resetCredits"]["count"], again["resetCredits"]["count"]), (2, 2))
+        self.assertEqual(anthropic, [(fetch.CLAUDE_RESET_URL, "Bearer token-team")])
         self.assertEqual({team_record["accountCount"], unavailable["accountCount"]}, {2})
-        # Saved resets share Anthropic's per-token usage limit: the next
-        # refresh within the hour reuses the answer.
-        with (
-            mock.patch.object(fetch, "_read_http_body", side_effect=http),
-            mock.patch.object(fetch.subprocess, "run", side_effect=AssertionError("CLI ran")),
-        ):
-            _, again = fetch._fetch_provider(str(self.cli), "claude", 10)
-        self.assertEqual(again["resetCredits"]["count"], 2)
-        self.assertEqual(reset_tokens, ["Bearer token-team"])
 
     def test_failed_saved_resets_ask_waits_like_an_answered_one(self) -> None:
         team = self.login("team")
@@ -332,16 +334,14 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
         }
         asks = []
 
-        def http(url, _timeout, headers=None):
-            if url == fetch.CLAUDE_RESET_URL:
-                asks.append(url)
-                raise OSError("HTTP Error 429")
-            return json.dumps(responses[url.split(":3456", 1)[1]]).encode()
+        def ask(url, _headers):
+            asks.append(url)
+            raise OSError("HTTP Error 429")
 
-        with mock.patch.object(fetch, "_read_http_body", side_effect=http):
+        with serve_meridian(responses, ask):
             first = fetch._fetch_provider(str(self.cli), "claude", 10)
             second = fetch._fetch_provider(str(self.cli), "claude", 10)
-        self.assertEqual(len(asks), 1)
+        self.assertEqual(asks, [fetch.CLAUDE_RESET_URL])
         self.assertEqual([r["ok"] for r in first + second], [True, True])
 
     def test_meridian_banked_resets_replace_the_anthropic_ask(self) -> None:
@@ -369,13 +369,10 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
                                    ("unknown", None))]},
         }
 
-        def http(url, _timeout, headers=None):
-            if url == fetch.CLAUDE_RESET_URL:
-                raise AssertionError("asked Anthropic")
-            return json.dumps(responses[url.split(":3456", 1)[1]]).encode()
-
-        with mock.patch.object(fetch, "_read_http_body", side_effect=http):
+        with serve_meridian(responses) as http:
             team_record, spent, unknown = fetch._fetch_provider(str(self.cli), "claude", 10)
+        # Meridian's banked resets answer, even "unknown": Anthropic is not asked.
+        self.assertTrue(all(call.args[0].startswith(MERIDIAN) for call in http.call_args_list))
         self.assertEqual(team_record["resetCredits"]["count"], 3)
         self.assertEqual(
             fetch._parse_iso(team_record["resetCredits"]["soonestExpiresAt"]).timestamp(),
@@ -386,10 +383,7 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
 
     def test_meridian_facts_come_first_and_the_login_fills_what_it_lacks(self) -> None:
         full = self.login("full", email="saved@example.com")
-        bare = self.login("bare", email="bare@example.com")
-        oauth = json.loads((bare / ".credentials.json").read_text())
-        oauth["claudeAiOauth"].update(subscriptionType="max", rateLimitTier="default_claude_max_20x")
-        (bare / ".credentials.json").write_text(json.dumps(oauth))
+        bare = self.login("bare", email="bare@example.com", plan=("max", "default_claude_max_20x"))
         now_ms = int(time.time() * 1000)
         responses = {
             "/profiles/list": {"profiles": [
@@ -404,14 +398,8 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
                  "windows": [{"type": "five_hour", "utilization": 0.1, "resetsAt": None}]}
                 for id_ in ("full", "bare")]},
         }
-        urls = []
-
-        def http(url, _timeout, _headers=None):
-            urls.append(url)
-            return json.dumps(responses[url.split(":3456", 1)[1]]).encode()
-
         with (
-            mock.patch.object(fetch, "_read_http_body", side_effect=http),
+            serve_meridian(responses) as http,
             mock.patch.object(fetch.subprocess, "run", side_effect=AssertionError("CLI ran")),
         ):
             records = fetch._fetch_provider(str(self.cli), "claude", 10)
@@ -419,7 +407,7 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
             [(r["accountEmail"], r["loginMethod"], r["planWeight"]) for r in records],
             [("meridian@example.com", "Claude Team", 5), ("bare@example.com", "Claude Max 20x", 20)])
         # Meridian and the login directories answered everything: no Anthropic call.
-        self.assertTrue(all(url.startswith("http://127.0.0.1:3456/") for url in urls), urls)
+        self.assertTrue(all(call.args[0].startswith(MERIDIAN) for call in http.call_args_list))
 
     def test_meridian_chatgpt_seats_fill_in_codex_accounts_the_cli_cannot_read(self) -> None:
         now_ms = int(time.time() * 1000)
@@ -441,9 +429,6 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
             ]},
         }
 
-        def http(url, _timeout, _headers=None):
-            return json.dumps(responses[url.split(":3456", 1)[1]]).encode()
-
         cli_account = fetch._normalize_record("codex", {"usage": {
             "accountEmail": "A@example.com", "loginMethod": "plus",
             "primary": {"usedPercent": 10, "windowMinutes": 300}}})
@@ -453,7 +438,7 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
              [("a@example.com", 90), ("b@example.com", 50), ("c@example.com", None)]),
         ):
             with (
-                mock.patch.object(fetch, "_read_http_body", side_effect=http),
+                serve_meridian(responses),
                 mock.patch.object(fetch, "_fetch_sources", return_value=cli_records),
             ):
                 records = fetch._fetch_provider(str(self.cli), "codex", 10)
@@ -469,25 +454,16 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
                          (43200, 10))
 
     def test_meridian_without_profiles_serves_the_local_login_as_default(self) -> None:
-        local = self.login(".claude", email="local@example.com")
-        oauth = json.loads((local / ".credentials.json").read_text())
-        oauth["claudeAiOauth"].update(subscriptionType="max", rateLimitTier="default_claude_max_20x")
-        (local / ".credentials.json").write_text(json.dumps(oauth))
+        self.login(".claude", email="local@example.com", plan=("max", "default_claude_max_20x"))
         responses = {
             "/profiles/list": {"profiles": []},
             "/v1/usage/quota/all": {"profiles": [
                 {"id": "default", "fetchedAt": int(time.time() * 1000), "bankedResets": None,
                  "windows": [{"type": "five_hour", "utilization": 0.3, "resetsAt": None}]}]},
         }
-        keys = []
-
-        def http(url, _timeout, headers=None):
-            keys.append((headers or {}).get("x-api-key"))
-            return json.dumps(responses[url.split(":3456", 1)[1]]).encode()
-
         with (
             mock.patch.dict(fetch.os.environ, {"MERIDIAN_API_KEY": "secret"}),
-            mock.patch.object(fetch, "_read_http_body", side_effect=http),
+            serve_meridian(responses) as http,
             mock.patch.object(fetch.subprocess, "run", side_effect=AssertionError("CLI ran")),
         ):
             [record] = fetch._fetch_provider(str(self.cli), "claude", 10)
@@ -495,51 +471,38 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
             (record["accountEmail"], record["loginMethod"], record["planWeight"],
              record["primary"]["usedPercent"]),
             ("local@example.com", "Claude Max 20x", 20, 30))
-        self.assertEqual(keys, ["secret", "secret"])
+        # Both Meridian requests carry its API key.
+        self.assertEqual([call.args[2] for call in http.call_args_list], [{"x-api-key": "secret"}] * 2)
 
-    def meridian_stale_record(self, age_ms: int, failure: dict) -> dict:
-        measured = int(time.time() * 1000) - age_ms
-        responses = {
-            "/profiles/list": {"profiles": [
-                {"id": "team", "type": "claude-max", "email": "team@example.com",
-                 "subscriptionType": "team"}]},
-            "/v1/usage/quota/all": {"profiles": [
-                {"id": "team", "fetchedAt": measured, "stale": True, "failure": failure,
-                 "windows": [{"type": "five_hour", "utilization": 0.4, "resetsAt": None}]}]},
-        }
-        output = io.StringIO()
-        with (
-            mock.patch.object(fetch, "_read_http_body",
-                              side_effect=lambda url, *_: json.dumps(
-                                  responses[url.split(":3456", 1)[1]]).encode()),
-            mock.patch.object(fetch.subprocess, "run", side_effect=AssertionError("CLI ran")),
-            mock.patch.object(fetch, "_cli_version", return_value=None),
-            mock.patch("sys.stdout", output),
+    def test_meridian_reports_a_failed_refresh_once_it_is_news(self) -> None:
+        for age_ms, failures, reported in (
+            (60_000, 2, True),
+            ((fetch.MERIDIAN_QUIET_STALE_SECONDS + 60) * 1000, 1, True),
+            # Meridian retries after its own backoff; one 429 on a recent reading is not news.
+            (60_000, 1, False),
         ):
-            self.assertEqual(fetch.main(["--cli-path", str(self.cli), "--providers", "claude"]), 0)
-        [record] = json.loads(output.getvalue())["providers"]
-        self.assertTrue(record["ok"])
-        self.assertTrue(record["stale"])
-        self.assertEqual(fetch._parse_iso(record["cachedAt"]).timestamp(), measured / 1000)
-        self.assertEqual(record["primary"]["usedPercent"], 40)
-        return record
-
-    def test_meridian_repeated_failure_reports_the_refresh_error(self) -> None:
-        record = self.meridian_stale_record(
-            60_000, {"reason": "rate_limited", "consecutiveFailures": 2})
-        self.assertIn("rate_limited", record["refreshError"])
-
-    def test_meridian_one_off_failure_on_an_old_reading_reports_the_refresh_error(self) -> None:
-        record = self.meridian_stale_record(
-            (fetch.MERIDIAN_QUIET_STALE_SECONDS + 60) * 1000,
-            {"reason": "rate_limited", "consecutiveFailures": 1})
-        self.assertIn("rate_limited", record["refreshError"])
-
-    def test_meridian_one_off_failure_on_a_recent_reading_stays_quiet(self) -> None:
-        # Meridian retries after its own backoff; one 429 is not news.
-        record = self.meridian_stale_record(
-            60_000, {"reason": "rate_limited", "consecutiveFailures": 1})
-        self.assertEqual(record["refreshError"], "")
+            with self.subTest(age_ms=age_ms, failures=failures):
+                shutil.rmtree(self.home / ".local" / "state", ignore_errors=True)
+                measured = int(time.time() * 1000) - age_ms
+                failure = {"reason": "rate_limited", "consecutiveFailures": failures}
+                responses = {
+                    "/profiles/list": {"profiles": [
+                        {"id": "team", "type": "claude-max", "email": "team@example.com",
+                         "subscriptionType": "team"}]},
+                    "/v1/usage/quota/all": {"profiles": [
+                        {"id": "team", "fetchedAt": measured, "stale": True, "failure": failure,
+                         "windows": [{"type": "five_hour", "utilization": 0.4, "resetsAt": None}]}]},
+                }
+                with (
+                    serve_meridian(responses),
+                    mock.patch.object(fetch.subprocess, "run", side_effect=AssertionError("CLI ran")),
+                    mock.patch.object(fetch, "_cli_version", return_value=None),
+                ):
+                    [record] = run_main("--providers", "claude", cli=str(self.cli))["providers"]
+                self.assertEqual((record["ok"], record["stale"], record["primary"]["usedPercent"]),
+                                 (True, True, 40))
+                self.assertEqual(fetch._parse_iso(record["cachedAt"]).timestamp(), measured / 1000)
+                self.assertRegex(record["refreshError"], "rate_limited" if reported else "^$")
 
     def test_out_of_range_meridian_time_leaves_other_profiles_readable(self) -> None:
         now_ms = int(time.time() * 1000)
@@ -555,8 +518,7 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
                  "windows": [{"type": "five_hour", "utilization": 0.3, "resetsAt": now_ms + 3_600_000}]},
             ]},
         }
-        with mock.patch.object(fetch, "_read_http_body", side_effect=lambda url, *_: json.dumps(
-                responses[url.split(":3456", 1)[1]]).encode()):
+        with serve_meridian(responses):
             bad, good = fetch._fetch_provider(str(self.cli), "claude", 10)
         self.assertEqual((bad["ok"], bad["primary"]["usedPercent"], bad["primary"]["resetsAt"]),
                          (True, 20, None))
@@ -599,9 +561,10 @@ class UsageCacheTests(IsolatedUsageTestCase):
         })
 
     def snapshot(self, records=None, providers="codex", cache_only=False, cli=TRUE_EXECUTABLE,
-                 min_interval=None, forecast_url=None) -> dict:
-        output = io.StringIO()
-        arguments = ["--cli-path", cli, "--providers", providers]
+                 min_interval=None, forecast_url=None, fetch_provider=None) -> dict:
+        """main's answer, offline: `fetch_provider(name)` answers each provider
+        fetched, else its `records`. `self.fetched` lists the providers fetched."""
+        arguments = ["--providers", providers]
         if cache_only:
             arguments += ["--cache-only", "--forecast-url", "https://example.invalid/forecast"]
         if min_interval is not None:
@@ -609,26 +572,21 @@ class UsageCacheTests(IsolatedUsageTestCase):
         if forecast_url is not None:
             arguments += ["--forecast-url", forecast_url]
         self.fetched: list[str] = []
+
+        def provider(_cli, name, *_):
+            self.fetched.append(name)
+            if fetch_provider is not None:
+                return fetch_provider(name)
+            return [record for record in records or [] if record["id"] == name]
+
         with (
-            mock.patch.object(fetch, "_fetch_provider", side_effect=lambda _, p, *__: self.fetched.append(p) or [
-                record for record in (records or []) if record["id"] == p
-            ]),
+            mock.patch.object(fetch, "_fetch_provider", side_effect=provider),
             mock.patch.object(fetch, "_cli_version", return_value=None),
             mock.patch.object(fetch, "_read_rotation", return_value=None),
             mock.patch.object(fetch.subprocess, "run", side_effect=AssertionError("unexpected subprocess")),
             mock.patch.object(fetch, "_read_http_body", side_effect=AssertionError("unexpected network")),
-            mock.patch("sys.stdout", output),
         ):
-            self.assertEqual(fetch.main(arguments), 0)
-        return json.loads(output.getvalue())
-
-    def test_min_interval_serves_cache_after_a_recent_fetch(self) -> None:
-        first = self.snapshot([self.record(used=42)], min_interval=60)
-        self.assertNotIn("cacheOnly", first)
-        second = self.snapshot([self.record(used=99)], min_interval=60)
-        self.assertTrue(second["cacheOnly"])
-        self.assertTrue(second["sharedCache"])
-        self.assertEqual([r["primary"]["usedPercent"] for r in second["providers"]], [42])
+            return run_main(*arguments, cli=cli)
 
     def test_shared_cache_freshness_uses_requesting_cadence_and_grace(self) -> None:
         for age, stale in ((149, False), (150, False), (151, True)):
@@ -670,9 +628,12 @@ class UsageCacheTests(IsolatedUsageTestCase):
         self.assertEqual(readings, {"codex": (70, False), "claude": (10, False)})
         cached = json.loads(self.cache_path.read_text())["providers"]
         self.assertEqual(cached["claude"]["records"][0]["primary"]["usedPercent"], 10)
+        # Within the interval every provider comes from the shared cache.
         again = self.snapshot([self.record("codex", used=99)], providers="codex,claude", min_interval=60)
-        self.assertTrue(again["sharedCache"])
         self.assertEqual(self.fetched, [])
+        self.assertTrue(again["cacheOnly"])
+        self.assertTrue(again["sharedCache"])
+        self.assertEqual([r["primary"]["usedPercent"] for r in again["providers"]], [70, 10])
 
     def test_a_claim_from_before_per_provider_claims_covers_every_provider(self) -> None:
         claim = self.cache_path.with_name("fetch_claim")
@@ -909,24 +870,16 @@ class UsageCacheTests(IsolatedUsageTestCase):
                 auth.write_text('{"tokens":{"account_id":"account-a"}}')
                 self.snapshot([self.record()])
                 old_scope = fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["codex"])["codex"]
-                output = io.StringIO()
 
-                def changed_fetch(_cli, provider, _timeout, *_rest):
+                def changed_fetch(provider):
                     if provider == "kilo":
                         return [self.record("kilo", None, 17)]
                     auth.write_text('{"tokens":{"account_id":"account-b"}}')
-                    return ([self.record(used=91)] if succeeds else [
-                        fetch._result_error("codex", "timeout", "Offline")
-                    ])
+                    return [self.record(used=91) if succeeds
+                            else fetch._result_error("codex", "timeout", "Offline")]
 
-                with (
-                    mock.patch.object(fetch, "_fetch_provider", side_effect=changed_fetch),
-                    mock.patch.object(fetch, "_cli_version", return_value=None),
-                    mock.patch.object(fetch, "_read_rotation", return_value=None),
-                    mock.patch("sys.stdout", output),
-                ):
-                    fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "codex,kilo"])
-                failed, healthy = json.loads(output.getvalue())["providers"]
+                failed, healthy = self.snapshot(
+                    providers="codex,kilo", fetch_provider=changed_fetch)["providers"]
                 self.assertFalse(failed["ok"])
                 self.assertEqual(failed["error"]["code"], "credential_scope_changed")
                 self.assertNotIn("primary", failed)
@@ -939,40 +892,44 @@ class UsageCacheTests(IsolatedUsageTestCase):
     def test_switching_meridian_mid_fetch_discards_the_old_instances_accounts(self) -> None:
         self.snapshot([self.record("claude")], providers="claude")
         for name, value in (("MERIDIAN_PORT", "3457"), ("MERIDIAN_API_KEY", "other")):
-            with self.subTest(name=name):
-                output = io.StringIO()
-
-                def switched_fetch(*_args):
+            with self.subTest(name=name), mock.patch.dict(fetch.os.environ):
+                def switched_fetch(_provider):
                     fetch.os.environ[name] = value
                     return [self.record("claude", used=91)]
 
-                with (
-                    mock.patch.dict(fetch.os.environ),
-                    mock.patch.object(fetch, "_fetch_provider", side_effect=switched_fetch),
-                    mock.patch.object(fetch, "_cli_version", return_value=None),
-                    mock.patch("sys.stdout", output),
-                ):
-                    fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "claude"])
-                [record] = json.loads(output.getvalue())["providers"]
+                [record] = self.snapshot(providers="claude", fetch_provider=switched_fetch)["providers"]
                 self.assertEqual(record["error"]["code"], "credential_scope_changed")
                 self.assertNotIn("primary", record)
 
-    def test_known_codex_account_refresh_preserves_scope_and_cache(self) -> None:
-        auth = self.home / ".codex" / "auth.json"
-        auth.parent.mkdir()
-        auth.write_text(json.dumps({"tokens": {
-            "account_id": "stable-account", "access_token": "old", "refresh_token": "old",
-        }, "last_refresh": "before"}))
-        fresh = self.snapshot([self.record()])["providers"][0]
-        auth.write_text(json.dumps({"tokens": {
-            "account_id": "stable-account", "access_token": "new", "refresh_token": "new",
-        }, "last_refresh": "after"}))
-        restored = self.snapshot(cache_only=True)["providers"]
-        self.assertEqual([r["primary"]["usedPercent"] for r in restored], [42])
-        self.assertEqual(restored[0]["sourceScope"], fresh["sourceScope"])
-        self.assertRegex(fresh["sourceScope"], r"^[a-f0-9]{64}$")
-        auth.write_text('{"tokens":{"account_id":"different-account"}}')
-        self.assertEqual(self.snapshot(cache_only=True)["providers"], [])
+    def test_token_rotation_keeps_the_cache_and_an_account_change_drops_it(self) -> None:
+        def codex(token: str, account: str) -> Path:
+            auth = self.home / ".codex" / "auth.json"
+            auth.parent.mkdir(exist_ok=True)
+            auth.write_text(json.dumps({"tokens": {
+                "account_id": account, "access_token": token, "refresh_token": token}}))
+            return auth
+
+        def claude(token: str, account: str) -> Path:
+            # Claude's account is the one its login saved beside the token.
+            login = self.home / ".claude"
+            login.mkdir(exist_ok=True)
+            (login / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": token}}))
+            (login / ".claude.json").write_text(json.dumps(
+                {"oauthAccount": {"accountUuid": account, "emailAddress": "a@example.com"}}))
+            return login / ".claude.json"
+
+        for provider, save in (("codex", codex), ("claude", claude)):
+            with self.subTest(provider=provider):
+                save("token-a", "account-a")
+                fresh = self.snapshot([self.record(provider)], providers=provider)["providers"][0]
+                identity = save("token-b", "account-a")
+                restored = self.snapshot(providers=provider, cache_only=True)
+                self.assertEqual([r["primary"]["usedPercent"] for r in restored["providers"]], [42])
+                self.assertEqual(restored["providers"][0]["sourceScope"], fresh["sourceScope"])
+                # Pollers reread when the file naming the account changes.
+                self.assertIn(str(identity), restored["inputs"])
+                save("token-b", "account-b")
+                self.assertEqual(self.snapshot(providers=provider, cache_only=True)["providers"], [])
 
     def test_live_cached_and_failed_records_share_scope_without_persisting_it(self) -> None:
         live = self.snapshot([self.record()])["providers"][0]
@@ -1040,26 +997,6 @@ class UsageCacheTests(IsolatedUsageTestCase):
                 # Claude without a saved account (.claude.json) has no stable id either.
                 self.assertEqual(self.snapshot(providers=provider, cache_only=True)["providers"], [])
 
-    def test_claude_scope_follows_the_saved_account_across_token_rotation(self) -> None:
-        login = self.home / ".claude"
-        login.mkdir()
-        account = login / ".claude.json"
-
-        def save(token: str, uuid: str) -> None:
-            (login / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": token}}))
-            account.write_text(json.dumps(
-                {"oauthAccount": {"accountUuid": uuid, "emailAddress": "a@example.com"}}))
-
-        save("token-a", "uuid-a")
-        self.snapshot([self.record("claude")], providers="claude")
-        save("token-b", "uuid-a")
-        restored = self.snapshot(providers="claude", cache_only=True)
-        self.assertEqual([r["primary"]["usedPercent"] for r in restored["providers"]], [42])
-        # Pollers reread when the saved account changes.
-        self.assertIn(str(account), restored["inputs"])
-        save("token-b", "uuid-b")
-        self.assertEqual(self.snapshot(providers="claude", cache_only=True)["providers"], [])
-
     def test_an_unfinished_fetch_keeps_its_claim_past_the_interval(self) -> None:
         clock = [1000.0]
         claim = self.cache_path.with_name("fetch_claim")
@@ -1092,18 +1029,14 @@ class UsageCacheTests(IsolatedUsageTestCase):
                 {"id": "seat", "fetchedAt": now_ms,
                  "windows": [{"type": "five_hour", "utilization": 0.3, "resetsAt": None}]}]},
         }
-        output = io.StringIO()
         with (
-            mock.patch.object(fetch, "_read_http_body", side_effect=lambda url, *_: json.dumps(
-                responses[url.split(":3456", 1)[1]]).encode()),
+            serve_meridian(responses),
             mock.patch.object(fetch, "_fetch_sources", return_value=[
                 fetch._result_error("codex", "timeout", "CLI timed out after 30s")]),
             mock.patch.object(fetch, "_cli_version", return_value=None),
             mock.patch.object(fetch, "_read_rotation", return_value=None),
-            mock.patch("sys.stdout", output),
         ):
-            fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "codex"])
-        seat, kept = json.loads(output.getvalue())["providers"]
+            seat, kept = run_main("--providers", "codex")["providers"]
         self.assertEqual((seat["accountEmail"], seat["primary"]["usedPercent"], seat.get("stale")),
                          ("a@example.com", 30, None))
         self.assertEqual((kept["accountEmail"], kept["primary"]["usedPercent"], kept["stale"],
@@ -1113,28 +1046,21 @@ class UsageCacheTests(IsolatedUsageTestCase):
         claim = self.cache_path.with_name("fetch_claim")
         claim.parent.mkdir(parents=True, exist_ok=True)
         claim.write_text(json.dumps({"claude": time.time()}))
-        urls = []
-
-        def http(url, *_):
-            urls.append(url)
-            raise OSError("offline")
 
         def provider(_cli, name, *_):
             self.assertEqual(name, "zai")
             return [self.record("zai", None)]
 
-        output = io.StringIO()
         with (
             mock.patch.object(fetch, "_fetch_provider", side_effect=provider),
-            mock.patch.object(fetch, "_read_http_body", side_effect=http),
+            mock.patch.object(fetch, "_read_http_body") as http,
             mock.patch.object(fetch, "_meridian_profile_emails",
                               wraps=fetch._meridian_profile_emails) as emails,
             mock.patch.object(fetch, "_cli_version", return_value=None),
-            mock.patch("sys.stdout", output),
         ):
-            fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "claude,zai", "--min-interval", "60"])
-        self.assertEqual([r["id"] for r in json.loads(output.getvalue())["providers"]], ["zai"])
-        self.assertEqual(urls, [])
+            payload = run_main("--providers", "claude,zai", "--min-interval", "60")
+        self.assertEqual([r["id"] for r in payload["providers"]], ["zai"])
+        http.assert_not_called()
         # Without omp's rotation state there is nothing to label with emails.
         emails.assert_not_called()
 
@@ -1147,19 +1073,16 @@ class UsageCacheTests(IsolatedUsageTestCase):
             time.sleep(timeout)
             raise subprocess.TimeoutExpired(command, timeout)
 
-        output = io.StringIO()
         started = time.monotonic()
         with (
-            mock.patch.object(fetch, "FETCH_BUDGET_MARGIN", 0.5),
+            mock.patch.object(fetch, "FETCH_BUDGET_MARGIN", 0.1),
             mock.patch.object(fetch, "_read_http_body", side_effect=stall),
             mock.patch.object(fetch.subprocess, "run", side_effect=cli),
             mock.patch.object(fetch, "_read_rotation", return_value=None),
-            mock.patch("sys.stdout", output),
         ):
-            fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "claude,codex", "--timeout", "0.5"])
-        # Budget: 2 × 0.5 s + 0.5 s; Meridian alone would wait 2 × 10 s.
-        self.assertLess(time.monotonic() - started, 2.5)
-        records = json.loads(output.getvalue())["providers"]
+            records = run_main("--providers", "claude,codex", "--timeout", "0.1")["providers"]
+        # Budget: 2 × 0.1 s + 0.1 s; Meridian alone would wait 2 × 10 s.
+        self.assertLess(time.monotonic() - started, 2)
         self.assertEqual(sorted(r["id"] for r in records), ["claude", "codex"])
         self.assertFalse(any(r["ok"] for r in records))
 
@@ -1194,20 +1117,12 @@ class UsageCacheTests(IsolatedUsageTestCase):
         auth.parent.mkdir()
         auth.write_text('{"tokens":{"account_id":"same","access_token":"old"}}')
         original_scope = fetch._usage_cache_scopes(TRUE_EXECUTABLE, ["codex"])["codex"]
-        output = io.StringIO()
 
-        def refreshed_fetch(*_args):
-            auth.write_text('{"tokens":{"account_id":"same","access_token":"refreshed"}}')
+        def refreshed_fetch(_provider):
+            auth.write_text('{"tokens":{"account_id":"same","access_token":"new"}}')
             return [self.record(used=57)]
 
-        with (
-            mock.patch.object(fetch, "_fetch_provider", side_effect=refreshed_fetch),
-            mock.patch.object(fetch, "_cli_version", return_value=None),
-            mock.patch.object(fetch, "_read_rotation", return_value=None),
-            mock.patch("sys.stdout", output),
-        ):
-            fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "codex"])
-        record = json.loads(output.getvalue())["providers"][0]
+        [record] = self.snapshot(fetch_provider=refreshed_fetch)["providers"]
         self.assertTrue(record["ok"])
         self.assertEqual(record["primary"]["usedPercent"], 57)
         self.assertEqual(record["sourceScope"], original_scope)
@@ -1342,22 +1257,20 @@ class StateMigrationTests(IsolatedUsageTestCase):
         self.assertEqual((target / "usage_cache.json").read_text(), "old usage")
 
 
-class CodexRotationTests(unittest.TestCase):
+class RotationTestCase(IsolatedUsageTestCase):
+    STATE = ""  # omp-sub-rotate's state file for this provider
+
     def setUp(self) -> None:
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        home = mock.patch.dict(fetch.os.environ, {
-            "HOME": directory.name,
-            "USERPROFILE": directory.name,
-            "XDG_STATE_HOME": str(Path(directory.name) / ".local" / "state"),
-        })
-        home.start()
-        self.addCleanup(home.stop)
-        self.directory = Path(directory.name) / ".omp" / "agent" / "sub-rotate"
+        super().setUp()
+        self.directory = self.home / ".omp" / "agent" / "sub-rotate"
 
     def write_state(self, state: object) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
-        (self.directory / "codex-state.json").write_text(json.dumps(state), encoding="utf-8")
+        (self.directory / self.STATE).write_text(json.dumps(state), encoding="utf-8")
+
+
+class CodexRotationTests(RotationTestCase):
+    STATE = "codex-state.json"
 
     def test_missing_directory_or_state_hides_rotation(self) -> None:
         self.assertIsNone(fetch._read_rotation("codex"))
@@ -1385,14 +1298,14 @@ class CodexRotationTests(unittest.TestCase):
                 })
 
     def test_operating_modes_and_stalled_are_read_without_writes(self) -> None:
-        for operating_mode in ("auto", "confirm"):
+        # A mode file without the field means confirm, like a missing file.
+        for config, operating_mode in (({"operatingMode": "auto"}, "auto"),
+                                       ({"operatingMode": "confirm"}, "confirm"), ({}, "confirm")):
             for stalled in (False, True):
-                with self.subTest(operating_mode=operating_mode, stalled=stalled):
+                with self.subTest(config=config, stalled=stalled):
                     self.write_state({"mode": "TARGET", "stalled": stalled})
                     mode_file = self.directory / "codex-mode.json"
-                    mode_file.write_text(
-                        json.dumps({"operatingMode": operating_mode}), encoding="utf-8"
-                    )
+                    mode_file.write_text(json.dumps(config), encoding="utf-8")
                     state_bytes = (self.directory / "codex-state.json").read_bytes()
                     mode_bytes = mode_file.read_bytes()
                     rotation = fetch._read_rotation("codex")
@@ -1400,11 +1313,6 @@ class CodexRotationTests(unittest.TestCase):
                     self.assertEqual(rotation["stalled"], stalled)
                     self.assertEqual((self.directory / "codex-state.json").read_bytes(), state_bytes)
                     self.assertEqual(mode_file.read_bytes(), mode_bytes)
-
-    def test_missing_operating_mode_field_defaults_to_confirm(self) -> None:
-        self.write_state({"mode": "FILL"})
-        (self.directory / "codex-mode.json").write_text("{}", encoding="utf-8")
-        self.assertEqual(fetch._read_rotation("codex")["operatingMode"], "confirm")
 
     def test_invalid_state_hides_rotation_instead_of_inventing_idle(self) -> None:
         for state in (
@@ -1502,26 +1410,19 @@ class CodexRotationTests(unittest.TestCase):
         self.write_state({"mode": "FILL", "owned": {"14": {}}, "accounts": accounts})
 
         def snapshot() -> dict:
-            output = io.StringIO()
             with (
                 mock.patch.object(fetch, "_fetch_provider", return_value=[
                     {"id": "codex", "ok": True, "accountEmail": "a@example.com"},
                     {"id": "codex", "ok": True, "accountEmail": "b@example.com"},
                 ]),
                 mock.patch.object(fetch, "_cli_version", return_value=None),
-                mock.patch("sys.stdout", output),
             ):
-                self.assertEqual(fetch.main([
-                    "--cli-path", TRUE_EXECUTABLE, "--providers", "codex",
-                ]), 0)
-            return json.loads(output.getvalue())
+                return run_main("--providers", "codex")
 
         rotation = snapshot()["codexRotation"]
         self.assertEqual(rotation["mode"], "FILL")
         self.assertEqual(rotation["accountAvailability"], {"a@example.com": "blocked"})
-        self.write_state({
-            "mode": "BURN", "stalled": True, "owned": {}, "accounts": accounts,
-        })
+        self.write_state({"mode": "BURN", "stalled": True, "owned": {}, "accounts": accounts})
         rotation = snapshot()["codexRotation"]
         self.assertEqual(rotation["mode"], "BURN")
         self.assertTrue(rotation["stalled"])
@@ -1533,31 +1434,18 @@ class CodexRotationTests(unittest.TestCase):
         (self.directory / "codex-state.json").unlink()
         result = snapshot()
         self.assertIsNone(result["codexRotation"])
-        self.assertEqual(
-            [record["accountEmail"] for record in result["providers"]],
-            ["a@example.com", "b@example.com"],
-        )
+        self.assertEqual([record["accountEmail"] for record in result["providers"]],
+                         ["a@example.com", "b@example.com"])
 
 
-class ClaudeRotationTests(unittest.TestCase):
+class ClaudeRotationTests(RotationTestCase):
     """omp-sub-rotate's Meridian rotation: `closed` keyed by Meridian profile id."""
 
-    def setUp(self) -> None:
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        home = mock.patch.dict(fetch.os.environ, {
-            "HOME": directory.name,
-            "USERPROFILE": directory.name,
-            "XDG_STATE_HOME": str(Path(directory.name) / ".local" / "state"),
-        })
-        home.start()
-        self.addCleanup(home.stop)
-        self.directory = Path(directory.name) / ".omp" / "agent" / "sub-rotate"
-        self.emails = {"work": "a@example.com", "home": "b@example.com"}
+    STATE = "meridian-state.json"
 
-    def write_state(self, state: object) -> None:
-        self.directory.mkdir(parents=True, exist_ok=True)
-        (self.directory / "meridian-state.json").write_text(json.dumps(state), encoding="utf-8")
+    def setUp(self) -> None:
+        super().setUp()
+        self.emails = {"work": "a@example.com", "home": "b@example.com"}
 
     def test_without_state_file_nothing_is_shown(self) -> None:
         self.assertIsNone(fetch._read_rotation("claude", self.emails))
@@ -1603,7 +1491,6 @@ class ClaudeRotationTests(unittest.TestCase):
         self.write_state({"mode": "FILL", "closed": {"work": {}}, "accounts": [{"id": "work"}]})
 
         def snapshot(providers: str) -> dict:
-            output = io.StringIO()
             with (
                 mock.patch.object(fetch, "_fetch_provider", return_value=[
                     {"id": "claude", "ok": True, "accountEmail": "a@example.com"},
@@ -1612,10 +1499,8 @@ class ClaudeRotationTests(unittest.TestCase):
                     ({"id": "work", "email": "a@example.com"}, {}),
                 ]),
                 mock.patch.object(fetch, "_cli_version", return_value=None),
-                mock.patch("sys.stdout", output),
             ):
-                self.assertEqual(fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", providers]), 0)
-            return json.loads(output.getvalue())
+                return run_main("--providers", providers)
 
         result = snapshot("claude")
         self.assertEqual(result["claudeRotation"]["accountAvailability"], {"a@example.com": "blocked"})
@@ -1625,23 +1510,17 @@ class ClaudeRotationTests(unittest.TestCase):
         self.assertIsNone(snapshot("claude")["claudeRotation"])
 
     def test_cache_only_read_tracks_state_file_offline(self) -> None:
-        home = Path(fetch.os.environ["HOME"])
-        login = home / ".config" / "meridian" / "work"
+        login = self.home / ".config" / "meridian" / "work"
         login.mkdir(parents=True)
         (login / ".claude.json").write_text(
             json.dumps({"oauthAccount": {"emailAddress": "a@example.com"}}), encoding="utf-8")
-        (home / ".config" / "meridian" / "profiles.json").write_text(
+        (login.parent / "profiles.json").write_text(
             json.dumps([{"id": "work", "claudeConfigDir": str(login)}]), encoding="utf-8")
         self.write_state({"mode": "FILL", "closed": {"work": {}}, "accounts": [{"id": "work"}]})
 
         def cached() -> dict:
-            output = io.StringIO()
-            with (
-                mock.patch.object(fetch._Meridian, "snapshot", side_effect=AssertionError("network")),
-                mock.patch("sys.stdout", output),
-            ):
-                fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "claude", "--cache-only"])
-            return json.loads(output.getvalue())
+            with mock.patch.object(fetch._Meridian, "snapshot", side_effect=AssertionError("network")):
+                return run_main("--providers", "claude", "--cache-only")
 
         self.assertEqual(cached()["claudeRotation"]["accountAvailability"], {"a@example.com": "blocked"})
         (self.directory / "meridian-state.json").unlink()
@@ -1649,29 +1528,23 @@ class ClaudeRotationTests(unittest.TestCase):
 
 
 class SessionWindowClampTests(unittest.TestCase):
-    def _primary(self, weekly_reset: str, provider: str = "codex") -> dict:
-        return fetch._normalize_record(provider, {"usage": {
-            "primary": {"usedPercent": 64, "windowMinutes": 300,
-                        "resetsAt": "2026-09-26T21:49:00Z"},
-            "secondary": {"usedPercent": 71, "windowMinutes": 10080,
-                          "resetsAt": weekly_reset},
-        }})["primary"]
-
-    def test_earlier_weekly_reset_ends_session_window(self) -> None:
-        primary = self._primary("2026-09-26T20:00:00Z")
-        self.assertEqual(primary["resetsAt"], "2026-09-26T20:00:00Z")
-        self.assertEqual(primary["startsAt"], "2026-09-26T16:49:00Z")
-
-    def test_later_weekly_reset_leaves_session_window(self) -> None:
-        primary = self._primary("2026-09-30T20:00:00Z")
-        self.assertEqual(primary["resetsAt"], "2026-09-26T21:49:00Z")
-        self.assertNotIn("startsAt", primary)
-
-    def test_claude_weekly_reset_leaves_session_window(self) -> None:
+    def test_only_a_codex_weekly_reset_ends_the_session_window_early(self) -> None:
         # Claude's weekly rollover does not clear the running 5h session.
-        primary = self._primary("2026-09-26T20:00:00Z", provider="claude")
-        self.assertEqual(primary["resetsAt"], "2026-09-26T21:49:00Z")
-        self.assertNotIn("startsAt", primary)
+        for provider, weekly_reset, expected in (
+            ("codex", "2026-09-26T20:00:00Z",
+             {"resetsAt": "2026-09-26T20:00:00Z", "startsAt": "2026-09-26T16:49:00Z"}),
+            ("codex", "2026-09-30T20:00:00Z", {"resetsAt": "2026-09-26T21:49:00Z"}),
+            ("claude", "2026-09-26T20:00:00Z", {"resetsAt": "2026-09-26T21:49:00Z"}),
+        ):
+            with self.subTest(provider=provider, weekly_reset=weekly_reset):
+                primary = fetch._normalize_record(provider, {"usage": {
+                    "primary": {"usedPercent": 64, "windowMinutes": 300,
+                                "resetsAt": "2026-09-26T21:49:00Z"},
+                    "secondary": {"usedPercent": 71, "windowMinutes": 10080,
+                                  "resetsAt": weekly_reset},
+                }})["primary"]
+                self.assertEqual({key: primary[key] for key in ("resetsAt", "startsAt") if key in primary},
+                                 expected)
 
 
 class ResetCreditTests(unittest.TestCase):
@@ -1717,53 +1590,36 @@ class ResetCreditTests(unittest.TestCase):
 
 
 class ForecastTests(IsolatedUsageTestCase):
-    def test_eta_uses_cadence_and_future_window_start(self) -> None:
-        last_reset = dt.datetime(2026, 8, 31, 2, 34, 27, tzinfo=dt.timezone.utc)
-        now = dt.datetime(2026, 9, 2, 10, 0, tzinfo=dt.timezone.utc)
+    BODY = json.dumps({
+        "last_reset_at": "2026-09-14T02:00:00Z",
+        "cadence": {"recent_median_days": 2},
+    }).encode()
 
-        eta = fetch._forecast_eta(last_reset, 2.1, 23, 2, "UTC", now)
-
-        self.assertEqual(eta, dt.datetime(2026, 9, 2, 23, tzinfo=dt.timezone.utc))
-
-    def test_eta_keeps_projection_inside_window(self) -> None:
-        last_reset = dt.datetime(2026, 9, 1, 22, 30, tzinfo=dt.timezone.utc)
-        now = dt.datetime(2026, 9, 2, 10, 0, tzinfo=dt.timezone.utc)
-
-        eta = fetch._forecast_eta(last_reset, 25 / 24, 23, 2, "UTC", now)
-
-        self.assertEqual(eta, dt.datetime(2026, 9, 2, 23, 30, tzinfo=dt.timezone.utc))
-
-    def test_eta_rolls_elapsed_projection(self) -> None:
-        last_reset = dt.datetime(2026, 9, 1, 22, 30, tzinfo=dt.timezone.utc)
-        now = dt.datetime(2026, 9, 2, 23, 45, tzinfo=dt.timezone.utc)
-
-        eta = fetch._forecast_eta(last_reset, 25 / 24, 23, 2, "UTC", now)
-
-        self.assertEqual(eta, dt.datetime(2026, 9, 3, 23, 30, tzinfo=dt.timezone.utc))
+    def test_eta_uses_cadence_and_the_next_window(self) -> None:
+        for last_reset, cadence, now, expected in (
+            # A projection before the window waits for its start.
+            (utc(2026, 8, 31, 2, 34, 27), 2.1, utc(2026, 9, 2, 10), utc(2026, 9, 2, 23)),
+            # One inside the window stays.
+            (utc(2026, 9, 1, 22, 30), 25 / 24, utc(2026, 9, 2, 10), utc(2026, 9, 2, 23, 30)),
+            # One inside the window but already past rolls a day.
+            (utc(2026, 9, 1, 22, 30), 25 / 24, utc(2026, 9, 2, 23, 45), utc(2026, 9, 3, 23, 30)),
+        ):
+            with self.subTest(last_reset=last_reset, now=now):
+                self.assertEqual(fetch._forecast_eta(last_reset, cadence, 23, 2, "UTC", now), expected)
 
     @unittest.skipUnless(HAS_TZ_DATABASE, "needs the IANA time zone database (tzdata on Windows)")
     def test_eta_window_hours_are_in_the_window_zone(self) -> None:
+        def eta(last_reset, now, zone="America/Los_Angeles"):
+            return fetch._forecast_eta(last_reset, 1, 23, 2, zone, now)
+
         # Projection 2026-11-01 12:00Z is 04:00 PST, after the DST change; the
         # 23:00 Los Angeles window start that day is 07:00Z on Nov 2.
-        last_reset = dt.datetime(2026, 10, 31, 12, tzinfo=dt.timezone.utc)
-        now = dt.datetime(2026, 10, 31, 13, tzinfo=dt.timezone.utc)
-
-        eta = fetch._forecast_eta(last_reset, 1, 23, 2, "America/Los_Angeles", now)
-        unknown = fetch._forecast_eta(last_reset, 1, 23, 2, "Mars/Olympus", now)
-
-        self.assertEqual(eta, dt.datetime(2026, 11, 2, 7, tzinfo=dt.timezone.utc))
-        self.assertEqual(unknown, dt.datetime(2026, 11, 1, 12, tzinfo=dt.timezone.utc))
-
-    @unittest.skipUnless(HAS_TZ_DATABASE, "needs the IANA time zone database (tzdata on Windows)")
-    def test_eta_rolls_in_window_zone_across_dst(self) -> None:
+        self.assertEqual(eta(utc(2026, 10, 31, 12), utc(2026, 10, 31, 13)), utc(2026, 11, 2, 7))
+        self.assertEqual(eta(utc(2026, 10, 31, 12), utc(2026, 10, 31, 13), "Mars/Olympus"),
+                         utc(2026, 11, 1, 12))
         # Projection Oct 31 23:30 PDT is inside the window but elapsed; one
         # day later is Nov 1 23:30 PST, not 22:30.
-        last_reset = dt.datetime(2026, 10, 31, 6, 30, tzinfo=dt.timezone.utc)
-        now = dt.datetime(2026, 11, 1, 6, 45, tzinfo=dt.timezone.utc)
-
-        eta = fetch._forecast_eta(last_reset, 1, 23, 2, "America/Los_Angeles", now)
-
-        self.assertEqual(eta, dt.datetime(2026, 11, 2, 7, 30, tzinfo=dt.timezone.utc))
+        self.assertEqual(eta(utc(2026, 10, 31, 6, 30), utc(2026, 11, 1, 6, 45)), utc(2026, 11, 2, 7, 30))
 
     def test_end_of_day_deadline_rounds_up_to_the_minute(self) -> None:
         deadline = fetch._announcement_deadline(
@@ -1773,207 +1629,92 @@ class ForecastTests(IsolatedUsageTestCase):
         self.assertEqual(deadline, dt.datetime(2026, 10, 3, 7, tzinfo=dt.timezone.utc))
 
     def test_normalizes_forecast_fields(self) -> None:
-        payload = fetch._normalize_forecast(
-            {
-                "updated_at": "2026-09-02T10:03:10.570Z",
-                "last_reset_at": "2026-08-31T02:34:27.000Z",
-                "probabilities": {
-                    "raw_24h": 0.25,
-                    "raw_48h": 0.45,
-                },
-                "time_window": {
-                    "start_hour": 23,
-                    "end_hour": 2,
-                    "label": "11 PM - 2 AM",
-                    "timezone": "UTC",
-                },
-                "cadence": {"recent_median_days": 2.1},
-                "confidence": "low",
-            }
-        )
-
+        payload = fetch._normalize_forecast({
+            "updated_at": "2026-09-02T10:03:10.570Z",
+            "last_reset_at": "2026-08-31T02:34:27.000Z",
+            "probabilities": {"raw_24h": 0.25, "raw_48h": 0.45},
+            "time_window": {"start_hour": 23, "end_hour": 2, "label": "11 PM - 2 AM", "timezone": "UTC"},
+            "cadence": {"recent_median_days": 2.1},
+            "confidence": "low",
+        })
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["prob24h"], 25.0)
-        self.assertEqual(payload["prob48h"], 45.0)
-        self.assertEqual(payload["windowStartHour"], 23)
-        self.assertEqual(payload["windowEndHour"], 2)
+        self.assertEqual((payload["prob24h"], payload["prob48h"]), (25.0, 45.0))
+        self.assertEqual((payload["windowStartHour"], payload["windowEndHour"]), (23, 2))
         self.assertTrue(payload["expectedAt"])
         self.assertIsNone(payload["alertSummary"])
 
-    def _forecast_with_alert(self, alert) -> dict:
-        return fetch._normalize_forecast(
-            {
-                "last_reset_at": "2026-08-31T02:34:27.000Z",
-                "cadence": {"recent_median_days": 2.1},
-                "latest_alert": alert,
-            }
-        )
-
-    def test_alert_newer_than_last_reset_surfaces_summary(self) -> None:
-        payload = self._forecast_with_alert(
-            {
-                "source_at": "2026-09-01T18:00:00.000Z",
-                "summary": "  Reset promised for 6pm PT.  ",
-            }
-        )
-
-        self.assertEqual(payload["alertSummary"], "Reset promised for 6pm PT.")
-
-    def test_alert_matching_last_reset_is_dropped(self) -> None:
-        payload = self._forecast_with_alert(
-            {
-                "source_at": "2026-08-31T02:34:27.000Z",
-                "summary": "Usage reset for every paid subscription.",
-            }
-        )
-
-        self.assertIsNone(payload["alertSummary"])
-
-    def test_alert_older_than_last_reset_is_dropped(self) -> None:
-        payload = self._forecast_with_alert(
-            {
-                "source_at": "2026-08-29T12:00:00.000Z",
-                "summary": "An earlier reset announcement.",
-            }
-        )
-
-        self.assertIsNone(payload["alertSummary"])
-
-    def test_missing_alert_yields_no_summary(self) -> None:
-        self.assertIsNone(self._forecast_with_alert(None)["alertSummary"])
+    def test_only_an_alert_newer_than_the_last_reset_is_summarized(self) -> None:
+        for alert, summary in (
+            ({"source_at": "2026-09-01T18:00:00.000Z", "summary": "  Reset promised for 6pm PT.  "},
+             "Reset promised for 6pm PT."),
+            ({"source_at": "2026-08-31T02:34:27.000Z", "summary": "Usage reset for every paid subscription."},
+             None),
+            ({"source_at": "2026-08-29T12:00:00.000Z", "summary": "An earlier reset announcement."}, None),
+            (None, None),
+        ):
+            with self.subTest(alert=alert):
+                payload = fetch._normalize_forecast({
+                    "last_reset_at": "2026-08-31T02:34:27.000Z",
+                    "cadence": {"recent_median_days": 2.1},
+                    "latest_alert": alert,
+                })
+                self.assertEqual(payload["alertSummary"], summary)
 
     def test_nonfinite_cadence_keeps_snapshot_healthy(self) -> None:
-        body = json.dumps(
-            {
-                "last_reset_at": "2026-08-31T02:34:27.000Z",
-                "cadence": {"recent_median_days": "inf"},
-            }
-        ).encode()
-
-        output = io.StringIO()
-        with (
-            mock.patch.object(fetch, "_forecast_cache_read", return_value=None),
-            mock.patch.object(fetch, "_read_http_body", return_value=body),
-            mock.patch("sys.stdout", output),
-        ):
-            exit_code = fetch.main(
-                [
-                    "--cli-path",
-                    TRUE_EXECUTABLE,
-                    "--providers",
-                    "",
-                    "--forecast-url",
-                    "https://example.invalid/forecast",
-                ]
-            )
-
-        payload = json.loads(output.getvalue())
-        self.assertEqual(exit_code, 0)
+        body = json.dumps({
+            "last_reset_at": "2026-08-31T02:34:27.000Z",
+            "cadence": {"recent_median_days": "inf"},
+        }).encode()
+        with mock.patch.object(fetch, "_read_http_body", return_value=body):
+            payload = run_main("--providers", "", "--forecast-url", "https://example.invalid/forecast")
         self.assertIsNone(payload["fatal"])
         self.assertEqual(payload["providers"], [])
         self.assertFalse(payload["forecast"]["ok"])
 
-    def test_failed_refresh_uses_stale_cache(self) -> None:
-        cached = {
-            "ok": True,
-            "stale": False,
-            "expectedAt": "2026-09-02T23:00:00+00:00",
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            with mock.patch.dict(fetch.os.environ, {"XDG_STATE_HOME": directory}):
+    def test_failed_refresh_serves_the_cache_as_stale(self) -> None:
+        for cached in (
+            {"ok": True, "stale": False, "expectedAt": "2026-09-02T23:00:00+00:00"},
+            # A cached forecast without an ETA keeps it missing.
+            {"ok": True, "stale": False, "expectedAt": None, "windowStartHour": 23, "windowEndHour": 2},
+        ):
+            with self.subTest(cached=cached):
                 fetch._forecast_cache_write(cached)
-                with mock.patch.object(fetch, "FORECAST_CACHE_TTL", -1):
-                    with mock.patch.object(
-                        fetch,
-                        "_read_http_body",
-                        side_effect=OSError("offline"),
-                    ):
-                        result = fetch._fetch_forecast("http://127.0.0.1:9", 1)
-
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["stale"])
-        self.assertEqual(result["expectedAt"], cached["expectedAt"])
-
-    def test_stale_cache_preserves_missing_eta(self) -> None:
-        cached = {
-            "ok": True,
-            "stale": False,
-            "expectedAt": None,
-            "windowStartHour": 23,
-            "windowEndHour": 2,
-        }
-        with tempfile.TemporaryDirectory() as directory:
-            with mock.patch.dict(fetch.os.environ, {"XDG_STATE_HOME": directory}):
-                fetch._forecast_cache_write(cached)
-                with mock.patch.object(fetch, "FORECAST_CACHE_TTL", -1):
-                    with mock.patch.object(
-                        fetch,
-                        "_read_http_body",
-                        side_effect=OSError("offline"),
-                    ):
-                        result = fetch._fetch_forecast("http://127.0.0.1:9", 1)
-
-        self.assertTrue(result["ok"])
-        self.assertTrue(result["stale"])
-        self.assertIsNone(result["expectedAt"])
+                with (
+                    mock.patch.object(fetch, "FORECAST_CACHE_TTL", -1),
+                    mock.patch.object(fetch, "_read_http_body", side_effect=OSError("offline")),
+                ):
+                    result = fetch._fetch_forecast("http://127.0.0.1:9", 1)
+                self.assertEqual(result, dict(cached, stale=True))
 
     def test_successful_response_is_cached(self) -> None:
-        body = json.dumps({
-            "last_reset_at": "2026-09-14T02:00:00Z",
-            "cadence": {"recent_median_days": 2},
-        }).encode()
-        with tempfile.TemporaryDirectory() as directory:
-            cache = Path(directory) / "forecast.json"
-            with mock.patch.object(fetch, "_state_file", lambda name: str(cache)):
-                with forecast_server(body) as (url, _):
-                    result = fetch._fetch_forecast(url, 2)
-                cached = fetch._fetch_forecast(url, 0.1)
+        with forecast_server(self.BODY) as (url, _):
+            result = fetch._fetch_forecast(url, 2)
+        cached = fetch._fetch_forecast(url, 0.1)
         self.assertTrue(result["ok"])
         self.assertFalse(result["stale"])
         self.assertEqual(cached, result)
 
     def test_slow_drip_has_total_deadline_and_retains_stale_cache(self) -> None:
-        body = json.dumps({
-            "last_reset_at": "2026-09-14T02:00:00Z",
-            "cadence": {"recent_median_days": 2},
-        }).encode()
-        cached = {
-            "ok": True,
-            "stale": False,
-            "expectedAt": "2026-09-16T02:00:00+00:00",
-        }
+        cached = {"ok": True, "stale": False, "expectedAt": "2026-09-16T02:00:00+00:00"}
+        fetch._forecast_cache_write(cached)
         timeout = 0.4
-        with tempfile.TemporaryDirectory() as directory:
-            cache = Path(directory) / "forecast.json"
-            with (
-                mock.patch.object(fetch, "_state_file", lambda name: str(cache)),
-                mock.patch.object(fetch, "FORECAST_CACHE_TTL", -1),
-                forecast_server(body, interval=0.05) as (url, requested),
-                ThreadPoolExecutor(max_workers=1) as pool,
-            ):
-                fetch._forecast_cache_write(cached)
-                started = time.monotonic()
-                result = pool.submit(fetch._fetch_forecast, url, timeout).result(
-                    timeout=3
-                )
-                elapsed = time.monotonic() - started
+        with (
+            mock.patch.object(fetch, "FORECAST_CACHE_TTL", -1),
+            forecast_server(self.BODY, interval=0.05) as (url, requested),
+            ThreadPoolExecutor(max_workers=1) as pool,
+        ):
+            started = time.monotonic()
+            result = pool.submit(fetch._fetch_forecast, url, timeout).result(timeout=3)
+            elapsed = time.monotonic() - started
         self.assertLess(elapsed, timeout + 0.75)
         self.assertTrue(requested.is_set())
         self.assertEqual(result, dict(cached, stale=True))
 
     def test_oversized_valid_forecast_is_rejected(self) -> None:
-        body = json.dumps({
-            "last_reset_at": "2026-09-14T02:00:00Z",
-            "cadence": {"recent_median_days": 2},
-        }).encode() + b" " * (fetch.FORECAST_MAX_BODY_BYTES + 1)
-        with tempfile.TemporaryDirectory() as directory:
-            cache = Path(directory) / "forecast.json"
-            with (
-                mock.patch.object(fetch, "_state_file", lambda name: str(cache)),
-                forecast_server(body) as (url, _),
-            ):
-                result = fetch._fetch_forecast(url, 2)
-                self.assertFalse(cache.exists())
+        body = self.BODY + b" " * (fetch.FORECAST_MAX_BODY_BYTES + 1)
+        with forecast_server(body) as (url, _):
+            result = fetch._fetch_forecast(url, 2)
+        self.assertFalse(Path(fetch._state_file(fetch.FORECAST_CACHE_NAME)).exists())
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], "forecast_unavailable")
 
@@ -1996,154 +1737,65 @@ class ForecastTests(IsolatedUsageTestCase):
         self.assertEqual([p.name for p in path.parent.iterdir()], [path.name])
 
 
-class CliVersionTests(IsolatedUsageTestCase):
-    def _run(self, **kwargs) -> str | None:
-        completed = mock.MagicMock()
-        completed.returncode = kwargs.get("returncode", 0)
-        completed.stdout = kwargs.get("stdout", "")
-        with mock.patch.object(
-            fetch.subprocess,
-            "run",
-            side_effect=kwargs.get("side_effect"),
-            return_value=completed,
+class CliVersionTests(unittest.TestCase):
+    def test_version_comes_only_from_a_parsable_banner(self) -> None:
+        for returncode, stdout, version in (
+            (0, "CodexBar 0.56.3\n", "0.56.3"),
+            (64, "Unknown flag '--version'", None),
+            (0, "CodexBar\n", None),
         ):
-            return fetch._cli_version("/bin/codexbar")
-
-    def test_parses_version_from_cli_banner(self) -> None:
-        self.assertEqual(self._run(stdout="CodexBar 0.56.3\n"), "0.56.3")
-
-    def test_nonzero_exit_yields_none(self) -> None:
-        self.assertIsNone(self._run(returncode=64, stdout="Unknown flag '--version'"))
-
-    def test_unparseable_output_yields_none(self) -> None:
-        self.assertIsNone(self._run(stdout="CodexBar\n"))
+            with self.subTest(returncode=returncode, stdout=stdout):
+                completed = subprocess.CompletedProcess([], returncode, stdout, "")
+                with mock.patch.object(fetch.subprocess, "run", return_value=completed):
+                    self.assertEqual(fetch._cli_version("/bin/codexbar"), version)
 
     def test_missing_binary_yields_none(self) -> None:
-        self.assertIsNone(self._run(side_effect=FileNotFoundError("no cli")))
-
-    def test_snapshot_carries_cli_version(self) -> None:
-        output = io.StringIO()
-        with (
-            mock.patch.object(fetch, "_cli_version", return_value="0.56.3"),
-            mock.patch("sys.stdout", output),
-        ):
-            exit_code = fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", ""])
-
-        payload = json.loads(output.getvalue())
-        self.assertEqual(exit_code, 0)
-        self.assertEqual(payload["cliVersion"], "0.56.3")
+        with mock.patch.object(fetch.subprocess, "run", side_effect=FileNotFoundError("no cli")):
+            self.assertIsNone(fetch._cli_version("/bin/codexbar"))
 
 
 class OpenRouterBalanceTests(unittest.TestCase):
-    CREDITS_DETAILS = [
-        {
-            "title": "Credits",
-            "rows": [
-                {"label": "Remaining", "value": "$6.17"},
-                {"label": "Used", "value": "$126.83"},
-            ],
-        }
-    ]
+    CREDITS_DETAILS = [{"title": "Credits", "rows": [
+        {"label": "Remaining", "value": "$6.17"},
+        {"label": "Used", "value": "$126.83"},
+    ]}]
 
     def _normalize(self, usage: dict) -> dict:
         return fetch._normalize_record(
             "openrouter", {"provider": "openrouter", "source": "api", "usage": usage}
         )
 
-    def test_details_row_supplies_balance_without_openrouter_usage(self) -> None:
-        # CLI 0.56.3 shape: no openRouterUsage at all.
-        record = self._normalize(
-            {
-                "primary": {"usedPercent": 100.0, "resetDescription": "placeholder"},
-                "loginMethod": "Balance: $6.17",
-                "details": self.CREDITS_DETAILS,
-            }
-        )
-
-        self.assertEqual(record["balanceText"], "$6.17 left")
-        self.assertIsNone(record["primary"])
-
-    def test_login_method_supplies_balance_without_details(self) -> None:
-        record = self._normalize(
-            {"primary": {"usedPercent": 100.0}, "loginMethod": "Balance: $6.17"}
-        )
-
-        self.assertEqual(record["balanceText"], "$6.17 left")
-        self.assertIsNone(record["primary"])
-
-    def test_zero_key_limit_still_shows_balance(self) -> None:
-        record = self._normalize(
-            {
-                "primary": {"usedPercent": 100.0},
-                "openRouterUsage": {"keyLimit": 0},
-                "details": self.CREDITS_DETAILS,
-            }
-        )
-
-        self.assertEqual(record["balanceText"], "$6.17 left")
-        self.assertIsNone(record["primary"])
-
-    def test_openrouter_usage_without_key_limit_still_shows_balance(self) -> None:
-        record = self._normalize(
-            {
-                "primary": {"usedPercent": 100.0},
-                "openRouterUsage": {"balance": 6.17},
-                "details": self.CREDITS_DETAILS,
-            }
-        )
-
-        self.assertEqual(record["balanceText"], "$6.17 left")
-        self.assertIsNone(record["primary"])
+    def test_without_a_key_limit_the_balance_replaces_the_bar(self) -> None:
+        full = {"usedPercent": 100.0}
+        for name, usage, balance in (
+            # CLI 0.56.3 shape: no openRouterUsage at all.
+            ("details row", {"primary": {**full, "resetDescription": "placeholder"},
+                             "loginMethod": "Balance: $6.17", "details": self.CREDITS_DETAILS}, "$6.17 left"),
+            ("login method", {"primary": full, "loginMethod": "Balance: $6.17"}, "$6.17 left"),
+            ("zero key limit", {"primary": full, "openRouterUsage": {"keyLimit": 0},
+                                "details": self.CREDITS_DETAILS}, "$6.17 left"),
+            ("no key limit", {"primary": full, "openRouterUsage": {"balance": 6.17},
+                              "details": self.CREDITS_DETAILS}, "$6.17 left"),
+            ("thousands separator", {"details": [{"title": "Credits", "rows": [
+                {"label": "Remaining", "value": "$1,234.50"}]}]}, "$1234.50 left"),
+            ("unparseable", {"primary": full, "loginMethod": "Balance: unavailable", "details": [
+                {"title": "Credits", "rows": [{"label": "Remaining", "value": "Unavailable"}]}]}, None),
+            ("missing usage", {}, None),
+        ):
+            with self.subTest(name):
+                record = self._normalize(usage)
+                self.assertEqual(record["balanceText"], balance)
+                self.assertIsNone(record["primary"])
 
     def test_key_limit_renders_bar_and_no_balance_text(self) -> None:
-        record = self._normalize(
-            {
-                "primary": {"usedPercent": 100.0},
-                "openRouterUsage": {"keyLimit": 20, "keyUsageMonthly": 5.0},
-                "details": self.CREDITS_DETAILS,
-            }
-        )
-
+        record = self._normalize({
+            "primary": {"usedPercent": 100.0},
+            "openRouterUsage": {"keyLimit": 20, "keyUsageMonthly": 5.0},
+            "details": self.CREDITS_DETAILS,
+        })
         self.assertIsNone(record["balanceText"])
         self.assertEqual(record["primary"]["usedPercent"], 25.0)
         self.assertEqual(record["primary"]["resetDescription"], "$5.00 / $20")
-
-    def test_thousands_separator_parses(self) -> None:
-        record = self._normalize(
-            {
-                "details": [
-                    {
-                        "title": "Credits",
-                        "rows": [{"label": "Remaining", "value": "$1,234.50"}],
-                    }
-                ]
-            }
-        )
-
-        self.assertEqual(record["balanceText"], "$1234.50 left")
-
-    def test_unparseable_balance_yields_none(self) -> None:
-        record = self._normalize(
-            {
-                "primary": {"usedPercent": 100.0},
-                "loginMethod": "Balance: unavailable",
-                "details": [
-                    {
-                        "title": "Credits",
-                        "rows": [{"label": "Remaining", "value": "Unavailable"}],
-                    }
-                ],
-            }
-        )
-
-        self.assertIsNone(record["balanceText"])
-        self.assertIsNone(record["primary"])
-
-    def test_missing_usage_yields_none(self) -> None:
-        record = self._normalize({})
-
-        self.assertIsNone(record["balanceText"])
-        self.assertIsNone(record["primary"])
 
 
 class RecentUsageTests(unittest.TestCase):
@@ -2156,6 +1808,16 @@ class RecentUsageTests(unittest.TestCase):
             "updatedAt": (self.NOW - dt.timedelta(minutes=minutes_ago)).isoformat(),
             "secondary": {"usedPercent": used, "windowMinutes": 10080, "resetsAt": reset.isoformat()},
         }, self.NOW)
+
+    def observe_claude(self, history: dict, readings, reset: dt.datetime, slots=("primary",)) -> None:
+        """Claude's (minutes_ago, used) readings of its 5h window, or of `slots`."""
+        window_minutes = {"primary": 300, "secondary": 10080}
+        for minutes, used in readings:
+            fetch._usage_history_observe(history, {
+                "id": "claude", "ok": True, "updatedAt": (self.NOW - dt.timedelta(minutes=minutes)).isoformat(),
+                **{slot: {"usedPercent": used, "windowMinutes": window_minutes[slot],
+                          "resetsAt": reset.isoformat()} for slot in slots},
+            }, self.NOW)
 
     def consumption(self, samples) -> dict | None:
         """samples: (minutes_ago, used, reset) polled every 10 minutes between steps."""
@@ -2196,27 +1858,18 @@ class RecentUsageTests(unittest.TestCase):
         self.assertEqual(recent, {"hours": 24, "consumedPercent": 10})
 
     def test_five_hour_window_uses_one_hour_lookback(self) -> None:
-        reset = self.NOW + dt.timedelta(hours=2)
         history: dict = {}
-        for minutes, used in ((120, 10), (110, 20), (100, 30), (90, 30), (80, 30), (70, 30),
-                              (60, 30), (50, 30), (40, 33), (30, 35), (20, 35), (10, 36), (0, 37)):
-            fetch._usage_history_observe(history, {
-                "id": "claude", "ok": True, "updatedAt": (self.NOW - dt.timedelta(minutes=minutes)).isoformat(),
-                "primary": {"usedPercent": used, "windowMinutes": 300, "resetsAt": reset.isoformat()},
-            }, self.NOW)
+        self.observe_claude(history, ((120, 10), (110, 20), (100, 30), (90, 30), (80, 30), (70, 30), (60, 30),
+                                      (50, 30), (40, 33), (30, 35), (20, 35), (10, 36), (0, 37)),
+                            self.NOW + dt.timedelta(hours=2))
         record = {"id": "claude", "ok": True, "primary": {"usedPercent": 37, "windowMinutes": 300}}
         fetch._attach_recent_usage([record], history, self.NOW)
         self.assertEqual(record["primary"]["recent"], {"hours": 1, "consumedPercent": 7})
 
     def test_windows_get_runs_covering_their_span(self) -> None:
-        reset = self.NOW + dt.timedelta(hours=2)
         history: dict = {}
-        for minutes, used in ((7 * 60, 5), (6 * 60, 8), (4 * 60, 20), (0, 37)):
-            fetch._usage_history_observe(history, {
-                "id": "claude", "ok": True, "updatedAt": (self.NOW - dt.timedelta(minutes=minutes)).isoformat(),
-                "primary": {"usedPercent": used, "windowMinutes": 300, "resetsAt": reset.isoformat()},
-                "secondary": {"usedPercent": used, "windowMinutes": 10080, "resetsAt": reset.isoformat()},
-            }, self.NOW)
+        self.observe_claude(history, ((7 * 60, 5), (6 * 60, 8), (4 * 60, 20), (0, 37)),
+                            self.NOW + dt.timedelta(hours=2), ("primary", "secondary"))
         record = {"id": "claude", "ok": True, "primary": {"usedPercent": 37, "windowMinutes": 300},
                   "secondary": {"usedPercent": 37, "windowMinutes": 10080}}
         fetch._attach_recent_usage([record], history, self.NOW)
@@ -2261,13 +1914,9 @@ class RecentUsageTests(unittest.TestCase):
         ])
 
     def test_gap_across_lookback_start_is_not_counted(self) -> None:
-        reset = self.NOW + dt.timedelta(hours=2)
         history: dict = {}
-        for minutes, used in ((90, 10), (30, 30), (20, 30), (10, 32), (0, 32)):
-            fetch._usage_history_observe(history, {
-                "id": "claude", "ok": True, "updatedAt": (self.NOW - dt.timedelta(minutes=minutes)).isoformat(),
-                "primary": {"usedPercent": used, "windowMinutes": 300, "resetsAt": reset.isoformat()},
-            }, self.NOW)
+        self.observe_claude(history, ((90, 10), (30, 30), (20, 30), (10, 32), (0, 32)),
+                            self.NOW + dt.timedelta(hours=2))
         recent = fetch._recent_consumption(history["claude::primary"], 1, self.NOW)
         self.assertEqual(recent, {"hours": 1, "consumedPercent": 2})
 
