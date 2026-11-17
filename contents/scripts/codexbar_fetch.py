@@ -23,11 +23,13 @@ stale, cachedAt, and refreshError fields. The same file keeps a run-length
 usage history per 7d and 5h window, reported as `recent` consumption over the
 last 24 hours and 1 hour respectively.
 
-Every refresh stamps a shared claim per provider. With --min-interval N, a
-provider claimed under N seconds ago is answered from the cache instead, so
-pollers in several processes do not refresh the same usage twice; when every
-requested provider is, the answer is the --cache-only result. A poller asking
-for fewer providers leaves the rest to the next one asking for them.
+Every refresh stamps a shared claim per provider, held while it runs (at most
+its budget: twice --timeout plus a margin) and released with the time it
+ended. With --min-interval N, a provider in flight or fetched under N seconds
+ago is answered from the cache instead, so pollers in several processes do not
+refresh the same usage twice; when every requested provider is, the answer is
+the --cache-only result. A poller asking for fewer providers leaves the rest to
+the next one asking for them.
 Our files live in the state directory from state_paths; the CLI's own
 ~/.codexbar/config.json is only read.
 """
@@ -43,11 +45,11 @@ import re
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -152,10 +154,11 @@ def _rotation_accounts(provider: str, state: dict, emails: dict) -> dict:
     return availability
 
 
-def _read_rotation(provider: str, emails: dict | None = None) -> dict | None:
+def _read_rotation(provider: str, emails: dict | Callable[[], dict] | None = None) -> dict | None:
     """Read omp's rotation status for `provider` without changing its state or mode.
 
     No state file means omp does not rotate this provider: nothing is shown.
+    `emails` may be a function, called only once a state file was read.
     """
     name = OMP_ROTATIONS[provider]
     descriptions = ROTATION_DESCRIPTIONS[provider]
@@ -191,6 +194,8 @@ def _read_rotation(provider: str, emails: dict | None = None) -> dict | None:
         "operatingMode": operating_mode,
         "stalled": stalled,
     }
+    if callable(emails):
+        emails = emails()
     accounts = _rotation_accounts(provider, state, emails or {})
     if accounts:
         result["accountAvailability"] = accounts
@@ -345,18 +350,23 @@ def _meridian_profile_emails(meridian: "_Meridian | None") -> dict[str, str]:
 def _rotations(providers: list[str], meridian: "_Meridian | None") -> dict:
     """omp's rotation status per enabled provider; None where omp writes none."""
     return {
-        "claudeRotation": _read_rotation("claude", _meridian_profile_emails(meridian))
+        "claudeRotation": _read_rotation("claude", lambda: _meridian_profile_emails(meridian))
         if "claude" in providers else None,
         "codexRotation": _read_rotation("codex") if "codex" in providers else None,
     }
 
 
-def _claude_local_account(config_dir: str) -> tuple[str | None, str | None]:
-    """(accountUuid, email) Claude Code saved for this login, when it did."""
+def _claude_account_files(config_dir: str) -> list[str]:
+    """Where Claude Code saves the login's account (`oauthAccount`)."""
     paths = [os.path.join(config_dir, ".claude.json")]
     if config_dir == _expand("~/.claude"):
         paths.append(_expand("~/.claude.json"))
-    for path in paths:
+    return paths
+
+
+def _claude_local_account(config_dir: str) -> tuple[str | None, str | None]:
+    """(accountUuid, email) Claude Code saved for this login, when it did."""
+    for path in _claude_account_files(config_dir):
         try:
             with open(path, encoding="utf-8") as fh:
                 account = json.load(fh).get("oauthAccount")
@@ -462,14 +472,9 @@ def _meridian_reset_credits(banked, now: _dt.datetime) -> dict | None:
     """Usable grants of a Meridian profile's `bankedResets`. None when ineligible or unknown."""
     if not isinstance(banked, dict) or banked.get("eligible") is not True:
         return None
-
-    def at(ms):
-        value = _as_float(ms)
-        return _dt.datetime.fromtimestamp(value / 1000, _dt.timezone.utc) if value else None
-
     grants = banked.get("grants")
     return _usable_reset_credits((
-        (g.get("resetsLeft"), at(g.get("startsAt")), at(g.get("expiresAt")),
+        (g.get("resetsLeft"), _ms_datetime(g.get("startsAt")), _ms_datetime(g.get("expiresAt")),
          g.get("paused"), g.get("usableNow"))
         for g in (grants if isinstance(grants, list) else []) if isinstance(g, dict)
     ), now)
@@ -494,10 +499,11 @@ CLAUDE_RESET_CACHE_NAME = "claude_reset_credits.json"
 # Meridian needs for the usage readings themselves. Meridian 1.87+ lists them
 # itself; this path serves older Meridian and the CLI.
 CLAUDE_RESET_TTL = 3600
-_claude_reset_lock = threading.Lock()
 
 
-def _claude_reset_credits_for(email: str | None, token: str | None, may_fetch: bool) -> dict | None:
+def _claude_reset_credits_for(
+    email: str | None, token: str | None, may_fetch: bool, timeout: float = CLAUDE_RESET_TIMEOUT,
+) -> dict | None:
     """The account's saved resets, asking Anthropic at most once per CLAUDE_RESET_TTL.
 
     A failed ask also starts the wait and keeps the last answer. Without an
@@ -517,29 +523,31 @@ def _claude_reset_credits_for(email: str | None, token: str | None, may_fetch: b
     entry = load().get(key) if key else None
     entry = entry if isinstance(entry, dict) else None
     cached = entry.get("credits") if entry and isinstance(entry.get("credits"), dict) else None
+    if cached is not None:
+        # Its soonest grant ran out since: the count no longer holds.
+        expires = _parse_iso(cached.get("soonestExpiresAt"))
+        if expires is not None and expires <= _dt.datetime.now(_dt.timezone.utc):
+            cached = None
     at = _as_float(entry.get("at")) if entry else None
     if at is not None and 0 <= time.time() - at < CLAUDE_RESET_TTL:
         return cached
     if not (may_fetch and token):
         return cached
-    answered, credits = _fetch_claude_reset_credits(token, CLAUDE_RESET_TIMEOUT)
+    answered, credits = _fetch_claude_reset_credits(token, timeout)
     if not answered:
         credits = cached
     if key:
-        with _claude_reset_lock:
-            data = load()
-            data[key] = {"at": time.time(), "credits": credits}
-            try:
-                os.makedirs(os.path.dirname(path), exist_ok=True)
-                with tempfile.NamedTemporaryFile(
-                    mode="w", encoding="utf-8", dir=os.path.dirname(path),
-                    prefix=".claude_reset-", delete=False,
-                ) as fh:
-                    state_paths.make_private(fh.fileno())
-                    json.dump(data, fh)
-                state_paths.replace(fh.name, path)
-            except OSError:
-                pass
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            # Lock the stable sidecar, not the file write_file replaces.
+            with open(path + ".lock", "a", encoding="utf-8") as lock:
+                state_paths.make_private(lock.fileno())
+                state_paths.lock(lock)
+                data = load()
+                data[key] = {"at": time.time(), "credits": credits}
+                state_paths.write_file(path, json.dumps(data), durable=False)
+        except OSError:
+            pass
     return credits
 
 
@@ -669,10 +677,19 @@ def _normalize_record(provider: str, record: dict) -> dict:
     }
 
 
+def _time_left(deadline: float | None, timeout: float) -> float:
+    """`timeout`, cut to what is left before the run's `deadline` (time.monotonic)."""
+    if deadline is None:
+        return timeout
+    return max(0.0, min(timeout, deadline - time.monotonic()))
+
+
 def _run_cli(
     cli: str, provider: str, source: str | None, timeout: float, env: dict | None = None,
 ) -> list[dict]:
     """Invoke `codexbar usage` and normalize every returned account."""
+    if timeout <= 0:
+        return [_result_error(provider, "timeout", "No time left in this refresh")]
     cmd = [cli, "usage", "--json", "--provider", provider]
     if provider == "codex":
         cmd.append("--all-accounts")
@@ -715,11 +732,13 @@ def _run_cli(
     return results
 
 
-def _fetch_sources(cli: str, provider: str, timeout: float, env: dict | None = None) -> list[dict]:
-    results = _run_cli(cli, provider, PROVIDER_SOURCE.get(provider), timeout, env)
+def _fetch_sources(
+    cli: str, provider: str, timeout: float, env: dict | None = None, deadline: float | None = None,
+) -> list[dict]:
+    results = _run_cli(cli, provider, PROVIDER_SOURCE.get(provider), _time_left(deadline, timeout), env)
     if not any(result.get("ok") for result in results):
         for fallback in PROVIDER_FALLBACK_SOURCES.get(provider, []):
-            retries = _run_cli(cli, provider, fallback, timeout, env)
+            retries = _run_cli(cli, provider, fallback, _time_left(deadline, timeout), env)
             if any(retry.get("ok") for retry in retries):
                 results = retries
                 break
@@ -735,10 +754,12 @@ class _ClaudeLogin:
     through this class, so neither can skip a source or reorder them.
     """
 
-    def __init__(self, directory, profile: dict | None = None, usage: dict | None = None) -> None:
+    def __init__(self, directory, profile: dict | None = None, usage: dict | None = None,
+                 deadline: float | None = None) -> None:
         self.directory = _expand(directory) if isinstance(directory, str) and directory else None
         self.profile = profile or {}
         self.usage = usage or {}
+        self.deadline = deadline
 
     def _field(self, key: str) -> str | None:
         oauth = _claude_oauth(self.directory) if self.directory else {}
@@ -759,7 +780,9 @@ class _ClaudeLogin:
         if saved:
             return saved
         token = self.token()
-        return _claude_profile_email(token, CLAUDE_RESET_TIMEOUT) if token else None
+        if not token:
+            return None
+        return _claude_profile_email(token, _time_left(self.deadline, CLAUDE_RESET_TIMEOUT))
 
     def plan(self, reported: str | None = None) -> str | None:
         """Meridian's plan, else the CLI-reported one, else the saved login's."""
@@ -775,17 +798,18 @@ class _ClaudeLogin:
         if "bankedResets" in self.usage:
             return _meridian_reset_credits(
                 self.usage["bankedResets"], _dt.datetime.now(_dt.timezone.utc))
-        return _claude_reset_credits_for(email, self.token(), may_fetch)
+        return _claude_reset_credits_for(
+            email, self.token(), may_fetch, _time_left(self.deadline, CLAUDE_RESET_TIMEOUT))
 
 
-def _fetch_claude_account(cli: str, config_dir: str, timeout: float) -> list[dict]:
+def _fetch_claude_account(cli: str, config_dir: str, timeout: float, deadline: float | None) -> list[dict]:
     """One Claude login. Every record carries the login's email when it is known,
     so a failed refresh keeps that account's last-known usage."""
     env = None
     if config_dir != _claude_default_dir():
         env = {**os.environ, "CLAUDE_CONFIG_DIR": config_dir}
-    results = _fetch_sources(cli, "claude", timeout, env)
-    login = _ClaudeLogin(config_dir)
+    results = _fetch_sources(cli, "claude", timeout, env, deadline)
+    login = _ClaudeLogin(config_dir, deadline=deadline)
     email = login.email(next((r["accountEmail"] for r in results if r.get("accountEmail")), None))
     ok = any(result.get("ok") for result in results)
     credits = login.reset_credits(email, True) if ok else None
@@ -812,11 +836,11 @@ def _claude_plan(subscription, tier) -> str | None:
     return "Claude " + name
 
 
-def _meridian_get(path: str) -> dict:
+def _meridian_get(path: str, timeout: float) -> dict:
     port = os.environ.get("MERIDIAN_PORT") or str(MERIDIAN_DEFAULT_PORT)
     key = os.environ.get("MERIDIAN_API_KEY")
     body = _read_http_body(
-        f"http://127.0.0.1:{port}{path}", MERIDIAN_TIMEOUT, {"x-api-key": key} if key else None)
+        f"http://127.0.0.1:{port}{path}", timeout, {"x-api-key": key} if key else None)
     data = json.loads(body.decode("utf-8", "replace"))
     if not isinstance(data, dict):
         raise ValueError(f"Meridian {path}: not an object")
@@ -830,18 +854,21 @@ class _Meridian:
     each provider falls back to the CodexBar CLI.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, deadline: float | None = None) -> None:
         self._lock = threading.Lock()
         self._read = False
         self._snapshot: tuple[dict, dict] | None = None
+        self.deadline = deadline
 
     def snapshot(self) -> tuple[dict, dict] | None:
         with self._lock:
             if not self._read:
                 self._read = True
                 try:
-                    self._snapshot = (_meridian_get("/profiles/list"),
-                                      _meridian_get("/v1/usage/quota/all"))
+                    self._snapshot = (
+                        _meridian_get("/profiles/list", _time_left(self.deadline, MERIDIAN_TIMEOUT)),
+                        _meridian_get("/v1/usage/quota/all", _time_left(self.deadline, MERIDIAN_TIMEOUT)),
+                    )
                 except Exception:  # noqa: BLE001 - Meridian is optional
                     self._snapshot = None
             return self._snapshot
@@ -874,20 +901,34 @@ class _Meridian:
         return [(profile, usage.get(profile["id"]) or {}) for profile in profiles]
 
 
+def _ms_datetime(value) -> _dt.datetime | None:
+    """A Meridian epoch-milliseconds field as UTC time; None when absent or out of range."""
+    ms = _as_float(value)
+    if not ms:
+        return None
+    try:
+        return _dt.datetime.fromtimestamp(ms / 1000, _dt.timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _ms_to_iso(value) -> str | None:
+    moment = _ms_datetime(value)
+    return moment.isoformat() if moment else None
+
+
 def _meridian_window(window: dict, minutes: int) -> dict | None:
     used = _as_float(window.get("utilization"))
     if used is None:
         return None
-    resets = _as_float(window.get("resetsAt"))
     return {
         "usedPercent": round(used * 100, 1),
         "windowMinutes": minutes,
-        "resetsAt": _dt.datetime.fromtimestamp(resets / 1000, _dt.timezone.utc).isoformat()
-        if resets else None,
+        "resetsAt": _ms_to_iso(window.get("resetsAt")),
     }
 
 
-def _meridian_claude_account(profile: dict, usage: dict) -> list[dict]:
+def _meridian_claude_account(profile: dict, usage: dict, deadline: float | None) -> list[dict]:
     """One Meridian profile as a CLI-shaped record, through `_normalize_record`.
 
     Window types follow Anthropic's OAuth usage keys, mapped like the CLI:
@@ -895,7 +936,7 @@ def _meridian_claude_account(profile: dict, usage: dict) -> list[dict]:
     model weeklies are scoped extras, and Design (omelette) and app limits
     are not shown.
     """
-    login = _ClaudeLogin(profile.get("credentialDir"), profile, usage)
+    login = _ClaudeLogin(profile.get("credentialDir"), profile, usage, deadline)
     email = login.email()
     identity = {"accountEmail": email, "loginMethod": login.plan()}
     raw_windows = usage.get("windows")
@@ -922,15 +963,13 @@ def _meridian_claude_account(profile: dict, usage: dict) -> list[dict]:
                 "title": scope.replace("_", " ").capitalize() + " only",
                 "window": converted,
             })
-    fetched = _as_float(usage.get("fetchedAt"))
     record = _normalize_record("claude", {"usage": {
         **identity,
         "primary": _meridian_window(windows.get("five_hour") or {}, 300),
         "secondary": _meridian_window(windows.get("seven_day") or {}, 10080),
         "tertiary": _meridian_window(windows.get("seven_day_sonnet") or {}, 10080),
         "extraRateWindows": extras,
-        "updatedAt": _dt.datetime.fromtimestamp(fetched / 1000, _dt.timezone.utc).isoformat()
-        if fetched else None,
+        "updatedAt": _ms_to_iso(usage.get("fetchedAt")),
     }})
     record["planWeight"] = login.weight()
     # A rate-limited login gets no extra call; the last answer stands.
@@ -986,13 +1025,12 @@ def _meridian_seat_resets(resets) -> dict | None:
         return None
     expiries = resets.get("expiresAt")
     soonest = min((
-        ms for ms in (_as_float(value) for value in (expiries if isinstance(expiries, list) else []))
-        if ms
+        moment for moment in map(_ms_datetime, expiries if isinstance(expiries, list) else [])
+        if moment
     ), default=None)
     return {
         "count": count,
-        "soonestExpiresAt": _dt.datetime.fromtimestamp(soonest / 1000, _dt.timezone.utc).isoformat()
-        if soonest else None,
+        "soonestExpiresAt": soonest.isoformat() if soonest else None,
     }
 
 
@@ -1026,19 +1064,17 @@ def _meridian_codex_account(profile: dict, usage: dict) -> dict:
         else:
             extras.append({"id": f"codex-meridian-{window['type']}",
                            "title": window["type"], "window": converted})
-    fetched = _as_float(usage.get("fetchedAt"))
     record = _normalize_record("codex", {"usage": {
         **identity,
         **slots,
         "extraRateWindows": extras,
-        "updatedAt": _dt.datetime.fromtimestamp(fetched / 1000, _dt.timezone.utc).isoformat()
-        if fetched else None,
+        "updatedAt": _ms_to_iso(usage.get("fetchedAt")),
     }})
     record["resetCredits"] = _meridian_seat_resets(profile.get("resets"))
     return _meridian_stale(record, usage)
 
 
-def _fetch_claude(cli: str, timeout: float, meridian: _Meridian) -> list[dict]:
+def _fetch_claude(cli: str, timeout: float, meridian: _Meridian, deadline: float | None) -> list[dict]:
     """Every Claude login, one record per account, fetched in parallel.
 
     A running Meridian already polls each profile's usage, and Anthropic's
@@ -1048,7 +1084,8 @@ def _fetch_claude(cli: str, timeout: float, meridian: _Meridian) -> list[dict]:
     """
     served = meridian.profiles("claude")
     if served:
-        jobs = [lambda p=profile, u=usage: _meridian_claude_account(p, u) for profile, usage in served]
+        jobs = [lambda p=profile, u=usage: _meridian_claude_account(p, u, deadline)
+                for profile, usage in served]
     else:
         jobs, uuids = [], set()
         for config_dir in _claude_config_dirs():
@@ -1056,7 +1093,7 @@ def _fetch_claude(cli: str, timeout: float, meridian: _Meridian) -> list[dict]:
             if uuid and uuid in uuids:
                 continue
             uuids.add(uuid)
-            jobs.append(lambda d=config_dir: _fetch_claude_account(cli, d, timeout))
+            jobs.append(lambda d=config_dir: _fetch_claude_account(cli, d, timeout, deadline))
     with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
         per_login = list(pool.map(lambda job: job(), jobs))
     return _one_record_per_account(record for records in per_login for record in records)
@@ -1076,14 +1113,14 @@ def _one_record_per_account(records) -> list[dict]:
     return results
 
 
-def _fetch_codex(cli: str, timeout: float, meridian: _Meridian) -> list[dict]:
+def _fetch_codex(cli: str, timeout: float, meridian: _Meridian, deadline: float | None) -> list[dict]:
     """Codex accounts from the CLI, plus every ChatGPT seat Meridian serves.
 
     The CLI's reading of an account wins: it carries Reserve and saved-reset
     detail. A seat fills in what the CLI cannot read, and with seats a missing
     CLI is no error, since Meridian is then the Codex source.
     """
-    cli_records = _fetch_sources(cli, "codex", timeout)
+    cli_records = _fetch_sources(cli, "codex", timeout, deadline=deadline)
     seats = [_meridian_codex_account(profile, usage) for profile, usage in meridian.profiles("codex")]
     if not seats:
         return cli_records
@@ -1094,16 +1131,23 @@ def _fetch_codex(cli: str, timeout: float, meridian: _Meridian) -> list[dict]:
         [*filter(ok, cli_records), *filter(ok, seats), *filter(failed, cli_records), *filter(failed, seats)])
 
 
-def _fetch_provider(cli: str, provider: str, timeout: float, meridian: _Meridian | None = None) -> list[dict]:
-    meridian = meridian or _Meridian()
+def _fetch_provider(
+    cli: str, provider: str, timeout: float, meridian: _Meridian | None = None,
+    deadline: float | None = None,
+) -> list[dict]:
+    """`provider`'s accounts; `deadline` (time.monotonic) bounds every request."""
+    meridian = meridian or _Meridian(deadline)
     if provider == "claude":
-        return _fetch_claude(cli, timeout, meridian)
+        return _fetch_claude(cli, timeout, meridian, deadline)
     if provider == "codex":
-        return _fetch_codex(cli, timeout, meridian)
-    return _fetch_sources(cli, provider, timeout)
+        return _fetch_codex(cli, timeout, meridian, deadline)
+    return _fetch_sources(cli, provider, timeout, deadline=deadline)
 
 
-def _cli_version(cli: str, timeout: float = 5.0) -> str | None:
+CLI_VERSION_TIMEOUT = 5.0
+
+
+def _cli_version(cli: str, timeout: float = CLI_VERSION_TIMEOUT) -> str | None:
     """Return the codexbar CLI version, or None when it cannot be determined.
 
     `codexbar --version` prints e.g. "CodexBar 0.56.3". Any failure (missing
@@ -1173,8 +1217,12 @@ def _parse_iso(value) -> _dt.datetime | None:
 
 
 USAGE_CACHE_NAME = "usage_cache.json"
-# Each provider's last fetch start, which every fetch that runs it stamps.
+# Each provider's last fetch and the end of the one in flight, which every
+# fetch that runs it stamps.
 FETCH_CLAIM_NAME = "fetch_claim"
+# One refresh may take two CLI attempts plus this. 20 s keeps a run at the
+# default 30 s timeout inside Tern's 90 s process limit.
+FETCH_BUDGET_MARGIN = 20.0
 USAGE_CACHE_TTL = 24 * 60 * 60
 # Recent-consumption lookback per window length: minutes → hours.
 RECENT_LOOKBACK_HOURS = {10080: 24, 300: 1}
@@ -1217,8 +1265,14 @@ def _usage_auth_input(provider: str, payload: dict, path: str) -> dict:
         payload = payload.get("opencode-go")
     elif provider == "kilo":
         payload = payload.get("kilo")
-    # Claude's local OAuth record has no reliable account id. Opaque secrets
-    # must remain conservative: a refresh can also be an account replacement.
+    elif provider == "claude":
+        # The OAuth record has no account id, but the login's saved account
+        # does, and it survives token refresh.
+        uuid = _claude_local_account(os.path.dirname(path))[0]
+        if uuid:
+            return {"claude": uuid}
+    # Opaque secrets must remain conservative: a refresh can also be an
+    # account replacement.
     return {"path": path, "credentials": payload}
 
 
@@ -1314,6 +1368,10 @@ def _cache_inputs(providers: list[str]) -> list[str]:
     rotate = _expand(OMP_SUB_ROTATE_DIR)
     for provider in providers:
         paths.extend(_usage_auth_paths(provider, [e for e in entries if e.get("id") == provider]))
+        if provider == "claude":
+            # The saved account scopes Claude's usage too (_usage_auth_input).
+            paths.extend(path for directory in _claude_config_dirs()
+                         for path in _claude_account_files(directory))
         if provider in OMP_ROTATIONS:
             name = OMP_ROTATIONS[provider]
             paths.append(os.path.join(rotate, f"{name}-state.json"))
@@ -1468,11 +1526,10 @@ def _usage_cache_write(scopes: dict[str, str], records: list[dict], now: _dt.dat
         if normalized is not None and normalized["id"] in replacements:
             replacements[normalized["id"]]["records"].append(normalized)
     path = _state_file(USAGE_CACHE_NAME)
-    temporary = None
     history: dict[str, list[list]] = {}
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        # Lock the stable sidecar, not the cache inode replaced by os.replace().
+        # Lock the stable sidecar, not the cache file write_file replaces.
         with open(path + ".lock", "a", encoding="utf-8") as lock:
             state_paths.make_private(lock.fileno())
             state_paths.lock(lock)
@@ -1482,24 +1539,12 @@ def _usage_cache_write(scopes: dict[str, str], records: list[dict], now: _dt.dat
             history = _usage_history_entries(payload, now)
             for record in records:
                 if record.get("ok") is True and record.get("stale") is not True:
-                    _usage_history_observe(history, record)
+                    _usage_history_observe(history, record, now)
             _usage_history_prune(history, now)
-            with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=os.path.dirname(path),
-                prefix=".usage_cache-", delete=False,
-            ) as fh:
-                temporary = fh.name
-                state_paths.make_private(fh.fileno())
-                json.dump({"version": 1, "providers": entries, "history": history}, fh, allow_nan=False)
-            state_paths.replace(temporary, path)
+            text = json.dumps({"version": 1, "providers": entries, "history": history}, allow_nan=False)
+            state_paths.write_file(path, text, durable=False)
     except (OSError, ValueError):
         pass
-    finally:
-        if temporary is not None:
-            try:
-                os.unlink(temporary)
-            except OSError:
-                pass
     return history
 
 
@@ -1534,11 +1579,14 @@ def _usage_history_entries(payload: dict, now: _dt.datetime) -> dict[str, list[l
             if not (
                 isinstance(run, list) and len(run) == 4
                 and type(run[0]) is int and type(run[1]) is int
-                and (kept[-1][1] if kept else 0) <= run[0] <= run[1] <= limit
+                and (kept[-1][1] if kept else 0) <= run[0] <= run[1]
                 and type(run[2]) in (int, float) and math.isfinite(run[2])
                 and (run[3] is None or type(run[3]) is int)
             ):
                 kept = []
+                break
+            if run[1] > limit:
+                # A clock that ran ahead wrote it; every later run is ahead too.
                 break
             kept.append(run)
         if kept:
@@ -1554,10 +1602,11 @@ def _usage_history_new_cycle(previous: list, current: list) -> bool:
             and current[3] - previous[3] > HISTORY_CYCLE_SHIFT_SECONDS)
 
 
-def _usage_history_observe(history: dict[str, list[list]], record: dict) -> None:
-    """Extend the window's current run, or start one when the reading changed."""
+def _usage_history_observe(history: dict[str, list[list]], record: dict, now: _dt.datetime) -> None:
+    """Extend the window's current run, or start one when the reading changed.
+    A reading from the future is skipped: it would hold back every later one."""
     measured = _parse_iso(record.get("updatedAt"))
-    if measured is None:
+    if measured is None or measured > now:
         return
     seen = int(measured.timestamp())
     for key, window in _usage_history_windows(record):
@@ -1673,33 +1722,41 @@ def _by_account(records: list[dict]) -> list[dict]:
 
 
 def _merge_usage_results(results: list[dict], cached: list[dict], now: _dt.datetime) -> list[dict]:
-    """A returned account roster replaces the old one, except matching failures."""
+    """A returned account roster replaces the old one, except failures. One
+    naming an account keeps that account's last-known reading; one naming none
+    (the source as a whole) keeps every cached account the results lack."""
     def account(record):
         return (record.get("accountEmail") or "").strip().casefold()
 
-    if len(results) == 1 and not results[0].get("ok") and not account(results[0]) and cached:
-        message = results[0].get("error", {}).get("message") or "Refresh failed"
-        merged = [_last_known(record, message) for record in cached]
-    else:
-        merged = []
-        for record in results:
-            if record.get("ok") and record.get("stale") is True:
-                # The source itself served a last-known reading.
-                merged.append(record)
-                continue
-            if record.get("ok"):
-                fresh = {key: value for key, value in record.items()
-                         if key not in ("stale", "cachedAt", "refreshError")}
-                measured = _parse_iso(fresh.get("updatedAt")) or now
-                fresh["updatedAt"] = measured.isoformat()
-                merged.append(fresh)
-                continue
-            matches = [old for old in cached if account(old) == account(record)]
-            if len(matches) == 1:
-                message = record.get("error", {}).get("message") or "Refresh failed"
-                merged.append(_last_known(matches[0], message))
-            else:
-                merged.append(record)
+    merged, anonymous = [], []
+    for record in results:
+        if record.get("ok") and record.get("stale") is True:
+            # The source itself served a last-known reading.
+            merged.append(record)
+            continue
+        if record.get("ok"):
+            fresh = {key: value for key, value in record.items()
+                     if key not in ("stale", "cachedAt", "refreshError")}
+            measured = _parse_iso(fresh.get("updatedAt")) or now
+            fresh["updatedAt"] = measured.isoformat()
+            merged.append(fresh)
+            continue
+        if not account(record):
+            anonymous.append(record)
+            continue
+        matches = [old for old in cached if account(old) == account(record)]
+        if len(matches) == 1:
+            message = record.get("error", {}).get("message") or "Refresh failed"
+            merged.append(_last_known(matches[0], message))
+        else:
+            merged.append(record)
+    if anonymous:
+        # E.g. the Codex CLI timed out beside Meridian's seats: its accounts
+        # are missing, not gone.
+        message = anonymous[0].get("error", {}).get("message") or "Refresh failed"
+        returned = {account(record) for record in results if record.get("ok") or account(record)}
+        kept = [_last_known(old, message) for old in cached if account(old) not in returned]
+        merged.extend(kept or anonymous)
     merged = _by_account(merged)
     for record in merged:
         record["accountCount"] = len(merged)
@@ -1768,13 +1825,10 @@ def _forecast_cache_read(max_age: float | None) -> dict | None:
 
 def _forecast_cache_write(payload: dict) -> None:
     path = _state_file(FORECAST_CACHE_NAME)
-    tmp = path + ".tmp"
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump({"cachedAt": time.time(), "forecast": payload}, fh)
-        os.chmod(tmp, 0o600)
-        state_paths.replace(tmp, path)
+        state_paths.write_file(
+            path, json.dumps({"cachedAt": time.time(), "forecast": payload}), durable=False)
     except OSError:
         pass
 
@@ -1946,6 +2000,8 @@ def _read_http_body(url: str, timeout: float, headers: dict | None = None) -> by
     # Socket timeouts cannot stop a slow-drip response or bound DNS lookup.
     # Exec a disposable worker, including startup in its wall-clock budget.
     # Headers travel over stdin so credentials never reach argv.
+    if timeout <= 0:
+        raise TimeoutError("no time left for the request")
     deadline = time.monotonic() + timeout
     with subprocess.Popen(
         [sys.executable, os.path.abspath(__file__), "--http-worker"],
@@ -2045,11 +2101,17 @@ def _positive_seconds(value: str) -> float:
     return seconds
 
 
-def _claim_fetch(min_interval: float | None, providers: list[str]) -> list[str]:
-    """Stamp the shared fetch claim of every provider no fetch started on
-    under `min_interval` seconds ago, and return those. The flock makes check
-    and stamp atomic across processes. An unusable claim file never blocks a
-    fetch; a bare time, from before claims were per provider, covers all."""
+def _claim_entry(value) -> tuple[float | None, float | None]:
+    """(last fetch, end of the one in flight) of a claim; a bare time is the last fetch."""
+    if isinstance(value, dict):
+        return _as_float(value.get("last")), _as_float(value.get("until"))
+    return _as_float(value), None
+
+
+def _update_claims(change: Callable[[dict, float], list[str]], providers: list[str]) -> list[str]:
+    """Run `change(stamps, now)` under the claim file's flock, save the stamps
+    when it returns providers, and return them. An unusable claim file never
+    blocks a fetch: it reads as no claims, or answers every provider."""
     path = _state_file(FETCH_CLAIM_NAME)
     try:
         os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
@@ -2060,21 +2122,15 @@ def _claim_fetch(min_interval: float | None, providers: list[str]) -> list[str]:
     with os.fdopen(fd, "r+", encoding="utf-8") as fh:
         try:
             state_paths.lock(fh)
-            now = time.time()
             try:
                 stamps = json.loads(fh.read() or "{}")
             except ValueError:
                 stamps = {}
             if not isinstance(stamps, dict):
+                # A bare time, from before claims were per provider, covers all.
                 stamps = dict.fromkeys(providers, stamps)
-
-            def claimed(provider: str) -> bool:
-                last = _as_float(stamps.get(provider))
-                return min_interval is not None and last is not None and 0 <= now - last < min_interval
-
-            due = [provider for provider in providers if not claimed(provider)]
+            due = change(stamps, time.time())
             if due:
-                stamps.update(dict.fromkeys(due, now))
                 fh.seek(0)
                 fh.truncate()
                 json.dump(stamps, fh)
@@ -2082,6 +2138,44 @@ def _claim_fetch(min_interval: float | None, providers: list[str]) -> list[str]:
         except (OSError, ValueError, TypeError):
             pass
     return due
+
+
+def _claim_fetch(min_interval: float | None, providers: list[str], until: float) -> list[str]:
+    """Claim every provider with no fetch in flight and none that ended under
+    `min_interval` seconds ago, and return those. The claim lasts until this
+    run releases it or its budget ends at `until`, so a crashed run frees it.
+    Without `min_interval`, a refresh the user asked for, every provider is due."""
+    def claim(stamps: dict, now: float) -> list[str]:
+        def claimed(provider: str) -> bool:
+            if min_interval is None:
+                return False
+            last, busy = _claim_entry(stamps.get(provider))
+            # An end past our own budget's comes from a clock that ran back.
+            if busy is not None and now < busy <= until:
+                return True
+            return last is not None and 0 <= now - last < min_interval
+
+        due = [provider for provider in providers if not claimed(provider)]
+        for provider in due:
+            stamps[provider] = {"last": now, "until": until}
+        return due
+
+    return _update_claims(claim, providers)
+
+
+def _release_fetch(providers: list[str], until: float) -> None:
+    """Stamp the end of this run's fetch: the next one is due `min_interval`
+    from now. A claim another run stamped since stays in flight."""
+    def release(stamps: dict, now: float) -> list[str]:
+        for provider in providers:
+            busy = _claim_entry(stamps.get(provider))[1]
+            stamps[provider] = {"last": now}
+            if busy is not None and busy != until:
+                stamps[provider]["until"] = busy
+        return providers
+
+    if providers:
+        _update_claims(release, providers)
 
 
 def _adopt_shared(records: list[dict], now: _dt.datetime, min_interval: float) -> None:
@@ -2153,6 +2247,9 @@ def main(argv: list[str]) -> int:
     )
     args = parser.parse_args(argv)
     state_paths.migrate()
+    # One budget bounds the whole refresh: two CLI attempts and some margin.
+    budget = 2 * args.timeout + FETCH_BUDGET_MARGIN
+    deadline = time.monotonic() + budget
 
     cli = _expand(args.cli_path)
     providers = list(dict.fromkeys(p.strip() for p in args.providers.split(",") if p.strip()))
@@ -2173,7 +2270,8 @@ def main(argv: list[str]) -> int:
         "cliVersion": None,
     }
     cli_missing = not (os.path.isfile(cli) and os.access(cli, os.X_OK)) and not shutil.which(cli)
-    due = [] if args.cache_only else _claim_fetch(args.min_interval, providers)
+    until = time.time() + budget
+    due = [] if args.cache_only else _claim_fetch(args.min_interval, providers, until)
     if args.cache_only or (providers and not due):
         if not args.cache_only:
             _adopt_shared(restored, now, args.min_interval)
@@ -2196,15 +2294,14 @@ def main(argv: list[str]) -> int:
         return 0
 
     # Without the CLI, a running Meridian still serves Claude and ChatGPT seats.
-    meridian = _Meridian()
+    meridian = _Meridian(deadline)
     results: list[dict] = []
     forecast_future = None
-    with ThreadPoolExecutor(
-        max_workers=max(1, len(providers) + int(bool(args.forecast_url)))
-    ) as pool:
+    with ThreadPoolExecutor(max_workers=len(due) + 2) as pool:
         futures = {
-            pool.submit(_fetch_provider, cli, p, args.timeout, meridian): p for p in due
+            pool.submit(_fetch_provider, cli, p, args.timeout, meridian, deadline): p for p in due
         }
+        version_future = pool.submit(_cli_version, cli, _time_left(deadline, CLI_VERSION_TIMEOUT))
         if args.forecast_url:
             forecast_future = pool.submit(
                 _fetch_forecast, args.forecast_url, FORECAST_TIMEOUT
@@ -2258,20 +2355,22 @@ def main(argv: list[str]) -> int:
         {provider: scope for provider, scope in current_scopes.items() if provider in due},
         [record for record in results if record["id"] in due], now,
     )
+    _release_fetch(due, until)
     _attach_recent_usage(results, history, now)
+
+    # Meridian was read only if a due provider asked for it.
+    asked_meridian = bool({"claude", "codex"} & set(due))
 
     out = {
         "updatedAt": max((r["updatedAt"] for r in results if r.get("updatedAt")), default=None),
         "providers": results,
         "fatal": None,
         "forecast": forecast,
-        **_rotations(providers, meridian),
-        "cliVersion": _cli_version(cli),
+        **_rotations(providers, meridian if asked_meridian else None),
+        "cliVersion": version_future.result(),
     }
     if cli_missing and not served:
-        out["fatal"] = _cli_missing_fatal(
-            cli, bool({"claude", "codex"} & set(providers)) and meridian.snapshot() is None,
-        )
+        out["fatal"] = _cli_missing_fatal(cli, asked_meridian and meridian.snapshot() is None)
     json.dump(out, sys.stdout)
     sys.stdout.write("\n")
     return 0

@@ -541,6 +541,41 @@ class ClaudeAccountTests(IsolatedUsageTestCase):
             60_000, {"reason": "rate_limited", "consecutiveFailures": 1})
         self.assertEqual(record["refreshError"], "")
 
+    def test_out_of_range_meridian_time_leaves_other_profiles_readable(self) -> None:
+        now_ms = int(time.time() * 1000)
+        responses = {
+            "/profiles/list": {"profiles": [
+                {"id": id_, "type": "claude-max", "email": f"{id_}@example.com", "subscriptionType": "max"}
+                for id_ in ("bad", "good")]},
+            "/v1/usage/quota/all": {"profiles": [
+                {"id": "bad", "fetchedAt": 1e20,
+                 "bankedResets": {"eligible": True, "grants": [{"resetsLeft": 1, "expiresAt": 1e20}]},
+                 "windows": [{"type": "five_hour", "utilization": 0.2, "resetsAt": 1e20}]},
+                {"id": "good", "fetchedAt": now_ms, "bankedResets": None,
+                 "windows": [{"type": "five_hour", "utilization": 0.3, "resetsAt": now_ms + 3_600_000}]},
+            ]},
+        }
+        with mock.patch.object(fetch, "_read_http_body", side_effect=lambda url, *_: json.dumps(
+                responses[url.split(":3456", 1)[1]]).encode()):
+            bad, good = fetch._fetch_provider(str(self.cli), "claude", 10)
+        self.assertEqual((bad["ok"], bad["primary"]["usedPercent"], bad["primary"]["resetsAt"]),
+                         (True, 20, None))
+        self.assertEqual(bad["resetCredits"], {"count": 1, "soonestExpiresAt": None})
+        self.assertEqual((good["ok"], good["primary"]["usedPercent"]), (True, 30))
+        self.assertEqual(fetch._meridian_seat_resets({"available": 1, "expiresAt": [1e20]}),
+                         {"count": 1, "soonestExpiresAt": None})
+
+    def test_expired_saved_reset_is_not_served(self) -> None:
+        path = Path(fetch._state_file(fetch.CLAUDE_RESET_CACHE_NAME))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        now = dt.datetime.now(dt.timezone.utc)
+        for offset, served in ((-60, False), (3600, True)):
+            with self.subTest(offset=offset):
+                credits = {"count": 1, "soonestExpiresAt": (now + dt.timedelta(seconds=offset)).isoformat()}
+                path.write_text(json.dumps({"a@example.com": {"at": time.time(), "credits": credits}}))
+                self.assertEqual(fetch._claude_reset_credits_for("a@example.com", None, False),
+                                 credits if served else None)
+
 
 class UsageCacheTests(IsolatedUsageTestCase):
     def setUp(self) -> None:
@@ -864,7 +899,7 @@ class UsageCacheTests(IsolatedUsageTestCase):
             current = self.snapshot([self.record(used=73)])
         self.assertEqual(current["providers"][0]["primary"]["usedPercent"], 73)
         self.assertEqual(self.cache_path.read_bytes(), previous)
-        self.assertEqual(list(self.cache_path.parent.glob(".usage_cache-*")), [])
+        self.assertEqual(list(self.cache_path.parent.glob(".usage_cache.json.*")), [])
 
     def test_mid_fetch_account_switch_discards_success_and_failure(self) -> None:
         auth = self.home / ".codex" / "auth.json"
@@ -1002,7 +1037,131 @@ class UsageCacheTests(IsolatedUsageTestCase):
                 auth.write_text(json.dumps({section: {key: "opaque-a"}}))
                 self.snapshot([self.record(provider)], providers=provider)
                 auth.write_text(json.dumps({section: {key: "opaque-b"}}))
+                # Claude without a saved account (.claude.json) has no stable id either.
                 self.assertEqual(self.snapshot(providers=provider, cache_only=True)["providers"], [])
+
+    def test_claude_scope_follows_the_saved_account_across_token_rotation(self) -> None:
+        login = self.home / ".claude"
+        login.mkdir()
+        account = login / ".claude.json"
+
+        def save(token: str, uuid: str) -> None:
+            (login / ".credentials.json").write_text(json.dumps({"claudeAiOauth": {"accessToken": token}}))
+            account.write_text(json.dumps(
+                {"oauthAccount": {"accountUuid": uuid, "emailAddress": "a@example.com"}}))
+
+        save("token-a", "uuid-a")
+        self.snapshot([self.record("claude")], providers="claude")
+        save("token-b", "uuid-a")
+        restored = self.snapshot(providers="claude", cache_only=True)
+        self.assertEqual([r["primary"]["usedPercent"] for r in restored["providers"]], [42])
+        # Pollers reread when the saved account changes.
+        self.assertIn(str(account), restored["inputs"])
+        save("token-b", "uuid-b")
+        self.assertEqual(self.snapshot(providers="claude", cache_only=True)["providers"], [])
+
+    def test_an_unfinished_fetch_keeps_its_claim_past_the_interval(self) -> None:
+        clock = [1000.0]
+        claim = self.cache_path.with_name("fetch_claim")
+        with mock.patch.object(fetch, "time", mock.Mock(wraps=time, time=lambda: clock[0])):
+            self.assertEqual(fetch._claim_fetch(60, ["codex"], 1090), ["codex"])
+            clock[0] = 1070
+            self.assertEqual(fetch._claim_fetch(60, ["codex"], 1160), [])
+            clock[0] = 1080
+            fetch._release_fetch(["codex"], 1090)
+            clock[0] = 1130
+            self.assertEqual(fetch._claim_fetch(60, ["codex"], 1220), [])
+            clock[0] = 1141
+            self.assertEqual(fetch._claim_fetch(60, ["codex"], 1231), ["codex"])
+            # That fetch crashed: its claim lapses once its budget ran out.
+            clock[0] = 1230
+            self.assertEqual(fetch._claim_fetch(60, ["codex"], 1320), [])
+            clock[0] = 1232
+            self.assertEqual(fetch._claim_fetch(60, ["codex"], 1322), ["codex"])
+            # A per-provider time from before in-flight claims is the last fetch.
+            claim.write_text(json.dumps({"codex": 1200}))
+            self.assertEqual(fetch._claim_fetch(60, ["codex"], 1322), [])
+
+    def test_failed_codex_cli_keeps_cached_accounts_beside_meridian_seats(self) -> None:
+        self.snapshot([self.record(account="b@example.com", used=81)])
+        now_ms = int(time.time() * 1000)
+        responses = {
+            "/profiles/list": {"profiles": [
+                {"id": "seat", "type": "chatgpt", "email": "a@example.com", "subscriptionType": "plus"}]},
+            "/v1/usage/quota/all": {"profiles": [
+                {"id": "seat", "fetchedAt": now_ms,
+                 "windows": [{"type": "five_hour", "utilization": 0.3, "resetsAt": None}]}]},
+        }
+        output = io.StringIO()
+        with (
+            mock.patch.object(fetch, "_read_http_body", side_effect=lambda url, *_: json.dumps(
+                responses[url.split(":3456", 1)[1]]).encode()),
+            mock.patch.object(fetch, "_fetch_sources", return_value=[
+                fetch._result_error("codex", "timeout", "CLI timed out after 30s")]),
+            mock.patch.object(fetch, "_cli_version", return_value=None),
+            mock.patch.object(fetch, "_read_rotation", return_value=None),
+            mock.patch("sys.stdout", output),
+        ):
+            fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "codex"])
+        seat, kept = json.loads(output.getvalue())["providers"]
+        self.assertEqual((seat["accountEmail"], seat["primary"]["usedPercent"], seat.get("stale")),
+                         ("a@example.com", 30, None))
+        self.assertEqual((kept["accountEmail"], kept["primary"]["usedPercent"], kept["stale"],
+                          kept["refreshError"]), ("b@example.com", 81, True, "CLI timed out after 30s"))
+
+    def test_meridian_is_read_only_for_due_providers(self) -> None:
+        claim = self.cache_path.with_name("fetch_claim")
+        claim.parent.mkdir(parents=True, exist_ok=True)
+        claim.write_text(json.dumps({"claude": time.time()}))
+        urls = []
+
+        def http(url, *_):
+            urls.append(url)
+            raise OSError("offline")
+
+        def provider(_cli, name, *_):
+            self.assertEqual(name, "zai")
+            return [self.record("zai", None)]
+
+        output = io.StringIO()
+        with (
+            mock.patch.object(fetch, "_fetch_provider", side_effect=provider),
+            mock.patch.object(fetch, "_read_http_body", side_effect=http),
+            mock.patch.object(fetch, "_meridian_profile_emails",
+                              wraps=fetch._meridian_profile_emails) as emails,
+            mock.patch.object(fetch, "_cli_version", return_value=None),
+            mock.patch("sys.stdout", output),
+        ):
+            fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "claude,zai", "--min-interval", "60"])
+        self.assertEqual([r["id"] for r in json.loads(output.getvalue())["providers"]], ["zai"])
+        self.assertEqual(urls, [])
+        # Without omp's rotation state there is nothing to label with emails.
+        emails.assert_not_called()
+
+    def test_stalled_meridian_cannot_outlast_the_run_deadline(self) -> None:
+        def stall(_url, timeout, _headers=None):
+            time.sleep(timeout)
+            raise TimeoutError("stalled")
+
+        def cli(command, timeout=None, **_):
+            time.sleep(timeout)
+            raise subprocess.TimeoutExpired(command, timeout)
+
+        output = io.StringIO()
+        started = time.monotonic()
+        with (
+            mock.patch.object(fetch, "FETCH_BUDGET_MARGIN", 0.5),
+            mock.patch.object(fetch, "_read_http_body", side_effect=stall),
+            mock.patch.object(fetch.subprocess, "run", side_effect=cli),
+            mock.patch.object(fetch, "_read_rotation", return_value=None),
+            mock.patch("sys.stdout", output),
+        ):
+            fetch.main(["--cli-path", TRUE_EXECUTABLE, "--providers", "claude,codex", "--timeout", "0.5"])
+        # Budget: 2 × 0.5 s + 0.5 s; Meridian alone would wait 2 × 10 s.
+        self.assertLess(time.monotonic() - started, 2.5)
+        records = json.loads(output.getvalue())["providers"]
+        self.assertEqual(sorted(r["id"] for r in records), ["claude", "codex"])
+        self.assertFalse(any(r["ok"] for r in records))
 
     def test_provider_specific_auth_files_ignore_unrelated_opencode_entries(self) -> None:
         opencode = self.home / ".local/share/opencode/auth.json"
@@ -1793,6 +1952,24 @@ class ForecastTests(IsolatedUsageTestCase):
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"]["code"], "forecast_unavailable")
 
+    def test_concurrent_cache_writes_leave_valid_json(self) -> None:
+        payload = {"ok": True, "padding": "x" * 200_000}
+        path = Path(fetch._state_file(fetch.FORECAST_CACHE_NAME))
+        errors = []
+
+        def write(_):
+            for _ in range(30):
+                fetch._forecast_cache_write(payload)
+                try:
+                    json.loads(path.read_text(encoding="utf-8"))
+                except ValueError as error:
+                    errors.append(error)
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(write, range(8)))
+        self.assertEqual(errors, [])
+        self.assertEqual([p.name for p in path.parent.iterdir()], [path.name])
+
 
 class CliVersionTests(IsolatedUsageTestCase):
     def _run(self, **kwargs) -> str | None:
@@ -1953,7 +2130,7 @@ class RecentUsageTests(unittest.TestCase):
             "id": "codex", "ok": True, "accountEmail": "A@example.com",
             "updatedAt": (self.NOW - dt.timedelta(minutes=minutes_ago)).isoformat(),
             "secondary": {"usedPercent": used, "windowMinutes": 10080, "resetsAt": reset.isoformat()},
-        })
+        }, self.NOW)
 
     def consumption(self, samples) -> dict | None:
         """samples: (minutes_ago, used, reset) polled every 10 minutes between steps."""
@@ -2001,7 +2178,7 @@ class RecentUsageTests(unittest.TestCase):
             fetch._usage_history_observe(history, {
                 "id": "claude", "ok": True, "updatedAt": (self.NOW - dt.timedelta(minutes=minutes)).isoformat(),
                 "primary": {"usedPercent": used, "windowMinutes": 300, "resetsAt": reset.isoformat()},
-            })
+            }, self.NOW)
         record = {"id": "claude", "ok": True, "primary": {"usedPercent": 37, "windowMinutes": 300}}
         fetch._attach_recent_usage([record], history, self.NOW)
         self.assertEqual(record["primary"]["recent"], {"hours": 1, "consumedPercent": 7})
@@ -2014,7 +2191,7 @@ class RecentUsageTests(unittest.TestCase):
                 "id": "claude", "ok": True, "updatedAt": (self.NOW - dt.timedelta(minutes=minutes)).isoformat(),
                 "primary": {"usedPercent": used, "windowMinutes": 300, "resetsAt": reset.isoformat()},
                 "secondary": {"usedPercent": used, "windowMinutes": 10080, "resetsAt": reset.isoformat()},
-            })
+            }, self.NOW)
         record = {"id": "claude", "ok": True, "primary": {"usedPercent": 37, "windowMinutes": 300},
                   "secondary": {"usedPercent": 37, "windowMinutes": 10080}}
         fetch._attach_recent_usage([record], history, self.NOW)
@@ -2065,9 +2242,20 @@ class RecentUsageTests(unittest.TestCase):
             fetch._usage_history_observe(history, {
                 "id": "claude", "ok": True, "updatedAt": (self.NOW - dt.timedelta(minutes=minutes)).isoformat(),
                 "primary": {"usedPercent": used, "windowMinutes": 300, "resetsAt": reset.isoformat()},
-            })
+            }, self.NOW)
         recent = fetch._recent_consumption(history["claude::primary"], 1, self.NOW)
         self.assertEqual(recent, {"hours": 1, "consumedPercent": 2})
+
+    def test_a_future_run_drops_only_itself(self) -> None:
+        now = int(self.NOW.timestamp())
+        runs = [[now - 7200 + i * 60, now - 7200 + i * 60 + 30, i % 50, None] for i in range(100)]
+        payload = {"history": {self.KEY: runs + [[now + 600, now + 900, 99, None]]}}
+        self.assertEqual(fetch._usage_history_entries(payload, self.NOW), {self.KEY: runs})
+        # A reading stamped ahead of the clock is skipped, so it can't block later ones.
+        history: dict = {}
+        self.observe(history, -10, 50, self.NOW + dt.timedelta(days=1))
+        self.observe(history, 0, 51, self.NOW + dt.timedelta(days=1))
+        self.assertEqual([run[2] for run in history[self.KEY]], [51])
 
 
 if __name__ == "__main__":
