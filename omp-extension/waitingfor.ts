@@ -71,6 +71,8 @@ const PR_REF = new RegExp(String.raw`^(?:#?\d+|https?:\/\/\S+|${OWNER_REPO}#\d+)
 /** A lone `--` right after a gh form's arguments ends them: the sentence follows, whatever its first word. */
 const ARGS_END = "--";
 const AT = /^(?:(\d{4}-\d{2}-\d{2})(?:[T ](\d{1,2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?))?|(\d{1,2}:\d{2}))(?:\s+([\s\S]*))?$/;
+/** A sentence's first word after a date that reads as a clock AT can't take (10:30am, 9.30, 5pm). */
+const CLOCKISH = /^(?:\d{1,2}[:.]\d|\d[\d:.]*[ap]m$)/i;
 // `ready` leads: it is what a PR wait does by default, and Enter takes the first choice.
 const UNTILS = [
 	{ label: "ready", until: "ready", description: "Reviews and checks are through (the default)" },
@@ -218,18 +220,20 @@ const NO_PROMPT: Record<string, true> = { seen: true, stop: true, note: true, la
 
 const messageOf = (error) => (error instanceof Error ? error.message : String(error));
 
-/** Runs a program to its end without blocking the UI thread; never rejects. */
+/** Runs a program to its end without blocking the UI thread; never rejects. `timedOut`: killed at `timeout`. */
 function run(file: string, args: string[], options: { timeout: number; cwd?: string }) {
 	const { promise, resolve } = Promise.withResolvers();
 	execFile(file, args, { ...options, maxBuffer: 16 * 1024 * 1024 }, (error, stdout, stderr) => {
-		resolve({ failed: Boolean(error), stdout: String(stdout), stderr: String(stderr), message: error?.message });
+		resolve({ failed: Boolean(error), timedOut: Boolean(error?.killed), stdout: String(stdout), stderr: String(stderr), message: error?.message });
 	});
 	return promise;
 }
 
 /** One CLI command: its JSON answer, or an Error with the CLI's own message. */
 async function cli(args: string[]) {
-	const { stdout, stderr, message } = await run(PYTHON[0], [...PYTHON.slice(1), CLI, ...args], { timeout: CLI_TIMEOUT_MS });
+	const { stdout, stderr, message, timedOut } = await run(PYTHON[0], [...PYTHON.slice(1), CLI, ...args], { timeout: CLI_TIMEOUT_MS });
+	// Killed mid-write, it may have saved the change already: a blind retry could add it twice.
+	if (timedOut) throw new Error(`codexbar_waiting.py timed out after ${CLI_TIMEOUT_MS / 1000} s; the change may have been saved: call list before retrying`);
 	let answer;
 	try {
 		answer = JSON.parse(stdout);
@@ -297,7 +301,8 @@ function checkRequest(what: string, { interval = CHECK_EVERY, prompt = "", sente
 		command: "add",
 		args: ["--kind", "command", ...check, "--predicate=exit0", `--label=${command ?? what}`, `--interval=${interval}`, ...repeat, ...userArgs(sentence, prompt, park)],
 		close,
-		...(literal ? {} : { described: what }),
+		// A literal check's reading: its own -- may have started the prompt early.
+		...(literal ? { reading: `Check: ${command}${prompt ? ` · prompt: ${prompt}` : ""}` } : { described: what }),
 	};
 }
 
@@ -452,6 +457,8 @@ export function parseWait(input: string) {
 			const inline = DURATION.test(time);
 			const at = inline ? undefined : rest.match(AT);
 			if (!inline && !at) return bad(`snooze takes a time first, such as 2d, 3h, 18:00 or 2026-11-07 09:00, not ${time}.`);
+			const clock = badClock(at);
+			if (clock) return bad(clock);
 			const sentence = at ? at[4] : tail;
 			return { command: "snooze-session", args: [at ? `--at=${atValue(at)}` : `--in=${time}`, ...(sentence ? [`--note=${sentence}`] : [])] };
 		}
@@ -502,6 +509,8 @@ export function parseWait(input: string) {
 		case "<date>": {
 			const at = `${word} ${rest}`.trimEnd().match(AT);
 			if (!at) return bad(`Not a date or time: ${word}`);
+			const clock = badClock(at);
+			if (clock) return bad(clock);
 			if (!at[4]) return bad("A sentence must follow the time.");
 			return add("time", [`--at=${atValue(at)}`], at[4]);
 		}
@@ -514,6 +523,13 @@ export function parseWait(input: string) {
 function atValue(at): string {
 	const clock = (at[2] ?? at[3])?.replace(/^\d:/, "0$&");
 	return at[1] ? `${at[1]}${clock ? `T${clock}` : ""}` : clock;
+}
+
+/** Why a date's sentence starts with a clock AT couldn't read (CLOCKISH), lest the wait take the date alone; else undefined. */
+function badClock(at): string | undefined {
+	if (!at?.[1] || at[2]) return undefined;
+	const [first] = cut(at[4] ?? "");
+	return CLOCKISH.test(first) ? `Not a time: ${first}` : undefined;
 }
 
 /** What can follow the finished words after `every`: the interval, then `for`/`times`, then `until` and its kinds. */
@@ -886,26 +902,8 @@ async function readViewFile() {
 	}
 }
 
-const TOOL_FLAGS = {
-	at: "at",
-	in: "in",
-	interval: "interval",
-	predicate: "predicate",
-	what: "what",
-	until: "until",
-	bots: "bots",
-	size: "size",
-	label: "label",
-	note: "note",
-	deadline: "deadline",
-	deadline_in: "deadline-in",
-	prompt: "prompt",
-	verify: "verify",
-	after: "after",
-	every: "every",
-	for: "for",
-	times: "times",
-};
+/** The tool's add parameters the CLI takes as `--name`, an underscore as a dash (deadline_in: --deadline-in). */
+const TOOL_FLAGS = ["at", "in", "interval", "predicate", "what", "until", "bots", "size", "label", "note", "deadline", "deadline_in", "prompt", "verify", "after", "every", "for", "times"];
 
 const NOT_PARKED_OUTSIDE_TERN = "not parked: this omp runs outside Tern, so there is no pane to park";
 /** A session snooze outside Tern refused: it closes the session, and closing now would lose `why`. */
@@ -928,8 +926,8 @@ function parkNote(paneKnown: boolean): string {
 async function toolAddArgs(params, session: string, cwd: string): Promise<string[]> {
 	if (!params.kind) throw new Error("add needs a kind");
 	const args = ["add", "--session", session, "--kind", params.kind, "--by", "agent"];
-	for (const [name, flag] of Object.entries(TOOL_FLAGS)) {
-		if (params[name] !== undefined) args.push(`--${flag}=${params[name]}`);
+	for (const name of TOOL_FLAGS) {
+		if (params[name] !== undefined) args.push(`--${name.replace("_", "-")}=${params[name]}`);
 	}
 	if (params.argv) args.push(`--argv=${JSON.stringify(params.argv)}`);
 	if (params.kind === "pr") args.push(...(await toolPrTarget(params, cwd)));
@@ -1444,7 +1442,7 @@ export default function (pi) {
 		// delivery is 2 minutes old, so one goes after SETTLE_IDLE_MS. One timer will do: the next
 		// prompt is claimed only once this one settled.
 		if (settle) ctx.clearTimer(settle);
-		settle = ctx.setTimeout(() => quietly(heartbeat), SETTLE_IDLE_MS);
+		settle = ctx.setTimeout(() => inOrder(heartbeat), SETTLE_IDLE_MS);
 	}
 
 	async function claimPrompts() {
@@ -1469,8 +1467,9 @@ export default function (pi) {
 		followSession();
 		const session = sessionId;
 		inOrder(async () => {
-			const record = (await readViewFile())?.sessions?.find((s) => s.session_id === session);
-			if (record && applies(record)) applyView((await cli(["event", "--type", type, "--session", session])).view);
+			// The record the last applied view had: the view file holds nothing newer.
+			if (session !== sessionId || !ownSession || !applies(ownSession)) return;
+			applyView((await cli(["event", "--type", type, "--session", session])).view);
 		});
 	}
 	// A repeat's run leaves its wait `waiting`; the CLI tells whether one is with the agent.
@@ -1557,7 +1556,7 @@ export default function (pi) {
 		// Heartbeats carry the moves one at a time, each until one gets through: the CLI's re-key is idempotent.
 		return beat.then((answer) => {
 			if (moves[0] === move) moves.shift();
-			if (moves.length > 0) quietly(heartbeat);
+			if (moves.length > 0) inOrder(heartbeat);
 			return answer;
 		});
 	}
@@ -1639,7 +1638,7 @@ export default function (pi) {
 		}
 		timers = [
 			c.setInterval(() => quietly(refresh), REFRESH_MS),
-			c.setInterval(() => quietly(heartbeat), HEARTBEAT_MS),
+			c.setInterval(() => inOrder(heartbeat), HEARTBEAT_MS),
 			c.setInterval(sampleActivity, ACTIVITY_MS),
 			// On resume or switch omp replaces the transcript after this hook returns; a prompt
 			// sent before that would be lost, so the first claim runs on the next tick.
@@ -1785,6 +1784,8 @@ export default function (pi) {
 		if (resolved.gh) {
 			const reading = ghReading(resolved.command, args, resolved === request ? undefined : request.guessedRepo);
 			setPanel(c, (theme) => theme.fg("muted", reading));
+		} else if (resolved.reading) {
+			setPanel(c, (theme) => theme.fg("muted", resolved.reading));
 		} else if (resolved.described) {
 			setPanel(c, (theme) => theme.fg("muted", `Asked the agent for a command that checks: ${resolved.described}`));
 		}
