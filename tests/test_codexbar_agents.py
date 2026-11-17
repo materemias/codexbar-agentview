@@ -311,17 +311,23 @@ class SnapshotMergeTests(unittest.TestCase):
         )
         self.assertEqual(set(row["recent"][0]), {"role", "kind", "text", "ts"})
 
-    def test_unresolved_reboot_history_survives_reboots_and_unions_new_active(self) -> None:
+    def test_a_later_reboot_turns_earlier_reboot_rows_into_exits(self) -> None:
         first = agents._merge_snapshot(
             [],
             {"bootId": "boot-a", "agents": [active("omp", "old")], "history": []},
             "boot-b",
             200,
         )
+        self.assertEqual(
+            [(row["sessionId"], row["closedBy"]) for row in first["history"]],
+            [("old", "reboot")],
+        )
+        # Only the last reboot's sessions stay `reboot`; older ones count
+        # against the history cap like any exit.
         second = agents._merge_snapshot([], first, "boot-c", 300)
         self.assertEqual(
-            [(row["provider"], row["sessionId"]) for row in second["history"]],
-            [("omp", "old")],
+            [(row["provider"], row["sessionId"], row["closedBy"]) for row in second["history"]],
+            [("omp", "old", "exit")],
         )
 
         with_new_live = agents._merge_snapshot(
@@ -329,9 +335,33 @@ class SnapshotMergeTests(unittest.TestCase):
         )
         later = agents._merge_snapshot([], with_new_live, "boot-d", 400)
         self.assertEqual(
-            {(row["provider"], row["sessionId"]) for row in later["history"]},
-            {("omp", "old"), ("claude", "new")},
+            {(row["provider"], row["sessionId"], row["closedBy"]) for row in later["history"]},
+            {("omp", "old", "exit"), ("claude", "new", "reboot")},
         )
+
+    def test_untracked_processes_never_become_history_on_reboot(self) -> None:
+        previous = {
+            "bootId": "boot-a",
+            "agents": [active("omp", "untracked-omp-7", state="untracked", identityExact=False)],
+            "history": [],
+        }
+        self.assertEqual(agents._merge_snapshot([], previous, "boot-b", 200)["history"], [])
+
+    def test_history_keeps_up_to_its_cap_whatever_the_caller(self) -> None:
+        previous = {
+            "bootId": "boot-a",
+            "agents": [],
+            "history": [
+                history("omp", f"exit-{n}", closedBy="exit", lastSeenAt=n + 1)
+                for n in range(1050)
+            ],
+        }
+        snapshot = agents._merge_snapshot([], previous, "boot-a", 5000)
+        self.assertEqual(len(snapshot["history"]), 1000)
+        self.assertEqual(snapshot["history"][-1]["sessionId"], "exit-50")
+        # No caller can ask for fewer.
+        with self.assertRaises(SystemExit), mock.patch.object(agents.sys, "stderr"):
+            agents.main(["--history-limit", "5"])
 
     def test_just_ended_active_record_wins_history_duplicate(self) -> None:
         previous = {
@@ -369,7 +399,8 @@ class SnapshotMergeTests(unittest.TestCase):
                 history("omp", f"rebooted-{n}", lastSeenAt=1) for n in range(limit + 1)
             ],
         }
-        snapshot = agents._merge_snapshot([], previous, "boot-a", 5000, limit)
+        with mock.patch.object(agents, "HISTORY_CAP", limit):
+            snapshot = agents._merge_snapshot([], previous, "boot-a", 5000)
         rows = [(row["sessionId"], row["closedBy"]) for row in snapshot["history"]]
         newest = limit + 2
         self.assertEqual(
@@ -1062,13 +1093,44 @@ class ResumeAndIdentityTests(unittest.TestCase):
             mock.patch.object(agents, "_INFO_FN", {"claude": info, "omp": info}),
             mock.patch.object(agents, "_pgrep", return_value=[42]),
             mock.patch.object(agents, "_session_host", return_value=("kitty", [42, 10])),
+            mock.patch.object(agents, "_cwd_of", return_value="/work"),
         ):
             records = agents._build_records()
-        self.assertEqual(len(records), 1)
+        self.assertEqual(len(records), 2)
         self.assertEqual(records[0]["provider"], "claude")
         self.assertEqual(records[0]["sessionId"], "shared")
         self.assertTrue(records[0]["identityExact"])
         self.assertEqual(records[0]["resumeCommand"], resume_line("/work", "claude", "--resume", "shared"))
+        self.assertEqual((records[1]["sessionId"], records[1]["state"]), ("untracked-omp-42", "untracked"))
+
+    def test_session_id_collision_keeps_the_exact_owner_and_lists_the_other(self) -> None:
+        infos = {
+            10: {"sessionId": "shared", "cwd": "/a", "state": "idle",
+                 "identityExact": False, "lastPrompt": "not mine"},
+            20: {"sessionId": "shared", "cwd": "/b", "state": "idle", "identityExact": True},
+        }
+        with (
+            mock.patch.object(agents, "_INFO_FN", {"omp": infos.__getitem__}),
+            mock.patch.object(agents, "_pgrep", return_value=[10, 20]),
+            mock.patch.object(agents, "_session_host", side_effect=lambda pid, _w: ("kitty", [pid])),
+            mock.patch.object(agents, "_cwd_of", return_value="/proc-cwd"),
+        ):
+            records = {r["pid"]: r for r in agents._build_records()}
+        self.assertEqual(set(records), {10, 20})
+        self.assertEqual((records[20]["sessionId"], records[20]["identityExact"]), ("shared", True))
+        loser = records[10]
+        self.assertEqual(
+            (loser["sessionId"], loser["state"], loser["identityExact"],
+             loser["resumeCommand"], loser["lastPrompt"], loser["cwd"]),
+            ("untracked-omp-10", "untracked", False, "", "", "/proc-cwd"),
+        )
+
+    def test_session_id_starting_with_a_dash_has_no_resume_command(self) -> None:
+        # It would read as an option to the agent's CLI.
+        for provider in ("claude", "codex", "omp"):
+            with self.subTest(provider=provider):
+                self.assertEqual(agents._resume_command(provider, "--help", "/tmp", True), "")
+                self.assertEqual(agents._resume_command(provider, "-p", "", True), "")
 
 
 class HeadlessArgvTests(unittest.TestCase):
@@ -1079,8 +1141,8 @@ class HeadlessArgvTests(unittest.TestCase):
             ["claude", "--resume", "abc"],
         )
         # So a daemon or a one-shot reads as one, as a native install's does.
-        self.assertTrue(agents._is_service_argv(agents._script_argv(["node", claude, "daemon", "run"])))
-        self.assertTrue(agents._is_service_argv(agents._script_argv(["node", claude, "-p", "hi"])))
+        self.assertTrue(agents._is_service_argv(agents._script_argv(["node", claude, "daemon", "run"]), "claude"))
+        self.assertTrue(agents._is_service_argv(agents._script_argv(["node", claude, "-p", "hi"]), "claude"))
         omp = "/home/me/.bun/install/global/node_modules/@oh-my-pi/pi-coding-agent/src/cli.ts"
         self.assertEqual(agents._script_argv(["bun", "run", omp, "--resume", "x"]), ["omp", "--resume", "x"])
         pi = "/usr/lib/node_modules/@mariozechner/pi-coding-agent/dist/cli.js"
@@ -1094,11 +1156,26 @@ class HeadlessArgvTests(unittest.TestCase):
 
     def test_omp_rpc_and_json_modes_are_headless(self) -> None:
         # Tern's built-in Carly assistant drives omp over RPC.
-        self.assertTrue(agents._is_service_argv(["omp", "--mode", "rpc", "--no-tools"]))
-        self.assertTrue(agents._is_service_argv(["omp", "--mode=json", "hi"]))
-        self.assertFalse(agents._is_service_argv(["omp", "--mode", "text"]))
-        self.assertFalse(agents._is_service_argv(["omp", "--model", "rpc"]))
-        self.assertFalse(agents._is_service_argv(["omp", "--mode"]))
+        self.assertTrue(agents._is_service_argv(["omp", "--mode", "rpc", "--no-tools"], "omp"))
+        self.assertTrue(agents._is_service_argv(["omp", "--mode=json", "hi"], "omp"))
+        self.assertFalse(agents._is_service_argv(["omp", "--mode", "text"], "omp"))
+        self.assertFalse(agents._is_service_argv(["omp", "--model", "rpc"], "omp"))
+        self.assertFalse(agents._is_service_argv(["omp", "--mode"], "omp"))
+
+    def test_headless_flags_follow_each_agents_cli(self) -> None:
+        for provider in ("claude", "omp", "pi"):
+            with self.subTest(provider=provider):
+                self.assertTrue(agents._is_service_argv([provider, "-p", "hi"], provider))
+                self.assertTrue(agents._is_service_argv([provider, "--print", "hi"], provider))
+        # Codex's `-p` names a profile; its one-shot is `codex exec`.
+        self.assertFalse(agents._is_service_argv(["codex", "-p", "work"], "codex"))
+        self.assertFalse(agents._is_service_argv(["codex", "--profile", "work", "resume", "x"], "codex"))
+        self.assertFalse(agents._is_service_argv(["codex", "fix exec"], "codex"))
+        self.assertFalse(agents._is_service_argv(["codex", "-m", "exec"], "codex"))
+        self.assertTrue(agents._is_service_argv(["codex", "exec", "fix it"], "codex"))
+        self.assertTrue(agents._is_service_argv(["codex", "e", "fix it"], "codex"))
+        self.assertTrue(agents._is_service_argv(["codex", "-p", "work", "--full-auto", "exec", "x"], "codex"))
+        self.assertTrue(agents._is_service_argv(["codex", "app-server"], "codex"))
 
 
 class MacBundleHostTests(unittest.TestCase):
@@ -1372,6 +1449,61 @@ class OmpRecapTests(unittest.TestCase):
         self.assertEqual(row["recent"][0]["ts"], 500_000_000)
 
 
+class UntrustedInputTests(unittest.TestCase):
+    def test_proc_text_with_invalid_utf8_reads_with_replacements(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "comm"
+            path.write_bytes(b"bad\xff\xfename\n")
+            self.assertEqual(agents._read_text(str(path)), "bad\ufffd\ufffdname\n")
+
+    def test_deeply_nested_transcript_lines_are_skipped(self) -> None:
+        deep = "[" * 100_000 + "]" * 100_000
+        ask = {"type": "user", "message": {"role": "user", "content": "ask"}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "claude.jsonl"
+            path.write_text(deep + "\n" + json.dumps(ask) + "\n")
+            self.assertEqual(agents._transcript_info(str(path), "claude")["lastPrompt"], "ask")
+            (Path(directory) / "session_index.jsonl").write_text(
+                '{"id": "s", "x": ' + deep + "}\n"
+                + json.dumps({"id": "s", "thread_name": "named"}) + "\n"
+            )
+            self.assertEqual(agents._codex_thread_name(directory, "s"), "named")
+
+
+class ClaudeProjectFolderTests(unittest.TestCase):
+    def info(self, home: Path, cwd: str, folder: str) -> dict:
+        sid = "0b4e-session"
+        (home / ".claude" / "sessions").mkdir(parents=True, exist_ok=True)
+        (home / ".claude" / "sessions" / "42.json").write_text(
+            json.dumps({"sessionId": sid, "cwd": cwd, "status": "idle"}))
+        project = home / ".claude" / "projects" / folder
+        project.mkdir(parents=True)
+        (project / f"{sid}.jsonl").write_text(json.dumps(
+            {"type": "user", "sessionId": sid, "cwd": cwd,
+             "message": {"role": "user", "content": f"ask in {folder[:8]}"}}) + "\n")
+        with mock.patch.object(agents.Path, "home", return_value=home):
+            return agents._claude_info(42)
+
+    def test_folder_names_replace_every_non_ascii_alphanumeric(self) -> None:
+        cwd = "/work/My Project/árvíztűrő \U0001f680"
+        # JavaScript counts the emoji as two UTF-16 units, each replaced.
+        slug = "-work-My-Project--rv-zt-r----"
+        for windows in (False, True):
+            with self.subTest(windows=windows), mock.patch.object(agents.state_paths, "WINDOWS", windows):
+                self.assertEqual(agents._claude_slug(cwd), slug)
+        with tempfile.TemporaryDirectory() as directory:
+            info = self.info(Path(directory), cwd, slug)
+        self.assertEqual(info["lastPrompt"], f"ask in {slug[:8]}")
+
+    def test_long_folder_names_are_found_by_session_id(self) -> None:
+        # Past 200 characters Claude Code appends a hash of the path.
+        cwd = "/" + "a" * 250
+        folder = agents._claude_slug(cwd)[:200] + "-1x2y3z"
+        with tempfile.TemporaryDirectory() as directory:
+            info = self.info(Path(directory), cwd, folder)
+        self.assertEqual(info["lastPrompt"], f"ask in {folder[:8]}")
+
+
 class HistoryBackfillTests(unittest.TestCase):
     def _home(self, directory: str, sessions: dict[str, tuple]) -> Path:
         """omp files for sessions {id: (cwd, last prompt seconds[, answer seconds])}."""
@@ -1472,8 +1604,9 @@ class HistoryBackfillTests(unittest.TestCase):
               mock.patch.object(agents, "_argv_of", side_effect=lambda pid: list(
                   (claude.get(pid, ("", "")) + ((),))[2])),
               mock.patch.object(agents, "_cwd_of", side_effect=lambda pid: (
-                  claude[pid][1] if pid in claude else processes[pid][1]))):
-            payload, _ = agents._locked_sweep(aggregate_path=saved, history_limit=limit)
+                  claude[pid][1] if pid in claude else processes[pid][1])),
+              mock.patch.object(agents, "HISTORY_CAP", limit)):
+            payload, _ = agents._locked_sweep(aggregate_path=saved)
         return payload
 
     def test_unseen_ended_sessions_are_added_unless_live_known_or_gone(self) -> None:
@@ -2149,19 +2282,23 @@ class WindowsSessionTests(unittest.TestCase):
             folder.mkdir(parents=True)
             rollout = folder / "2026-09-28T10-00-00-000Z_01a0.jsonl"
             rollout.write_text("{}\n")
+            work = str(home / "work")
+            platforms = (False, True)
             with mock.patch.object(agents.Path, "home", return_value=home), \
                     mock.patch.object(agents.tempfile, "gettempdir", return_value=str(home / "elsewhere")):
-                with mock.patch.object(agents.state_paths, "WINDOWS", False):
-                    self.assertEqual(agents._find_pi_rollout(str(home / "work")), "")
-                with self.windows():
-                    self.assertEqual(agents._find_pi_rollout(str(home / "work")), str(rollout))
-                    # pi keeps to its own folders, and omp to its own.
-                    self.assertEqual(agents._find_pi_rollout(str(home / "work"), "pi"), "")
-                    pi_folder = home / ".pi" / "agent" / "sessions" / agents._pi_slug(str(home / "work"))
-                    pi_folder.mkdir(parents=True)
-                    (pi_folder / "pi.jsonl").write_text("{}\n")
-                    self.assertEqual(agents._find_pi_rollout(str(home / "work")), str(rollout))
-                    self.assertEqual(agents._find_pi_rollout(str(home / "work"), "pi"), str(pi_folder / "pi.jsonl"))
+                # omp names a folder under home by its relative path on every platform.
+                for windows in platforms:
+                    with self.subTest(windows=windows), mock.patch.object(agents.state_paths, "WINDOWS", windows):
+                        self.assertEqual(agents._find_pi_rollout(work), str(rollout))
+                        # pi keeps to its own folders, and omp to its own.
+                        self.assertEqual(agents._find_pi_rollout(work, "pi"), "")
+                pi_folder = home / ".pi" / "agent" / "sessions" / agents._pi_slug(work)
+                pi_folder.mkdir(parents=True)
+                (pi_folder / "pi.jsonl").write_text("{}\n")
+                for windows in platforms:
+                    with self.subTest(windows=windows), mock.patch.object(agents.state_paths, "WINDOWS", windows):
+                        self.assertEqual(agents._find_pi_rollout(work), str(rollout))
+                        self.assertEqual(agents._find_pi_rollout(work, "pi"), str(pi_folder / "pi.jsonl"))
 
     def test_codex_rollouts_since_a_start_stand_in_for_held_ones(self) -> None:
         start = int(time.time() * 1000) - 3_600_000

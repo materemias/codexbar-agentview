@@ -287,7 +287,8 @@ it works.
   reboot, in desktop order, until it runs again. **Restore all** brings them
   back one by one: kitty sessions on their saved desktop, Tern sessions as
   tabs.
-- **Recently closed.** The last 100 sessions that exited since boot, each with
+- **Recently closed.** The last 100 sessions that exited (set in Settings; up
+  to 1000 are kept), each with
   **Launch** and a copyable resume command. omp and Claude Code sessions that
   closed while nothing watched, or before you installed this, come from their
   prompt history (`~/.omp/agent/history.db`, `~/.claude/history.jsonl`) while
@@ -337,7 +338,8 @@ while it starts asks you to retry; the startup reservation lasts up to
   Refresh now and CLI changes fetch immediately.
 - **Warnings.** A desktop alert at 80% and 95%, or earlier when the pace says
   the window runs out before it resets, once a quarter of the window has
-  passed. Alerts from one refresh arrive as one notification. Plasma only.
+  passed. Alerts from one refresh arrive as one notification, and so do
+  several agents waiting for input at once. Plasma only.
 - **Optional.** Usage tracking is on by default. Turn it off when you don't
   have the `codexbar` CLI or track usage elsewhere: Plasma's **Track usage**
   switch (Settings → Backend), or Tern's **Usage tracking** (Settings →

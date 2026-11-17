@@ -52,6 +52,41 @@
 - Filter initials match only neighbouring words, and tool-call summaries no longer match.
 - In Tern, Space types into a filter instead of opening the conversation, and clearing a filter keeps the selection.
 - The integration installer keeps file associations when an update fails.
+- History keeps up to 1000 closed sessions whichever of Plasma and Tern scans.
+- The agent list keeps updating past odd process names and deeply nested transcript lines.
+- A failed teleport leaves the kitty window open and prints the resume command.
+- The installer leaves your own Claude Code hooks alone.
+- Only one poller fetches a provider at a time, however long the fetch runs.
+- Usage graphs survive a clock correction.
+- A `ready` wait waits while the PR is a draft and ends quietly once it merged.
+- A release wait finds a release whose tag GitHub hadn't compared yet.
+- `/wait` refuses a date followed by an unreadable time such as `10:30am`.
+- Panel and popup text shows as plain text, never as HTML.
+- Two processes on one session list the exact owner, and the other as untracked.
+- `codex -p <profile>` sessions are listed, and `codex exec` runs are hidden.
+- Cached Claude usage survives an access-token refresh.
+- One bad Meridian timestamp leaves the other accounts readable.
+- Codex accounts outside Meridian stay as last-known when the Codex CLI fails.
+- Untracked processes stay out of History after a reboot.
+- Claude sessions in folders with spaces or accents show their details.
+- omp sessions under your home folder are found without an open transcript.
+- A job wait gets its result even when the first report to the CLI fails.
+- Waits from another Tern daemon stay off this daemon's panes.
+- Tern fetches a provider only it enables once that provider's reading is old.
+- Tern retries a failing agent scan once a minute.
+- A waiting session open in two panes leaves the shared view file alone.
+- A logged-out `gh` shows one hint to run `gh auth login`.
+- `/wait check !` shows the command and prompt it saved.
+- A `STALE` check counts as cancelled, and a bot's own reply doesn't count as a fix.
+- A comment made before the first GraphQL poll is reported.
+- Plasma shows an error when it can't read agent state, and helpers time out.
+- Launch and Focus report when kitty didn't start or no window matched.
+- The installer follows `XDG_CONFIG_HOME` and `XDG_DATA_HOME` and quotes the handler path.
+- An account's "only if proj > 100%" box shows the old all-accounts setting.
+- Typing switches the Plasma popup to Agents after a tab click.
+- Kilo and OpenRouter tray meters hide windows the account doesn't report.
+- Several agents waiting for input arrive as one notification.
+- Resume works for nu and tcsh users.
 
 ### Docs
 

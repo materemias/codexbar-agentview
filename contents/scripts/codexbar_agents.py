@@ -6,8 +6,7 @@ aggregate state to agents.json in the state directory (state_paths.STATE_DIR,
 ~/.local/state/codexbar-agentview by default). The plasmoid widget reads that
 file on its own poll cycle (XHR).
 
-Designed to run continuously as a systemd `--user` service. Hooks are no
-longer required — all state is derived from on-disk session files each
+Needs no hooks: all state is derived from on-disk session files each
 process keeps open:
   * claude  : ~/.claude/sessions/<pid>.json + ~/.claude/projects/<slug>/<sid>.jsonl
   * codex   : the rollout JSONL the codex pid keeps open via /proc/<pid>/fd
@@ -22,8 +21,6 @@ CodexBar extension reports in waiting.json; what stays unknown is untracked.
 Usage:
   codexbar_agents.py                  one-shot, prints aggregate to stdout
   codexbar_agents.py --once           one-shot, writes agents.json
-  codexbar_agents.py --watch [-i N]   daemon; sweep + write every N seconds
-  --history-limit N                   keep the N newest same-boot exits
 """
 from __future__ import annotations
 
@@ -32,6 +29,7 @@ import hashlib
 import contextlib
 import math
 import functools
+import glob
 import heapq
 import json
 import os
@@ -88,9 +86,17 @@ _SERVICE_VERBS = {
 
 # Headless/piped invocations (SDK calls from claudecodeui, `-p` one-shots,
 # `omp --mode rpc` drivers such as Tern's built-in Carly assistant).
-# Real processes, but no terminal session behind them.
+# Real processes, but no terminal session behind them. Codex spells its
+# one-shot as a subcommand and uses `-p` for --profile.
 _HEADLESS_FLAGS = {"--output-format", "--input-format", "--print", "-p"}
 _HEADLESS_MODES = {"rpc", "json"}
+_CODEX_HEADLESS = {"exec", "e"}
+# Codex options before its subcommand that take a value.
+_CODEX_VALUE_OPTIONS = {
+    "-c", "--config", "-p", "--profile", "-m", "--model", "-s", "--sandbox",
+    "-a", "--ask-for-approval", "-C", "--cd", "-i", "--image", "--add-dir",
+    "--enable", "--disable", "--local-provider",
+}
 
 # Fork helpers (embeddings, js eval, lsp mux, ...) keep comm="omp"/"pi" and so
 # show up in `pgrep -x`; their cmdline carries a `__*_worker_` verb.
@@ -129,7 +135,8 @@ _CACHE_VERSION = 2
 
 def _read_text(path: str) -> str:
     try:
-        return Path(path).read_text()
+        # A process may set any bytes as its comm.
+        return Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return ""
 
@@ -445,7 +452,7 @@ def t3_window_pids() -> list[int]:
 # Process discovery
 # ---------------------------------------------------------------------------
 
-def _is_service_argv(argv: list[str]) -> bool:
+def _is_service_argv(argv: list[str], provider: str) -> bool:
     """True when the argv belongs to a daemon, a fork helper or a piped
     one-shot — anything that isn't a session sitting in a terminal."""
     if not argv:
@@ -458,6 +465,8 @@ def _is_service_argv(argv: list[str]) -> bool:
             return True
     if rest and rest[0] in _SERVICE_VERBS:
         return True
+    if provider == "codex":
+        return _codex_subcommand(rest) in _CODEX_HEADLESS
     for i, a in enumerate(rest):
         if a in _HEADLESS_FLAGS:
             return True
@@ -466,6 +475,19 @@ def _is_service_argv(argv: list[str]) -> bool:
         if mode in _HEADLESS_MODES:
             return True
     return False
+
+
+def _codex_subcommand(args: list[str]) -> str:
+    """Codex's first positional argument: a subcommand, or the prompt."""
+    skip = False
+    for a in args:
+        if skip:
+            skip = False
+        elif a.startswith("-"):
+            skip = a in _CODEX_VALUE_OPTIONS
+        else:
+            return a
+    return ""
 
 
 def _under_t3(pid: int) -> bool:
@@ -515,7 +537,7 @@ def _pgrep(name: str, services: bool = False) -> list[int]:
     background ones (app servers, daemons) that the scan otherwise skips."""
     out: list[int] = []
     for pid in _process_names().get(name, ()):
-        service = _is_service_argv(_argv_of(pid)) and not _under_t3(pid)
+        service = _is_service_argv(_argv_of(pid), name) and not _under_t3(pid)
         if service != services:
             continue
         out.append(pid)
@@ -844,7 +866,8 @@ def _read_transcript(path: str, provider: str) -> dict:
                 digest.update(raw)
                 try:
                     rec = json.loads(raw)
-                except (ValueError, UnicodeError):
+                # Nesting past the recursion limit raises RecursionError.
+                except (ValueError, UnicodeError, RecursionError):
                     continue
                 if isinstance(rec, dict):
                     _parse_record(provider, state, rec)
@@ -872,10 +895,25 @@ def _transcript_info(path: str, provider: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def _claude_slug(cwd: str) -> str:
-    if state_paths.WINDOWS:
-        # Claude Code's projects folder for C:\Users\me\app is C--Users-me-app.
-        return re.sub(r"[^A-Za-z0-9]", "-", cwd)
-    return "".join(("-" if c in "/_." else c) for c in cwd) if cwd else ""
+    """Claude Code's projects folder name for `cwd` on every platform: each
+    character but an ASCII letter or digit becomes `-`, once per UTF-16
+    unit as JavaScript counts them (C:\\Users\\me\\app is C--Users-me-app).
+    Past 200 characters Claude Code cuts the name and appends a hash."""
+    return "".join(
+        c if c.isascii() and c.isalnum() else "-" * (1 + (ord(c) > 0xFFFF))
+        for c in cwd
+    )
+
+
+def _claude_transcript(cwd: str, sid: str) -> Path:
+    """The transcript of Claude session `sid` started in `cwd`. Long names
+    end in a hash we can't reproduce (Bun.hash in the native build), so a
+    missing folder is looked up by the session id instead."""
+    projects = Path.home() / ".claude" / "projects"
+    path = projects / _claude_slug(cwd) / f"{sid}.jsonl"
+    if path.is_file() or "/" in sid or "\\" in sid:
+        return path
+    return next(projects.glob(f"*/{glob.escape(sid)}.jsonl"), path)
 
 
 def _claude_state(pid: int) -> dict:
@@ -912,7 +950,7 @@ def _claude_info(pid: int) -> dict:
         info["state"] = "idle"
 
     if sid and cwd:
-        transcript = Path.home() / ".claude" / "projects" / _claude_slug(cwd) / f"{sid}.jsonl"
+        transcript = _claude_transcript(cwd, sid)
         parsed = _transcript_info(str(transcript), "claude")
         for field in ("windowTitle", "lastPrompt", "model", "recent", "recap", "recapStale"):
             if parsed[field]:
@@ -939,7 +977,7 @@ def _codex_thread_name(home: str, session_id: str) -> str:
                     continue
                 try:
                     entry = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):
                     continue
                 if isinstance(entry, dict) and entry.get("id") == session_id:
                     name = _text(entry.get("thread_name")).strip() or name
@@ -953,7 +991,7 @@ def _codex_meta(path: str) -> tuple[str, str, int]:
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             rec = json.loads(f.readline() or "{}")
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return "", "", 0
     payload = rec.get("payload") if isinstance(rec, dict) and rec.get("type") == "session_meta" else None
     if not isinstance(payload, dict):
@@ -1114,7 +1152,7 @@ def _opencode_info(pid: int) -> dict:
                     message = {}
                     try:
                         message = json.loads(mdata) or {}
-                    except (TypeError, json.JSONDecodeError):
+                    except (TypeError, json.JSONDecodeError, RecursionError):
                         pass
                     if (
                         isinstance(message, dict)
@@ -1132,7 +1170,7 @@ def _opencode_info(pid: int) -> dict:
                         continue
                     try:
                         pd = json.loads(pdata) or {}
-                    except (TypeError, json.JSONDecodeError):
+                    except (TypeError, json.JSONDecodeError, RecursionError):
                         continue
                     if isinstance(pd, dict) and pd.get("type") == "text" and isinstance(pd.get("text"), str):
                         entry[1] = (entry[1] + " " + pd["text"]).strip()
@@ -1195,18 +1233,15 @@ def _find_pi_rollout(cwd: str, tool: str = "omp") -> str:
     """Find the latest-modified JSONL under ~/.{pi,omp}/agent/sessions/<slug>/
     matching the agent's cwd. pi doesn't keep the file open as an fd so the
     /proc/<pid>/fd trick we use for codex/omp doesn't apply, nor does it on
-    Windows. There each tool looks only in its own folders, omp's own name
+    Windows. Each tool looks only in its own folders, omp's own name
     first: a fresh omp would otherwise take a pi session in that folder."""
     slug = _pi_slug(cwd)
     if not slug:
         return ""
-    sessions = Path.home() / ".pi" / "agent" / "sessions"
-    omp_sessions = Path.home() / ".omp" / "agent" / "sessions"
-    if not state_paths.WINDOWS:
-        folders = [sessions / slug, omp_sessions / slug]
-    elif tool == "pi":
-        folders = [sessions / slug]
+    if tool == "pi":
+        folders = [Path.home() / ".pi" / "agent" / "sessions" / slug]
     else:
+        omp_sessions = Path.home() / ".omp" / "agent" / "sessions"
         folders = [omp_sessions / _omp_dir_name(cwd), omp_sessions / slug]
     for base in folders:
         if not base.is_dir():
@@ -1416,7 +1451,7 @@ def _session_header(path: Path) -> dict:
                     break
                 try:
                     entry = json.loads(line)
-                except ValueError:
+                except (ValueError, RecursionError):
                     continue
                 if isinstance(entry, dict) and entry.get("type") == "session":
                     return entry
@@ -1442,7 +1477,7 @@ def _newest_turn(path: Path, header: dict) -> tuple[int, str]:
                         continue
                     try:
                         entry = json.loads(line)
-                    except ValueError:
+                    except (ValueError, RecursionError):
                         continue
                     if not isinstance(entry, dict) or entry.get("type") == "session":
                         chunk = size
@@ -1484,7 +1519,7 @@ def _has_entry(path: Path, entry_id: str) -> bool:
                         continue
                     try:
                         entry = json.loads(line)
-                    except ValueError:
+                    except (ValueError, RecursionError):
                         continue
                     if (isinstance(entry, dict) and entry.get("type") != "session"
                             and entry.get("id") == entry_id):
@@ -1565,7 +1600,7 @@ def _header_ms(path: str) -> int:
     try:
         with open(path, encoding="utf-8", errors="replace") as f:
             head = json.loads(f.readline() or "{}")
-    except (OSError, ValueError):
+    except (OSError, ValueError, RecursionError):
         return 0
     if not isinstance(head, dict) or head.get("type") != "session":
         return 0
@@ -1733,6 +1768,8 @@ def _resume_command(
         or provider not in _RESUME_PREFIXES
         or not isinstance(session_id, str)
         or not session_id
+        # It would read as an option to the agent's CLI.
+        or session_id.startswith("-")
         or len(session_id) > 256
         or "\0" in session_id
         or not isinstance(cwd, str)
@@ -1791,9 +1828,40 @@ def _session_host(pid: int, windows: dict[str, list[int]]) -> tuple[str, list[in
 def _build_records() -> list[dict]:
     """Sweep all known providers, return the per-session records."""
     records: list[dict] = []
-    seen_sids: set[str] = set()
     now_ms = int(time.time() * 1000)
     windows: dict[str, list[int]] = {}
+
+    def record(provider: str, pid: int, host: str, ancestors: list[int], info: dict) -> dict:
+        known_sid = _session_id(info.get("sessionId"))
+        sid = known_sid or f"untracked-{provider}-{pid}"
+        cwd = _text(info.get("cwd")) or _cwd_of(pid)
+        identity_exact = bool(known_sid) and info.get("identityExact") is True
+        state = (info.get("state") or "working") if known_sid else "untracked"
+        return {
+            "provider": provider,
+            "sessionId": sid,
+            "cwd": cwd,
+            "pid": pid,
+            "ancestorPids": ancestors,
+            "host": host,
+            "state": state,
+            "model": _model_text(info.get("model")),
+            "lastPrompt": info.get("lastPrompt") or "",
+            "recent": info.get("recent") or [],
+            "windowTitle": info.get("windowTitle") or "",
+            # Claude's away summary; omp recaps are attached below.
+            "recap": _text(info.get("recap")),
+            "recapStale": info.get("recapStale") is True,
+            "startedAt": 0,
+            "stateChangedAt": now_ms,
+            "updatedAt": now_ms,
+            "identityExact": identity_exact,
+            "codexHome": _codex_home_value(info.get("codexHome")),
+            "resumeCommand": _resume_command(
+                provider, sid, cwd, identity_exact, info.get("codexHome")
+            ),
+        }
+
     for provider, info_fn in _INFO_FN.items():
         for pid in _pgrep(provider):
             host, ancestors = _session_host(pid, windows)
@@ -1804,39 +1872,19 @@ def _build_records() -> list[dict]:
                 info = info_fn(pid)
             except (OSError, ValueError, TypeError, AttributeError, OverflowError):
                 info = {}
-            info = info if isinstance(info, dict) else {}
-            known_sid = _session_id(info.get("sessionId"))
-            sid = known_sid or f"untracked-{provider}-{pid}"
-            if sid in seen_sids:
-                continue
-            seen_sids.add(sid)
-            cwd = _text(info.get("cwd")) or _cwd_of(pid)
-            identity_exact = bool(known_sid) and info.get("identityExact") is True
-            state = (info.get("state") or "working") if known_sid else "untracked"
-            records.append({
-                "provider": provider,
-                "sessionId": sid,
-                "cwd": cwd,
-                "pid": pid,
-                "ancestorPids": ancestors,
-                "host": host,
-                "state": state,
-                "model": _model_text(info.get("model")),
-                "lastPrompt": info.get("lastPrompt") or "",
-                "recent": info.get("recent") or [],
-                "windowTitle": info.get("windowTitle") or "",
-                # Claude's away summary; omp recaps are attached below.
-                "recap": _text(info.get("recap")),
-                "recapStale": info.get("recapStale") is True,
-                "startedAt": 0,
-                "stateChangedAt": now_ms,
-                "updatedAt": now_ms,
-                "identityExact": identity_exact,
-                "codexHome": _codex_home_value(info.get("codexHome")),
-                "resumeCommand": _resume_command(
-                    provider, sid, cwd, identity_exact, info.get("codexHome")
-                ),
-            })
+            records.append(record(provider, pid, host, ancestors, info if isinstance(info, dict) else {}))
+    # A folder guess can name a session another process runs. The proven
+    # claim keeps the session; the other process stays listed, untracked.
+    owners: dict[str, dict] = {}
+    for r in records:
+        owner = owners.get(r["sessionId"])
+        if owner is None or (r["identityExact"] and not owner["identityExact"]):
+            owners[r["sessionId"]] = r
+    records = [
+        r if owners[r["sessionId"]] is r
+        else record(r["provider"], r["pid"], r["host"], r["ancestorPids"], {})
+        for r in records
+    ]
     _attach_omp_recaps([r for r in records if r["provider"] == "omp"], keep_stale=True)
     _mark_tern_panes(records)
     return records
@@ -2050,10 +2098,10 @@ def _apply_desktop_map(
     return mapped
 
 
-# Sessions that ended while this boot kept running, unless --history-limit
-# says otherwise. Sessions cut off by a reboot stay until they run again,
-# however many there are.
-HISTORY_LIMIT = 100
+# The most recent ended sessions kept; the plasmoid and Tern show fewer.
+# Sessions cut off by the last reboot stay until they run again, however
+# many there are; a later reboot turns them into ordinary exits.
+HISTORY_CAP = 1000
 _CLOSED_BY = ("reboot", "exit")
 
 
@@ -2131,7 +2179,6 @@ def _history_record(record: dict, active: bool, closed_by: str = "") -> dict:
 
 def _merge_snapshot(
     records: list[dict], previous: dict, boot_id: str, now_ms: int,
-    history_limit: int = HISTORY_LIMIT,
 ) -> dict:
     """Reduce one live scan and one saved snapshot into the next snapshot."""
     previous = previous if isinstance(previous, dict) else {}
@@ -2192,7 +2239,10 @@ def _merge_snapshot(
                 continue
             key = _record_key(record)
             if key is not None:
-                history_by_key[key] = _history_record(record, active=False)
+                row = _history_record(record, active=False)
+                if boot_changed and row["closedBy"] == "reboot":
+                    row["closedBy"] = "exit"
+                history_by_key[key] = row
     current_keys = {
         key for key in (_record_key(record) for record in current)
         if key is not None
@@ -2204,19 +2254,16 @@ def _merge_snapshot(
         if isinstance(record.get("pid"), int)
     }
     # A reboot ends every previous session. On the same boot, a session
-    # missing from this scan has exited; untracked processes carry no
-    # session identity, so their exits are not history.
+    # missing from this scan has exited. Untracked processes carry no
+    # session identity, so their ends are not history.
     if boot_changed or same_boot:
         for record in previous_agents:
             if not isinstance(record, dict):
                 continue
             key = _record_key(record)
-            if key is None or key in current_keys:
+            if key is None or key in current_keys or record.get("state") == "untracked":
                 continue
-            if same_boot and (
-                record.get("state") == "untracked"
-                or (record.get("provider"), record.get("pid")) in current_pids
-            ):
+            if same_boot and (record.get("provider"), record.get("pid")) in current_pids:
                 continue
             history_by_key[key] = _history_record(
                 record, active=True,
@@ -2233,7 +2280,7 @@ def _merge_snapshot(
     exited = sorted(
         (r for r in history_by_key.values() if r["closedBy"] == "exit"),
         key=lambda r: r["lastSeenAt"], reverse=True,
-    )[:history_limit]
+    )[:HISTORY_CAP]
 
     counts = {
         "working": 0, "blocked": 0, "idle": 0, "untracked": 0, "total": 0
@@ -2261,24 +2308,6 @@ def _merge_snapshot(
         "ternInstalled": bool(tern_bin()),
         "backfill": _saved_backfill(previous),
     }
-
-
-def _aggregate(
-    desktop_map: dict[tuple[str, str], str] | None = None,
-    path: Path = AGGREGATE_PATH,
-    history_limit: int = HISTORY_LIMIT,
-) -> dict:
-    previous = _load_payload(path)
-    boot_id = _read_boot_id()
-    records = _build_records()
-    if not _confirmed_boot_change(previous, boot_id):
-        records = _apply_desktop_map(records, desktop_map or {})
-    payload = _merge_snapshot(
-        records, previous, boot_id, int(time.time() * 1000), history_limit
-    )
-    _backfill_history(payload, history_limit)
-    _backfill_history_recaps(payload["history"])
-    return payload
 
 
 def _backfill_history_recaps(history: list[dict]) -> None:
@@ -2424,7 +2453,7 @@ def _claude_prompt_sessions() -> dict[str, tuple[int, str]]:
     for line in data[:end].splitlines():
         try:
             rec = json.loads(line)
-        except (ValueError, UnicodeError):
+        except (ValueError, UnicodeError, RecursionError):
             continue
         if not isinstance(rec, dict):
             continue
@@ -2578,14 +2607,14 @@ _BACKFILL_SOURCES = {
 }
 
 
-def _backfill_history(payload: dict, history_limit: int = HISTORY_LIMIT) -> None:
+def _backfill_history(payload: dict) -> None:
     """Add sessions that ended while no sweep watched them, or before
     CodexBar AgentView ran, from each provider's own prompt history.
 
     A session qualifies while its transcript and folder exist and no
     process runs it. Rows already in history win. Candidates rank by
     transcript mtime, which no turn in it can postdate, so the newest
-    `history_limit` are found without reading older transcripts."""
+    `HISTORY_CAP` are found without reading older transcripts."""
     state = payload["backfill"]
     floor = state["floor"]
     known = {
@@ -2613,15 +2642,15 @@ def _backfill_history(payload: dict, history_limit: int = HISTORY_LIMIT) -> None
     candidates.sort(reverse=True)
     history = payload["history"]
     exited = [r for r in history if r["closedBy"] == "exit"]
-    # The `history_limit` newest exits so far; a candidate that cannot beat
+    # The `HISTORY_CAP` newest exits so far; a candidate that cannot beat
     # the oldest of them once there are that many is not read.
-    kept = heapq.nlargest(history_limit, (r["lastSeenAt"] for r in exited))
+    kept = heapq.nlargest(HISTORY_CAP, (r["lastSeenAt"] for r in exited))
     heapq.heapify(kept)
     added: dict[tuple[str, str], tuple[dict, int]] = {}
     live: dict[str, tuple[set[str], set[str]]] = {}
     host = "tern" if payload.get("ternInstalled") else "kitty"
     for bound, provider, sid, rollout, prompt_ms, title in candidates:
-        if len(kept) >= history_limit and bound <= kept[0]:
+        if len(kept) >= HISTORY_CAP and bound <= kept[0]:
             break
         source = _BACKFILL_SOURCES[provider]
         info = _transcript_info(rollout, source.parser)
@@ -2658,54 +2687,26 @@ def _backfill_history(payload: dict, history_limit: int = HISTORY_LIMIT) -> None
             "recapStale": info["recapStale"],
         }, active=False), bound)
         heapq.heappush(kept, last_seen)
-        if len(kept) > history_limit:
+        if len(kept) > HISTORY_CAP:
             heapq.heappop(kept)
     if added:
         exited = sorted(
             exited + [row for row, _bound in added.values()],
             key=lambda r: r["lastSeenAt"], reverse=True,
-        )[:history_limit]
+        )[:HISTORY_CAP]
         payload["history"] = [r for r in history if r["closedBy"] == "reboot"] + exited
-        # Rows the limit cut stay out until their transcript changes.
+        # Rows the cap cut stay out until their transcript changes.
         for key in added.keys() - {_record_key(r) for r in exited}:
             state["skip"][key[0]][key[1]] = added[key][1]
-    if len(exited) >= history_limit:
+    if len(exited) >= HISTORY_CAP:
         state["floor"] = max(floor, min(r["lastSeenAt"] for r in exited))
 
 
 def _write_aggregate(payload: dict, path: Path = AGGREGATE_PATH) -> None:
     # json.dumps encodes in C; json.dump streams through the pure-Python encoder.
-    _write_file(Path(path), json.dumps(payload, separators=(",", ":")), durable=True)
-
-
-def _write_file(path: Path, text: str, durable: bool) -> None:
-    """Replace `path` atomically; `durable` also fsyncs it and its folder."""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as output:
-            temporary = Path(output.name)
-            state_paths.make_private(output.fileno())
-            output.write(text)
-            if durable:
-                output.flush()
-                os.fsync(output.fileno())
-        state_paths.replace(temporary, path)
-        if durable:
-            state_paths.fsync_dir(path.parent)
-    finally:
-        if temporary is not None:
-            try:
-                temporary.unlink()
-            except FileNotFoundError:
-                pass
+    state_paths.write_file(path, json.dumps(payload, separators=(",", ":")), durable=True)
 
 
 def _confirmed_boot_change(previous: dict, boot_id: str) -> bool:
@@ -2744,6 +2745,7 @@ def _aggregate_lock(aggregate_path: Path, lock_path: Path | None = None):
         )
     lock_path = Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
+    aggregate_path.parent.mkdir(parents=True, exist_ok=True)
     lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     try:
         state_paths.make_private(lock_fd)
@@ -2812,82 +2814,56 @@ def _locked_sweep(
     requested_at: int | None = None,
     aggregate_path: Path = AGGREGATE_PATH,
     lock_path: Path | None = None,
-    history_limit: int = HISTORY_LIMIT,
+    write: bool = True,
 ) -> tuple[dict, bool]:
+    """Sweep and save the next snapshot under the writer lock. Without
+    `write`, sweep with neither the lock nor the parser cache and save
+    nothing."""
+    global _TRANSCRIPT_CACHE, _CACHE_ACTIVE
     aggregate_path = Path(aggregate_path)
-    with _aggregate_lock(aggregate_path, lock_path):
+    with _aggregate_lock(aggregate_path, lock_path) if write else contextlib.nullcontext():
         boot_id = _read_boot_id()
         previous = _load_payload(aggregate_path)
         now_ms = int(time.time() * 1000)
         if _saved_write_is_newer(previous, boot_id, requested_at, now_ms):
             return previous, False
-        global _TRANSCRIPT_CACHE, _CACHE_ACTIVE
         cache_path = aggregate_path.with_suffix(".parsers.json")
         cache_text = ""
-        try:
-            cache_text = cache_path.read_text()
-            saved = json.loads(cache_text)
-            entries = saved.get("entries") if isinstance(saved, dict) and saved.get("version") == _CACHE_VERSION else None
-            _TRANSCRIPT_CACHE = entries if isinstance(entries, dict) else {}
-        except (OSError, ValueError, UnicodeError):
-            _TRANSCRIPT_CACHE = {}
-        _CACHE_ACTIVE = set()
+        if write:
+            try:
+                cache_text = cache_path.read_text()
+                saved = json.loads(cache_text)
+                entries = saved.get("entries") if isinstance(saved, dict) and saved.get("version") == _CACHE_VERSION else None
+                _TRANSCRIPT_CACHE = entries if isinstance(entries, dict) else {}
+            except (OSError, ValueError, UnicodeError):
+                _TRANSCRIPT_CACHE = {}
+            _CACHE_ACTIVE = set()
         try:
             with _process_snapshot():
                 records = _build_records()
                 if not _confirmed_boot_change(previous, boot_id):
                     records = _apply_desktop_map(records, desktop_map or {})
-                payload = _merge_snapshot(
-                    records, previous, boot_id, int(time.time() * 1000), history_limit
-                )
+                payload = _merge_snapshot(records, previous, boot_id, int(time.time() * 1000))
                 # Inside the cache window, so rollouts it parses stay cached.
-                _backfill_history(payload, history_limit)
+                _backfill_history(payload)
                 _backfill_history_recaps(payload["history"])
-            _TRANSCRIPT_CACHE = {key: value for key, value in _TRANSCRIPT_CACHE.items()
-                                 if key in _CACHE_ACTIVE}
-            text = json.dumps({"version": _CACHE_VERSION, "entries": _TRANSCRIPT_CACHE},
-                              separators=(",", ":"))
-            # A lost or torn cache only costs a full reparse, so it skips fsync.
-            if text != cache_text:
-                _write_file(cache_path, text, durable=False)
+            if write:
+                _TRANSCRIPT_CACHE = {key: value for key, value in _TRANSCRIPT_CACHE.items()
+                                     if key in _CACHE_ACTIVE}
+                text = json.dumps({"version": _CACHE_VERSION, "entries": _TRANSCRIPT_CACHE},
+                                  separators=(",", ":"))
+                # A lost or torn cache only costs a full reparse, so it skips fsync.
+                if text != cache_text:
+                    state_paths.write_file(cache_path, text, durable=False)
         finally:
             _CACHE_ACTIVE = None
-        _write_aggregate(payload, aggregate_path)
-        return payload, True
-
-
-def _watch(
-    interval: float,
-    desktop_map: dict[tuple[str, str], str] | None = None,
-    requested_at: int | None = None,
-    history_limit: int = HISTORY_LIMIT,
-) -> int:
-    """Run forever and retain the prior complete snapshot after failures."""
-    while True:
-        try:
-            _locked_sweep(desktop_map, requested_at, history_limit=history_limit)
-        except Exception as exc:
-            sys.stderr.write(f"codexbar_agents: sweep failed: {exc}\n")
-        time.sleep(interval)
-
-
-def _history_limit(value: str) -> int:
-    try:
-        limit = int(value)
-    except ValueError:
-        limit = -1
-    if not 1 <= limit <= 1000:
-        raise argparse.ArgumentTypeError("history limit must be 1-1000")
-    return limit
+        if write:
+            _write_aggregate(payload, aggregate_path)
+        return payload, write
 
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--watch", action="store_true",
-        help="Run forever, sweeping every --interval seconds.",
-    )
-    parser.add_argument("-i", "--interval", type=float, default=5.0)
     parser.add_argument(
         "--once", action="store_true",
         help="Sweep once and write the aggregate file.",
@@ -2895,7 +2871,6 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--desktop-map")
     parser.add_argument("--requested-at")
     parser.add_argument("--dismiss")
-    parser.add_argument("--history-limit", type=_history_limit, default=HISTORY_LIMIT)
     args = parser.parse_args(argv)
     state_paths.migrate()
     desktop_map = _parse_desktop_map(args.desktop_map)
@@ -2904,13 +2879,11 @@ def main(argv: list[str]) -> int:
     if args.dismiss is not None:
         _dismiss_history(_parse_session_keys(args.dismiss))
         return 0
-    if args.watch:
-        return _watch(args.interval, desktop_map, requested_at, args.history_limit)
     if args.once:
-        _locked_sweep(desktop_map, requested_at, history_limit=args.history_limit)
+        _locked_sweep(desktop_map, requested_at)
         return 0
 
-    payload = _aggregate(desktop_map, history_limit=args.history_limit)
+    payload, _ = _locked_sweep(desktop_map, write=False)
     json.dump(payload, sys.stdout, separators=(",", ":"))
     sys.stdout.write("\n")
     return 0

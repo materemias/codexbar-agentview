@@ -143,7 +143,8 @@ def _sysctl(mib: list[int], size: int) -> bytes:
     length = ctypes.c_size_t(size)
     if _libc.sysctl(arr, len(mib), buf, ctypes.byref(length), None, 0) != 0 or length.value > size:
         return b""
-    return buf.raw[:length.value]
+    # `.raw` would copy the whole buffer, often far larger than the reply.
+    return ctypes.string_at(buf, length.value)
 
 
 def _procargs(pid: int) -> tuple[list[str], list[bytes]]:
