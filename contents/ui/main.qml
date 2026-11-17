@@ -180,7 +180,8 @@ PlasmoidItem {
         Plasmoid.configuration.enableCodex !== false
         && Plasmoid.configuration.showCodexResetForecast !== false
     readonly property bool showRecentUsage: Plasmoid.configuration.showRecentUsage !== false
-    readonly property int refreshMs: Math.max(10, Plasmoid.configuration.refreshSeconds || 30) * 1000
+    // Tests assign it to poll below the settings' 10 s floor.
+    property int refreshMs: Math.max(10, Plasmoid.configuration.refreshSeconds || 30) * 1000
     readonly property var enabledProviders: {
         // Display order: Claude → Codex → z.ai → OpenCode Go → OpenRouter → Kilo → TypeSafe
         // (preserved in tray rings, popup sections, tooltip, settings).

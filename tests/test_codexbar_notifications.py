@@ -153,9 +153,8 @@ Item {
             state = Notifications.usage(state, [stale], now, true).state
             check(Notifications.usage(state, [record(81)], now, true).events.length === 0,
                 "stale intervals must preserve deduplication")
-            check(Notifications.usage({}, [stale], now, true).events.length === 0
-                && Notifications.usage({}, [record(99)], now, true).events.length === 1,
-                "startup cache stays silent but first fresh reading can alert")
+            check(Notifications.usage({}, [record(99)], now, true).events.length === 1,
+                "the first fresh reading can alert, unlike the stale startup cache above")
         ''')
 
     def test_accounts_windows_and_named_notification_text(self):

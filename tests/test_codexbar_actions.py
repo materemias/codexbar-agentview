@@ -63,8 +63,10 @@ Item {
     }
 }
 ''')
+            # configAgents.qml reads agents.json from the state dir: keep it scratch.
             env = dict(os.environ, QT_QPA_PLATFORM="offscreen",
-                       QT_FORCE_STDERR_LOGGING="1", QT_LOGGING_TO_CONSOLE="1")
+                       QT_FORCE_STDERR_LOGGING="1", QT_LOGGING_TO_CONSOLE="1",
+                       XDG_STATE_HOME=str(root / "state"))
             result = subprocess.run([QML, str(root / "test.qml")], env=env,
                                     capture_output=True, text=True, timeout=15)
             output = result.stdout + result.stderr

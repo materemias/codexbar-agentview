@@ -14,13 +14,13 @@ import xml.etree.ElementTree as ET
 ROOT = Path(__file__).resolve().parents[1]
 QML = shutil.which("qml6") or shutil.which("qml") or "/usr/lib/qt6/bin/qml"
 PLUGIN = ROOT / "build/package/contents/ui/process"
+SCENARIO_SECONDS = 6
 
 
 @unittest.skipUnless(Path(QML).is_file() and (PLUGIN / "libcodexbarprocess.so").is_file(),
                      "Build the native package and install the Qt 6 qml tool first")
 class MainLifecycleTest(unittest.TestCase):
-    def applet(self, scenario, helper_case=None, views=False, real_fetch=False,
-               scenario_seconds=6):
+    def applet(self, scenario, helper_case=None, views=False, real_fetch=False):
         with tempfile.TemporaryDirectory(prefix="codexbar-main-") as directory:
             root = Path(directory)
 
@@ -130,8 +130,10 @@ with calls.open("a") as output:
 history = [json.loads(line) for line in calls.read_text().splitlines()]
 number = len(history)
 normal = sum(call["backend"] == backend and not call["cache"] for call in history)
-time.sleep(0.15)
 test = json.loads((root / "scenario.json").read_text())
+# Slow enough for a 20 ms fixture tick to see the fetch in flight. Scenarios
+# that only act between fetches set fetchDelay 0.
+time.sleep((test or {}).get("fetchDelay", 0.15))
 snapshots = (test or {}).get("freshSnapshots", {}).get(backend, [])
 if snapshots and not cache:
     print(json.dumps(snapshots[min(normal - 1, len(snapshots) - 1)]))
@@ -205,10 +207,11 @@ state = pathlib.Path(os.environ["XDG_STATE_HOME"]) / "codexbar-agentview"
 ''')
             put("bin/notify-send", "#!/usr/bin/env python3\n"
                 "import json, pathlib, sys, time\n"
-                "time.sleep(0.8)\n"
+                "config = json.loads((pathlib.Path(__file__).parent.parent / 'scripts/scenario.json').read_text()) or {}\n"
+                "# Scenarios that need a delivery still in flight set notifyDelay.\n"
+                "time.sleep(config.get('notifyDelay', 0))\n"
                 "with pathlib.Path(__file__).with_name('notifications').open('a') as output:\n"
                 "    output.write(json.dumps(sys.argv[1:]) + '\\n')\n"
-                "config = json.loads((pathlib.Path(__file__).parent.parent / 'scripts/scenario.json').read_text()) or {}\n"
                 "if config.get('notifyFails'):\n"
                 "    print('synthetic service failure', file=sys.stderr)\n"
                 "    sys.exit(1)\n")
@@ -220,7 +223,7 @@ import "ui/process" as Process
     id: fixture
     property int stage: 0
     property int ticks: 0
-    property double deadlineMs: Date.now() + ''' + str(scenario_seconds * 1000) + '''
+    property double deadlineMs: Date.now() + ''' + str(SCENARIO_SECONDS * 1000) + '''
     property string oldCommand: ""
     property var compact: null
     property var rows: []
@@ -251,11 +254,25 @@ import "ui/process" as Process
     function check(condition, message) {
         if (!condition) throw new Error(message)
     }
+    // Every item under `item` (itself included) that passes `test`.
+    function findAll(item, test, out) {
+        out = out || []
+        if (test(item)) out.push(item)
+        var kids = item.children || []
+        for (var i = 0; i < kids.length; i++) findAll(kids[i], test, out)
+        return out
+    }
+    function find(item, name) {
+        return findAll(item, function(i) { return i.objectName === name })
+    }
     Loader {
         id: applet
         source: "ui/Main.qml"
         onStatusChanged: if (status === Loader.Error) Qt.exit(1)
-    }
+''' + ('''        // Shorter polling than settings allow. Assigned before any helper
+        // finishes: only the startup cache read has started.
+        onLoaded: item.refreshMs = %d
+''' % helper_case["refreshMs"] if (helper_case or {}).get("refreshMs") else "") + '''    }
     Timer {
         interval: 20; running: true; repeat: true
         onTriggered: {
@@ -329,11 +346,11 @@ root = pathlib.Path(__file__).parent
 first = root / "first-fresh-started"
 if "--cache-only" not in sys.argv and not first.exists():
     first.touch()
-    time.sleep(1.2)
+    time.sleep(0.5)
 runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
 ''')
             result = subprocess.run([QML, str(root / "test.qml")], env=env,
-                                    capture_output=True, text=True, timeout=scenario_seconds + 9)
+                                    capture_output=True, text=True, timeout=SCENARIO_SECONDS + 9)
             output = result.stdout + result.stderr
             self.assertEqual(result.returncode, 0, output)
             self.assertIn("PASS actual main", output)
@@ -343,7 +360,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
             return calls, ([json.loads(line) for line in notifications.read_text().splitlines()]
                            if notifications.exists() else [])
 
-    def test_automatic_refresh_respects_shared_fetch_claim_and_expiry(self):
+    def test_shared_fetch_claim_holds_automatic_refresh_until_expiry_but_not_manual(self):
         calls, notifications = self.applet('''
                 if (fixture.stage === 0) {
                     // Startup restores cache, then schedules the real automatic refresh.
@@ -376,12 +393,20 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                     fixture.check(app.snapshot.providers[0].primary.usedPercent === 81,
                         "newly cached reading was lost")
                     fixture.check(app.lastError === "", "new cache-only response became a UI error")
+                    fixture.stage = 4
+                    app.refresh()
+                } else if (fixture.stage === 4) {
+                    if (app.loading) return
+                    fixture.check(fixture.freshFetches === 4, "manual refresh did not complete")
+                    fixture.check(app.snapshot.providers[0].primary.usedPercent === 81
+                        && app.snapshot.cacheOnly !== true && app.lastError === "",
+                        "Refresh now must execute the provider despite a fresh claim")
                     console.log("PASS actual main")
                     Qt.quit()
                 }
 ''', real_fetch=True)
-        self.assertEqual(calls, [{"provider": "kilo"}],
-                         "only the refresh after shared claim expiry may execute the provider")
+        self.assertEqual(calls, [{"provider": "kilo"}, {"provider": "kilo"}],
+                         "only the refresh after claim expiry and Refresh now may execute the provider")
         self.assertEqual(notifications, [])
 
     def test_recent_shared_reading_is_current_and_notifies_critical_usage_once(self):
@@ -442,30 +467,6 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 self.assertEqual(notifications, [],
                                  "old, failed or source-stale usage must not notify")
 
-    def test_manual_refresh_bypasses_fresh_shared_claim(self):
-        calls, notifications = self.applet('''
-                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
-                if (fixture.stage === 0) {
-                    check(app.snapshot.cacheOnly === true
-                        && app.snapshot.providers[0].primary.usedPercent === 42,
-                        "startup must adopt the preceding poller's reading")
-                    fixture.stage = 1
-                    app.refresh()
-                } else {
-                    check(fixture.freshFetches === 2, "manual refresh did not complete")
-                    check(app.snapshot.providers.length === 1
-                        && app.snapshot.providers[0].primary.usedPercent === 81,
-                        "Refresh now must execute the provider despite a fresh shared claim")
-                    check(app.snapshot.cacheOnly !== true && app.lastError === "",
-                        "manual refresh must publish a fresh successful reading")
-                    console.log("PASS actual main manual refresh bypasses shared claim")
-                    Qt.quit()
-                }
-''', real_fetch=True)
-        self.assertEqual(calls, [{"provider": "kilo"}],
-                         "manual refresh must execute the actual helper's provider path")
-        self.assertEqual(notifications, [])
-
     def test_backend_change_bypasses_fresh_shared_claim(self):
         calls, notifications = self.applet('''
                 if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
@@ -493,6 +494,8 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
         self.assertEqual(notifications, [])
 
     def test_first_natural_poll_fetches_after_delayed_initial_helper(self):
+        # A 1 s poll with a 0.5 s delayed first helper: a Timer anchored
+        # anywhere but the helper's completion polls inside the applet's own claim.
         calls, notifications = self.applet('''
                 if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
                 if (fixture.stage === 0) {
@@ -512,61 +515,26 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                     console.log("PASS actual main natural polling follows helper completion")
                     Qt.quit()
                 }
-''', {"configuration": {"refreshSeconds": 10}, "expireInitialClaim": True,
-      "delayFirstFresh": True}, real_fetch=True, scenario_seconds=16)
+''', {"refreshMs": 1000, "expireInitialClaim": True, "delayFirstFresh": True}, real_fetch=True)
         self.assertEqual(calls, [{"provider": "kilo"}, {"provider": "kilo"}],
                          "both startup and the first natural poll must execute the provider")
         self.assertEqual(notifications, [])
 
-    def test_shared_cache_preserves_forecast_and_cli_version_for_same_backend(self):
-        initial = {
-            "providers": [{"id": "codex", "ok": True, "sourceScope": "a" * 64,
-                           "primary": {"usedPercent": 42}}],
-            "forecast": {"ok": True, "signal": {
-                "deadlineAt": "2099-01-01T12:00:00Z", "percent": 75}},
-            "cliVersion": "CodexBar 0.56.3",
-        }
-        shared = dict(initial, cacheOnly=True, sharedCache=True, forecast=None, cliVersion=None,
-                      providers=[{"id": "codex", "ok": True, "sourceScope": "a" * 64,
-                                  "primary": {"usedPercent": 83}}])
-        shared_without_metadata = {"providers": shared["providers"],
-                                   "cacheOnly": True, "sharedCache": True}
-        calls, notifications = self.applet('''
-                if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
-                if (fixture.stage === 0) {
-                    check(app.codexForecastState(app.snapshot.forecast) === "announced"
-                        && app.snapshot.cliVersion === "CodexBar 0.56.3",
-                        "initial fresh response must establish usable metadata")
-                    fixture.stage = 1
-                    app.refresh(true)
-                } else {
-                    check(app.snapshot.sharedCache === true
-                        && app.snapshot.providers[0].primary.usedPercent === 83,
-                        "the new shared usage response must replace the old provider reading")
-                    check(app.codexForecastState(app.snapshot.forecast) === "announced"
-                        && app.snapshot.forecast.signal.percent === 75,
-                        "shared-cache adoption must retain the existing valid forecast")
-                    check(app.snapshot.cliVersion === "CodexBar 0.56.3",
-                        "shared-cache adoption must retain the current backend's CLI version")
-                    if (fixture.stage === 1) {
-                        fixture.stage = 2
-                        app.refresh(true)
-                    } else {
-                        console.log("PASS actual main shared cache retains current backend metadata")
-                        Qt.quit()
-                    }
-                }
-''', {"freshSnapshots": {"/backend-a": [initial, shared, shared_without_metadata]}})
-        self.assertEqual([call["cache"] for call in calls], [True, False, False, False])
-        self.assertEqual(notifications, [])
+    def test_shared_cache_keeps_backend_metadata_and_adopts_only_current_rotation(self):
+        def records(percent):
+            return [{"id": provider, "ok": True, "sourceScope": provider[0] * 64,
+                     "accountEmail": provider + "@example.test", "primary": {"usedPercent": percent}}
+                    for provider in ("claude", "codex")]
 
-    def test_shared_cache_uses_current_local_rotation_badges_and_clears_deleted_status(self):
-        records = [{"id": provider, "ok": True, "sourceScope": provider[0] * 64,
-                    "accountEmail": provider + "@example.test", "primary": {"usedPercent": 42}}
-                   for provider in ("claude", "codex")]
-        initial = {"providers": records}
-        shared = {"providers": records, "cacheOnly": True, "sharedCache": True}
-        deleted = dict(shared, claudeRotation=None, codexRotation=None)
+        initial = {"providers": records(42), "cliVersion": "CodexBar 0.56.3",
+                   "forecast": {"ok": True, "signal": {
+                       "deadlineAt": "2099-01-01T12:00:00Z", "percent": 75}}}
+        # A claim refusal: null forecast and CLI version, the current local rotation.
+        shared = {"providers": records(83), "cacheOnly": True, "sharedCache": True,
+                  "forecast": None, "cliVersion": None}
+        # Then no forecast or CLI version keys at all, and the local rotation deleted.
+        deleted = {"providers": records(83), "cacheOnly": True, "sharedCache": True,
+                   "claudeRotation": None, "codexRotation": None}
         for provider in ("claude", "codex"):
             initial[provider + "Rotation"] = {
                 "mode": "FILL", "operatingMode": "auto",
@@ -576,6 +544,11 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 "accountAvailability": {provider + "@example.test": "blocked"}}
         calls, notifications = self.applet('''
                 if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
+                check(app.snapshot.providers.length === 2, "both providers must remain represented")
+                check(app.codexForecastState(app.snapshot.forecast) === "announced"
+                    && app.snapshot.forecast.signal.percent === 75
+                    && app.snapshot.cliVersion === "CodexBar 0.56.3",
+                    "shared-cache adoption must retain the current backend's forecast and CLI version")
                 for (var index = 0; index < app.snapshot.providers.length; index++) {
                     var record = app.snapshot.providers[index]
                     var rotation = app.providerRotation(record.id)
@@ -583,7 +556,11 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                         check(rotation && rotation.mode === "FILL"
                             && app.accountAvailabilityIndicator(record) === "\\uD83D\\uDFE2",
                             "initial fresh response establishes local rotation badges")
-                    } else if (fixture.stage === 1) {
+                        continue
+                    }
+                    check(app.snapshot.sharedCache === true && record.primary.usedPercent === 83,
+                        "the new shared usage response must replace the old provider reading")
+                    if (fixture.stage === 1) {
                         check(rotation && rotation.mode === "TARGET"
                             && rotation.operatingMode === "confirm",
                             "shared-cache response must use its current local rotation, not clear or copy old status")
@@ -594,15 +571,14 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                             "deleted local rotation must clear the old badge, never resurrect it from memory")
                     }
                 }
-                check(app.snapshot.providers.length === 2, "both providers must remain represented")
                 if (fixture.stage === 2) {
-                    console.log("PASS actual main shared cache adopts only current local rotation badges")
+                    console.log("PASS actual main shared cache keeps metadata and current rotation")
                     Qt.quit()
                 } else {
                     fixture.stage++
                     app.refresh(true)
                 }
-''', {"configuration": {"enableClaude": True},
+''', {"configuration": {"enableClaude": True}, "fetchDelay": 0,
       "freshSnapshots": {"/backend-a": [initial, shared, deleted]}})
         self.assertEqual([call["cache"] for call in calls], [True, False, False, False])
         self.assertEqual(notifications, [],
@@ -666,12 +642,13 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                     console.log("PASS actual main authoritative empty snapshot")
                     Qt.exit(0)
                 }
-''', {"failure": "fatal"})
+''', {"failure": "fatal", "fetchDelay": 0})
         self.assertEqual([call["cache"] for call in calls], [True, False, False])
         self.assertEqual(notifications, [])
 
     def test_transport_failure_revalidates_cache_and_preserves_empty_marker(self):
-        for failure in ("", "not json", '{"providers": [null]}'):
+        # Empty output, the stub's third failure, is the recovery tests' failure below.
+        for failure in ("not json", '{"providers": [null]}'):
             with self.subTest(failure=failure):
                 calls, notifications = self.applet('''
                 if (fixture.freshFetches < 1 || app.cacheRestoring || app.loading) return
@@ -689,7 +666,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                     console.log("PASS actual main scoped empty recovery")
                     Qt.exit(0)
                 }
-''', {"failure": failure})
+''', {"failure": failure, "fetchDelay": 0})
                 self.assertEqual([call["cache"] for call in calls], [True, False, False, True])
                 self.assertEqual(notifications, [])
 
@@ -712,7 +689,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                     console.log("PASS actual main scoped recovery")
                     Qt.exit(0)
                 }
-''', {"failure": "", "recoveryProviders": [current]})
+''', {"failure": "", "recoveryProviders": [current], "fetchDelay": 0})
         self.assertEqual([call["cache"] for call in calls], [True, False, False, True])
         self.assertEqual(notifications, [])
 
@@ -732,7 +709,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                     console.log("PASS actual main failed scoped recovery")
                     Qt.exit(0)
                 }
-''', {"failure": "", "recoveryFails": True})
+''', {"failure": "", "recoveryFails": True, "fetchDelay": 0})
         self.assertEqual([call["cache"] for call in calls], [True, False, False, True])
         self.assertEqual(notifications, [])
 
@@ -758,7 +735,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                     console.log("PASS actual main scopes usage acknowledgements")
                     Qt.exit(0)
                 }
-''', {"switchScope": True, "usageNotifications": True})
+''', {"switchScope": True, "usageNotifications": True, "notifyDelay": 0.8, "fetchDelay": 0})
         self.assertEqual(len(calls), 3)
         self.assertEqual(len(notifications), 2)
 
@@ -781,7 +758,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                     console.log("PASS actual main preserves notification service failures")
                     Qt.exit(0)
                 }
-''', {"notifyFails": True})
+''', {"notifyFails": True, "fetchDelay": 0})
         self.assertEqual(len(calls), 4)
         self.assertEqual(len(notifications), 1)
 
@@ -857,7 +834,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 }
                 fixture.stage++
                 app.refresh()
-''')
+''', {"fetchDelay": 0})
         self.assertEqual([call["cache"] for call in calls],
                          [True] + [False] * 6 + [True, False, False])
         self.assertEqual([args[-1] for args in notifications], [
@@ -921,7 +898,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                     console.log("PASS actual main isolates late notification acknowledgements")
                     Qt.exit(0)
                 }
-''')
+''', {"notifyDelay": 0.8, "fetchDelay": 0})
         self.assertEqual([call["backend"] for call in calls],
                          ["/backend-a"] * 3 + ["/backend-b"] * 2)
         self.assertEqual([args[-1] for args in notifications],
@@ -967,13 +944,6 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 "panes": []}
         self.applet('''
                 if (app.cacheRestoring || app.loading) return
-                function find(item, name, out) {
-                    out = out || []
-                    if (item.objectName === name) out.push(item)
-                    var kids = item.children || []
-                    for (var i = 0; i < kids.length; i++) find(kids[i], name, out)
-                    return out
-                }
                 function markers() {
                     var out = {}
                     find(fixture.popup, "waitingMarker").forEach(function(m) {
@@ -1010,11 +980,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                     check(Object.keys(marks).length === 2, "a session without a wait stays unmarked")
                     var section = find(fixture.popup, "agentsSection")[0]
                     var tip = section.data.filter(function(o) { return o.objectName === "rowTip" })[0]
-                    var rows = []
-                    ;(function walk(item) {
-                        if (item.waitingHoverText !== undefined) rows.push(item)
-                        ;(item.children || []).forEach(walk)
-                    })(fixture.popup)
+                    var rows = findAll(fixture.popup, function(i) { return i.waitingHoverText !== undefined })
                     section.hoveredRow = rows.filter(function(r) { return r.waiting && r.waiting.onMe })[0]
                     check(tip.textFormat === Text.PlainText
                         && tip.text === line.replace("&", "&\\u200a") + "\\n/w/back"
@@ -1059,13 +1025,6 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                               "close": {"verdict": "safe", "reason": "prompt", "text": "closable"}}]}
         self.applet('''
                 if (app.cacheRestoring || app.loading) return
-                function find(item, name, out) {
-                    out = out || []
-                    if (item.objectName === name) out.push(item)
-                    var kids = item.children || []
-                    for (var i = 0; i < kids.length; i++) find(kids[i], name, out)
-                    return out
-                }
                 if (fixture.stage === 0) {
                     app.agentSnapshot = { counts: { working: 0, blocked: 0, idle: 1, untracked: 0, total: 1 },
                         agents: [{ provider: "omp", sessionId: "back", state: "idle", cwd: "/w/back" }] }
@@ -1080,11 +1039,9 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                 var count = find(fixture.compact, "waitingOnMeCount")[0]
                 var countText = find(count, "waitingOnMeCountLabel")[0]
                 var label = find(fixture.popup, "waitingWarning")[0]
-                var row = null
-                ;(function walk(item) {
-                    if (item.waitingHoverText !== undefined && item.waiting) row = item
-                    ;(item.children || []).forEach(walk)
-                })(fixture.popup)
+                var row = findAll(fixture.popup, function(i) {
+                    return i.waitingHoverText !== undefined && i.waiting
+                }).pop()
                 check(app.waitingWarning === expected, "failed tick read from the file: " + app.waitingWarning)
                 check(label.visible && label.text === expected, "Agents section shows the warning")
                 check(count.visible && countText.text === "2?" && count.opacity < 1,
@@ -1290,13 +1247,6 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                                  {"id": "codex", "ok": True, "stale": True, "accountEmail": "b@example.com",
                                   "cachedAt": "2026-11-13T08:00:00Z", "primary": {"usedPercent": 30}}]}
         calls, notifications = self.applet('''
-                function find(item, name, out) {
-                    out = out || []
-                    if (item.objectName === name) out.push(item)
-                    var kids = item.children || []
-                    for (var i = 0; i < kids.length; i++) find(kids[i], name, out)
-                    return out
-                }
                 function shown(item, test, out) {
                     out = out || []
                     if (!item.visible) return out
@@ -1370,13 +1320,6 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                     "providers": [{"id": "codex", "ok": True, "primary": {"usedPercent": 40},
                                    "updatedAt": now}]}
         calls, notifications = self.applet('''
-                function find(item, name, out) {
-                    out = out || []
-                    if (item.objectName === name) out.push(item)
-                    var kids = item.children || []
-                    for (var i = 0; i < kids.length; i++) find(kids[i], name, out)
-                    return out
-                }
                 if (fixture.stage === 0) {
                     fixture.popup = app.fullRepresentation.createObject(fixture, { width: 500, height: 460 })
                     fixture.stage = 1
@@ -1502,17 +1445,10 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
 
     def test_account_over_pace_box_reads_and_migrates_the_all_accounts_flag(self):
         self.applet('''
-                function find(item, test, out) {
-                    out = out || []
-                    if (test(item)) out.push(item)
-                    var kids = item.children || []
-                    for (var i = 0; i < kids.length; i++) find(kids[i], test, out)
-                    return out
-                }
                 function overPaceBox(key) {
-                    var meter = find(fixture.popup, function(i) { return i.key === key && i.isOn !== undefined })[0]
+                    var meter = findAll(fixture.popup, function(i) { return i.key === key && i.isOn !== undefined })[0]
                     check(meter, "no meter " + key)
-                    return find(meter, function(i) { return i.text === "only if proj > 100%" })[0]
+                    return findAll(meter, function(i) { return i.text === "only if proj > 100%" })[0]
                 }
                 if (fixture.stage === 0) {
                     var page = Qt.createComponent(Qt.resolvedUrl("ui/configTray.qml"))
@@ -1551,13 +1487,6 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
 
     def test_typing_after_a_manual_tab_click_returns_to_agents(self):
         self.applet('''
-                function find(item, test, out) {
-                    out = out || []
-                    if (test(item)) out.push(item)
-                    var kids = item.children || []
-                    for (var i = 0; i < kids.length; i++) find(kids[i], test, out)
-                    return out
-                }
                 if (fixture.stage === 0) {
                     if (app.cacheRestoring || app.loading) return
                     fixture.popup = app.fullRepresentation.createObject(fixture, { width: 600, height: 400 })
@@ -1566,7 +1495,7 @@ runpy.run_path(str(root / "real_codexbar_fetch.py"), run_name="__main__")
                     fixture.since = fixture.ticks
                 } else if (fixture.stage === 1) {
                     if (fixture.ticks - fixture.since < 10) return
-                    var bar = find(fixture.popup, function(i) { return String(i).indexOf("TabBar") >= 0 })[0]
+                    var bar = findAll(fixture.popup, function(i) { return String(i).indexOf("TabBar") >= 0 })[0]
                     check(bar.currentIndex === 1, "Super+A opens Agents")
                     bar.currentIndex = 0
                     fixture.popup.forceActiveFocus()
