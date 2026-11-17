@@ -5288,6 +5288,11 @@ class CloseTests(Case):
         self.run_cli("babysit-pr", "--session", SID, "--repo", "o/r", "--number", "7", "--no-fix")
         self.assertEqual(self.close()["verdict"], "manual")
 
+    def test_a_pr_wait_i_chain_myself_still_comes_back_to_me(self) -> None:
+        first = self.add("--kind", "time", "--in", "1h", "--prompt", "go")["id"]
+        self.add("--kind", "pr", "--repo", "o/r", "--number", "7", "--until", "merged", "--after", first)
+        self.assertEqual(self.close()["verdict"], "manual")
+
     def test_later_and_a_pin_come_back_to_me(self) -> None:
         self.add("--kind", "later")
         self.assertEqual(self.close()["verdict"], "manual")

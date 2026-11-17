@@ -1596,6 +1596,8 @@ def _new_wait(state: dict, now: datetime, daemon: str | None = None, **fields: o
         # (`_back_early`); a resume may be bringing it up, to hide on arrival.
         # Waits from before these have none: read them with `.get`.
         "wake": False, "closed_seen": False, "arriving_at": None,
+        # A step `babysit-pr` chained (`_close_reason`); read it with `.get` too.
+        "babysit": False,
     }
     wait.update(fields)
     if wait.get("kind") == "job":
@@ -3897,14 +3899,13 @@ def _on_me_already(wait: dict) -> bool:
     return bool(wait["on_me"]) or state in ("fired", "review", "needs_attention")
 
 
-def _close_reason(wait: dict, linked: set[str]) -> str:
+def _close_reason(wait: dict) -> str:
     """What a wait still to come says about closing: `prompt`, a closed session
     is reopened for its prompt, each repeat run, or its snooze's wake; `news`, a
     babysat PR's step past the review, which only tells me; else `manual`."""
     if wait["kind"] == "snooze" or (bool(wait["prompt"] or wait.get("repeat")) and wait["kind"] != "later"):
         return "prompt"
-    chained = bool(wait["next"]) or wait["id"] in linked
-    if wait["kind"] == "pr" and chained and wait["condition"]["until"] != "review_on_head":
+    if wait.get("babysit") and wait["condition"]["until"] != "review_on_head":
         return "news"
     return "manual"
 
@@ -3931,8 +3932,7 @@ def _session_close(
     waits = _open_waits(record) if record else []
     if not waits:
         return None
-    linked = {wait["next"] for wait in record["waits"] if wait["next"]}
-    reasons = {_close_reason(wait, linked) for wait in waits if not _on_me_already(wait)} or {"seen"}
+    reasons = {_close_reason(wait) for wait in waits if not _on_me_already(wait)} or {"seen"}
     if pinned:
         reasons.add("manual")
     if not resumable:
@@ -4550,7 +4550,7 @@ def cmd_babysit_pr(args: argparse.Namespace) -> dict:
             condition = {"type": "pr", "repo": repo, "number": number, "until": until}
             wait = _new_wait(
                 state, now, kind="pr", condition=condition, by=args.by,
-                label=PR_UNTIL[until],
+                label=PR_UNTIL[until], babysit=True,
             )
             if waits:
                 waits[-1]["next"] = wait["id"]
