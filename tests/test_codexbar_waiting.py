@@ -68,6 +68,7 @@ def fake_github(**overrides) -> types.SimpleNamespace:
         GhError=FakeGhError,
         is_transient=lambda text: "connect" in text or "HTTP 502" in text,
         FIX_PROMPT="fix {repo}#{number} at {head}",
+        REBASE_PROMPT="rebase {repo}#{number}: {why}",
         parse_pr=lambda text: ("o/r", 7) if "7" in text else None,
         poll=lambda cond, memo, **kwargs: {
             "memo": memo, "events": [], "fired": False, "fire_text": None,
@@ -1083,6 +1084,43 @@ class PrTests(Case):
             self.assertEqual(self.wait_of(review)["state"], "waiting")
             head[0] = "def456"
             self.advance(minutes=4)
+
+    def conflicted(self, *argv: str) -> str:
+        conflict = {"key": "merge:DIRTY:abc123:b1", "text": "conflicts with main, rebase it", "on_me": True}
+        polls = []
+
+        def poll(cond, memo, **kwargs):
+            polls.append(cond["until"])
+            events = [conflict] if len(polls) == 1 else []
+            return poll_result(memo, events=events, head="abc123", merge_state="DIRTY", base="main")
+
+        self.github(poll=poll)
+        self.agents(SID)
+        self.heartbeat()
+        review = self.run_cli(
+            "babysit-pr", "--session", SID, "--repo", "o/r", "--number", "7", *argv,
+        )["waits"][0]["id"]
+        self.tick()
+        return review
+
+    def test_a_babysat_pr_in_conflict_is_rebased_by_the_agent(self) -> None:
+        review = self.conflicted()
+        self.assertEqual(self.wait_of(review)["ball"], "on_machine")
+        prompt = self.run_cli("claim-prompts", "--session", SID)["prompts"][0]
+        self.assertEqual(prompt["text"], "rebase o/r#7: conflicts with main")
+        self.run_cli("ack", "--action", prompt["action"], "--result", "delivered")
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        self.assertEqual(self.wait_of(review)["state"], "waiting")
+        # The poll right after the turn finds the head unmoved and still in conflict.
+        self.tick()
+        seen = self.wait_of(review)
+        self.assertEqual(seen["ball"], "on_me")
+        self.assertEqual(seen["reason"], "rebase onto main didn't land: head still abc123")
+
+    def test_without_the_fix_a_conflict_comes_to_me(self) -> None:
+        review = self.conflicted("--no-fix")
+        self.assertEqual(self.run_cli("claim-prompts", "--session", SID)["prompts"], [])
+        self.assertEqual(self.wait_of(review)["reason"], "conflicts with main, rebase it")
 
     def test_failed_fix_needs_attention_and_the_chain_stops(self) -> None:
         first = self.fix_chain(lambda repo, number, snapshot: (False, "head did not move"))

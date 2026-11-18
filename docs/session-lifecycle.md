@@ -138,6 +138,11 @@ waits for it again, counting its time from when the chain gets back to it.
 A babysat PR's review and ready steps don't end when their round does: Seen,
 or a verified fix, sends them back to watching, and they fire again only for a
 push they haven't fired on.
+Unless it was set up with `--no-fix`, a babysat PR that conflicts with its base,
+or is behind a base that must be in it to merge, gets a rebase prompt instead
+of coming to you: one at a time per PR, after the turn running then. The poll
+after the rebase turn checks it: the same head, still unmergeable, comes to you
+as `rebase onto main didn't land`.
 
 The review bots are Greptile, Macroscope, CodeRabbit, Codex, Copilot, Gemini,
 Cursor Bugbot, Sourcery and roboomp. Copilot, Codex and Gemini review a PR once

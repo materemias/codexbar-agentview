@@ -11,6 +11,7 @@
 - Set a session aside with `Ctrl+Alt+B` or `/wait`: your sentence about why you stopped, and what the session waits for.
 - Waits on a time, a pull request's review, readiness, merge or next comment, a repo's release, a command check, a shell job, a person, or "when I have time".
 - `/wait gh babysit` takes a pull request through every round of review fixes to merge.
+- A babysat pull request that conflicts with its base or falls behind it gets rebased by the agent.
 - `/wait every 2h -- <prompt>` repeats a prompt for a while or until a condition holds; it replaces the omp-schedule extension.
 - A wait can carry a prompt; when it fires, Tern sends it, reopening a closed session in a new tab.
 - Waits survive reboots and closed sessions; a turn cut off by either is sent again once.

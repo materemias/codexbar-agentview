@@ -133,9 +133,11 @@ fix what's real in the findings and answer the rest. Code then checks that the
 agent pushed or answered every thread, waits for the PR to be ready (checks
 green, no open thread), and finally for the merge. The review and ready steps
 come round again for every new push, so a PR that takes several review and fix
-rounds is fixed each time. A failed check or a conflict comes straight back to
-you. The merge ends the review and ready steps and fires the merge step; a
-close without merging ends every step and comes back to you once.
+rounds is fixed each time. When the PR conflicts with its base, or falls behind
+a base that must be in it to merge, the agent rebases it and pushes; if the
+head hasn't moved after that turn, it comes to you. A failed check comes
+straight back to you. The merge ends the review and ready steps and fires the
+merge step; a close without merging ends every step and comes back to you once.
 
 The review bots it knows are Greptile, Macroscope, CodeRabbit, Codex, Copilot,
 Gemini, Cursor Bugbot, Sourcery and roboomp. Without a number, it takes the PR

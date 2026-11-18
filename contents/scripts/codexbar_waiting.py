@@ -1603,6 +1603,9 @@ def _new_wait(state: dict, now: datetime, daemon: str | None = None, **fields: o
         # A step `babysit-pr` chained (`_close_reason`, `_rounds`) and the head
         # its last round fired on (`_next_round`); read them with `.get` too.
         "babysit": False, "round_head": None,
+        # A babysit step whose PR the agent rebases when it can't merge as it
+        # stands, and the head its last rebase turn left (`_queue_rebase`).
+        "rebase": False, "rebase_head": None,
     }
     wait.update(fields)
     if wait.get("kind") == "job":
@@ -2209,6 +2212,10 @@ def _deliver(
             # A repeat's run too: it already counts, and stays the running one.
             _send_again(record, entry, CLOSE_NOTE, now)
             _log(record, now, wait, f"Sending again after the session closed: {wait['label']}")
+        elif entry.get("rebase"):
+            queue.pop(0)
+            if wait is not None:
+                _flag_on_me(state, record, wait, now, REASON_CUT_TWICE, "error")
         elif entry.get("repeat"):
             queue.pop(0)
             # Cut twice, the run is over; the repeat goes on and its next run resumes the session.
@@ -2851,6 +2858,9 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
             reason = REASON_OVERDUE if wait["overdue"] else None
             wait.update(on_me=False, reason=reason, event_flag=False)
         if event.get("on_me"):
+            if wait.get("rebase") and str(event.get("key", "")).startswith("merge:"):
+                _queue_rebase(state, record, wait, event, result, now)
+                continue
             _flag_on_me(state, record, wait, now, event["text"], "error")
             wait["event_flag"] = True
         else:
@@ -2869,6 +2879,7 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
         return
     _checks_work(wait)
     wait["errors"] = 0
+    _check_rebase(state, record, wait, result, now)
     # `confirm` needs nothing here: its on_me event told me, and the wait stays
     # watched, so a compare that later proves the release fires it.
     if result.get("fired"):
@@ -2879,6 +2890,41 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
         text = result.get("fire_text") or wait["label"]
         name = f"PR#{wait['condition']['number']} "
         _fire(state, record, wait, now, text, fired=text if text.startswith(name) else name + text)
+
+
+def _queue_rebase(state: dict, record: dict, wait: dict, event: dict, result: dict, now: datetime) -> None:
+    """A babysat PR that conflicts with its base, or is behind a base that must
+    be in it to merge: the agent rebases it, as it fixes reviews. One rebase per
+    PR is queued at a time; the poll after its turn checks it landed (`_check_rebase`)."""
+    condition = wait["condition"]
+    key = _pr_key(condition)
+    if any(entry.get("rebase") == key for entry in record["prompt_queue"]):
+        _log(record, now, wait, event["text"])
+        return
+    base = result.get("base") or "its base"
+    conflict = str(event["key"]).split(":")[1] == "DIRTY"
+    why = f"conflicts with {base}" if conflict else f"is behind {base}, which must be in it to merge"
+    text = _github().REBASE_PROMPT.format(
+        repo=condition["repo"], number=condition["number"], why=why, base=base,
+        head=result.get("head") or "the current head",
+    )
+    _queue_prompt(state, record, wait, text, now, rebase=key, head=result.get("head"))
+    wait["rebase_head"] = None
+    _touch(wait)
+    _log(record, now, wait, f"PR#{condition['number']} {why}: the agent rebases it")
+
+
+def _check_rebase(state: dict, record: dict, wait: dict, result: dict, now: datetime) -> None:
+    """The first poll after a rebase turn: a new head, or a PR that merges as
+    it stands, says it landed; else it comes to me."""
+    before = wait.get("rebase_head")
+    if before is None or not result.get("head"):
+        return
+    wait["rebase_head"] = None
+    if result["head"] == before and result.get("merge_state") in ("DIRTY", "BEHIND"):
+        base = result.get("base") or "its base"
+        _flag_on_me(state, record, wait, now, f"rebase onto {base} didn't land: head still {before[:7]}", "error")
+        wait["event_flag"] = True
 
 
 def _apply_verify(state: dict, record: dict, wait: dict, result: dict, now: datetime) -> None:
@@ -4659,6 +4705,8 @@ def cmd_babysit_pr(args: argparse.Namespace) -> dict:
                 prompt=prompt, fix=True,
                 verify={"type": "pr_fix", "repo": repo, "number": number},
             )
+            for wait in waits:
+                wait["rebase"] = True
         record["waits"].extend(waits)
         tail = waits[-1]
         for orphan in orphans:
@@ -5046,6 +5094,13 @@ def _settle_turn(state: dict, record: dict, now: datetime) -> None:
     entry = queue.pop(0)
     if entry.get("repeat"):
         _run_over(state, record, entry, now)
+        return
+    if entry.get("rebase"):
+        wait = _wait_in(record, entry["wait"])
+        if wait is not None and wait["state"] != "done":
+            # The next poll sees what the turn did (`_check_rebase`).
+            wait.update(rebase_head=entry.get("head") or "", next_check_at=_iso(now))
+            _touch(wait)
         return
     wait = _wait_in(record, entry["wait"])
     if entry.get("check"):

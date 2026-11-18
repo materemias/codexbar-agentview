@@ -226,6 +226,17 @@ A review landed on {repo}#{number} at head {head}. Triage it:
 - Never merge. Push your fixes and stop.
 """
 
+REBASE_PROMPT = """\
+{repo}#{number} {why} at head {head}. Bring it up to date:
+
+- Fetch {base} and rebase the branch onto it; merge {base} in instead only if others build on the branch.
+- Resolve every conflict keeping the intent of both sides; read the commits on {base} that touched the conflicted code first.
+- Run the checks that cover the files you resolved.
+- Push, with --force-with-lease after a rebase.
+- If a conflict needs a decision the code can't settle, stop and say which.
+- Never merge.
+"""
+
 
 class GhError(Exception):
     def __init__(self, message: str, transient: bool, auth: bool = False) -> None:
