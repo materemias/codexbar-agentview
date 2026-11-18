@@ -2895,10 +2895,11 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
 def _queue_rebase(state: dict, record: dict, wait: dict, event: dict, result: dict, now: datetime) -> None:
     """A babysat PR that conflicts with its base, or is behind a base that must
     be in it to merge: the agent rebases it, as it fixes reviews. One rebase per
-    PR is queued at a time; the poll after its turn checks it landed (`_check_rebase`)."""
+    PR is queued or running at a time, across sessions, so two agents never
+    force-push it at once; the poll after its turn checks it landed (`_check_rebase`)."""
     condition = wait["condition"]
     key = _pr_key(condition)
-    if any(entry.get("rebase") == key for entry in record["prompt_queue"]):
+    if any(entry.get("rebase") == key for other in _records(state) for entry in other["prompt_queue"]):
         _log(record, now, wait, event["text"])
         return
     base = result.get("base") or "its base"

@@ -1117,6 +1117,19 @@ class PrTests(Case):
         self.assertEqual(seen["ball"], "on_me")
         self.assertEqual(seen["reason"], "rebase onto main didn't land: head still abc123")
 
+    def test_two_sessions_babysitting_one_pr_rebase_it_once(self) -> None:
+        conflict = {"key": "merge:DIRTY:abc123:b1", "text": "conflicts with main, rebase it", "on_me": True}
+        self.github(poll=lambda cond, memo, **kwargs: poll_result(
+            memo, events=[conflict], head="abc123", merge_state="DIRTY", base="main",
+        ))
+        for session in (SID, OTHER):
+            self.run_cli("babysit-pr", "--session", session, "--repo", "o/r", "--number", "7")
+        self.tick()
+        sessions = self.state()["sessions"]
+        self.assertEqual(
+            sum(bool(entry.get("rebase")) for sid in (SID, OTHER) for entry in sessions[sid]["prompt_queue"]), 1,
+        )
+
     def test_without_the_fix_a_conflict_comes_to_me(self) -> None:
         review = self.conflicted("--no-fix")
         self.assertEqual(self.run_cli("claim-prompts", "--session", SID)["prompts"], [])
