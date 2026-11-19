@@ -47,6 +47,7 @@ from typing import Callable, NamedTuple
 from urllib.parse import unquote
 
 import state_paths
+import stretch_text
 
 AGGREGATE_PATH = state_paths.STATE_DIR / "agents.json"
 BOOT_ID_PATH = Path("/proc/sys/kernel/random/boot_id")
@@ -126,7 +127,8 @@ _MODEL_MAX_CHARS = 160
 _TRANSCRIPT_CACHE: dict = {}
 _CACHE_ACTIVE: set[str] | None = None
 # 2: Claude transcripts record their session id, folder and state.
-_CACHE_VERSION = 2
+# 3: omp replies keep omp-stretch short forms, not the markup.
+_CACHE_VERSION = 3
 
 
 # ---------------------------------------------------------------------------
@@ -603,11 +605,12 @@ def _peek_squash(text: str) -> str:
 
 
 def _content_preview(content) -> str:
-    """Readable text of a message content field: either a plain string or a
-    list of parts. Text parts are joined; a message that only ran a tool
-    collapses to "→ toolname" so tool activity still shows up in the peek."""
+    """Readable text of an omp or pi assistant message's content field: either
+    a plain string or a list of parts. Text parts are joined, each with its
+    omp-stretch stretches drawn as their short forms; a message that only ran
+    a tool collapses to "→ toolname" so tool activity still shows up in the peek."""
     if isinstance(content, str):
-        return content
+        return stretch_text.short_forms(content)
     if not isinstance(content, list):
         return ""
     texts, tool = [], ""
@@ -615,7 +618,7 @@ def _content_preview(content) -> str:
         if not isinstance(c, dict):
             continue
         if c.get("type") == "text" and isinstance(c.get("text"), str):
-            texts.append(c["text"])
+            texts.append(stretch_text.short_forms(c["text"]))
         elif not tool and isinstance(c.get("name"), str):
             tool = c.get("name")
     if texts:
@@ -2114,8 +2117,10 @@ HISTORY_CAP = 1000
 _CLOSED_BY = ("reboot", "exit")
 
 
-def _history_turns(value: object) -> list[dict]:
-    """Keep the peek turns a live record carried, bounded like the peek."""
+def _history_turns(value: object, stretch: bool = False) -> list[dict]:
+    """Keep the peek turns a live record carried, bounded like the peek.
+    `stretch` draws omp-stretch markup in replies as short forms, for turns
+    saved before writer revision 2, which drew them at peek time."""
     if not isinstance(value, list):
         return []
     turns: list[dict] = []
@@ -2126,10 +2131,13 @@ def _history_turns(value: object) -> list[dict]:
             and entry.get("kind") in ("text", "tools")
             and isinstance(entry.get("text"), str)
         ):
+            text = entry["text"]
+            if stretch and entry["role"] == "assistant" and entry["kind"] == "text":
+                text = stretch_text.short_forms(text)
             turn = {
                 "role": entry["role"],
                 "kind": entry["kind"],
-                "text": entry["text"][:_PEEK_CHARS],
+                "text": text[:_PEEK_CHARS],
             }
             ts = entry.get("ts")
             if isinstance(ts, int) and not isinstance(ts, bool) and ts > 0:
@@ -2138,7 +2146,7 @@ def _history_turns(value: object) -> list[dict]:
     return turns
 
 
-def _history_record(record: dict, active: bool, closed_by: str = "") -> dict:
+def _history_record(record: dict, active: bool, closed_by: str = "", redraw: bool = False) -> dict:
     key = _record_key(record)
     if key is None:
         return {}
@@ -2180,7 +2188,7 @@ def _history_record(record: dict, active: bool, closed_by: str = "") -> dict:
         "resumeCommand": command,
         "codexHome": codex_home,
         "closedBy": closed_by,
-        "recent": _history_turns(record.get("recent")),
+        "recent": _history_turns(record.get("recent"), redraw and provider in ("omp", "pi")),
         # History shows only a recap of the session's final exchange.
         "recap": "" if record.get("recapStale") is True else text("recap")[:_RECAP_CHARS],
     }
@@ -2197,6 +2205,9 @@ def _merge_snapshot(
     boot_id = boot_id if isinstance(boot_id, str) else ""
     boot_changed = bool(saved_boot_id and boot_id and saved_boot_id != boot_id)
     same_boot = bool(saved_boot_id and boot_id and saved_boot_id == boot_id)
+    # Turns saved since revision 2 hold short forms already; drawing them again
+    # would reparse text the peek squashed onto one line.
+    redraw = _saved_revision(previous) < 2
 
     previous_agents = previous.get("agents")
     if not isinstance(previous_agents, list):
@@ -2248,7 +2259,7 @@ def _merge_snapshot(
                 continue
             key = _record_key(record)
             if key is not None:
-                row = _history_record(record, active=False)
+                row = _history_record(record, active=False, redraw=redraw)
                 if boot_changed and row["closedBy"] == "reboot":
                     row["closedBy"] = "exit"
                 history_by_key[key] = row
@@ -2275,7 +2286,7 @@ def _merge_snapshot(
             if same_boot and (record.get("provider"), record.get("pid")) in current_pids:
                 continue
             history_by_key[key] = _history_record(
-                record, active=True,
+                record, active=True, redraw=redraw,
                 closed_by="reboot" if boot_changed else "exit",
             )
     for record in current:
@@ -2751,7 +2762,8 @@ def _saved_write_is_newer(
 # which rows exist, what a field says. The Plasma applet and the Tern plugin run
 # their own copies of this script on one agents.json, and an older copy left
 # installed would overwrite a newer one's sweep with its own (`_locked_sweep`).
-WRITER_REVISION = 1
+# 2: omp and pi peek turns hold omp-stretch short forms, not the markup.
+WRITER_REVISION = 2
 
 
 class _NewerWriter(Exception):

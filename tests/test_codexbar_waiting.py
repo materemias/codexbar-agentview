@@ -3513,6 +3513,14 @@ class SeenStopTests(SessionPrCase):
         self.finish_turn()
         self.assertIsNone(self.session()["on_you"][0]["report"])
 
+    def test_a_review_report_shows_stretch_short_forms(self) -> None:
+        self.queued_prompt()
+        self.write(
+            stamped(said("Merged. {{Checks pass.|Checks pass on all 3 runners.}}"), self.clock + timedelta(seconds=1)),
+        )
+        self.finish_turn()
+        self.assertEqual(self.session()["on_you"][0]["report"], "Merged. Checks pass.")
+
 
 class OutcomeTests(Case):
     """What a wait came to, and how every surface says it."""

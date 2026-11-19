@@ -305,6 +305,24 @@ class SnapshotMergeTests(unittest.TestCase):
         )
         self.assertEqual(set(row["recent"][0]), {"role", "kind", "text", "ts"})
 
+    def test_history_rows_saved_before_revision_2_show_stretch_short_forms_once(self) -> None:
+        turns = [
+            {"role": "user", "kind": "text", "text": "Ask {{a|b}}", "ts": 1},
+            {"role": "assistant", "kind": "text", "text": "Fixed. {{The cache.|The stale cache key.}}", "ts": 2},
+        ]
+        rows = [active(provider, provider, recent=turns) for provider in ("omp", "claude")]
+        previous = {"bootId": "boot-a", "agents": [], "history": rows}
+        old = agents._merge_snapshot([], previous, "boot-a", 200)["history"]
+        by_provider = {row["provider"]: row["recent"] for row in old}
+        self.assertEqual([turn["text"] for turn in by_provider["omp"]], ["Ask {{a|b}}", "Fixed. The cache."])
+        self.assertEqual(by_provider["claude"], turns)
+        # A revision 2 snapshot already holds short forms: `~~~ {{x|y}} ~~~` is a squashed fence.
+        drawn = [{"role": "assistant", "kind": "text", "text": "~~~ {{x|y}} ~~~", "ts": 2}]
+        previous = {"writerRevision": 2, "bootId": "boot-a", "agents": [],
+                    "history": [active("omp", "omp", recent=drawn)]}
+        row = agents._merge_snapshot([], previous, "boot-a", 200)["history"][0]
+        self.assertEqual(row["recent"], drawn)
+
     def test_a_later_reboot_turns_earlier_reboot_rows_into_exits(self) -> None:
         first = agents._merge_snapshot(
             [],
@@ -1802,6 +1820,19 @@ class IncrementalParserTests(unittest.TestCase):
         agents._TRANSCRIPT_CACHE.clear()
         agents._TRANSCRIPT_CACHE.update(cache)
         return warm
+
+    def test_omp_replies_show_stretch_short_forms(self):
+        reply = {"type": "message", "message": {"role": "assistant", "stopReason": "stop", "content": [
+            {"type": "text", "text": "Done. {{CI passes.|CI passes on all 3 runners.}}\n```\n{{x|y}}\n```"},
+            {"type": "text", "text": "Next {{step|half-written"}]}}
+        claude = {"type": "assistant", "message": {"content": "Kept {{as|written}}"}}
+        with tempfile.TemporaryDirectory() as directory:
+            omp = write_jsonl(Path(directory) / "omp.jsonl", [*self.rows("pi"), reply])
+            claude_path = write_jsonl(Path(directory) / "claude.jsonl", [claude])
+            self.assertEqual(agents._transcript_info(str(omp), "pi")["recent"][-1]["text"],
+                             "Done. CI passes. ``` {{x|y}} ``` Next half-written")
+            self.assertEqual(agents._transcript_info(str(claude_path), "claude")["recent"][-1]["text"],
+                             "Kept {{as|written}}")
 
     def test_append_rewrite_truncate_partial_and_rotation(self):
         for provider in ("claude", "codex", "pi"):

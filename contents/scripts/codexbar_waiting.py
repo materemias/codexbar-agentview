@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 import state_paths
+import stretch_text
 
 STATE_VERSION = 1
 HISTORY_KEPT = 200
@@ -1006,14 +1007,15 @@ def _pr_key(pr: dict) -> str:
     return f"{pr['repo'].lower()}#{pr['number']}"
 
 
-def _message_text(content: object) -> str:
-    """A transcript message's text: a plain string, or its text blocks."""
+def _message_text(content: object, render: Callable[[str], str] = str) -> str:
+    """A transcript message's text: a plain string, or its text blocks, each
+    passed through `render`."""
     if isinstance(content, str):
-        return content
+        return render(content)
     if not isinstance(content, list):
         return ""
     return "\n".join(
-        block["text"] for block in content if isinstance(block, dict)
+        render(block["text"]) for block in content if isinstance(block, dict)
         and block.get("type") == "text" and isinstance(block.get("text"), str)
     )
 
@@ -1056,7 +1058,8 @@ def _last_reply(path: Path, since: float) -> str | None:
                         entry.get("type") == "message" and isinstance(message, dict)
                         and message.get("role") == "assistant"
                     ):
-                        text = _message_text(message.get("content")).strip()
+                        # The reader sees omp-stretch replies as their short forms.
+                        text = _message_text(message.get("content"), stretch_text.short_forms).strip()
                         if text:
                             return text
                 if not start:
