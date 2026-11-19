@@ -40,6 +40,7 @@
 - The Tern extension works on Tern 0.9.20 again.
 - Resume reopens a closed session while a fresh omp runs in the same folder.
 - Resume retries for 2 minutes while another omp in the session's folder starts up.
+- The session card lists waits in the order they come due.
 - Claude and Codex account windows in the Plasma popup sit indented under their account.
 - Usage alerts no longer repeat for one reset or get dropped as too many.
 - A Claude 5h window that hasn't started says `not started · resets 5h after first use`.

@@ -3377,6 +3377,11 @@ class CardTests(SessionPrCase):
         self.add("--kind", "later")
         self.assertEqual(set(self.cached()), set(self.card()))
 
+    def test_waits_come_in_the_order_they_are_due(self) -> None:
+        for hours, label in ((3, "third"), (1, "first"), (2, "second")):
+            self.add("--kind", "time", "--at", (T0 + timedelta(hours=hours)).isoformat(), "--label", label)
+        self.assertEqual([wait["label"] for wait in self.cached()["waits"]], ["first", "second", "third"])
+
     def test_cached_refuses_an_unknown_session(self) -> None:
         self.run_cli("card", "--session", OTHER, "--cached", expect=2)
 

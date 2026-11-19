@@ -3920,6 +3920,11 @@ def _target_view(
         {**_wait_view(wait, now), "snoozable": _snooze_refusal(record, wait) is None}
         for wait in waits
     ]
+    # Threads in the order they come due, each chain's steps together: waits are
+    # stored as they were added, which an agent may do in any order.
+    views = [view for track in sorted(_tracks(views), key=lambda track: (
+        _sort_time(track[0]["due_at"]), track[0]["created_at"],
+    )) for view in track]
     outcome, headline = _outcome_headline(views)
     dues = [view["due_at"] for view in _active(views) if view["due_at"]]
     snooze = _hiding_snooze(record)
@@ -5854,6 +5859,14 @@ def _pid_arg(text: str) -> int:
         raise argparse.ArgumentTypeError(f"bad pid: {text!r}")
     return pid
 
+def _pid_arg(text: str) -> int:
+    try:
+        pid = int(text)
+    except ValueError:
+        pid = 0
+    if pid <= 0:
+        raise argparse.ArgumentTypeError(f"bad pid: {text!r}")
+    return pid
 
 def _add_target(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session", type=_session_arg)
