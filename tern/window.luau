@@ -1629,12 +1629,13 @@ end
 -- (codexbar_focus.py's SESSION_START_RESERVATION_SECONDS) lost its answer, and
 -- the resume starts over.
 local RESERVE_LOST_S = 30 + 60 + 5
--- The CLI drops a resume no window carried out within RESUME_GRACE_S (3
--- minutes) from when it was queued, without saying why: retries end before.
+-- Retries end RESERVE_BLOCKED_S after the first refusal, within the CLI's
+-- RESUME_GRACE_S (3 minutes) from queueing unless the first try came late; a
+-- resume the CLI dropped meanwhile ends them early (`stillQueued`).
 local RESERVE_RETRY_S = 15
 local RESERVE_BLOCKED_S = 120
--- Sessions a Resume click retries (`waitingRequest`), so a second click adds no second loop.
-local blockedLaunches: { [string]: boolean } = {}
+-- Sessions a Resume click is reserving (`waitingRequest`), so a second click adds no second loop.
+local launchingSessions: { [string]: boolean } = {}
 local function reserveThenResume(a: any, state: any, blocked: number?)
 	local id = tostring(a.id)
 	local function store(entry: any)
@@ -1658,10 +1659,11 @@ local function reserveThenResume(a: any, state: any, blocked: number?)
 			return
 		end
 		local now = os.clock()
-		local since = blocked or now
+		-- A stamp ahead of now comes from before a reboot: the window starts over.
+		local since = if blocked and blocked <= now then blocked else now
 		if status == 5 then
 			settle("done")
-		elseif status == 11 and now - since >= 0 and now - since < RESERVE_BLOCKED_S then
+		elseif status == 11 and now - since < RESERVE_BLOCKED_S then
 			-- Not acked: the next runActions after `retryAt` takes it up again.
 			state.sending = false
 			if acted[id] == state then
@@ -2451,17 +2453,18 @@ local function waitingRequest(cx: WindowCx)
 			-- The same startup ownership as an automatic resume and History's Launch,
 			-- and the same retries while an omp in its folder hasn't named its session.
 			local session = request.session :: string
-			if blockedLaunches[session] then
-				cx2:toast("info", "CodexBar AgentView: Resume waits for the omp in that folder already")
+			if launchingSessions[session] then
+				cx2:toast("info", "CodexBar AgentView: that session is opening already")
 				return
 			end
-			local first = os.clock()
+			launchingSessions[session] = true
+			local first, told = os.clock(), false
 			local function attempt()
 				reserveSession(session, request.cwd, function(status, why, cx3, release)
 					local age = os.clock() - first
 					if status == 11 and cx3 and age < RESERVE_BLOCKED_S then
-						if not blockedLaunches[session] then
-							blockedLaunches[session] = true
+						if not told then
+							told = true
 							cx3:toast("info", "CodexBar AgentView: waiting for the omp in that folder to name its session",
 								string.format("Resume tries again for %d minutes", RESERVE_BLOCKED_S // 60))
 						end
@@ -2470,7 +2473,7 @@ local function waitingRequest(cx: WindowCx)
 						end)
 						return
 					end
-					blockedLaunches[session] = nil
+					launchingSessions[session] = nil
 					if not cx3 then
 						release()
 					elseif status == 0 then
