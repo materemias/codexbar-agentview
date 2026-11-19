@@ -40,7 +40,7 @@ It started as a Linux port of the macOS
 CodexBar module.
 
 [Tern extension](#tern-extension) · [Set sessions aside](#set-sessions-aside) ·
-[Install](#install) · [Shortcuts](#keyboard-shortcuts) ·
+[Works well with](#works-well-with) · [Install](#install) · [Shortcuts](#keyboard-shortcuts) ·
 [Features](#features) · [Plasma widget](docs/plasma.md) ·
 [Providers](#supported-providers) · [Agents](#supported-agent-sessions) ·
 [Credentials](#provider-credentials) · [Update](#update)
@@ -109,6 +109,43 @@ shows the same list on your phone.
 watches, what happens when one fires, Seen, Stop and Snooze, when a session is
 safe to close, and every keyboard shortcut.
 
+## Works well with
+
+These are separate projects for omp and Tern, and none needs setup on
+AgentView's side. Settings → **About**, in Tern and in the Plasma widget, shows
+which of them this machine has installed, with a link to each one's install
+steps or, once installed, its project page.
+
+- **[tern-awui](https://github.com/materemias/tern-awui).** A web app on your
+  phone or in a browser for the omp sessions running in Tern, over Tailscale.
+  It shows AgentView's Waiting list: snooze a session, mark it seen or stop a
+  wait from the phone, and get a push notification when one is back on you.
+  See its [Install](https://github.com/materemias/tern-awui#install) section.
+- **[omp-stretch](https://github.com/materemias/omp-stretch).** omp's replies
+  arrive as their gist, and a click opens the detail in place. AgentView's
+  peeks and the reply excerpt of a finished wait show that gist too, not the
+  raw `{{…|…}}` markup.
+
+  ```sh
+  omp plugin marketplace add materemias/omp-stretch
+  omp plugin install omp-stretch@omp-stretch
+  tern plugin link ~/.omp/plugins/node_modules/omp-stretch/tern-plugin
+  ```
+
+- **[omp-compact](https://github.com/arksdev/omp-compact).** Folds omp's tool
+  log to one line per action and keeps the verified file and Git changes.
+  With omp-stretch as well, the tools fold and the reply opens at its gist, so
+  a long run reads in a few lines. Turn on omp's Extension Transcript
+  Presenters setting for it.
+
+  ```sh
+  omp plugin marketplace add arksdev/omp-compact
+  omp plugin install omp-compact@arksdev
+  ```
+
+omp loads plugins at start, so run `/restart` in sessions that were already
+open.
+
 ## Requirements
 
 The Tern extension and the omp extension run on Linux, macOS and Windows. The
@@ -128,6 +165,31 @@ build, so there usage comes from Meridian only, or you turn it off.
 | KDE Plasma 6 and its build tools | | Required | The widget; see [its requirements](docs/plasma.md#requirements) |
 
 ## Install
+
+### With a coding agent
+
+Paste this prompt into an agent (omp, Claude Code, Codex, …) running on the
+machine where Tern runs:
+
+```text
+Install CodexBar AgentView (https://github.com/materemias/codexbar-agentview) on this machine.
+
+1. Read its README, especially Requirements and Install.
+2. Check the requirements for what I use (Tern, omp, KDE Plasma) and tell me what is
+   missing instead of working around it.
+3. Clone it to ~/code/codexbar-agentview (ask me if I want a different place). The
+   Tern extension runs from the checkout, so it stays there.
+4. From the checkout, run `tern plugin link tern`. Ask me which widgets I want before
+   changing Tern's widget bar: `tern ctl widgets set` replaces the whole bar.
+5. If omp is installed, run `python3 contents/scripts/install_integration.py --omp-extension`
+   (`py -3` instead of `python3` on Windows).
+6. On Linux with KDE Plasma 6, ask whether I want the Plasma widget. If I do, build and
+   install it as docs/plasma.md says, and tell me which steps are mine.
+
+At the end, remind me to run /restart in omp sessions that were already running.
+Then ask whether I also want tern-awui, omp-stretch or omp-compact
+(the "Works well with" section) and install the ones I pick, following their READMEs.
+```
 
 ### Tern extension
 
@@ -249,7 +311,9 @@ it works.
   "Fix MCP history" and `autor` finds "Auto-Research", but only across
   neighbouring words.
 - **Peek** at the last eight turns, laid out like a chat, and the agent's
-  latest recap (omp and Claude Code write them).
+  latest recap (omp and Claude Code write them). An
+  [omp-stretch](https://github.com/materemias/omp-stretch) reply shows as its
+  short forms.
 - **Focus.** Plasma switches desktop and raises the terminal. Tern shows the
   pane, a kitty window or a T3 Code thread.
 - **Teleport to Tern.** Moves an idle kitty session into a new Tern tab.

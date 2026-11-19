@@ -106,6 +106,8 @@
 - The README leads with the Tern extension and treats the Plasma widget as optional.
 - [Set sessions aside](docs/waiting.md) is a guide to waits, with a film.
 - The films show current model names.
+- The README's "Works well with" covers tern-awui, omp-stretch and omp-compact.
+- Install has a prompt to paste into a coding agent, which then installs AgentView for you.
 
 ## 0.3.0 (2026-11-02)
 
