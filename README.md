@@ -8,6 +8,7 @@ Windows.
 
 A KDE Plasma 6 widget shows the same usage and agents in your panel. It's
 optional: use it beside Tern, or on its own if you work in other terminals.
+See [KDE Plasma widget](docs/plasma.md).
 
 What you get:
 
@@ -40,7 +41,7 @@ CodexBar module.
 
 [Tern extension](#tern-extension) · [Set sessions aside](#set-sessions-aside) ·
 [Install](#install) · [Shortcuts](#keyboard-shortcuts) ·
-[Features](#features) · [Plasma widget](#kde-plasma-widget) ·
+[Features](#features) · [Plasma widget](docs/plasma.md) ·
 [Providers](#supported-providers) · [Agents](#supported-agent-sessions) ·
 [Credentials](#provider-credentials) · [Update](#update)
 
@@ -124,10 +125,7 @@ build, so there usage comes from Meridian only, or you turn it off.
 | [Meridian](https://github.com/rynfar/meridian) | Optional | Optional | Claude accounts and ChatGPT seats read from its usage poll |
 | kitty | Optional | Optional | Launch and Restore all for kitty sessions; with Tern, Teleport to Tern |
 | kitty remote control | Optional | Optional | Exact focus of kitty windows |
-| KDE Plasma 6 with KWin | | Required | The widget |
-| CMake 3.21+, C++17 compiler, Qt 6 QML headers | | Required | Building the widget (Arch: `base-devel cmake qt6-declarative`) |
-| `qdbus6` | | Optional | Click to focus and desktop switching |
-| `notify-send` | | Optional | Usage and waiting-for-input alerts |
+| KDE Plasma 6 and its build tools | | Required | The widget; see [its requirements](docs/plasma.md#requirements) |
 
 ## Install
 
@@ -194,32 +192,8 @@ open. `--omp-extension --uninstall` removes the link or loader. What it does:
 
 ### Plasma widget (optional)
 
-Skip this unless you want usage and agents in a KDE panel too.
-
-1. Build and install. The package has a small native QML plugin, so build it
-   on the machine that runs it:
-
-   ```sh
-   git clone https://github.com/materemias/codexbar-agentview
-   cd codexbar-agentview
-   cmake -S . -B build
-   cmake --build build
-   kpackagetool6 -t Plasma/Applet -i build/package
-   ```
-
-2. Right-click the panel → **Enter Edit Mode** → **Add Widgets…**, search for
-   **CodexBar AgentView** and drag it onto the panel.
-3. In the widget's settings, open **Agents** and click **Install**, then run
-   `systemctl --user restart plasma-plasmashell.service` once. Agents and
-   History stay empty until you do.
-4. [Add credentials](#provider-credentials) for providers beyond Claude and
-   Codex.
-
-The `codexbar` path defaults to `/usr/bin/codexbar`, where Arch's
-`codexbar-cli` package puts it. Change it in Settings → Backend.
-
-Updating file associations preserves existing settings, including symlinked
-configuration. A failed write leaves the original configuration intact.
+Skip this unless you want usage and agents in a KDE panel too. Build and
+install it as [KDE Plasma widget › Install](docs/plasma.md#install) says.
 
 ## Keyboard shortcuts
 
@@ -387,34 +361,10 @@ Plasma-only.
 ## KDE Plasma widget
 
 The optional panel widget: usage rings and agent dots in the panel, and a
-popup with the Agents, History and Usage tabs. With **Tern integration** on
-(Settings → Agents), its Agents list also marks set-aside sessions.
+popup with the Agents, History and Usage tabs. Install, panel options, update
+and uninstall: [KDE Plasma widget](docs/plasma.md).
 
 ![The Plasma widget: the panel's usage rings and agent dots, the Usage tab, filtering the Agents tab by typing, a peek at a session, jumping to its terminal, Restore all after a reboot and one closed session brought back](docs/kde.gif)
-
-<details>
-<summary>Screenshots</summary>
-
-[![Panel indicators](docs/panel.png)](docs/panel.png)
-
-| Usage | Agents | History |
-| :---: | :---: | :---: |
-| [![Usage tab](docs/plasma-usage.png)](docs/plasma-usage.png) | [![Agents tab](docs/plasma-agents.png)](docs/plasma-agents.png) | [![History tab](docs/plasma-history.png)](docs/plasma-history.png) |
-
-</details>
-
-### Panel
-
-Usage rings per provider and window, coloured by pace, which you can set to
-appear only once a window is projected to run out. Coloured dots count
-working, blocked and idle agents. The popup opens on Agents when one is
-blocked and on History when sessions wait to be restored.
-
-With several Claude or Codex accounts, the tray settings list each account
-with its own windows. A meter picked before the accounts were known (saved as
-`claude:primary`) shows every account's window until you change one account,
-which turns it into one meter per account
-(`claude:<email>:primary`).
 
 ## Supported providers
 
@@ -531,20 +481,7 @@ git pull
 tern plugin reload
 ```
 
-Plasma widget. Stop Plasma before replacing the native plugin;
-`systemctl --user stop` waits for plasmashell to exit, `kquitapp6` does not:
-
-```sh
-git pull
-cmake -S . -B build && cmake --build build
-systemctl --user stop plasma-plasmashell.service
-kpackagetool6 -t Plasma/Applet -u build/package
-systemctl --user start plasma-plasmashell.service
-```
-
-If an update deleted files, replace the `-u` line with
-`kpackagetool6 -t Plasma/Applet -r io.github.materemias.codexbaragentview`
-followed by `kpackagetool6 -t Plasma/Applet -i build/package`.
+Plasma widget: see [KDE Plasma widget › Update](docs/plasma.md#update).
 
 <details>
 <summary>Upgrading from codexbar-kde</summary>
@@ -554,27 +491,16 @@ Sessions, history and the usage cache move to
 `~/.local/state/codexbar-agentview/` the first time a helper runs;
 `~/.codexbar/config.json` stays.
 
-Point the existing panel widget at the new package so it keeps its place and
-settings:
+Relink the Tern extension; it copies its old settings on first start:
 
 ```sh
 git pull
-cmake -S . -B build && cmake --build build
-systemctl --user stop plasma-plasmashell.service
-kpackagetool6 -t Plasma/Applet -i build/package
-sed -i 's/^plugin=org\.codexbar\.plasmoid$/plugin=io.github.materemias.codexbaragentview/' \
-  ~/.config/plasma-org.kde.plasma.desktop-appletsrc
-kpackagetool6 -t Plasma/Applet -r org.codexbar.plasmoid
-systemctl --user start plasma-plasmashell.service
-```
-
-Then click widget settings → **Agents** → **Install** again. Relink the Tern
-extension; it copies its old settings on first start:
-
-```sh
 tern plugin unlink codexbar
 tern plugin link tern
 ```
+
+For the Plasma widget, see
+[Upgrading from codexbar-kde](docs/plasma.md#upgrading-from-codexbar-kde).
 
 </details>
 
@@ -585,12 +511,7 @@ tern plugin unlink codexbar-agentview
 python3 contents/scripts/install_integration.py --omp-extension --uninstall
 ```
 
-For the Plasma widget, click Settings → Agents → **Remove** if you installed
-the integration, then:
-
-```sh
-kpackagetool6 -t Plasma/Applet -r io.github.materemias.codexbaragentview
-```
+For the Plasma widget, see [KDE Plasma widget › Uninstall](docs/plasma.md#uninstall).
 
 ## Development
 
