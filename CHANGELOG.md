@@ -9,6 +9,7 @@
 
 ### Features
 
+- The session card's title starts with the session's project.
 - `Ctrl+Alt+B` or `/wait` sets a session aside, with why you stopped and what it waits for.
 - Waits watch a time, a PR, a release, a command check, a shell job, a person, or "when I have time".
 - A PR wait ends on the PR's review, readiness, merge or next comment.

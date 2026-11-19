@@ -838,7 +838,7 @@ local function age(secs: number): string
 	return if mins < 60 then mins .. "m" elseif mins < 1440 then (mins // 60) .. "h" else (mins // 1440) .. "d"
 end
 
--- "project · branch · model · state · started 2h ago · active 3m ago"
+-- "branch · model · state · started 2h ago · active 3m ago"; the project is in the title.
 local function cardFacts(r: any, now: number): string
 	local parts: { string } = {}
 	local function add(text: any)
@@ -846,7 +846,6 @@ local function cardFacts(r: any, now: number): string
 			table.insert(parts, text)
 		end
 	end
-	add(r.project)
 	add(r.branch)
 	if type(r.model) == "string" then
 		add((string.gsub(string.match(r.model, "[^/]*$") or r.model, "^claude%-", "")))
@@ -1099,10 +1098,13 @@ local function cardView(cx: WindowCx, pane: number, r: any, reading: boolean): N
 	return ui.col(kids)
 end
 
+-- "project · title": the project tells apart cards whose titles look alike.
 local function cardTitle(cx: WindowCx, pane: number, r: any): string
 	local info = paneInfo(cx, pane)
 	local title = val(r.title) or val(r.label) or (info and info.title)
-	return clipped(if type(title) == "string" and title ~= "" then title else "Session", 70)
+	title = if type(title) == "string" and title ~= "" then title else "Session"
+	local project = val(r.project)
+	return clipped(if type(project) == "string" and project ~= "" then project .. " · " .. title else title, 70)
 end
 
 -- Seen, Retry, Snooze 1d and Stop waits… need waits of a record; Seen only
