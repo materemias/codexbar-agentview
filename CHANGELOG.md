@@ -4,36 +4,41 @@
 
 ### Breaking
 
-- The Tern extension needs Tern 0.9.18 or later. Usage, agent counts, "on me" and "to restore" moved from the status line to widgets: add them through palette › Edit widgets….
+- The Tern extension needs Tern 0.9.18 or later.
+- Usage, agent counts, "on me" and "to restore" are widgets: add them in palette › Edit widgets….
 
 ### Features
 
-- Set a session aside with `Ctrl+Alt+B` or `/wait`: your sentence about why you stopped, and what the session waits for.
-- Waits on a time, a pull request's review, readiness, merge or next comment, a repo's release, a command check, a shell job, a person, or "when I have time".
+- `Ctrl+Alt+B` or `/wait` sets a session aside, with why you stopped and what it waits for.
+- Waits watch a time, a PR, a release, a command check, a shell job, a person, or "when I have time".
+- A PR wait ends on the PR's review, readiness, merge or next comment.
 - `/wait gh babysit` takes a pull request through every round of review fixes to merge.
 - A babysat pull request that conflicts with its base or falls behind it gets rebased by the agent.
-- `/wait every 2h -- <prompt>` repeats a prompt for a while or until a condition holds; it replaces the omp-schedule extension.
-- A wait can carry a prompt; when it fires, Tern sends it, reopening a closed session in a new tab.
-- Waits survive reboots and closed sessions; a turn cut off by either is sent again once.
+- `/wait every 2h -- <prompt>` repeats a prompt for a while or until a condition holds.
+- A wait's prompt is sent when the wait fires, and Tern reopens a closed session in a new tab for it.
+- Waits survive reboots and closed sessions.
+- A turn cut off by a reboot or a closed session is sent again once.
 - The Waiting tab (`Ctrl+Alt+W`) groups set-aside sessions by who has the next step.
 - The session card (`Ctrl+Alt+I`) shows why you left, the waits, what happened since and omp's recap.
 - A strip above the omp composer shows what the session waits for and whether it can be closed.
-- The omp extension adds `/wait` and the agent's `waitingfor` tool; install it from Plasma, the Tern palette or `install_integration.py --omp-extension`.
+- The omp extension adds `/wait` and the agent's `waitingfor` tool.
+- Install the omp extension from Plasma, the Tern palette or `install_integration.py --omp-extension`.
 - Every set-aside session says whether it is safe to close, and if not, why.
-- Seen closes what came back to you; Stop ends waits still being watched.
+- Seen closes what came back to you, and Stop ends waits still being watched.
 - Snooze session (`/wait snooze 2d`, `F4`) hides a session until a time, then brings it back.
 - Snooze 1d pushes a wait that's on you back by a day.
-- Retry (`F5`) restarts a wait whose checks failed; such waits also retry every hour.
+- Retry (`F5`) restarts a failed wait at once, and failed waits retry every hour on their own.
 - Waits warn when they aren't being checked or GitHub is unreachable.
 - Waiting rows show whether the session is running, parked or closed.
-- Plasma: Settings → Agents → Tern integration marks set-aside sessions and counts the ones back on you.
-- Tern widget bar widgets: combined Claude and Codex usage, weekly graphs, per-provider usage, agents, back on you, and to restore.
+- Plasma's Tern integration setting marks set-aside sessions and counts the ones back on you.
+- Tern widgets show usage, weekly graphs, agent counts, sessions back on you and sessions to restore.
 - Filters match several words in any order and highlight each one.
 - `Ctrl+Alt+H` opens the Tern dashboard on History.
-- Usage tracking can be turned off; without the `codexbar` CLI, the usage area says what to install.
-- Windows support for the Tern extension, the omp extension and the helpers; usage comes from Meridian only.
-- Tern dashboard buttons no longer show their keys; the footer lists them.
-- Tern settings open as a dialog over the dashboard, in the style of Tern's and omp's own, instead of a tab.
+- Usage tracking can be turned off.
+- Without the `codexbar` CLI, the usage area says what to install.
+- The Tern extension, the omp extension and the helpers run on Windows, with usage from Meridian only.
+- The Tern dashboard footer lists the keys, and its buttons show just their names.
+- Tern settings open as a dialog over the dashboard.
 
 ### Fixes
 
@@ -43,19 +48,20 @@
 - The session card lists waits in the order they come due.
 - An outdated Plasma applet asks to be updated and leaves Tern's newer agent list alone.
 - Claude and Codex account windows in the Plasma popup sit indented under their account.
-- Usage alerts no longer repeat for one reset or get dropped as too many.
+- Each reset sends one usage alert, and no alert is dropped as too many.
 - A Claude 5h window that hasn't started says `not started · resets 5h after first use`.
-- Accounts stay in alphabetical order instead of switching places.
-- A slow usage read no longer overwrites a newer one in Tern.
+- Accounts stay in alphabetical order.
+- In Tern, a newer usage read wins over a slower, older one.
 - Plasma keeps every provider current when Tern fetches fewer of them.
 - Plasma and Tern share usage refreshes within the configured interval.
 - A forked omp session reopened with `/restart` is listed under the session it continues.
 - Focusing an agent in a parked Tern pane brings the pane back.
 - Launch resumes an ended codex session while another codex runs in its folder.
-- Launch and Teleport no longer start the same session twice.
+- Launch and Teleport start each session only once.
 - Focusing a T3 Code 0.1 session opens its thread.
-- Filter initials match only neighbouring words, and tool-call summaries no longer match.
-- In Tern, Space types into a filter instead of opening the conversation, and clearing a filter keeps the selection.
+- Filter initials match only neighbouring words, and filters skip tool-call summaries.
+- In Tern, Space types into a filter.
+- Clearing a Tern filter keeps the selected session.
 - The integration installer keeps file associations when an update fails.
 - History keeps up to 1000 closed sessions whichever of Plasma and Tern scans.
 - The agent list keeps updating past odd process names and deeply nested transcript lines.
@@ -95,7 +101,7 @@
 
 ### Docs
 
-- The README leads with the Tern extension; the Plasma widget is optional.
+- The README leads with the Tern extension and treats the Plasma widget as optional.
 - [Set sessions aside](docs/waiting.md) is a guide to waits, with a film.
 - The films show current model names.
 
