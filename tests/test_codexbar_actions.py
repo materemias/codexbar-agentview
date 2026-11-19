@@ -1,4 +1,4 @@
-"""Exercise integration-button bursts through the real QML and process plugin."""
+"""Exercise config pages through the real QML and process plugin."""
 import os
 from pathlib import Path
 import shutil
@@ -10,6 +10,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 QML = shutil.which("qml6") or shutil.which("qml") or "/usr/lib/qt6/bin/qml"
 PLUGIN = ROOT / "build/package/contents/ui/process"
+KCMUTILS = Path("/usr/lib/qt6/qml/org/kde/kcmutils/qmldir")
 
 
 @unittest.skipUnless(Path(QML).is_file() and (PLUGIN / "libcodexbarprocess.so").is_file(),
@@ -74,6 +75,49 @@ Item {
             self.assertIn("PASS integration bursts serialize", output)
             self.assertEqual((root / "scripts/calls").read_text().splitlines(),
                              ["call", "call"])
+
+
+@unittest.skipUnless(Path(QML).is_file() and (PLUGIN / "libcodexbarprocess.so").is_file() and KCMUTILS.is_file(),
+                     "Build the native package and install the Qt 6 qml tool and KCMUtils first")
+class AboutCompanionsTest(unittest.TestCase):
+    def test_about_lists_what_the_helper_found(self):
+        with tempfile.TemporaryDirectory(prefix="codexbar-about-") as directory:
+            root = Path(directory)
+            (root / "ui").mkdir()
+            (root / "scripts").mkdir()
+            for name in ("configAbout.qml", "Command.js"):
+                shutil.copy2(ROOT / "contents/ui" / name, root / "ui" / name)
+            (root / "ui/process").symlink_to(PLUGIN, target_is_directory=True)
+            (root / "scripts/codexbar_companions.py").write_text(
+                "import json\n"
+                "print(json.dumps({'companions': ["
+                "{'id': 'tern-awui', 'name': 'tern-awui', 'url': 'https://example.com/a', 'benefit': 'b',"
+                " 'installed': True, 'status': 'Installed'},"
+                "{'id': 'omp-compact', 'name': 'omp-compact', 'url': 'https://example.com/c', 'benefit': 'c',"
+                " 'installed': False, 'status': 'Not found'}]}))\n"
+            )
+            (root / "test.qml").write_text('''import QtQuick
+Item {
+    Loader { id: page; source: "ui/configAbout.qml" }
+    Timer {
+        interval: 50; running: true; repeat: true
+        onTriggered: {
+            if (!page.item || page.item.companions.length === 0) return
+            var shown = page.item.companions.map(function(c) { return c.name + ": " + c.status })
+            console.log("SHOWN " + shown.join("; "))
+            Qt.exit(0)
+        }
+    }
+    Timer { interval: 10000; running: true; onTriggered: { console.error("FAIL no companions"); Qt.exit(1) } }
+}
+''')
+            env = dict(os.environ, QT_QPA_PLATFORM="offscreen",
+                       QT_FORCE_STDERR_LOGGING="1", QT_LOGGING_TO_CONSOLE="1")
+            result = subprocess.run([QML, str(root / "test.qml")], env=env,
+                                    capture_output=True, text=True, timeout=15)
+            output = result.stdout + result.stderr
+            self.assertEqual(result.returncode, 0, output)
+            self.assertIn("SHOWN tern-awui: Installed; omp-compact: Not found", output)
 
 
 if __name__ == "__main__":

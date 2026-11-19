@@ -470,6 +470,7 @@ local store = {
 	menuRetryAt = nil :: number?, -- os.clock() when a failed `menu` load runs again
 	loadMenu = nil :: (() -> ())?,
 	hidable = nil :: any, -- (r) -> boolean, set beside waitingOpen
+	companionsLoading = false, -- codexbar_companions.py is running for the About page
 }
 
 -- The settings dialog's state, while it is open over a dashboard (in its layer).
@@ -4388,7 +4389,8 @@ local function settingsSections(b: Settings): ({ any }, { any })
 		local value, default = rowValue(row), rowValue(row, true)
 		local control: any
 		if row.kind == "action" then
-			control = { k = "action", act = "open_github", label = "Open GitHub" }
+			-- Companion rows carry their status and install link (prefs.loadCompanions).
+			control = { k = "action", act = "open_github", label = if row.url and not row.installed then "Install steps" else "Open GitHub" }
 		elseif row.kind == "number" then
 			local limits = NUMBER_LIMITS[row.id]
 			control = { k = "number", value = value, min = limits[1], max = limits[2], step = 1, unit = row.unit }
@@ -4548,9 +4550,10 @@ local function activateSetting(b: Settings, row: any)
 	b.searching = false
 	if row.kind == "action" then
 		-- Windows: explorer.exe exits 1 even when it opened the page.
-		local argv = if MACOS then { "/usr/bin/open", row.hint }
-			elseif tern.runtime.os == "windows" then { "rundll32", "url.dll,FileProtocolHandler", row.hint }
-			else { "xdg-open", row.hint }
+		local url = row.url or row.hint
+		local argv = if MACOS then { "/usr/bin/open", url }
+			elseif tern.runtime.os == "windows" then { "rundll32", "url.dll,FileProtocolHandler", url }
+			else { "xdg-open", url }
 		local ok, err = pcall(tern.process.run, argv, { timeout_ms = 10000 }, function(res: ProcessResult)
 			report(b.cx, "open GitHub", res)
 		end)
@@ -4578,8 +4581,53 @@ function prefs.new(cx: BlockCx, page: string?, focus: string?): Settings
 	if not (page and SETTINGS_LEADS[page]) then
 		page = if setting("usage") then "usage" else "general"
 	end
+	prefs.loadCompanions()
 	local row = if focus and SETTINGS_BY_ID[focus] then focus else nil
 	return { cx = cx, page = page :: string, query = "", cursor = 0, searching = row == nil, focus = row, editing = nil }
+end
+
+-- The tools that work well with AgentView, as About rows: codexbar_companions.py names each,
+-- its benefit, its install link and whether its files are here. Read again each time the
+-- dialog opens (search reaches About rows from every page) or switches to About; nothing polls.
+function prefs.loadCompanions()
+	if store.companionsLoading then
+		return
+	end
+	store.companionsLoading = true
+	python("codexbar_companions.py", {}, 15000, function(res)
+		store.companionsLoading = false
+		local okj, data = pcall(tern.json.decode, res.stdout)
+		local list = if res.status == 0 and okj and type(data) == "table" then val(data.companions) else nil
+		if type(list) ~= "table" then
+			tern.log.warn("codexbar: companions failed", firstLine(res.stderr))
+			-- Rows from an earlier read keep their benefit but no longer claim a status.
+			for _, row in SETTINGS_ROWS do
+				if row.benefit then
+					row.hint = "Could not check. " .. row.benefit
+				end
+			end
+			renderAll()
+			return
+		end
+		for _, c in list do
+			local id, url = if type(c) == "table" then str(c.id) else "", if type(c) == "table" then str(c.url) else ""
+			if id == "" or string.sub(url, 1, 8) ~= "https://" then
+				continue
+			end
+			local row = SETTINGS_BY_ID["companion." .. id]
+			if not row then
+				row = { id = "companion." .. id, page = "about", section = "Works well with", kind = "action" }
+				SETTINGS_BY_ID[row.id] = row
+				table.insert(SETTINGS_ROWS, row)
+			end
+			row.label = str(c.name)
+			row.benefit = str(c.benefit)
+			row.hint = str(c.status) .. ". " .. row.benefit
+			row.url = url
+			row.installed = val(c.installed) == true
+		end
+		renderAll()
+	end)
 end
 
 -- In the dashboard's layer Tern draws the dialog as it draws omp's settings: a sheet,
@@ -4670,6 +4718,9 @@ function prefs.event(s: Settings, ev: UiEvent)
 		end
 	elseif ev.ev == "action" and ev.act == "page" and type(ev.value) == "string" and SETTINGS_LEADS[ev.value] then
 		s.page, s.query, s.cursor, s.focus, s.editing, s.searching = ev.value, "", 0, nil, nil, true
+		if ev.value == "about" then
+			prefs.loadCompanions()
+		end
 	elseif (ev.ev == "action" and ev.act == "search_focus") or ev.ev == "focus" then
 		s.focus, s.editing, s.searching = nil, nil, true
 	elseif ev.ev == "action" and ev.act == "close" and (ev.value == nil or ev.value == tern.json.null) then

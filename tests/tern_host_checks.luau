@@ -192,5 +192,38 @@ do (function()
 		assert(store.usageError == "boom", "got " .. tostring(store.usageError))
 	end)
 
+	check("prefs: the About page lists companions once the helper answers, read again on each open", function()
+		fresh("d1")
+		store.companionsLoading = false
+		local s = prefs.new(fakeBlock().cx, "about")
+		prefs.new(fakeBlock().cx, "about")
+		local runs = fake.runsOf("codexbar_companions.py")
+		assert(#runs == 1, "a second open while one runs starts no other: " .. #runs)
+		local answer = { companions = {
+			{ id = "tern-awui", name = "tern-awui", url = "https://example.com/awui#install", benefit = "On the phone.",
+				installed = true, status = "Installed" },
+			{ id = "omp-compact", name = "omp-compact", url = "https://example.com/compact#install", benefit = "Folds tools.",
+				installed = false, status = "Not found" },
+			{ id = "bad", name = "bad", url = "file:///etc/passwd", benefit = "", installed = false, status = "" },
+		} }
+		assert(fake.answer(runs[1], { stdout = fake.json(answer) }) == nil)
+		local sections = settingsSections(s)
+		local section = sections[#sections]
+		assert(section.title == "Works well with" and #section.rows == 2, tern.json.encode(section))
+		local awui, compact = section.rows[1], section.rows[2]
+		assert(awui.hint == "Installed. On the phone." and awui.control.label == "Open GitHub", tern.json.encode(awui))
+		assert(compact.hint == "Not found. Folds tools." and compact.control.label == "Install steps", tern.json.encode(compact))
+		prefs.event(s, { ev = "action", act = "page", value = "about" })
+		runs = fake.runsOf("codexbar_companions.py")
+		assert(#runs == 2, "switching to About reads the status again")
+		answer.companions[2].installed, answer.companions[2].status = true, "Installed"
+		assert(fake.answer(runs[2], { stdout = fake.json(answer) }) == nil)
+		sections = settingsSections(s)
+		assert(#sections[#sections].rows == 2 and sections[#sections].rows[2].control.label == "Open GitHub", "rows updated in place")
+		prefs.event(s, { ev = "action", act = "open_github", value = "companion.omp-compact" })
+		local opened = fake.runsOf("https://example.com/compact#install")
+		assert(#opened == 1 and opened[1].argv[1] == "xdg-open", "opens the install link")
+	end)
+
 	fake.runChecks()
 end)() end

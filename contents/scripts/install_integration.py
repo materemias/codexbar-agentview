@@ -314,10 +314,14 @@ def _systemctl(*args: str) -> tuple[int, str]:
 # omp extension
 # ---------------------------------------------------------------------------
 
-def _omp_extension_link() -> Path:
+def omp_agent_dir() -> Path:
     # omp itself reads PI_CODING_AGENT_DIR; codexbar_waiting.py checks the same order.
     agent_dir = os.environ.get("PI_CODING_AGENT_DIR") or os.environ.get("OMP_AGENT_DIR")
-    return (Path(agent_dir) if agent_dir else DEFAULT_OMP_AGENT_DIR) / "extensions" / OMP_EXTENSION_NAME
+    return Path(agent_dir) if agent_dir else DEFAULT_OMP_AGENT_DIR
+
+
+def _omp_extension_link() -> Path:
+    return omp_agent_dir() / "extensions" / OMP_EXTENSION_NAME
 
 
 def _omp_loader(source: Path) -> str:
