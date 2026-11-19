@@ -1614,8 +1614,11 @@ local function stillQueued(id: string): boolean
 end
 
 -- A 5 means someone else has the session, so the resume is done; the CLI puts
--- the wait on me if it still doesn't run within its grace. Any other refusal,
--- 11 included, fails the resume with its reason, which puts the wait on me now.
+-- the wait on me if it still doesn't run within its grace. An 11, an omp in its
+-- folder that hasn't said which session it writes yet, is tried again every
+-- RESERVE_RETRY_S for RESERVE_BLOCKED_S: its extension or log says so within
+-- seconds of its start. Any other refusal, and an 11 that outlasts that, fails
+-- the resume with its reason, which puts the wait on me now.
 -- Seen, Stop or Snooze may take the resume back while the helper runs: then nothing
 -- opens, and with the action gone nothing acks it either.
 --
@@ -1626,14 +1629,27 @@ end
 -- (codexbar_focus.py's SESSION_START_RESERVATION_SECONDS) lost its answer, and
 -- the resume starts over.
 local RESERVE_LOST_S = 30 + 60 + 5
-local function reserveThenResume(a: any, state: any)
+-- The CLI drops a resume no window carried out within RESUME_GRACE_S (3
+-- minutes) from when it was queued, without saying why: retries end before.
+local RESERVE_RETRY_S = 15
+local RESERVE_BLOCKED_S = 120
+-- Sessions a Resume click retries (`waitingRequest`), so a second click adds no second loop.
+local blockedLaunches: { [string]: boolean } = {}
+local function reserveThenResume(a: any, state: any, blocked: number?)
 	local id = tostring(a.id)
+	local function store(entry: any)
+		-- kv tables are protected here: copy by iterating.
+		local stored = tern.kv.get("waitingResumes")
+		local resumes = {}
+		for key, r in (if type(stored) == "table" then stored else {}) do
+			resumes[key] = r
+		end
+		resumes[id] = entry
+		tern.kv.set("waitingResumes", resumes)
+	end
 	local function settle(result: string, err: string?)
 		state.result, state.error, state.sending = result, err, false
-		local stored = tern.kv.get("waitingResumes")
-		local resumes = if type(stored) == "table" then stored else {}
-		resumes[id] = { result = result, error = err }
-		tern.kv.set("waitingResumes", resumes)
+		store({ result = result, error = err })
 	end
 	reserveSession(tostring(val(a.session)), val(a.cwd), function(status, why, cx2, release)
 		if not stillQueued(id) then
@@ -1641,8 +1657,17 @@ local function reserveThenResume(a: any, state: any)
 			release()
 			return
 		end
+		local now = os.clock()
+		local since = blocked or now
 		if status == 5 then
 			settle("done")
+		elseif status == 11 and now - since >= 0 and now - since < RESERVE_BLOCKED_S then
+			-- Not acked: the next runActions after `retryAt` takes it up again.
+			state.sending = false
+			if acted[id] == state then
+				acted[id] = nil
+			end
+			store({ blocked = since, retryAt = now + RESERVE_RETRY_S })
 		elseif status ~= 0 then
 			settle("failed", if why ~= "" then why else "couldn't reserve the session")
 		elseif not cx2 then
@@ -1664,13 +1689,16 @@ local function runActions(cx: WindowCx, leader: boolean)
 	-- a plugin reload or a leader's lease: how each resume went stays in
 	-- `tern.kv` until its action leaves the outbox, however long its ack fails.
 	local stored = tern.kv.get("waitingResumes")
-	local resumes: { [string]: { result: string?, error: string?, since: number? } } = {}
+	local resumes: { [string]: { result: string?, error: string?, since: number?, blocked: number?, retryAt: number? } } = {}
 	for id, r in (if type(stored) == "table" then stored else {}) do
 		if type(r) == "table" then
 			resumes[id] = {
 				result = if type(r.result) == "string" then r.result else nil,
 				error = if type(r.error) == "string" then r.error else nil,
 				since = if type(r.since) == "number" then r.since else nil,
+				-- An 11's first refusal, and when to reserve again (`reserveThenResume`).
+				blocked = if type(r.blocked) == "number" then r.blocked else nil,
+				retryAt = if type(r.retryAt) == "number" then r.retryAt else nil,
 			}
 		end
 	end
@@ -1694,21 +1722,31 @@ local function runActions(cx: WindowCx, leader: boolean)
 		local info = if pane then paneInfo(cx, pane) else nil
 		local owns = not state and ownsAction(a, info, leader)
 		local before = if a.type == "resume" then resumes[id] else nil
+		local blocked = if before then before.blocked else nil
 		if owns and before and not before.result then
-			local age = os.clock() - (before.since or 0)
-			if age >= 0 and age < RESERVE_LOST_S then
-				owns = false -- its helper may still answer
+			if before.retryAt then
+				local left = before.retryAt - os.clock()
+				if left > 0 and left <= RESERVE_RETRY_S then
+					owns = false -- blocked: reserves again then
+				else
+					before = nil
+				end
 			else
-				before = nil -- lost, or ahead of now: from before a reboot
+				local age = os.clock() - (before.since or 0)
+				if age >= 0 and age < RESERVE_LOST_S then
+					owns = false -- its helper may still answer
+				else
+					before = nil -- lost, or ahead of now: from before a reboot
+				end
 			end
 		end
 		if owns and a.type == "resume" and not before then
 			-- Held (`sending`) until the helper answers, so nothing acks it meanwhile.
 			state = { result = "failed", error = nil, sending = true, acked = false, retryAt = 0, tries = 0 }
 			acted[id] = state
-			resumes[id] = { since = os.clock() }
+			resumes[id] = { since = os.clock(), blocked = blocked }
 			resumesChanged = true
-			reserveThenResume(a, state)
+			reserveThenResume(a, state, blocked)
 		elseif owns then
 			local ok, result, err = true, nil, nil
 			if before then
@@ -2410,20 +2448,43 @@ local function waitingRequest(cx: WindowCx)
 				open(cx2)
 				return
 			end
-			-- The same startup ownership as an automatic resume and History's Launch.
-			reserveSession(request.session, request.cwd, function(status, why, cx3, release)
-				if not cx3 then
-					release()
-				elseif status == 0 then
-					if not open(cx3 :: WindowCx) then
-						release()
+			-- The same startup ownership as an automatic resume and History's Launch,
+			-- and the same retries while an omp in its folder hasn't named its session.
+			local session = request.session :: string
+			if blockedLaunches[session] then
+				cx2:toast("info", "CodexBar AgentView: Resume waits for the omp in that folder already")
+				return
+			end
+			local first = os.clock()
+			local function attempt()
+				reserveSession(session, request.cwd, function(status, why, cx3, release)
+					local age = os.clock() - first
+					if status == 11 and cx3 and age < RESERVE_BLOCKED_S then
+						if not blockedLaunches[session] then
+							blockedLaunches[session] = true
+							cx3:toast("info", "CodexBar AgentView: waiting for the omp in that folder to name its session",
+								string.format("Resume tries again for %d minutes", RESERVE_BLOCKED_S // 60))
+						end
+						tern.timer(RESERVE_RETRY_S * 1000, function()
+							attempt()
+						end)
+						return
 					end
-				elseif status == 5 then
-					cx3:toast("info", "CodexBar AgentView: that session is running or opening already")
-				else
-					waitingFailed("resume", why, cx3)
-				end
-			end)
+					blockedLaunches[session] = nil
+					if not cx3 then
+						release()
+					elseif status == 0 then
+						if not open(cx3 :: WindowCx) then
+							release()
+						end
+					elseif status == 5 then
+						cx3:toast("info", "CodexBar AgentView: that session is running or opening already")
+					else
+						waitingFailed("resume", why, cx3)
+					end
+				end)
+			end
+			attempt()
 			return
 		end
 		local target = tonumber(request.target)

@@ -106,5 +106,33 @@ do (function()
 		assert(#here.colored == 1 and here.colored[1].color == "yellow", "the local tab is colored")
 	end)
 
+	check("runActions: a resume an unnamed omp blocks reserves again, then fails", function()
+		fresh()
+		fake.kv.waitingActions = tern.json.array({ { id = "r1", type = "resume", session = "s1", cwd = "/w", command = "omp --resume s1" } })
+		local cx = fakeCx("w1", "local", {})
+		local blocked = { status = 11, stderr = "codexbar_focus: a running omp in /w may be writing this session\n" }
+		runActions(cx, true)
+		local runs = fake.runsOf("codexbar_focus.py")
+		assert(#runs == 1, "reserved " .. #runs .. " times")
+		local err = fake.answer(runs[1], blocked)
+		assert(err == nil, err)
+		local entry = fake.kv.waitingResumes.r1
+		assert(entry.retryAt and entry.blocked and not entry.result, "stored " .. tern.json.encode(entry))
+		runActions(cx, true)
+		assert(#fake.runsOf("codexbar_focus.py") == 1, "reserved again before its time")
+		assert(#fake.runsOf("codexbar_waiting.py") == 0, "acked a blocked resume")
+		-- Its time came, and the omp still says nothing after RESERVE_BLOCKED_S.
+		fake.kv.waitingResumes = { r1 = { blocked = os.clock() - RESERVE_BLOCKED_S - 1, retryAt = os.clock() - 1 } }
+		runActions(cx, true)
+		runs = fake.runsOf("codexbar_focus.py")
+		assert(#runs == 2, "reserved " .. #runs .. " times")
+		err = fake.answer(runs[2], blocked)
+		assert(err == nil, err)
+		assert(fake.kv.waitingResumes.r1.result == "failed", "stored " .. tern.json.encode(fake.kv.waitingResumes.r1))
+		runActions(cx, true)
+		local acks = fake.runsOf("codexbar_waiting.py")
+		assert(#acks == 1 and fake.has(acks[1].argv, "failed"), "acks: " .. #acks)
+	end)
+
 	fake.runChecks()
 end)() end
