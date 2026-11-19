@@ -137,6 +137,16 @@ def has_omp_plugin(plugin_dirs: list[Path], entries: list[Path], key: str, packa
     return any(matches(entry) for entry in entries)
 
 
+# omp-stretch's omp half: its marketplace key, its package, and the entry file of a checkout.
+_OMP_STRETCH = ("omp-stretch@omp-stretch", "omp-stretch",
+                lambda path: path.parts[-2:] == ("omp-stretch", "stretch.ts"))
+
+
+def omp_stretch_installed() -> bool:
+    """Whether omp's half of omp-stretch is here, the half that has the model write stretches."""
+    return has_omp_plugin(omp_plugin_dirs(), omp_extension_entries(omp_agent_dir()), *_OMP_STRETCH)
+
+
 def statuses() -> list[dict]:
     agent_dir = omp_agent_dir()
     plugins = tern_plugins_dir()
@@ -148,8 +158,7 @@ def statuses() -> list[dict]:
             "Tern plugin": has_tern_plugin(plugins, "tern-awui"),
         },
         "omp-stretch": {
-            "omp plugin": has_omp_plugin(omp_dirs, entries, "omp-stretch@omp-stretch", "omp-stretch",
-                                lambda path: path.parts[-2:] == ("omp-stretch", "stretch.ts")),
+            "omp plugin": has_omp_plugin(omp_dirs, entries, *_OMP_STRETCH),
             "Tern plugin": has_tern_plugin(plugins, "omp-stretch"),
         },
         "omp-compact": {

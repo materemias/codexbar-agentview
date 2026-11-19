@@ -1814,18 +1814,24 @@ class IncrementalParserTests(unittest.TestCase):
         agents._TRANSCRIPT_CACHE.update(cache)
         return warm
 
-    def test_omp_replies_show_stretch_short_forms(self):
+    def test_omp_replies_show_stretch_short_forms_where_omp_stretch_is_installed(self):
         reply = {"type": "message", "message": {"role": "assistant", "stopReason": "stop", "content": [
             {"type": "text", "text": "Done. {{CI passes.|CI passes on all 3 runners.}}\n```\n{{x|y}}\n```"},
             {"type": "text", "text": "Next {{step|half-written"}]}}
         claude = {"type": "assistant", "message": {"content": "Kept {{as|written}}"}}
-        with tempfile.TemporaryDirectory() as directory:
-            omp = write_jsonl(Path(directory) / "omp.jsonl", [*self.rows("pi"), reply])
-            claude_path = write_jsonl(Path(directory) / "claude.jsonl", [claude])
-            self.assertEqual(agents._transcript_info(str(omp), "pi")["recent"][-1]["text"],
-                             "Done. CI passes. ``` {{x|y}} ``` Next half-written")
-            self.assertEqual(agents._transcript_info(str(claude_path), "claude")["recent"][-1]["text"],
-                             "Kept {{as|written}}")
+        expected = {
+            True: "Done. CI passes. ``` {{x|y}} ``` Next half-written",
+            # Without omp-stretch, braces may be a template: the reply stays as written.
+            False: "Done. {{CI passes.|CI passes on all 3 runners.}} ``` {{x|y}} ``` Next {{step|half-written",
+        }
+        for installed, text in expected.items():
+            with self.subTest(installed=installed), tempfile.TemporaryDirectory() as directory, \
+                    mock.patch.object(agents.stretch_text, "_omp_stretch_installed", return_value=installed):
+                omp = write_jsonl(Path(directory) / "omp.jsonl", [*self.rows("pi"), reply])
+                claude_path = write_jsonl(Path(directory) / "claude.jsonl", [claude])
+                self.assertEqual(agents._transcript_info(str(omp), "pi")["recent"][-1]["text"], text)
+                self.assertEqual(agents._transcript_info(str(claude_path), "claude")["recent"][-1]["text"],
+                                 "Kept {{as|written}}")
 
     def test_append_rewrite_truncate_partial_and_rotation(self):
         for provider in ("claude", "codex", "pi"):

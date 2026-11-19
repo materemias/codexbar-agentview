@@ -606,11 +606,11 @@ def _peek_squash(text: str) -> str:
 
 def _content_preview(content) -> str:
     """Readable text of an omp or pi assistant message's content field: either
-    a plain string or a list of parts. Text parts are joined, each with its
-    omp-stretch stretches drawn as their short forms; a message that only ran
+    a plain string or a list of parts. Text parts are joined, each drawn as a
+    reply preview (omp-stretch short forms where it is installed); a message that only ran
     a tool collapses to "→ toolname" so tool activity still shows up in the peek."""
     if isinstance(content, str):
-        return stretch_text.short_forms(content)
+        return stretch_text.reply_preview(content)
     if not isinstance(content, list):
         return ""
     texts, tool = [], ""
@@ -618,7 +618,7 @@ def _content_preview(content) -> str:
         if not isinstance(c, dict):
             continue
         if c.get("type") == "text" and isinstance(c.get("text"), str):
-            texts.append(stretch_text.short_forms(c["text"]))
+            texts.append(stretch_text.reply_preview(c["text"]))
         elif not tool and isinstance(c.get("name"), str):
             tool = c.get("name")
     if texts:

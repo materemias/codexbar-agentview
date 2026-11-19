@@ -28,6 +28,7 @@ a cut-off stretch takes its borrowed words back, as `parse` does.
 """
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass, field
 
@@ -81,6 +82,21 @@ def short_forms(text: str) -> str:
     if "{{" not in text:
         return text
     return _draw(_parse(text))
+
+
+def reply_preview(text: str) -> str:
+    """A reply as a preview shows it: short forms where omp-stretch is installed,
+    since only there is `{{…|…}}` its markup. Elsewhere it may be a template
+    (`${{ github.ref }}`, `{{ .Values.x | quote }}`) and stays as written."""
+    if "{{" not in text or not _omp_stretch_installed():
+        return text
+    return short_forms(text)
+
+
+@functools.cache
+def _omp_stretch_installed() -> bool:
+    import codexbar_companions  # Imported here, so only a reply with braces pays for it.
+    return codexbar_companions.omp_stretch_installed()
 
 
 def _draw(parts: list) -> str:

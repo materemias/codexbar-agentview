@@ -3521,7 +3521,8 @@ class SeenStopTests(SessionPrCase):
             stamped(said("Merged. {{Checks pass.|Checks pass on all 3 runners.}}"), self.clock + timedelta(seconds=1)),
         )
         self.finish_turn()
-        self.assertEqual(self.session()["on_you"][0]["report"], "Merged. Checks pass.")
+        with mock.patch.object(waiting.stretch_text, "_omp_stretch_installed", return_value=True):
+            self.assertEqual(self.session()["on_you"][0]["report"], "Merged. Checks pass.")
 
 
 class OutcomeTests(Case):

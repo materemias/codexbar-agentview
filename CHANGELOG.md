@@ -39,7 +39,7 @@
 - The Tern extension, the omp extension and the helpers run on Windows, with usage from Meridian only.
 - The Tern dashboard footer lists the keys, and its buttons show just their names.
 - Tern settings open as a dialog over the dashboard.
-- Session peeks and finished-wait excerpts show omp-stretch replies as their short forms.
+- With omp-stretch installed, session peeks and finished-wait excerpts show replies' short forms.
 - Settings → About lists tern-awui, omp-stretch and omp-compact, and which are installed.
 
 ### Fixes

@@ -1058,8 +1058,8 @@ def _last_reply(path: Path, since: float) -> str | None:
                         entry.get("type") == "message" and isinstance(message, dict)
                         and message.get("role") == "assistant"
                     ):
-                        # The reader sees omp-stretch replies as their short forms.
-                        text = _message_text(message.get("content"), stretch_text.short_forms).strip()
+                        # With omp-stretch installed, the reader sees its replies as short forms.
+                        text = _message_text(message.get("content"), stretch_text.reply_preview).strip()
                         if text:
                             return text
                 if not start:
