@@ -2117,10 +2117,10 @@ HISTORY_CAP = 1000
 _CLOSED_BY = ("reboot", "exit")
 
 
-def _history_turns(value: object, stretch: bool = False) -> list[dict]:
-    """Keep the peek turns a live record carried, bounded like the peek.
-    `stretch` draws omp-stretch markup in replies as short forms, for turns
-    saved before writer revision 2, which drew them at peek time."""
+def _history_turns(value: object) -> list[dict]:
+    """Keep the peek turns a live record carried, bounded like the peek. Turns
+    hold what the peek drew; rows saved before writer revision 2 keep their
+    markup, since that text is squashed onto one line and cannot be reparsed."""
     if not isinstance(value, list):
         return []
     turns: list[dict] = []
@@ -2131,13 +2131,10 @@ def _history_turns(value: object, stretch: bool = False) -> list[dict]:
             and entry.get("kind") in ("text", "tools")
             and isinstance(entry.get("text"), str)
         ):
-            text = entry["text"]
-            if stretch and entry["role"] == "assistant" and entry["kind"] == "text":
-                text = stretch_text.short_forms(text)
             turn = {
                 "role": entry["role"],
                 "kind": entry["kind"],
-                "text": text[:_PEEK_CHARS],
+                "text": entry["text"][:_PEEK_CHARS],
             }
             ts = entry.get("ts")
             if isinstance(ts, int) and not isinstance(ts, bool) and ts > 0:
@@ -2146,7 +2143,7 @@ def _history_turns(value: object, stretch: bool = False) -> list[dict]:
     return turns
 
 
-def _history_record(record: dict, active: bool, closed_by: str = "", redraw: bool = False) -> dict:
+def _history_record(record: dict, active: bool, closed_by: str = "") -> dict:
     key = _record_key(record)
     if key is None:
         return {}
@@ -2188,7 +2185,7 @@ def _history_record(record: dict, active: bool, closed_by: str = "", redraw: boo
         "resumeCommand": command,
         "codexHome": codex_home,
         "closedBy": closed_by,
-        "recent": _history_turns(record.get("recent"), redraw and provider in ("omp", "pi")),
+        "recent": _history_turns(record.get("recent")),
         # History shows only a recap of the session's final exchange.
         "recap": "" if record.get("recapStale") is True else text("recap")[:_RECAP_CHARS],
     }
@@ -2205,9 +2202,6 @@ def _merge_snapshot(
     boot_id = boot_id if isinstance(boot_id, str) else ""
     boot_changed = bool(saved_boot_id and boot_id and saved_boot_id != boot_id)
     same_boot = bool(saved_boot_id and boot_id and saved_boot_id == boot_id)
-    # Turns saved since revision 2 hold short forms already; drawing them again
-    # would reparse text the peek squashed onto one line.
-    redraw = _saved_revision(previous) < 2
 
     previous_agents = previous.get("agents")
     if not isinstance(previous_agents, list):
@@ -2259,7 +2253,7 @@ def _merge_snapshot(
                 continue
             key = _record_key(record)
             if key is not None:
-                row = _history_record(record, active=False, redraw=redraw)
+                row = _history_record(record, active=False)
                 if boot_changed and row["closedBy"] == "reboot":
                     row["closedBy"] = "exit"
                 history_by_key[key] = row
@@ -2286,7 +2280,7 @@ def _merge_snapshot(
             if same_boot and (record.get("provider"), record.get("pid")) in current_pids:
                 continue
             history_by_key[key] = _history_record(
-                record, active=True, redraw=redraw,
+                record, active=True,
                 closed_by="reboot" if boot_changed else "exit",
             )
     for record in current:

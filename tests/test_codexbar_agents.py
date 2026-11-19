@@ -305,23 +305,16 @@ class SnapshotMergeTests(unittest.TestCase):
         )
         self.assertEqual(set(row["recent"][0]), {"role", "kind", "text", "ts"})
 
-    def test_history_rows_saved_before_revision_2_show_stretch_short_forms_once(self) -> None:
-        turns = [
-            {"role": "user", "kind": "text", "text": "Ask {{a|b}}", "ts": 1},
-            {"role": "assistant", "kind": "text", "text": "Fixed. {{The cache.|The stale cache key.}}", "ts": 2},
-        ]
-        rows = [active(provider, provider, recent=turns) for provider in ("omp", "claude")]
-        previous = {"bootId": "boot-a", "agents": [], "history": rows}
-        old = agents._merge_snapshot([], previous, "boot-a", 200)["history"]
-        by_provider = {row["provider"]: row["recent"] for row in old}
-        self.assertEqual([turn["text"] for turn in by_provider["omp"]], ["Ask {{a|b}}", "Fixed. The cache."])
-        self.assertEqual(by_provider["claude"], turns)
-        # A revision 2 snapshot already holds short forms: `~~~ {{x|y}} ~~~` is a squashed fence.
-        drawn = [{"role": "assistant", "kind": "text", "text": "~~~ {{x|y}} ~~~", "ts": 2}]
-        previous = {"writerRevision": 2, "bootId": "boot-a", "agents": [],
-                    "history": [active("omp", "omp", recent=drawn)]}
-        row = agents._merge_snapshot([], previous, "boot-a", 200)["history"][0]
-        self.assertEqual(row["recent"], drawn)
+    def test_saved_history_turns_are_never_reparsed(self) -> None:
+        # A saved turn is squashed onto one line: `Example: ~~~ {{x|y}} ~~~` was a fenced
+        # block, so drawing stretches in it again would change the code. Old and new rows alike.
+        turns = [{"role": "assistant", "kind": "text", "text": "Example: ~~~ {{x|y}} ~~~", "ts": 2}]
+        for revision in (None, 2):
+            previous = {"writerRevision": revision, "bootId": "boot-a",
+                        "agents": [active("omp", "live", recent=turns)],
+                        "history": [active("omp", "saved", recent=turns)]}
+            history = agents._merge_snapshot([], previous, "boot-a", 200)["history"]
+            self.assertEqual([row["recent"] for row in history], [turns, turns])
 
     def test_a_later_reboot_turns_earlier_reboot_rows_into_exits(self) -> None:
         first = agents._merge_snapshot(
