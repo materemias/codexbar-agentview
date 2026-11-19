@@ -36,3 +36,4 @@ Identities: applet `io.github.materemias.codexbaragentview`, Tern plugin `codexb
 - Filtering toggles row `visible`; Repeater models stay unfiltered so typing does not rebuild delegates.
 - Plasma clamps popup height: keep usage sections compact.
 - Claude OAuth fetches take about 16 s; keep the helper timeout at 30 s or more.
+- Plasma and Tern run separate copies of `codexbar_agents.py` on one `agents.json`. Bump `WRITER_REVISION` when a sweep's output changes meaning; an older copy then refuses to overwrite it.

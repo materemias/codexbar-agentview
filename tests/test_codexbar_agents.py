@@ -261,7 +261,7 @@ class SnapshotMergeTests(unittest.TestCase):
 
         self.assertEqual(
             set(snapshot),
-            {"bootId", "updatedAt", "counts", "agents", "history", "ternInstalled", "backfill"},
+            {"writerRevision", "bootId", "updatedAt", "counts", "agents", "history", "ternInstalled", "backfill"},
         )
         self.assertEqual(snapshot["bootId"], "boot-b")
         self.assertEqual(snapshot["agents"], [])
@@ -1689,6 +1689,27 @@ class PersistenceTests(unittest.TestCase):
 
             self.assertTrue(written)
             self.assertEqual(payload["updatedAt"], 1_000)
+
+    def test_an_older_writer_leaves_a_newer_ones_snapshot_alone(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "agents.json"
+            saved = agents._merge_snapshot([], {}, "boot-current", 200)
+            saved["writerRevision"] = agents.WRITER_REVISION + 1
+            agents._write_aggregate(saved, path)
+            before = path.read_bytes()
+            with (
+                mock.patch.object(agents, "_read_boot_id", return_value="boot-current"),
+                mock.patch.object(agents, "_build_records", return_value=[]),
+            ):
+                with self.assertRaises(agents._NewerWriter):
+                    agents._locked_sweep(aggregate_path=path)
+                self.assertEqual(path.read_bytes(), before)
+                # An older revision's snapshot it sweeps over, saying which it is.
+                saved["writerRevision"] = agents.WRITER_REVISION - 1
+                agents._write_aggregate(saved, path)
+                _, written = agents._locked_sweep(aggregate_path=path)
+            self.assertTrue(written)
+            self.assertEqual(json.loads(path.read_text())["writerRevision"], agents.WRITER_REVISION)
 
     def test_boot_change_ignores_desktop_map_until_same_boot_sweep(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

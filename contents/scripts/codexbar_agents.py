@@ -2308,6 +2308,7 @@ def _merge_snapshot(
         bucket.get(record.get("state"), 9), str(record.get("cwd") or "")
     ))
     return {
+        "writerRevision": WRITER_REVISION,
         "bootId": boot_id or saved_boot_id,
         "updatedAt": now_ms,
         "counts": counts,
@@ -2746,6 +2747,25 @@ def _saved_write_is_newer(
     )
 
 
+# Bump whenever a sweep's output changes meaning: which process gets a session,
+# which rows exist, what a field says. The Plasma applet and the Tern plugin run
+# their own copies of this script on one agents.json, and an older copy left
+# installed would overwrite a newer one's sweep with its own (`_locked_sweep`).
+WRITER_REVISION = 1
+
+
+class _NewerWriter(Exception):
+    def __init__(self, revision: int) -> None:
+        super().__init__(revision)
+        self.revision = revision
+
+
+def _saved_revision(payload: dict) -> int:
+    """The writer revision a snapshot was saved by; 0 from before revisions."""
+    revision = payload.get("writerRevision")
+    return revision if type(revision) is int else 0
+
+
 @contextlib.contextmanager
 def _aggregate_lock(aggregate_path: Path, lock_path: Path | None = None):
     """Hold the writer lock that serializes every aggregate update."""
@@ -2830,12 +2850,14 @@ def _locked_sweep(
 ) -> tuple[dict, bool]:
     """Sweep and save the next snapshot under the writer lock. Without
     `write`, sweep with neither the lock nor the parser cache and save
-    nothing."""
+    nothing. A snapshot a newer writer saved raises `_NewerWriter`."""
     global _TRANSCRIPT_CACHE, _CACHE_ACTIVE
     aggregate_path = Path(aggregate_path)
     with _aggregate_lock(aggregate_path, lock_path) if write else contextlib.nullcontext():
         boot_id = _read_boot_id()
         previous = _load_payload(aggregate_path)
+        if write and _saved_revision(previous) > WRITER_REVISION:
+            raise _NewerWriter(_saved_revision(previous))
         now_ms = int(time.time() * 1000)
         if _saved_write_is_newer(previous, boot_id, requested_at, now_ms):
             return previous, False
@@ -2892,7 +2914,14 @@ def main(argv: list[str]) -> int:
         _dismiss_history(_parse_session_keys(args.dismiss))
         return 0
     if args.once:
-        _locked_sweep(desktop_map, requested_at)
+        try:
+            _locked_sweep(desktop_map, requested_at)
+        except _NewerWriter as newer:
+            sys.stderr.write(
+                f"codexbar_agents: agents.json comes from a newer CodexBar AgentView "
+                f"(revision {newer.revision}, this copy {WRITER_REVISION}): update this one\n"
+            )
+            return 3
         return 0
 
     payload, _ = _locked_sweep(desktop_map, write=False)
