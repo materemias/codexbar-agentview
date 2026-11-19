@@ -1404,14 +1404,12 @@ def _reported_panes(path: str, _mtime_ns: int, _size: int) -> tuple[tuple[str, i
 
 def _extension_session(pid: int) -> str:
     """The session omp's CodexBar extension last reported from the Tern pane
-    `pid` runs in, or "". Used on Windows, where no open file names it.
+    `pid` runs in, or "".
 
     The extension reports the session omp writes and its TERN_PANE to
     codexbar_waiting.py, which keeps the newest session per pane in
     waiting.json. A report from before the process started came from an
     earlier one in that pane; reports carry whole seconds."""
-    if not state_paths.WINDOWS:
-        return ""
     pane, start = _tern_pane(pid), _start_ms(pid)
     if pane is None or not start:
         return ""
@@ -1726,7 +1724,8 @@ _INFO_FN = {
     "codex": _codex_info,
     "opencode": _opencode_info,
     "pi": lambda pid: _pi_info(pid, ("--session", "--session-id"), tool="pi"),
-    "omp": lambda pid: _pi_info(pid, reported=_extension_session(pid)),
+    # On Windows no open file names omp's session; elsewhere one does.
+    "omp": lambda pid: _pi_info(pid, reported=_extension_session(pid) if state_paths.WINDOWS else ""),
 }
 
 _RESUME_PREFIXES = {
@@ -2489,9 +2488,10 @@ def _live_omp_sessions() -> tuple[set[str], set[str]]:
     omp closes its transcript between writes, and argv names only the
     session it started in: `/resume` switches without changing it. Its own
     log names each session it works in, so every session there counts as
-    held, along with the one argv resumes. Background omp (workers, rpc)
-    counts only by those: its workers run in a session's folder without
-    being one."""
+    held, along with the one argv resumes and the one its CodexBar extension
+    reports from its Tern pane, which a fresh session's log may not name yet.
+    Background omp (workers, rpc) counts only by those: its workers run in a
+    session's folder without being one."""
     held: set[str] = set()
     unresolved: set[str] = set()
     logs = _omp_log_files()
@@ -2507,6 +2507,8 @@ def _live_omp_sessions() -> tuple[set[str], set[str]]:
             clues = _omp_logged_sessions(pid, logs.get(pid, []))
             if resumed := _resume_arg(pid, "--resume"):
                 clues.add(resumed)
+            if reported := _extension_session(pid):
+                clues.add(reported)
             held |= clues
             if not clues and not services and (cwd := _cwd_of(pid)):
                 unresolved.add(cwd)

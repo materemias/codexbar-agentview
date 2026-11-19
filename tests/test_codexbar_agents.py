@@ -750,20 +750,24 @@ class ResumeAndIdentityTests(unittest.TestCase):
                 json.dumps({"sessionId": "01a0bbbb-0000-7000-8000-000000000002"}) + "\n")
             # Logging, but no session named yet: no clue which one it is in.
             (logs / f"omp.{day}.44.log").write_text(json.dumps({"message": "startup"}) + "\n")
+            # A fresh session its log doesn't name yet, which its extension reports.
+            (logs / f"omp.{day}.45.log").write_text(json.dumps({"message": "startup"}) + "\n")
             # A headless omp resuming a session between writes.
-            argv = {42: ["omp", "--resume", "01a0-started"], 43: ["omp"], 44: ["omp"],
+            argv = {42: ["omp", "--resume", "01a0-started"], 43: ["omp"], 44: ["omp"], 45: ["omp"],
                     50: ["omp", "--mode", "rpc", "--resume", "01a0-headless"]}
             with (
                 mock.patch.object(agents.Path, "home", return_value=home),
                 mock.patch.object(agents, "_pgrep",
-                                  side_effect=lambda _n, services=False: [50] if services else [42, 43, 44]),
+                                  side_effect=lambda _n, services=False: [50] if services else [42, 43, 44, 45]),
                 mock.patch.object(agents, "_open_jsonl_under", return_value=("", False)),
                 mock.patch.object(agents, "_start_ms", return_value=started),
                 mock.patch.object(agents, "_argv_of", side_effect=lambda pid: argv[pid]),
                 mock.patch.object(agents, "_cwd_of", side_effect=lambda pid: f"/work{pid}"),
+                mock.patch.object(agents, "_extension_session",
+                                  side_effect=lambda pid: "01a0-reported" if pid == 45 else ""),
             ):
                 held, unresolved = agents._live_omp_sessions()
-        self.assertEqual(held, {switched, "01a0-started", "01a0-headless"})
+        self.assertEqual(held, {switched, "01a0-started", "01a0-headless", "01a0-reported"})
         self.assertEqual(unresolved, {"/work43", "/work44"})
 
     def test_codex_tuis_match_threads_loaded_by_shared_app_server(self) -> None:
@@ -1969,12 +1973,11 @@ class WindowsSessionTests(unittest.TestCase):
             waiting = Path(directory) / "codexbar-agentview" / "waiting.json"
             waiting.parent.mkdir()
 
-            def run(state: object, pane: str = "7", windows: bool = True) -> str:
+            def run(state: object, pane: str = "7") -> str:
                 waiting.write_text(state if isinstance(state, str) else json.dumps(state))
                 # A rewrite within one clock tick may keep size and mtime.
                 agents._reported_panes.cache_clear()
                 with (
-                    mock.patch.object(agents.state_paths, "WINDOWS", windows),
                     mock.patch.dict(agents.os.environ, {"XDG_STATE_HOME": directory}),
                     mock.patch.object(agents, "_environ_value", side_effect=lambda pid, name: pane if name == "TERN_PANE" else ""),
                     mock.patch.object(agents, "_start_ms", return_value=start),
@@ -1991,9 +1994,8 @@ class WindowsSessionTests(unittest.TestCase):
             self.assertEqual(run(state, pane="9"), "")
             self.assertEqual(run(state, pane=""), "")
             self.assertEqual(run(state, pane="\u00b2"), "")
-            # `True` is no pane number, and only Windows asks.
+            # `True` is no pane number.
             self.assertEqual(run(state, pane="1"), "")
-            self.assertEqual(run(state, windows=False), "")
             # A report from before the process started was an earlier process's,
             # even one from the second before.
             state["extensions"]["mine"] = stamp(start - 60_000)
@@ -2024,6 +2026,7 @@ class WindowsSessionTests(unittest.TestCase):
                 mock.patch.object(agents, "_comm_of", return_value="omp"),
                 mock.patch.object(agents, "_ppid_of", return_value=1),
                 mock.patch.object(agents, "_start_ms", return_value=1_790_000_000_000),
+                self.windows(),
             ):
                 with mock.patch.object(agents, "_extension_session", return_value="01a0-reported"):
                     info = agents._INFO_FN["omp"](42)
