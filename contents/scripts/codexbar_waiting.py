@@ -344,7 +344,7 @@ def _empty_state() -> dict:
     return {
         "version": STATE_VERSION, "wait_seq": 0, "action_seq": 0, "boot_id": "",
         "sessions": {}, "panes": {}, "actions": [], "extensions": {},
-        "extension_features": {}, "extension_panes": {}, "extension_activity": {},
+        "extension_features": {}, "extension_panes": {}, "extension_pids": {}, "extension_activity": {},
         "menu_seq": 0, "menu_requests": {},
         # Counts saves, for waiting.stamp.
         "save_seq": 0,
@@ -397,7 +397,7 @@ def _transaction():
 
 
 # What an extension's heartbeat changes: cheap to lose, as the next one says it again.
-HEARTBEAT_KEYS = ("extensions", "extension_activity", "extension_features", "extension_panes")
+HEARTBEAT_KEYS = ("extensions", "extension_activity", "extension_features", "extension_panes", "extension_pids")
 
 
 def _lasting(state: dict) -> dict:
@@ -3092,9 +3092,10 @@ def _after_reboot(state: dict, agents: Agents, now: datetime) -> None:
     state["extensions"] = {
         session: seen for session, seen in state["extensions"].items() if this_boots(session)
     }
-    state["extension_panes"] = {
-        session: pane for session, pane in state["extension_panes"].items() if this_boots(session)
-    }
+    for reported in ("extension_panes", "extension_pids"):
+        state[reported] = {
+            session: where for session, where in state[reported].items() if this_boots(session)
+        }
     for record in state["sessions"].values():
         record.update(resume_prompts=[], resume_opened_at=None)
         for entry in record["prompt_queue"]:
@@ -3201,8 +3202,11 @@ def _housekeeping(
         session: seen for session, seen in state["extensions"].items()
         if stamp - _parse_time(seen).timestamp() <= EXTENSION_KEPT_S
     }
-    # A session's features, pane and activity end with its extension's record.
-    for known in (state["extension_features"], state["extension_panes"], state["extension_activity"]):
+    # A session's features, pane, pid and activity end with its extension's record.
+    for known in (
+        state["extension_features"], state["extension_panes"], state["extension_pids"],
+        state["extension_activity"],
+    ):
         for session in [session for session in known if session not in state["extensions"]]:
             del known[session]
     state["menu_requests"] = _fresh_menu_requests(state, now)
@@ -5229,7 +5233,7 @@ def _move_session(state: dict, old: str, new: str, omp: Omp, now: datetime) -> N
     if old in state["menu_requests"]:
         state["menu_requests"].setdefault(new, state["menu_requests"].pop(old))
     # This process ran `old`, and runs `new` now.
-    for heard in ("extensions", "extension_features", "extension_panes", "extension_activity"):
+    for heard in ("extensions", "extension_features", "extension_panes", "extension_pids", "extension_activity"):
         state[heard].pop(old, None)
     # The old pin goes only once the new one holds: a pin no wait asks for
     # (one the user set) has no retry, and would be lost.
@@ -5311,6 +5315,12 @@ def cmd_heartbeat(args: argparse.Namespace) -> dict:
                 session: pane for session, pane in panes.items() if pane != args.pane
             }
             state["extension_panes"][args.session] = args.pane
+        if args.pid is not None:
+            # codexbar_agents.py tells which session an omp process writes by
+            # this, in any terminal; a process runs one session at a time.
+            pids = state["extension_pids"]
+            state["extension_pids"] = {session: pid for session, pid in pids.items() if pid != args.pid}
+            state["extension_pids"][args.session] = args.pid
         record = state["sessions"].get(args.session)
         if record:
             _back_early(state, record, agents, now)
@@ -5835,6 +5845,16 @@ def _pane_arg(text: str) -> int:
     return pane
 
 
+def _pid_arg(text: str) -> int:
+    try:
+        pid = int(text)
+    except ValueError:
+        pid = 0
+    if pid <= 0:
+        raise argparse.ArgumentTypeError(f"bad pid: {text!r}")
+    return pid
+
+
 def _add_target(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session", type=_session_arg)
     parser.add_argument("--pane", type=_pane_arg)
@@ -5959,6 +5979,7 @@ def _parser() -> argparse.ArgumentParser:
     heartbeat = command("heartbeat", cmd_heartbeat)
     heartbeat.add_argument("--session", type=_session_arg, required=True)
     heartbeat.add_argument("--pane", type=_pane_arg)
+    heartbeat.add_argument("--pid", type=_pid_arg)
     heartbeat.add_argument("--features")
     # omp runs no turn and streams nothing (`_settle_idle`).
     heartbeat.add_argument("--idle", action="store_true")

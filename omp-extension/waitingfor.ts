@@ -1546,7 +1546,8 @@ export default function (pi) {
 		const move = moves[0];
 		const moveArgs = move ? ["--moved-from", move.from, "--move-reason", move.reason] : [];
 		const activity = activityArgs();
-		const beat = cli(["heartbeat", "--session", sessionId, ...(pane ? ["--pane", pane] : []), "--features", "menu,activity", ...activity, ...moveArgs]).then(
+		// The pid tells codexbar_agents.py which session this omp writes, in any terminal.
+		const beat = cli(["heartbeat", "--session", sessionId, ...(pane ? ["--pane", pane] : []), "--pid", String(process.pid), "--features", "menu,activity", ...activity, ...moveArgs]).then(
 			(answer) => {
 				reported = activity.join(" ");
 				return answer;

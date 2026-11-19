@@ -1966,7 +1966,7 @@ class WindowsSessionTests(unittest.TestCase):
         self.assertEqual(run("7", ("code", [42, 5])), ("", []))
         self.assertEqual(run("", ("kitty", [42, 5]), windows=False), ("kitty", [42, 5]))
 
-    def test_extension_reports_name_the_session_of_a_pane(self) -> None:
+    def test_extension_reports_name_the_session_of_a_process_or_pane(self) -> None:
         start = 1_790_000_000_000
         stamp = lambda ms: datetime.fromtimestamp(ms / 1000, timezone.utc).isoformat(timespec="seconds")
         with tempfile.TemporaryDirectory() as directory:
@@ -1976,7 +1976,7 @@ class WindowsSessionTests(unittest.TestCase):
             def run(state: object, pane: str = "7") -> str:
                 waiting.write_text(state if isinstance(state, str) else json.dumps(state))
                 # A rewrite within one clock tick may keep size and mtime.
-                agents._reported_panes.cache_clear()
+                agents._extension_reports.cache_clear()
                 with (
                     mock.patch.dict(agents.os.environ, {"XDG_STATE_HOME": directory}),
                     mock.patch.object(agents, "_environ_value", side_effect=lambda pid, name: pane if name == "TERN_PANE" else ""),
@@ -1996,6 +1996,15 @@ class WindowsSessionTests(unittest.TestCase):
             self.assertEqual(run(state, pane="\u00b2"), "")
             # `True` is no pane number.
             self.assertEqual(run(state, pane="1"), "")
+            # Its pid names it in any terminal, ahead of its pane.
+            by_pid = {**state, "extension_pids": {"old-session": 41, "elsewhere": 42}}
+            by_pid["extensions"] = {**state["extensions"], "elsewhere": stamp(start + 5000)}
+            self.assertEqual(run(by_pid), "elsewhere")
+            self.assertEqual(run(by_pid, pane=""), "elsewhere")
+            # An earlier process with this pid reported it.
+            by_pid["extensions"]["elsewhere"] = stamp(start - 60_000)
+            self.assertEqual(run(by_pid), "mine")
+            self.assertEqual(run(by_pid, pane=""), "")
             # A report from before the process started was an earlier process's,
             # even one from the second before.
             state["extensions"]["mine"] = stamp(start - 60_000)

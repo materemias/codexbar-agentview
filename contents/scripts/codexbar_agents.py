@@ -1384,44 +1384,54 @@ def _tern_pane(pid: int) -> int | None:
 
 
 @functools.lru_cache(maxsize=1)
-def _reported_panes(path: str, _mtime_ns: int, _size: int) -> tuple[tuple[str, int, int], ...]:
-    """(session, pane, report ms) for each pane waiting.json maps, parsed
-    once per version of the file."""
+def _extension_reports(path: str, _mtime_ns: int, _size: int) -> tuple[tuple[str, int | None, int | None, int], ...]:
+    """(session, pane, pid, report ms) for each session waiting.json maps to a
+    Tern pane or a process, parsed once per version of the file."""
     try:
         state = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError):
         return ()
-    panes = state.get("extension_panes") if isinstance(state, dict) else None
-    heard = state.get("extensions") if isinstance(state, dict) else None
-    if not isinstance(panes, dict) or not isinstance(heard, dict):
+    if not isinstance(state, dict) or not isinstance(heard := state.get("extensions"), dict):
         return ()
-    return tuple(
-        (session, pane, _ts_ms(heard.get(session)))
-        for session, pane in panes.items()
-        if type(pane) is int and _safe_session_id(session)
-    )
+    panes, pids = state.get("extension_panes"), state.get("extension_pids")
+    panes = panes if isinstance(panes, dict) else {}
+    pids = pids if isinstance(pids, dict) else {}
+    reports = []
+    for session in dict.fromkeys([*panes, *pids]):
+        pane, pid = panes.get(session), pids.get(session)
+        pane, pid = (pane if type(pane) is int else None), (pid if type(pid) is int else None)
+        if (pane is not None or pid is not None) and _safe_session_id(session):
+            reports.append((session, pane, pid, _ts_ms(heard.get(session))))
+    return tuple(reports)
 
 
 def _extension_session(pid: int) -> str:
-    """The session omp's CodexBar extension last reported from the Tern pane
-    `pid` runs in, or "".
+    """The session omp's CodexBar extension last reported from process `pid`,
+    else from the Tern pane it runs in, or "".
 
-    The extension reports the session omp writes and its TERN_PANE to
-    codexbar_waiting.py, which keeps the newest session per pane in
-    waiting.json. A report from before the process started came from an
-    earlier one in that pane; reports carry whole seconds."""
-    pane, start = _tern_pane(pid), _start_ms(pid)
-    if pane is None or not start:
+    The extension reports the session omp writes with its pid and TERN_PANE
+    to codexbar_waiting.py, which keeps the newest session per pid and per
+    pane in waiting.json. An extension from before the pid report names only
+    the pane. A report from before the process started came from an earlier
+    one with that pid or in that pane; reports carry whole seconds."""
+    start = _start_ms(pid)
+    if not start:
         return ""
     path = state_paths.state_dir() / "waiting.json"
     try:
         stat = path.stat()
     except OSError:
         return ""
-    for session, reported, heard in _reported_panes(str(path), stat.st_mtime_ns, stat.st_size):
-        if reported == pane and heard >= start - start % 1000:
-            return session
-    return ""
+    reports = [
+        report for report in _extension_reports(str(path), stat.st_mtime_ns, stat.st_size)
+        if report[3] >= start - start % 1000
+    ]
+    if session := next((session for session, _, by, _ in reports if by == pid), ""):
+        return session
+    pane = _tern_pane(pid)
+    if pane is None:
+        return ""
+    return next((session for session, at, _, _ in reports if at == pane), "")
 
 
 # Entry types omp counts as a turn when it picks the newest copy of a session.
@@ -2489,7 +2499,7 @@ def _live_omp_sessions() -> tuple[set[str], set[str]]:
     session it started in: `/resume` switches without changing it. Its own
     log names each session it works in, so every session there counts as
     held, along with the one argv resumes and the one its CodexBar extension
-    reports from its Tern pane, which a fresh session's log may not name yet.
+    reports for it, which a fresh session's log may not name yet.
     Background omp (workers, rpc) counts only by those: its workers run in a
     session's folder without being one."""
     held: set[str] = set()

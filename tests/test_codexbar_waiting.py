@@ -1824,6 +1824,15 @@ class MenuRequestTests(Case):
         self.tick()
         self.assertEqual(self.state()["extension_panes"], {})
 
+    def test_a_process_runs_the_session_it_reported_last(self) -> None:
+        self.heartbeat(SID, "--pid", "4242")
+        self.heartbeat(OTHER, "--pid", "4242")
+        self.heartbeat(OTHER)
+        self.assertEqual(self.state()["extension_pids"], {OTHER: 4242})
+        self.advance(seconds=waiting.EXTENSION_KEPT_S + 1)
+        self.tick()
+        self.assertEqual(self.state()["extension_pids"], {})
+
     def test_menu_request_by_pane(self) -> None:
         self.heartbeat(SID, "--pane", "52", "--features", "menu")
         answer = self.run_cli("menu-request", "--pane", "52")
