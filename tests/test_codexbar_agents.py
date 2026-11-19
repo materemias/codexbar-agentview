@@ -2050,6 +2050,9 @@ class WindowsSessionTests(unittest.TestCase):
             by_pid["extensions"]["elsewhere"] = stamp(start - 60_000)
             self.assertEqual(run(by_pid), "mine")
             self.assertEqual(run(by_pid, pane=""), "")
+            # A pane report naming another pid is that process's, not this one's.
+            by_pid["extension_pids"]["mine"] = 43
+            self.assertEqual(run(by_pid), "")
             # A report from before the process started was an earlier process's,
             # even one from the second before.
             state["extensions"]["mine"] = stamp(start - 60_000)

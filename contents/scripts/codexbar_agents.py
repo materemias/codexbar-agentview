@@ -1434,7 +1434,9 @@ def _extension_session(pid: int) -> str:
     pane = _tern_pane(pid)
     if pane is None:
         return ""
-    return next((session for session, at, _, _ in reports if at == pane), "")
+    # Only an extension from before the pid report goes by the pane: one that
+    # names a pid speaks for that process, and a worker it spawned shares its pane.
+    return next((session for session, at, by, _ in reports if at == pane and by is None), "")
 
 
 # Entry types omp counts as a turn when it picks the newest copy of a session.
@@ -2757,7 +2759,8 @@ def _saved_write_is_newer(
 # their own copies of this script on one agents.json, and an older copy left
 # installed would overwrite a newer one's sweep with its own (`_locked_sweep`).
 # 2: omp and pi peek turns hold omp-stretch short forms, not the markup.
-WRITER_REVISION = 2
+# 3: a Tern pane names an omp's session only by reports that carry no pid.
+WRITER_REVISION = 3
 
 
 class _NewerWriter(Exception):
@@ -2803,6 +2806,8 @@ def _dismiss_history(
     aggregate_path = Path(aggregate_path)
     with _aggregate_lock(aggregate_path):
         payload = _load_payload(aggregate_path)
+        if _saved_revision(payload) > WRITER_REVISION:
+            raise _NewerWriter(_saved_revision(payload))
         kept = [r for r in payload["history"] if _record_key(r) not in keys]
         gone = [r for r in payload["history"] if _record_key(r) in keys]
         if gone:
@@ -2916,19 +2921,19 @@ def main(argv: list[str]) -> int:
     desktop_map = _parse_desktop_map(args.desktop_map)
     requested_at = _parse_requested_at(args.requested_at)
 
-    if args.dismiss is not None:
-        _dismiss_history(_parse_session_keys(args.dismiss))
-        return 0
-    if args.once:
-        try:
+    try:
+        if args.dismiss is not None:
+            _dismiss_history(_parse_session_keys(args.dismiss))
+            return 0
+        if args.once:
             _locked_sweep(desktop_map, requested_at)
-        except _NewerWriter as newer:
-            sys.stderr.write(
-                f"codexbar_agents: agents.json comes from a newer CodexBar AgentView "
-                f"(revision {newer.revision}, this copy {WRITER_REVISION}): update this one\n"
-            )
-            return 3
-        return 0
+            return 0
+    except _NewerWriter as newer:
+        sys.stderr.write(
+            f"codexbar_agents: agents.json comes from a newer CodexBar AgentView "
+            f"(revision {newer.revision}, this copy {WRITER_REVISION}): update this one\n"
+        )
+        return 3
 
     payload, _ = _locked_sweep(desktop_map, write=False)
     json.dump(payload, sys.stdout, separators=(",", ":"))
