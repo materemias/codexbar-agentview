@@ -5863,23 +5863,7 @@ def _pid_arg(text: str) -> int:
         raise argparse.ArgumentTypeError(f"bad pid: {text!r}")
     return pid
 
-def _pid_arg(text: str) -> int:
-    try:
-        pid = int(text)
-    except ValueError:
-        pid = 0
-    if pid <= 0:
-        raise argparse.ArgumentTypeError(f"bad pid: {text!r}")
-    return pid
 
-def _pid_arg(text: str) -> int:
-    try:
-        pid = int(text)
-    except ValueError:
-        pid = 0
-    if pid <= 0:
-        raise argparse.ArgumentTypeError(f"bad pid: {text!r}")
-    return pid
 def _add_target(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session", type=_session_arg)
     parser.add_argument("--pane", type=_pane_arg)
