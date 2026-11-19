@@ -3928,6 +3928,7 @@ def _target_view(
     views = [view for track in sorted(_tracks(views), key=lambda track: (
         _sort_time(track[0]["due_at"]), track[0]["created_at"],
     )) for view in track]
+    by_id = {wait["id"]: wait for wait in waits}
     outcome, headline = _outcome_headline(views)
     dues = [view["due_at"] for view in _active(views) if view["due_at"]]
     snooze = _hiding_snooze(record)
@@ -3946,9 +3947,9 @@ def _target_view(
             {
                 "id": view["id"], "label": view["label"], "mark": view["mark"],
                 "text": _on_you_text(view),
-                "report": reply(wait) if reply and wait["state"] == "review" else None,
+                "report": reply(by_id[view["id"]]) if reply and by_id[view["id"]]["state"] == "review" else None,
             }
-            for wait, view in zip(waits, views) if view["ball"] == "on_me"
+            for view in views if view["ball"] == "on_me"
         ],
         "stoppable": len(views),
     }
@@ -5871,6 +5872,14 @@ def _pid_arg(text: str) -> int:
         raise argparse.ArgumentTypeError(f"bad pid: {text!r}")
     return pid
 
+def _pid_arg(text: str) -> int:
+    try:
+        pid = int(text)
+    except ValueError:
+        pid = 0
+    if pid <= 0:
+        raise argparse.ArgumentTypeError(f"bad pid: {text!r}")
+    return pid
 def _add_target(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--session", type=_session_arg)
     parser.add_argument("--pane", type=_pane_arg)

@@ -3489,6 +3489,8 @@ class SeenStopTests(SessionPrCase):
 
     def test_a_review_wait_reports_the_agents_last_reply(self) -> None:
         self.write(stamped(said("before the prompt"), self.clock - timedelta(minutes=1)))
+        # Added first and due later: the card lists it second.
+        self.add("--kind", "time", "--in", "1d", "--label", "Later")
         wait, _ = self.queued_prompt()
         delivered = self.clock
         reply = "Done.  Merged\n the PR " + "and more " * 60
