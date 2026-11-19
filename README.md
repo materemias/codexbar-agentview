@@ -226,7 +226,10 @@ configuration. A failed write leaves the original configuration intact.
 | Key | Action | Where |
 | --- | --- | --- |
 | `Super+A` | Open the popup on Agents | Plasma |
-| `Ctrl+Alt+A` / `Ctrl+Alt+U` / `Ctrl+Alt+W` / `Ctrl+Alt+H` | Toggle the dashboard on Agents / Usage / Waiting / History | Tern |
+| `Ctrl+Alt+A` | Open the dashboard on Agents, every live session; pressed again on the focused Agents tab, close it | Tern |
+| `Ctrl+Alt+U` | Open the dashboard on Usage, every account's limits; pressed again on the focused Usage tab, close it. With usage tracking off, a toast says so | Tern |
+| `Ctrl+Alt+W` | Open the dashboard on Waiting, the sessions set aside; pressed again on the focused Waiting tab, close it | Tern |
+| `Ctrl+Alt+H` | Open the dashboard on History, closed sessions to launch again; pressed again on the focused History tab, close it | Tern |
 | `Ctrl+Alt+B` | Set the focused session aside (in omp outside Tern too) | Tern, omp |
 | `Ctrl+Alt+I` | Show or hide the focused session's card (in omp outside Tern: its details above the composer) | Tern, omp |
 | `←` / `→` | Switch tabs | Both |
