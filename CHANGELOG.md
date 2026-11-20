@@ -46,6 +46,7 @@
 
 ### Fixes
 
+- The session card's buttons answer: `Ctrl+Alt+I` opens it focused, or focuses one already open.
 - The Tern extension works on Tern 0.9.20 again.
 - Resume reopens a closed session while a fresh omp runs in the same folder.
 - Resume retries for 2 minutes while another omp in the session's folder starts up.

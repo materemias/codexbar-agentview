@@ -1163,7 +1163,9 @@ end
 -- `known` is the session a link named: it wins over what the agents scan, which
 -- lags a session started or resumed in the pane, maps there. Without one, the
 -- session the pane's omp extension reports wins, as its row's link names it.
-local function openCard(cx: WindowCx, pane: number, known: string?)
+-- `focus`: the user asked for the card, so it takes focus. Unfocused, Tern draws
+-- it as a glance that clicks pass through, so none of its buttons answer.
+local function openCard(cx: WindowCx, pane: number, known: string?, focus: boolean?)
 	if not known then
 		local extension = paneExtension(pane)
 		known = if extension and type(val(extension.session)) == "string" then extension.session else nil
@@ -1192,17 +1194,20 @@ local function openCard(cx: WindowCx, pane: number, known: string?)
 			.. " on a second press, × beside a wait ends that one, Close only closes this card.",
 		how = "beside",
 		target = pane,
-		focus = false,
+		focus = focus == true,
 	})
 	if not canvas then
 		waitingFailed("session card", err, cx)
 		return
 	end
-	local ok, floatErr = cx.layout:float(canvas, pane, "tr", { focus = false, size = { 0.45, 0.75 } })
+	local ok, floatErr = cx.layout:float(canvas, pane, "tr", { focus = focus == true, size = { 0.45, 0.75 } })
 	if not ok then
 		cx.layout:close(canvas)
 		waitingFailed("session card", floatErr, cx)
 		return
+	end
+	if focus then
+		cx.layout:focus(canvas)
 	end
 	if record and session and record.unseen == true then
 		waitingSend("mark seen", { "seen", "--session", session })
@@ -1349,10 +1354,14 @@ local function focusedTarget(cx: WindowCx): (number?, PaneInfo?)
 	return nil, nil
 end
 
--- Closes `pane`'s card, or opens it once a dashboard this closes has restored its layout.
+-- Opens `pane`'s card focused, once a dashboard this closes has restored its
+-- layout; focuses a card that is open as a glance, and closes a focused one.
 local function toggleCardOn(cx: WindowCx, pane: number, known: string?)
 	local canvas = cardOf(cx, pane)
-	if canvas then
+	if canvas and cx.session:focused() ~= canvas then
+		cx.layout:focus(canvas)
+		return
+	elseif canvas then
 		cx.layout:close(canvas)
 		return
 	end
@@ -1361,7 +1370,7 @@ local function toggleCardOn(cx: WindowCx, pane: number, known: string?)
 		closePane(cx, open.pane)
 	end
 	afterRestore(cx, function(cx2)
-		openCard(cx2, pane, known)
+		openCard(cx2, pane, known, true)
 	end)
 end
 
@@ -2528,7 +2537,7 @@ local function waitingRequest(cx: WindowCx)
 		end
 		cx2.layout:focus(target)
 		if request.card then
-			openCard(cx2, target)
+			openCard(cx2, target, nil, true)
 		end
 	end)
 end

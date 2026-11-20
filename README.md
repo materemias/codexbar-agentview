@@ -267,7 +267,7 @@ install it as [KDE Plasma widget › Install](docs/plasma.md#install) says.
 | `Ctrl+Alt+W` | Open the dashboard on Waiting, the sessions set aside; pressed again on the focused Waiting tab, close it | Tern |
 | `Ctrl+Alt+H` | Open the dashboard on History, closed sessions to launch again; pressed again on the focused History tab, close it | Tern |
 | `Ctrl+Alt+B` | Set the focused session aside (in omp outside Tern too) | Tern, omp |
-| `Ctrl+Alt+I` | Show or hide the focused session's card (in omp outside Tern: its details above the composer) | Tern, omp |
+| `Ctrl+Alt+I` | Show the focused session's card, focused so its buttons answer; on a card that opened by itself, focus it; on a focused card, hide it (in omp outside Tern: its details above the composer) | Tern, omp |
 | `←` / `→` | Switch tabs | Both |
 | `↑` / `↓` | Select a row on Agents, Waiting or History | Both |
 | `Space` | Peek at the selected session; while filtering, types a space | Both |
