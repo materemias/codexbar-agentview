@@ -555,8 +555,16 @@ def _session_operation(
         payload = agents._load_payload(AGGREGATE_PATH)
         record = next(
             (r for r in payload["agents"] + payload["history"]
-             if agents._record_key(r) == (provider, session_id)), {}
+             if agents._record_key(r) == (provider, session_id)), None
         )
+        if record is None and operation is _launch:
+            # A session History's search found on disk: `_launch` reads the
+            # row it shows from history, and the guards below need its folder.
+            # A reservation keeps the folder its caller names.
+            record = agents.disk_history_record(provider, session_id, payload)
+            if record:
+                payload["history"].append(record)
+        record = record or {}
         cwd = agents._text(record.get("cwd")) or cwd
         try:
             previous = json.loads(reservation.read_text())

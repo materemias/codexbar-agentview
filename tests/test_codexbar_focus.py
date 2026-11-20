@@ -99,7 +99,7 @@ class T3LinkTests(unittest.TestCase):
 
 
 class LaunchTests(unittest.TestCase):
-    def launch(self, payload: dict, desktops: int = 6):
+    def launch(self, payload: dict, desktops: int = 6, disk: dict | None = None):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "agents.json"
             path.write_text(json.dumps(payload))
@@ -122,6 +122,8 @@ class LaunchTests(unittest.TestCase):
                     mock.patch.object(focus.agents, "tern_bin", return_value="tern"),
                     mock.patch.dict(focus.os.environ, {"TERN_DAEMON_SOCKET": ""}),
                     mock.patch.object(focus.sys, "stderr", stderr),
+                    # What History's search finds on disk; off the real home.
+                    mock.patch.object(focus.agents, "disk_history_record", return_value=disk),
                 ):
                     stack.enter_context(patch)
                 switch, place = focus._set_current_desktop, focus._kwin_place
@@ -159,6 +161,12 @@ class LaunchTests(unittest.TestCase):
         self.assertIn("omp --resume sid-1", argv[-1])
         switch.assert_called_once_with(3)
         place.assert_called_once_with(4242, "3")
+
+    @unittest.skipIf(WINDOWS, "kitty and systemd scopes don't exist on Windows")
+    def test_a_session_history_no_longer_lists_launches_from_its_transcript(self) -> None:
+        code, popen, *_rest = self.launch({"agents": [], "history": []}, disk=entry())
+        self.assertEqual(code, 0)
+        self.assertIn("omp --resume sid-1", popen.call_args.args[0][-1])
 
     def test_refusals_never_spawn_or_switch(self) -> None:
         cases = {
@@ -744,12 +752,14 @@ class SessionOperationOwnershipTests(unittest.TestCase):
 
     def test_reserve_without_a_row_checks_the_folder_it_is_given(self) -> None:
         # agents.json has no row for the session; an omp that names none of
-        # its sessions runs in the folder the caller resumes it in.
+        # its sessions runs in the folder the caller resumes it in. Its
+        # transcript's folder, which History's search would show, isn't it.
         self.path.write_text(json.dumps({"agents": [], "history": []}))
         with (
             mock.patch.object(focus, "AGGREGATE_PATH", self.path),
             mock.patch.object(focus.sys, "stderr", io.StringIO()) as stderr,
             pgrep([77]),
+            mock.patch.object(focus.agents, "disk_history_record", return_value={"cwd": "/elsewhere"}),
             mock.patch.object(focus.agents, "_open_jsonl_under", return_value=("", False)),
             mock.patch.object(focus.agents, "_argv_of", return_value=["omp"]),
             mock.patch.object(focus.agents, "_cwd_of", return_value="/work/project"),

@@ -1425,6 +1425,55 @@ class HistoryBackfillTests(unittest.TestCase):
             payload, _ = agents._locked_sweep(aggregate_path=saved)
         return payload
 
+    def test_search_finds_ended_sessions_history_does_not_keep(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            work, busy = Path(directory) / "work", Path(directory) / "busy"
+            work.mkdir()
+            busy.mkdir()
+            home = self._home(directory, {
+                "alpha": (str(work), 300), "beta": (str(work), 400),
+                "known": (str(work), 500), "live": (str(work), 600), "other": (str(busy), 100),
+            })
+            payload = {"agents": [], "ternInstalled": True,
+                       "history": [history("omp", "known", closedBy="exit", lastSeenAt=1)]}
+            # `live` names its session; a process in `busy` names none.
+            omp = agents._BACKFILL_SOURCES["omp"]._replace(live=lambda: ({"live"}, {str(busy)}))
+            skimmed = []
+            skim = agents._skim_transcript
+
+            def search(query: str) -> dict:
+                skimmed.clear()
+                with (mock.patch.object(agents.Path, "home", return_value=home),
+                      mock.patch.dict(agents.os.environ, {"XDG_STATE_HOME": directory}),
+                      mock.patch.dict(agents._BACKFILL_SOURCES, {"omp": omp}),
+                      mock.patch.object(agents, "_skim_transcript",
+                                        side_effect=lambda path, parser: skimmed.append(path) or skim(path, parser))):
+                    return agents.search_history(query, payload)
+
+            # Every word somewhere: its title, folder or prompts. Not what
+            # History lists or what may still run; newest first.
+            found = search("PROMPT title")
+            self.assertEqual([r["sessionId"] for r in found["records"]], ["beta", "alpha"])
+            self.assertEqual((found["searched"], found["more"]), (4, False))
+            # More only when another one would show: `other` matches, but may still run.
+            for limit, more in ((1, True), (2, False)):
+                with mock.patch.object(agents, "SEARCH_RESULTS", limit):
+                    self.assertEqual(search("prompt")["more"], more)
+            alpha = found["records"][1]
+            self.assertEqual((alpha["windowTitle"], alpha["cwd"], alpha["host"]), ("title alpha", str(work), "tern"))
+            self.assertEqual(alpha["resumeCommand"], agents._resume_command("omp", "alpha", str(work), True))
+            self.assertEqual([r["sessionId"] for r in search("alpha work")["records"]], ["alpha"])
+            self.assertEqual(search("")["records"], [])
+            # Skimmed once, then read only when the transcript changes.
+            search("nothing matches")
+            self.assertEqual(skimmed, [])
+            rollout = next((home / ".omp" / "agent" / "sessions").glob("*/*_beta.jsonl"))
+            with rollout.open("a") as out:
+                out.write(json.dumps({"type": "message", "message": {"role": "user", "content": "zebra"}}) + "\n")
+            self.assertEqual([r["sessionId"] for r in search("zebra")["records"]], ["beta"])
+            # Skimmed once more, and its record built from that skim.
+            self.assertEqual(skimmed, [str(rollout)])
+
     def test_unseen_ended_sessions_are_added_unless_live_known_or_gone(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             work = Path(directory) / "work"

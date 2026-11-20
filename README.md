@@ -337,6 +337,13 @@ it works.
   Tern when it is installed, else kitty. Claude Code deletes transcripts after
   30 days by default (`cleanupPeriodDays`), so older sessions don't come back.
   A dismissed session stays gone until you use it again.
+- **Search older sessions** (Tern). Typing searches every exit History keeps,
+  not only the ones it shows. **Search all sessions** under the results also
+  looks through every saved omp and Claude Code session History doesn't
+  keep, by title, folder, id and first and last prompt, and lists the newest
+  50 matches under **Older sessions**, each with **Launch**. It skims each
+  transcript's ends once and remembers them in `history-index.json`, so later
+  searches read only what changed.
 
 Launch and Teleport share a startup guard for each session. A second request
 while it starts asks you to retry; the startup reservation lasts up to

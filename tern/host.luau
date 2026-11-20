@@ -421,6 +421,8 @@ local store = {
 	end,
 	agents = nil :: any,
 	agentsRaw = "",
+	-- History's searches of every saved session (`search_all`), by the filter they ran for.
+	diskSearches = {} :: { [string]: { running: boolean, rows: { any }, searched: number, more: boolean, error: string? } },
 	scanning = false,
 	summarySig = "",
 	openSig = "",
@@ -1348,7 +1350,9 @@ local function liveAgents(): { any }
 	return list
 end
 
-local function historyRecords(): { any }
+-- Ended sessions to list: restart rows, then exits newest first, `historyLimit`
+-- of them unless `all` (a filter searches every exit the helper keeps).
+local function historyRecords(all: boolean?): { any }
 	local data = store.agents
 	local includeNonTern = setting("includeNonTern")
 	local live: { [string]: boolean } = {}
@@ -1364,7 +1368,7 @@ local function historyRecords(): { any }
 	table.sort(exited, function(a, b)
 		return (tonumber(val(a.lastSeenAt)) or 0) > (tonumber(val(b.lastSeenAt)) or 0)
 	end)
-	for i = 1, math.min(#exited, setting("historyLimit")) do
+	for i = 1, if all then #exited else math.min(#exited, setting("historyLimit")) do
 		table.insert(rows, exited[i])
 	end
 	return rows
@@ -2812,7 +2816,8 @@ local function focusedKey(list: { any }): string?
 	return hit
 end
 
-type Row = { key: string, record: any, history: boolean, waiting: boolean? }
+-- `found`: a session History doesn't keep, which `search_all` found.
+type Row = { key: string, record: any, history: boolean, waiting: boolean?, found: boolean? }
 
 -- Over a day in a state other than working or blocked: the tab's eye switch hides these.
 local function isOld(a: any, nowMs: number): boolean
@@ -2868,10 +2873,11 @@ local function agentRows(q: string): { { folder: string, rows: { any } } }
 	return out
 end
 
--- Ended sessions that are not live again, matching `q`: restart rows by desktop, then exits newest first.
-local function historyRows(q: string): ({ any }, { any })
+-- Ended sessions that are not live again, matching `q`: restart rows by desktop, then exits newest first,
+-- then the sessions History doesn't keep that `searchAll` found for `q`.
+local function historyRows(q: string): ({ any }, { any }, { any })
 	local reboot, exited = {}, {}
-	for _, r in historyRecords() do
+	for _, r in historyRecords(q ~= "") do
 		if recordMatches(r, q) then
 			table.insert(if r.closedBy == "reboot" then reboot else exited, r)
 		end
@@ -2895,7 +2901,24 @@ local function historyRows(q: string): ({ any }, { any })
 		return newest(a, b)
 	end)
 	table.sort(exited, newest)
-	return reboot, exited
+	-- What a scan listed since the search ran shows once, in its own place.
+	local older = {}
+	local s = if q ~= "" then store.diskSearches[q] else nil
+	if s and #s.rows > 0 then
+		local listed: { [string]: boolean } = {}
+		local data = store.agents
+		for _, field in { "agents", "history" } do
+			for _, r in (if type(data) == "table" then val(data[field]) else nil) or {} do
+				listed[recordKey(r)] = true
+			end
+		end
+		for _, r in s.rows do
+			if not listed[recordKey(r)] then
+				table.insert(older, r)
+			end
+		end
+	end
+	return reboot, exited, older
 end
 
 local LAUNCH_HOSTS = { kitty = true, tern = true }
@@ -3063,10 +3086,10 @@ local function selectable(b: Block): { Row }
 			end
 		end
 	elseif b.tab == "history" then
-		local reboot, exited = historyRows(q)
-		for _, list in { reboot, exited } do
+		local reboot, exited, older = historyRows(q)
+		for _, list in { reboot, exited, older } do
 			for _, r in list do
-				table.insert(out, { key = recordKey(r), record = r, history = true })
+				table.insert(out, { key = recordKey(r), record = r, history = true, found = list == older })
 			end
 		end
 	end
@@ -3100,7 +3123,8 @@ local LIST_MAX = { lines = 1000 }
 -- Node path of list rows: the `fill` box in the main region, then the list.
 local LIST_PATH = "main.fill.list."
 
-local function peekNode(b: Block, r: any, history: boolean): Node
+-- `found`: a session History doesn't keep, which `searchAll` found; there's no row to dismiss.
+local function peekNode(b: Block, r: any, history: boolean, found: boolean?): Node
 	local kids: { Node } = {}
 	local recap = str(r.recap)
 	if recap ~= "" then
@@ -3120,7 +3144,9 @@ local function peekNode(b: Block, r: any, history: boolean): Node
 		if str(r.resumeCommand) ~= "" then
 			table.insert(buttons, button("Copy resume command", "copy_resume", { icon = "copy" }))
 		end
-		table.insert(buttons, button("Dismiss", "dismiss"))
+		if not found then
+			table.insert(buttons, button("Dismiss", "dismiss"))
+		end
 	else
 		table.insert(buttons, button("Focus", "focus", { variant = "primary" }))
 		if cardPane(r, false) then
@@ -3295,13 +3321,13 @@ end
 local function historyView(b: Block, now: number): Node
 	local q = string.lower(b.filter)
 	local sel = selected(b)
-	local reboot, exited = historyRows(q)
+	local reboot, exited, older = historyRows(q)
 	local kids: { Node } = {}
-	local function add(r)
+	local function add(r, found: boolean?)
 		local key = recordKey(r)
 		addRow(kids, historyItem(b, r, now, q), r, q)
 		if sel and sel.key == key then
-			table.insert(kids, peekNode(b, r, true))
+			table.insert(kids, peekNode(b, r, true, found))
 		end
 	end
 	if #reboot > 0 then
@@ -3319,9 +3345,33 @@ local function historyView(b: Block, now: number): Node
 			add(r)
 		end
 	end
-	local empty = if b.filter ~= "" then noMatch(b, "closed session")
-		else emptyNode("history", "No closed sessions yet", "Sessions you close show up here.")
-	return listView(b, kids, empty)
+	if #older > 0 then
+		table.insert(kids, groupHead("h-older", { ui.span("Older sessions", "strong"), ui.span("  " .. #older, "muted") }))
+		for _, r in older do
+			add(r, true)
+		end
+	end
+	if not string.find(q, "%S") then
+		return listView(b, kids, emptyNode("history", "No closed sessions yet", "Sessions you close show up here."))
+	end
+	-- A filter searches the exits History keeps; every saved session only on request (`search_all`).
+	local s = store.diskSearches[q]
+	local status, act = "Searched the sessions History keeps", { text = "Search all sessions", act = "search_all", busy = false }
+	if s and s.running then
+		status, act.busy = "Searching every saved session…", true
+	elseif s and s.error then
+		status, act.text = "Search failed: " .. s.error, "Try again"
+	elseif s then
+		status = "Searched " .. s.searched .. " more saved sessions" .. (if s.more then ", showing the newest " .. #s.rows else "")
+		act.text = "Search again"
+	end
+	if #kids == 0 then
+		return listView(b, kids, emptyNode("search", "No closed session matches “" .. b.filter .. "”", status,
+			if act.busy then { text = "Clear", act = "clear" } else act))
+	end
+	table.insert(kids, groupHead("h-search", { ui.span(status, "muted") },
+		{ button(act.text, act.act, { variant = "quiet", busy = act.busy }) }))
+	return listView(b, kids, noMatch(b, "closed session"))
 end
 
 -- "overdue", time left, else how long it has been set aside.
@@ -4035,6 +4085,34 @@ local function act(b: Block, name: string)
 	elseif name == "hide_old" then
 		store.writeSetting("hideOld", not setting("hideOld"))
 		renderAll()
+	elseif name == "search_all" then
+		-- Searches every saved session for the filter, beyond the exits History keeps:
+		-- skimming each transcript once can take seconds, so only on request. Inline:
+		-- this chunk is at Luau's 200 top-level locals.
+		local q = string.lower(b.filter)
+		local s = store.diskSearches[q]
+		if string.find(q, "%S") and not (s and s.running) then
+			local search = { running = true, rows = {}, searched = 0, more = false, error = nil }
+			store.diskSearches[q] = search
+			renderAll()
+			-- `=`: a filter that starts with "-" is no option.
+			python("codexbar_agents.py", { "--search-history=" .. q }, 120000, function(res)
+				if store.diskSearches[q] ~= search then
+					return
+				end
+				search.running = false
+				local okj, data = pcall(tern.json.decode, res.stdout)
+				if res.status ~= 0 or not okj or type(data) ~= "table" or type(val(data.records)) ~= "table" then
+					search.error = if res.timed_out then "it took over 2 minutes"
+						elseif firstLine(res.stderr) ~= "" then firstLine(res.stderr) else "no answer"
+				else
+					search.rows = data.records
+					search.searched = tonumber(val(data.searched)) or 0
+					search.more = val(data.more) == true
+				end
+				renderAll()
+			end)
+		end
 	elseif name == "restore_all" then
 		restoreAll(b)
 	elseif name == "dismiss_all" then
@@ -4059,7 +4137,7 @@ local function act(b: Block, name: string)
 		elseif name == "copy_resume" then -- `copy` is Tern's own action: it copies the node's text
 			b.cx:copy(str(row.record.resumeCommand))
 			b.cx:toast("success", "Resume command copied")
-		elseif name == "dismiss" then
+		elseif name == "dismiss" and not row.found then
 			dismiss(b, { row.record })
 		end
 	end
@@ -4339,7 +4417,7 @@ for _, row in {
 	{ id = "includeUntracked", page = "agents", section = "Live sessions", label = "Include untracked agents",
 		hint = "Show processes without a hook sentinel." },
 	{ id = "historyLimit", page = "agents", section = "History", label = "Recently closed sessions",
-		hint = "Show 10 to 1000 same-boot exits. Sessions ended by a reboot are not limited.", kind = "number" },
+		hint = "Show 10 to 1000 same-boot exits. Sessions ended by a reboot are not limited, and a filter searches every exit kept.", kind = "number" },
 	{ id = "usage", page = "general", section = "Usage", label = "Usage tracking",
 		hint = "Fetch and show provider usage: the Usage tab and the usage widgets. Off runs no CodexBar fetch; Agents, Waiting and History stay." },
 	{ id = "refreshSeconds", page = "general", section = "Polling", label = "Usage refresh interval",

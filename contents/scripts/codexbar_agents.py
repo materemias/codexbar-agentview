@@ -2668,45 +2668,20 @@ def _backfill_history(payload: dict) -> None:
     heapq.heapify(kept)
     added: dict[tuple[str, str], tuple[dict, int]] = {}
     live: dict[str, tuple[set[str], set[str]]] = {}
-    host = "tern" if payload.get("ternInstalled") else "kitty"
+    host = _history_host(payload)
     for bound, provider, sid, rollout, prompt_ms, title in candidates:
         if len(kept) >= HISTORY_CAP and bound <= kept[0]:
             break
         source = _BACKFILL_SOURCES[provider]
-        info = _transcript_info(rollout, source.parser)
-        cwd = info["cwd"]
-        recent = _history_turns(info["recent"])
-        last_seen = max([prompt_ms, *(turn.get("ts", 0) for turn in recent)])
-        if (info["sessionId"] != sid or not cwd or not Path(cwd).is_dir()
-                or last_seen <= floor):
+        record = _disk_record(provider, sid, _transcript_info(rollout, source.parser), prompt_ms, title, host)
+        if record is None or record["lastSeenAt"] <= floor:
             state["skip"][provider][sid] = bound
             continue
-        if provider not in live:
-            held, unresolved = source.live()
-            # Windows spells one folder in several cases and slashes.
-            live[provider] = held, {os.path.normcase(c) for c in unresolved}
         # Still running: it reaches history when a sweep sees it end.
-        if sid in live[provider][0] or os.path.normcase(cwd) in live[provider][1]:
+        if _runs_now(live, provider, sid, record["cwd"]):
             continue
-        state_name = info["state"]
-        added[(provider, sid)] = (_history_record({
-            "provider": provider,
-            "sessionId": sid,
-            "cwd": cwd,
-            "windowTitle": info["windowTitle"] or title,
-            "lastPrompt": info["lastPrompt"],
-            # Resumes open in Tern when it is installed.
-            "host": host,
-            "lastState": state_name if state_name in ("working", "blocked", "idle") else "idle",
-            "lastSeenAt": last_seen,
-            "model": info["model"],
-            "resumeCommand": _resume_command(provider, sid, cwd, True),
-            "closedBy": "exit",
-            "recent": recent,
-            "recap": info["recap"],
-            "recapStale": info["recapStale"],
-        }, active=False), bound)
-        heapq.heappush(kept, last_seen)
+        added[(provider, sid)] = (record, bound)
+        heapq.heappush(kept, record["lastSeenAt"])
         if len(kept) > HISTORY_CAP:
             heapq.heappop(kept)
     if added:
@@ -2720,6 +2695,208 @@ def _backfill_history(payload: dict) -> None:
             state["skip"][key[0]][key[1]] = added[key][1]
     if len(exited) >= HISTORY_CAP:
         state["floor"] = max(floor, min(r["lastSeenAt"] for r in exited))
+
+
+def _history_host(payload: dict) -> str:
+    """Where a session History found on disk resumes: Tern when it is installed."""
+    return "tern" if payload.get("ternInstalled") else "kitty"
+
+
+def _disk_record(
+    provider: str, sid: str, info: dict, prompt_ms: int, title: str, host: str,
+) -> dict | None:
+    """The History row of ended session `sid` from its transcript's `info`
+    (`_transcript_info`'s shape), or None when the transcript is another
+    session's or its folder is gone."""
+    cwd = info["cwd"]
+    if info["sessionId"] != sid or not cwd or not Path(cwd).is_dir():
+        return None
+    recent = _history_turns(info["recent"])
+    state_name = info["state"]
+    return _history_record({
+        "provider": provider,
+        "sessionId": sid,
+        "cwd": cwd,
+        "windowTitle": info["windowTitle"] or title,
+        "lastPrompt": info["lastPrompt"],
+        "host": host,
+        "lastState": state_name if state_name in ("working", "blocked", "idle") else "idle",
+        "lastSeenAt": max([prompt_ms, *(turn.get("ts", 0) for turn in recent)]),
+        "model": info["model"],
+        "resumeCommand": _resume_command(provider, sid, cwd, True),
+        "closedBy": "exit",
+        "recent": recent,
+        "recap": info["recap"],
+        "recapStale": info["recapStale"],
+    }, active=False) or None  # {} for an id `_record_key` refuses
+
+
+# A skim reads this much at each end of a transcript.
+_SKIM_BYTES = 64 * 1024
+
+
+def _skim_line(provider: str, state: dict, raw: bytes) -> None:
+    try:
+        rec = json.loads(raw)
+        if isinstance(rec, dict):
+            _parse_record(provider, state, rec)
+    # Nesting past the recursion limit raises RecursionError.
+    except (ValueError, UnicodeError, RecursionError, TypeError, KeyError):
+        pass
+
+
+def _skim_transcript(path: str, provider: str) -> dict | None:
+    """`_transcript_info` from a transcript's first and last `_SKIM_BYTES`
+    only, so a search through thousands stays cheap, plus `firstPrompt`, the
+    earliest prompt in its head. A file up to twice that is read whole. None
+    when it can't be read."""
+    try:
+        with open(path, "rb") as source:
+            size = os.fstat(source.fileno()).st_size
+            whole = size <= 2 * _SKIM_BYTES
+            head_data = source.read(size if whole else _SKIM_BYTES)
+            tail_data = b""
+            if not whole:
+                source.seek(size - _SKIM_BYTES)
+                tail_data = source.read()
+    except OSError:
+        return None
+    head, first, first_any = _parser_state(), "", ""
+    # Whole lines only: each end may cut one.
+    for raw in head_data.split(b"\n")[:-1]:
+        _skim_line(provider, head, raw)
+        first, first_any = first or head["last_real"], first_any or head["last_any"]
+    tail = _parser_state()
+    for raw in tail_data.split(b"\n")[1:-1]:
+        _skim_line(provider, tail, raw)
+    # A tail inside one line longer than the skim says nothing: the head stands in.
+    if tail == _parser_state():
+        tail = head
+    return {
+        "sessionId": tail["sessionId"] or head["sessionId"],
+        "cwd": head["cwd"] or tail["cwd"],
+        "windowTitle": tail["windowTitle"] or head["windowTitle"],
+        "model": tail["model"] or head["model"],
+        "state": tail["state"],
+        "recap": tail["recap"], "recapStale": tail["recap_stale"],
+        "lastPrompt": tail["last_real"] or tail["last_any"] or head["last_real"] or head["last_any"],
+        "firstPrompt": first or first_any,
+        "recent": _peek_finalize(tail["peek"]),
+    }
+
+
+def _runs_now(live: dict, provider: str, sid: str, cwd: str) -> bool:
+    """Whether a process may still run session `sid` in `cwd`: one names it,
+    or one in its folder names none. `live` keeps each source's answer."""
+    if provider not in live:
+        held, unresolved = _BACKFILL_SOURCES[provider].live()
+        # Windows spells one folder in several cases and slashes.
+        live[provider] = held, {os.path.normcase(c) for c in unresolved}
+    return sid in live[provider][0] or os.path.normcase(cwd) in live[provider][1]
+
+
+SEARCH_RESULTS = 50
+# What a search matches of each field, as the index keeps it.
+_SEARCH_FIELD_CHARS = 300
+# Bump when a skim or the indexed fields change: an older index is dropped.
+_SEARCH_INDEX_VERSION = 1
+
+
+def search_history(query: str, payload: dict) -> dict:
+    """Ended sessions on disk that History doesn't list, whose title, folder,
+    id, first or last prompt holds every word of `query`: the newest
+    `SEARCH_RESULTS` as History rows, how many sessions it searched, and
+    whether more matched.
+
+    It searches what backfill would add, any age: every session in a
+    provider's prompt history with its transcript, unless a process may
+    still run it. Each transcript is skimmed once and remembered by size and
+    mtime in history-index.json, so a search reads only transcripts that
+    changed since the last."""
+    words = list(dict.fromkeys(query.lower().split()))
+    if not words:
+        return {"records": [], "searched": 0, "more": False}
+    path = state_paths.state_dir() / "history-index.json"
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, ValueError):
+        saved = None
+    current = isinstance(saved, dict) and saved.get("version") == _SEARCH_INDEX_VERSION
+    saved = saved.get("files") if current else None
+    saved = saved if isinstance(saved, dict) else {}
+    known = {key for key in map(_record_key, payload["agents"] + payload["history"]) if key}
+    index: dict[str, dict] = {}
+    matches, searched = [], 0
+    for provider, source in _BACKFILL_SOURCES.items():
+        sessions = source.sessions()
+        rollouts = source.rollouts() if sessions else {}
+        for sid, (prompt_ms, title) in sessions.items():
+            rollout = rollouts.get(sid)
+            if not rollout:
+                continue
+            if (provider, sid) in known:
+                # Kept for when History lets it go.
+                if rollout in saved:
+                    index[rollout] = saved[rollout]
+                continue
+            try:
+                stat = os.stat(rollout)
+            except OSError:
+                continue
+            signature = [stat.st_size, stat.st_mtime_ns]
+            entry, info = saved.get(rollout), None
+            if not (isinstance(entry, dict) and entry.get("signature") == signature
+                    and isinstance(entry.get("text"), str)):
+                info = _skim_transcript(rollout, source.parser)
+                if info is None:
+                    continue
+                fields = ("sessionId", "cwd", "windowTitle", "firstPrompt", "lastPrompt")
+                text = "\n".join(" ".join(info[f].split())[:_SEARCH_FIELD_CHARS] for f in fields)
+                entry = {"signature": signature, "text": text.lower()}
+            index[rollout] = entry
+            searched += 1
+            haystack = entry["text"] + "\n" + title.lower()
+            if all(word in haystack for word in words):
+                bound = max(stat.st_mtime_ns // 1_000_000, prompt_ms)
+                matches.append((bound, provider, sid, rollout, prompt_ms, title, info))
+    if index != saved:
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            state_paths.write_file(path, json.dumps(
+                {"version": _SEARCH_INDEX_VERSION, "files": index}, separators=(",", ":"),
+            ), durable=False)
+        except OSError:
+            pass  # only a cache: the next search skims again
+    matches.sort(key=lambda match: match[:3], reverse=True)
+    host = _history_host(payload)
+    records: list[dict] = []
+    live: dict[str, tuple[set[str], set[str]]] = {}
+    more = False
+    with _process_snapshot():
+        for _bound, provider, sid, rollout, prompt_ms, title, info in matches:
+            info = info or _skim_transcript(rollout, _BACKFILL_SOURCES[provider].parser)
+            record = info and _disk_record(provider, sid, info, prompt_ms, title, host)
+            if not record or _runs_now(live, provider, sid, record["cwd"]):
+                continue
+            if len(records) == SEARCH_RESULTS:
+                more = True
+                break
+            records.append(record)
+    # Picked by transcript mtime, shown by last activity as History is.
+    records.sort(key=lambda r: r["lastSeenAt"], reverse=True)
+    return {"records": records, "searched": searched, "more": more}
+
+
+def disk_history_record(provider: str, sid: str, payload: dict) -> dict | None:
+    """The row `search_history` shows for ended session `sid`, which History
+    doesn't list; None when its prompt history or transcript doesn't show it."""
+    source = _BACKFILL_SOURCES.get(provider)
+    found = source.sessions().get(sid) if source else None
+    rollout = source.rollouts().get(sid) if source and found else None
+    info = _skim_transcript(rollout, source.parser) if source and rollout else None
+    if not info:
+        return None
+    return _disk_record(provider, sid, info, found[0], found[1], _history_host(payload))
 
 
 def _write_aggregate(payload: dict, path: Path = AGGREGATE_PATH) -> None:
@@ -2916,11 +3093,20 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--desktop-map")
     parser.add_argument("--requested-at")
     parser.add_argument("--dismiss")
+    parser.add_argument(
+        "--search-history", metavar="QUERY",
+        help="Print ended sessions on disk that History doesn't list and that match QUERY.",
+    )
     args = parser.parse_args(argv)
     state_paths.migrate()
     desktop_map = _parse_desktop_map(args.desktop_map)
     requested_at = _parse_requested_at(args.requested_at)
 
+    if args.search_history is not None:
+        result = search_history(args.search_history, _load_payload(AGGREGATE_PATH))
+        json.dump(result, sys.stdout, separators=(",", ":"))
+        sys.stdout.write("\n")
+        return 0
     try:
         if args.dismiss is not None:
             _dismiss_history(_parse_session_keys(args.dismiss))

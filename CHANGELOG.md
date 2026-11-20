@@ -9,6 +9,7 @@
 
 ### Features
 
+- A History filter searches every kept session, and Search all sessions finds older ones on disk.
 - The session card's title starts with the session's project.
 - `Ctrl+Alt+B` or `/wait` sets a session aside, with why you stopped and what it waits for.
 - Waits watch a time, a PR, a release, a command check, a shell job, a person, or "when I have time".
