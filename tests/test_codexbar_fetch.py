@@ -1019,6 +1019,17 @@ class UsageCacheTests(IsolatedUsageTestCase):
             claim.write_text(json.dumps({"codex": 1200}))
             self.assertEqual(fetch._claim_fetch(60, ["codex"], 1322), [])
 
+    def test_a_longer_fetch_holds_its_claim_against_a_shorter_budget(self) -> None:
+        clock = [1000.0]
+        with mock.patch.object(fetch, "time", mock.Mock(wraps=time, time=lambda: clock[0])):
+            # A fetch with a 120 s timeout runs until 1260; a 30 s poller's budget ends sooner.
+            self.assertEqual(fetch._claim_fetch(60, ["claude"], 1260), ["claude"])
+            clock[0] = 1061
+            self.assertEqual(fetch._claim_fetch(60, ["claude"], 1141), [])
+            # A clock that ran back before the claim began frees it.
+            clock[0] = 900
+            self.assertEqual(fetch._claim_fetch(60, ["claude"], 980), ["claude"])
+
     def test_failed_codex_cli_keeps_cached_accounts_beside_meridian_seats(self) -> None:
         self.snapshot([self.record(account="b@example.com", used=81)])
         now_ms = int(time.time() * 1000)

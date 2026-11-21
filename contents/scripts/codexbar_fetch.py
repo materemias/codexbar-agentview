@@ -2150,8 +2150,8 @@ def _claim_fetch(min_interval: float | None, providers: list[str], until: float)
             if min_interval is None:
                 return False
             last, busy = _claim_entry(stamps.get(provider))
-            # An end past our own budget's comes from a clock that ran back.
-            if busy is not None and now < busy <= until:
+            # A claim that begins after now comes from a clock that ran back.
+            if last is not None and busy is not None and last <= now < busy:
                 return True
             return last is not None and 0 <= now - last < min_interval
 
