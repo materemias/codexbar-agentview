@@ -52,11 +52,11 @@ CodexBar module.
 <details>
 <summary>Screenshots</summary>
 
-![Tern widget bar: the combined Claude usage ring, the combined Codex 5h graph, agent counts and the Claude widget's details](docs/tern/widget-bar.png)
+![Tern widget bar: the combined Claude usage ring, the Claude 7d graph, the combined Codex graph, agent counts, sessions back on you and the Claude widget's details](docs/tern/widget-bar.png)
 
-| Usage | Agents | History | Settings |
-| :---: | :---: | :---: | :---: |
-| [![Tern usage](docs/tern/usage.png)](docs/tern/usage.png) | [![Tern agents](docs/tern/agents.png)](docs/tern/agents.png) | [![Tern history](docs/tern/history.png)](docs/tern/history.png) | [![Tern settings](docs/tern/settings.png)](docs/tern/settings.png) |
+| Usage | Agents | Waiting | History | Settings |
+| :---: | :---: | :---: | :---: | :---: |
+| [![Tern usage](docs/tern/usage.png)](docs/tern/usage.png) | [![Tern agents](docs/tern/agents.png)](docs/tern/agents.png) | [![Tern waiting](docs/tern/waiting.png)](docs/tern/waiting.png) | [![Tern history](docs/tern/history.png)](docs/tern/history.png) | [![Tern settings](docs/tern/settings.png)](docs/tern/settings.png) |
 
 </details>
 
@@ -592,7 +592,9 @@ with `python tests/run.py` (parallel, slowest tests first; `-j N` sets the
 workers, `--durations N` lists the slowest, names narrow it). Re-render the films with
 `uv run film/take_kde.py && uv run film/compose.py kde`, or `take_tern.py` and
 `compose.py tern`, or `take_waiting.py` and `compose.py waiting`; the Tern takes
-open a window on a scratch daemon for about a minute.
+open a window on a scratch daemon for about a minute. Re-shoot the Tern screenshots
+in `docs/tern/` with `headless-gui -- uv run film/shoot_tern.py`, on the same kind of
+scratch daemon.
 
 ## License
 
