@@ -210,13 +210,14 @@ Item {
 
     // Blocked-agent indicator: small red dot in the top-right corner of the
     // tray icon group whenever an agent is waiting on user input. Gated by
-    // `agentBlockedBadge` so users who don't want it can switch off.
+    // `agentBlockedBadge` so users who don't want it can switch off. The state
+    // dots already count blocked agents, and the corner is their first count.
     readonly property int blockedAgentCount: _agentCounts.blocked || 0
 
     Rectangle {
         id: blockedBadge
         visible: Plasmoid.configuration.agentBlockedBadge !== false
-            && compact.blockedAgentCount > 0
+            && compact.blockedAgentCount > 0 && !compact.stateDotsVisible
         anchors.top: parent.top
         anchors.right: parent.right
         anchors.topMargin: -1

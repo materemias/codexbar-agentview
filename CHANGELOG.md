@@ -103,6 +103,7 @@
 - Kilo and OpenRouter tray meters hide windows the account doesn't report.
 - Several agents waiting for input arrive as one notification.
 - Resume works for nu and tcsh users.
+- The legacy blocked badge shows only while the panel's agent state dots are off.
 
 ### Docs
 
