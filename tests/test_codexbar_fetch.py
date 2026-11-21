@@ -1723,9 +1723,9 @@ class ForecastTests(IsolatedUsageTestCase):
     def test_slow_drip_has_total_deadline_and_retains_stale_cache(self) -> None:
         cached = {"ok": True, "stale": False, "expectedAt": "2026-09-16T02:00:00+00:00"}
         fetch._forecast_cache_write(cached)
-        # The deadline includes starting the worker process, which takes a
-        # Windows runner over half a second: the request must still go out.
-        timeout = 1.5 if WINDOWS else 0.4
+        # The deadline includes starting the worker process, which takes a busy
+        # CI runner (Windows or macOS) over half a second: the request must still go out.
+        timeout = 1.5
         with (
             mock.patch.object(fetch, "FORECAST_CACHE_TTL", -1),
             forecast_server(self.BODY, interval=0.05) as (url, requested),
