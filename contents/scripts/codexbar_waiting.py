@@ -5507,11 +5507,18 @@ def cmd_tick(args: argparse.Namespace) -> dict:
 
 def _for_other_panes(action: dict, daemon: str | None) -> bool:
     """A park or close_pane another daemon's pane ids name: this daemon's
-    windows would act on the wrong pane. It stays queued until it expires."""
+    windows would act on the wrong pane. That daemon's skipped tick hands it
+    over (`_for_own_panes`)."""
     return (
         daemon is not None and action["type"] in PANE_ACTIONS
         and action.get("daemon") not in (None, daemon)
     )
+
+
+def _for_own_panes(action: dict, daemon: str) -> bool:
+    """A pane action only `daemon`'s windows can carry out: the daemon that
+    ticks leaves it out of its outbox."""
+    return action["type"] in PANE_ACTIONS and action.get("daemon") == daemon
 
 
 def _ticked_elsewhere(state: dict, daemon: str, now: datetime) -> bool:
@@ -5639,8 +5646,14 @@ def _tick(args: argparse.Namespace) -> dict:
 
     with _transaction(now, agents, args.daemon) as state:
         if args.daemon and _ticked_elsewhere(state, args.daemon, now):
+            # The ticking daemon checks the waits; this one's windows still
+            # carry out what acts on its panes.
             return {
-                "ok": True, "skipped": TICK_SKIPPED, "actions": [], "next_tick_s": TICK_MAX_S,
+                "ok": True, "skipped": TICK_SKIPPED, "next_tick_s": TICK_MAX_S,
+                "actions": [
+                    _public_action(action) for action in state["actions"]
+                    if _for_own_panes(action, args.daemon)
+                ],
                 "view": _build_view(state, now, agents, omp=omp),
             }
         _note_tick(state, now)

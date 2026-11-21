@@ -1708,8 +1708,9 @@ local function waitingTick()
 				store.waitingSkipped = if skipped ~= "" then skipped else nil
 				store.waitingError = nil
 				applyWaiting(val(data.view))
-				-- Another daemon's windows carry the outbox out; ours would do it twice.
-				publishActions(if skipped == "" and type(val(data.actions)) == "table" then val(data.actions) else tern.json.array())
+				-- A skipped tick lists only what acts on this daemon's panes: the
+				-- other daemon's windows carry out the rest.
+				publishActions(if type(val(data.actions)) == "table" then val(data.actions) else tern.json.array())
 				if skipped ~= "" and wasSkipped == nil then
 					tern.log.warn("codexbar: waiting tick skipped", skipped)
 				end
@@ -1732,7 +1733,7 @@ local function waitingTick()
 			-- tick's last transaction: the poll would take that change as seen, and a
 			-- window action it queued would wait for the next timed tick. Its view or
 			-- an action the tick didn't return tells; one recheck, so no tick loop.
-			-- A skipped tick publishes no action, so it doesn't look.
+			-- A skipped tick's outbox is the poll's to keep current (below).
 			local recheck = false
 			if ticked and skipped == "" and not store.waitingAgain and not store.waitingRecheck then
 				local okv, file = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
@@ -1832,8 +1833,9 @@ end
 -- gone from every window. A pane action's target gone: the outbox is the last
 -- tick's, so an ack that landed stays marked until a tick drops its action, and
 -- a failed one waits before the next try (while another daemon ticks, the outbox
--- here is empty). A watched job's pane gone without the event that ends its wait
--- (`tern close`, no window, a plugin reload): after 10 s, time for a
+-- here holds only this daemon's pane actions). A watched job's pane gone
+-- without the event that ends its wait (`tern close`, no window, a plugin
+-- reload): after 10 s, time for a
 -- `pane_exited` in flight to land, the CLI hears `pane_closed`. A
 -- `job_finished` the CLI didn't take goes again, until it does or no wait of
 -- ours watches the pane. Only this daemon's job waits count (jobPanes). An
@@ -2235,19 +2237,39 @@ local function tick()
 			end
 			reconcilePanes()
 			-- Another writer (the omp extension, tern-awui) may have queued a window
-			-- action. While another daemon ticks, the outbox is its business, but
-			-- the view it writes still names this daemon's job waits: reconcilePanes
-			-- and jobFinished read it, without a Python process.
+			-- action. While another daemon ticks, the outbox is its business, bar the
+			-- actions on this daemon's panes, and the view it writes still names this
+			-- daemon's job waits: reconcilePanes and jobFinished read it, without a
+			-- Python process.
 			local raw = if store.waitingTicking then nil else readWaiting()
 			if raw ~= nil and raw ~= store.waitingRaw then
-				if store.waitingSkipped then
+				local stale = not store.waitingSkipped
+				if not stale and store.daemonId then
+					-- One of this daemon's pane actions queued or gone since the
+					-- outbox went out: a tick, skipped too, hands over the new list.
+					local published: { [string]: boolean } = {}
+					local count = 0
+					for _, a in (if type(store.waitingActions) == "table" then store.waitingActions else {}) do
+						published[str(a.id)] = true
+						count += 1
+					end
+					local okr, state = pcall(tern.json.decode, readWaiting(WAITING_FILE))
+					for _, a in (if okr and type(state) == "table" then val(state.actions) else nil) or {} do
+						if type(a) == "table" and str(a.daemon) == store.daemonId then
+							stale = stale or not published[str(a.id)]
+							count -= 1
+						end
+					end
+					stale = stale or count ~= 0
+				end
+				if stale then
+					waitingTick()
+				else
 					store.waitingRaw = raw
 					local okv, view = pcall(tern.json.decode, readWaiting(WAITING_VIEW_FILE))
 					if okv and type(view) == "table" and type(val(view.panes)) == "table" then
 						applyWaiting(view)
 					end
-				else
-					waitingTick()
 				end
 			end
 			if store.menuRetryAt and os.clock() >= store.menuRetryAt and store.loadMenu then

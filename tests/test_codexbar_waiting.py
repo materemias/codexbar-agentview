@@ -6268,6 +6268,19 @@ class DaemonTests(Case):
         self.assertEqual([action["pane"] for action in actions if action["type"] == "park"], [53])
         self.assertEqual([action["pane"] for action in self.state()["actions"]], [52, 53])
 
+    def test_a_skipped_tick_hands_a_daemon_the_actions_on_its_own_panes(self) -> None:
+        self.tick("--daemon", "a")
+        self.creator = "b"
+        self.run_cli("add", "--pane", "52", "--kind", "later", "--park")
+        self.creator = None
+        self.run_cli("add", "--pane", "53", "--kind", "later", "--park")
+        self.assertEqual([action["pane"] for action in self.tick("--daemon", "a")["actions"]], [53])
+        answer = self.tick("--daemon", "b")
+        self.assertEqual(answer["skipped"], waiting.TICK_SKIPPED)
+        self.assertEqual([(action["type"], action["pane"]) for action in answer["actions"]], [("park", 52)])
+        self.run_cli("ack", "--action", answer["actions"][0]["id"], "--result", "done")
+        self.assertEqual(self.tick("--daemon", "b")["actions"], [])
+
     @unittest.skipUnless(NAMES_DAEMONS, "tells a gone daemon by /proc or Windows' process times")
     def test_a_daemon_that_is_gone_holds_no_lease(self) -> None:
         self.tick("--daemon", GONE_DAEMON)  # no such process

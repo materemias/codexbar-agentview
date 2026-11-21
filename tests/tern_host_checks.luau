@@ -182,6 +182,43 @@ do (function()
 		assert(not store.waitingTicking, "still ticking")
 	end)
 
+	check("waitingTick: a skipped tick publishes what acts on this daemon's panes", function()
+		fresh("d1")
+		store.waitingAt, store.waitingAtMono, store.waitingSig, store.waitingActionsSig = 0, 0, "", nil
+		waitingTick()
+		local runs = fake.runsOf("codexbar_waiting.py")
+		local answer = {
+			view = view({}), skipped = "another Tern daemon ticks this state", next_tick_s = 300,
+			actions = { { id = "a1", type = "park", pane = 4 } },
+		}
+		assert(fake.answer(runs[1], { stdout = fake.json(answer) }) == nil)
+		local published = fake.kv.waitingActions
+		assert(type(published) == "table" and #published == 1 and published[1].id == "a1", tern.json.encode(published))
+	end)
+
+	check("tick: while skipped, an action on this daemon's pane missing from the outbox takes a tick", function()
+		local function polled(published: { any }): number
+			fresh("d1", "another Tern daemon ticks this state")
+			store.waitingActions, store.waitingRaw, ticks = published, "1", 3
+			store.waitingAt, store.waitingAtMono = math.huge, math.huge -- no timed tick due
+			fake.files[STATE_DIR .. "/waiting.stamp"] = "2"
+			fake.files[WAITING_FILE] = fake.json({ actions = {
+				{ id = "a1", type = "park", pane = 4, daemon = "d1" },
+				{ id = "a2", type = "park", pane = 4, daemon = "d2" },
+				{ id = "a3", type = "toast" },
+			} })
+			tick()
+			local runs = 0
+			for _, r in fake.runsOf("codexbar_waiting.py") do
+				runs += if fake.has(r.argv, "tick") then 1 else 0
+			end
+			return runs
+		end
+		assert(polled({}) == 1, "a1 queued since the outbox went out")
+		assert(polled({ { id = "a1" } }) == 0, "the outbox is current")
+		assert(polled({ { id = "a1" }, { id = "a0" } }) == 1, "a0 gone since the outbox went out")
+	end)
+
 	check("applyUsage: a failure without stderr still says something", function()
 		fresh("d1")
 		applyUsage({ status = 2, stdout = "", stderr = "", timed_out = false })
