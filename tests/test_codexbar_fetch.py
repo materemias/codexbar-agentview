@@ -752,6 +752,21 @@ class UsageCacheTests(IsolatedUsageTestCase):
                          [("claude", True), ("codex", False)])
         self.assertIsNone(self.snapshot(cache_only=True, providers="claude,codex", cli=cli)["fatal"])
 
+    def test_missing_cli_is_not_fatal_while_another_poller_shares_a_meridian_reading(self) -> None:
+        # Another poller just read Claude from Meridian; Codex, due here, has no seat.
+        cli = str(self.home / "removed-cli")
+        self.measured = self.now
+        fetch._usage_cache_write(fetch._usage_cache_scopes(cli, ["claude"]),
+                                 [self.record("claude")], self.now)
+        claim = self.cache_path.with_name("fetch_claim")
+        claim.write_text(json.dumps({"claude": time.time()}))
+        missing = fetch._result_error("codex", "cli_missing", f"CLI not found at {cli}")
+        result = self.snapshot([missing], providers="claude,codex", cli=cli, min_interval=60)
+        self.assertEqual(self.fetched, ["codex"])
+        self.assertEqual([(r["id"], r["ok"], r.get("stale", False)) for r in result["providers"]],
+                         [("claude", True, False), ("codex", False, False)])
+        self.assertIsNone(result["fatal"])
+
     def test_provider_failure_retains_only_that_provider_and_does_not_renew_age(self) -> None:
         self.snapshot([self.record(), self.record("kilo", None, 12)], providers="codex,kilo")
         failed = fetch._result_error("codex", "timeout", "Timed out")

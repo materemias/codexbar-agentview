@@ -2335,6 +2335,8 @@ def main(argv: list[str]) -> int:
                 for record in _by_account(cached.get(provider, []))
             ]
             _adopt_shared(records, now, args.min_interval)
+            # As on a cache answer, a reading served without error keeps a missing CLI from fatal.
+            served = served or any(r.get("ok") and not r.get("refreshError") for r in records)
         elif scopes.get(provider) != current_scopes.get(provider):
             records = [_result_error(
                 provider, "credential_scope_changed",
