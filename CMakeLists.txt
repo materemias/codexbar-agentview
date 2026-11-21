@@ -48,4 +48,6 @@ if(CODEXBAR_BUILD_TESTS)
     )
     target_link_libraries(commandrunner_test PRIVATE Qt6::Core)
     add_test(NAME commandrunner COMMAND commandrunner_test)
+    # Without a terminal Qt sends qFatal to journald, so ctest showed nothing.
+    set_tests_properties(commandrunner PROPERTIES ENVIRONMENT QT_FORCE_STDERR_LOGGING=1)
 endif()
