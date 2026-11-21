@@ -129,6 +129,8 @@ local DEFAULTS = {
 	includeUntracked = true,
 	includeNonTern = false,
 	hideOld = false,
+	-- codexbar_update.py asks GitHub for the latest release, at most once a day.
+	updateCheck = true,
 }
 
 local NUMBER_LIMITS = { refreshSeconds = { 60, 3600 }, historyLimit = { 10, 1000 } }
@@ -473,6 +475,12 @@ local store = {
 	loadMenu = nil :: (() -> ())?,
 	hidable = nil :: any, -- (r) -> boolean, set beside waitingOpen
 	companionsLoading = false, -- codexbar_companions.py is running for the About page
+	update = nil :: any, -- codexbar_update.py check's last answer, while the update check is on
+	updateError = nil :: string?, -- why the last check gave no answer
+	updateLoading = false,
+	updateApplying = false, -- `update --apply` is running
+	version = nil :: string?, -- tern/plugin.toml's, read once (prefs.updateRows)
+	updateTimer = nil :: (() -> ())?,
 }
 
 -- The settings dialog's state, while it is open over a dashboard (in its layer).
@@ -3759,6 +3767,11 @@ local function dockView(b: Block, now: number): Node
 		table.insert(hints, key("esc"))
 		table.insert(hints, ui.span(if b.filter ~= "" then "\u{a0}clear" else "\u{a0}close", "dim"))
 	end
+	-- A newer release: one quiet segment, beside Settings; it opens About on the update.
+	local newer = prefs.newerRelease()
+	if newer then
+		table.insert(segs, seg("update", newer .. " available", { icon = "download", tone = "accent", side = "right", priority = 6, actions = { click = "update_open" } }))
+	end
 	table.insert(segs, seg("settings", "Settings", { icon = "gear", side = "right", priority = 6, actions = { click = "settings" } }))
 	return ui.col({
 		ui.node("status", { key = "status", transparent = true }, segs),
@@ -4093,6 +4106,8 @@ local function act(b: Block, name: string)
 		scanAgents()
 	elseif name == "settings" then
 		b.settings = b.settings or prefs.new(b.cx)
+	elseif name == "update_open" then
+		b.settings = b.settings or prefs.new(b.cx, "about", prefs.updateFocus())
 	elseif name == "setup_settings" then
 		-- The setup panel's: the dialog on the CLI path.
 		b.settings = prefs.new(b.cx, "general", "cliPath")
@@ -4446,6 +4461,13 @@ for _, row in {
 		hint = "60 to 3600 seconds. Set the applet's interval: the plugin fetches after twice this without a reading, and the shared fetch claim allows one fetch per provider per interval.", kind = "number", unit = "s" },
 	{ id = "cliPath", page = "general", section = "CLI", label = "CodexBar executable",
 		hint = "Empty selects the installed CLI automatically. Enter saves, Escape cancels; Ctrl+A clears the draft.", kind = "text" },
+	{ id = "updateCheck", page = "general", section = "Updates", label = "Check for updates",
+		hint = "Check GitHub once a day for a newer release. Nothing else is sent." },
+	-- prefs.updateRows fills these in from codexbar_update.py's answer; the last two show only for a newer release.
+	{ id = "update.version", page = "about", section = "Version", label = "CodexBar AgentView", hint = "", kind = "info" },
+	{ id = "update.apply", page = "about", section = "Version", label = "Update", hint = "", kind = "action", hidden = true },
+	{ id = "update.notes", page = "about", section = "Version", label = "Release notes", hint = "", kind = "action",
+		button = "Open GitHub", hidden = true },
 	{ id = "about.kde", page = "about", section = "Projects", label = "CodexBar AgentView",
 		hint = "https://github.com/materemias/codexbar-agentview", kind = "action" },
 	{ id = "about.upstream", page = "about", section = "Projects", label = "CodexBar",
@@ -4459,7 +4481,7 @@ for _, row in SETTINGS_ROWS do
 end
 
 local function rowValue(row: any, defaults: boolean?): any
-	if row.kind == "action" then
+	if row.kind == "action" or row.kind == "info" then
 		return nil
 	end
 	if row.provider then
@@ -4472,9 +4494,9 @@ local function settingsSections(b: Settings): ({ any }, { any })
 	local sections, rows = {}, {}
 	local query = string.lower(b.query)
 	for _, row in SETTINGS_ROWS do
-		local matches = row.page == b.page
+		local matches = row.page == b.page and not row.hidden
 		if string.find(query, "%S") then
-			matches = true
+			matches = not row.hidden
 			local text = string.lower(row.label .. " " .. row.hint .. " " .. row.section .. " " .. row.page .. " " .. row.id)
 			for word in string.gmatch(query, "%S+") do
 				if not string.find(text, word, 1, true) then
@@ -4489,8 +4511,10 @@ local function settingsSections(b: Settings): ({ any }, { any })
 		local value, default = rowValue(row), rowValue(row, true)
 		local control: any
 		if row.kind == "action" then
-			-- Companion rows carry their status and install link (prefs.loadCompanions).
-			control = { k = "action", act = "open_github", label = if row.url and not row.installed then "Install steps" else "Open GitHub" }
+			-- Companion rows carry their status and install link (prefs.loadCompanions); update rows name their own.
+			control = { k = "action", act = "open_github", label = row.button or (if row.url and not row.installed then "Install steps" else "Open GitHub") }
+		elseif row.kind == "info" then
+			control = nil
 		elseif row.kind == "number" then
 			local limits = NUMBER_LIMITS[row.id]
 			control = { k = "number", value = value, min = limits[1], max = limits[2], step = 1, unit = row.unit }
@@ -4506,7 +4530,7 @@ local function settingsSections(b: Settings): ({ any }, { any })
 		end
 		table.insert(section.rows, {
 			id = row.id, label = row.label, hint = row.hint, changed = value ~= default,
-			defaultLabel = if row.kind == "action" then nil
+			defaultLabel = if row.kind == "action" or row.kind == "info" then nil
 				elseif type(default) == "boolean" then (if default then "On" else "Off")
 				elseif default == "" then "Automatic" else tostring(default),
 			control = control,
@@ -4517,7 +4541,7 @@ local function settingsSections(b: Settings): ({ any }, { any })
 end
 
 local function saveSetting(b: Settings, row: any, value: any): boolean
-	if row.kind == "action" then
+	if row.kind == "action" or row.kind == "info" then
 		return false
 	end
 	local name = if row.provider then "providers" else row.id
@@ -4575,6 +4599,15 @@ local function saveSetting(b: Settings, row: any, value: any): boolean
 			readUsageCache(false, true)
 		elseif name == "usage" and store.usageSwitched then
 			store.usageSwitched()
+		elseif name == "updateCheck" then
+			-- Off forgets the answer, so no footer or About row claims a release it no longer checks,
+			-- and drops the helper's cache, so no omp session announces one either.
+			store.update, store.updateError = nil, nil
+			if not parsed then
+				pcall(tern.fs.remove, STATE_DIR .. "/update_check.json")
+			end
+			prefs.checkUpdate()
+			prefs.updateRows()
 		end
 		publishSummary()
 	end
@@ -4648,7 +4681,9 @@ end
 local function activateSetting(b: Settings, row: any)
 	b.focus = row.id
 	b.searching = false
-	if row.kind == "action" then
+	if row.id == "update.apply" then
+		prefs.applyUpdate(b)
+	elseif row.kind == "action" then
 		-- Windows: explorer.exe exits 1 even when it opened the page.
 		local url = row.url or row.hint
 		local argv = if MACOS then { "/usr/bin/open", url }
@@ -4663,7 +4698,7 @@ local function activateSetting(b: Settings, row: any)
 	elseif row.kind == "text" then
 		local value = rowValue(row)
 		b.editing = { row = row.id, draft = value, cursor = utf8.len(value) :: number }
-	elseif row.kind ~= "number" then
+	elseif row.kind ~= "number" and row.kind ~= "info" then
 		saveSetting(b, row, not rowValue(row))
 	end
 end
@@ -4682,6 +4717,9 @@ function prefs.new(cx: BlockCx, page: string?, focus: string?): Settings
 		page = if setting("usage") then "usage" else "general"
 	end
 	prefs.loadCompanions()
+	-- The plan may have changed since the last check (changes committed, a branch moved); the
+	-- release comes from the helper's cache, so GitHub is still asked at most once a day.
+	prefs.checkUpdate()
 	local row = if focus and SETTINGS_BY_ID[focus] then focus else nil
 	return { cx = cx, page = page :: string, query = "", cursor = 0, searching = row == nil, focus = row, editing = nil }
 end
@@ -4728,6 +4766,148 @@ function prefs.loadCompanions()
 		end
 		renderAll()
 	end)
+end
+
+-- The update check ----------------------------------------------------------
+-- codexbar_update.py check answers whether GitHub has a newer release and how this
+-- checkout gets there; its cache keeps every poller to one request a day.
+
+-- The About row the footer's segment opens on: Update, or Version when the plan left
+-- nothing to do there (hidden rows take no focus). Here, after SETTINGS_BY_ID: act()
+-- comes before it in the chunk.
+function prefs.updateFocus(): string
+	return if SETTINGS_BY_ID["update.apply"].hidden then "update.version" else "update.apply"
+end
+
+-- The newer release's version, when the last check found one.
+function prefs.newerRelease(): string?
+	local u = store.update
+	local latest = if type(u) == "table" then str(u.latest) else ""
+	return if type(u) == "table" and val(u.newer) == true and string.match(latest, "^%d+%.%d+%.%d+$") then latest else nil
+end
+
+function prefs.checkUpdate()
+	if store.updateLoading or not setting("updateCheck") then
+		return
+	end
+	store.updateLoading = true
+	python("codexbar_update.py", { "check" }, 90000, function(res)
+		store.updateLoading = false
+		if not setting("updateCheck") then -- turned off meanwhile: this check wrote the cache again
+			pcall(tern.fs.remove, STATE_DIR .. "/update_check.json")
+			return
+		end
+		local okj, data = pcall(tern.json.decode, res.stdout)
+		if res.status == 0 and okj and type(data) == "table" then
+			store.update, store.updateError = data, nil
+		else
+			store.updateError = if res.timed_out then "it took over 90 seconds"
+				elseif firstLine(res.stderr) ~= "" then firstLine(res.stderr) else "exit " .. res.status
+			tern.log.warn("codexbar: update check failed", store.updateError)
+		end
+		prefs.updateRows()
+		renderAll()
+	end)
+end
+
+-- About › Version from the last answer: the installed version and whether it is the
+-- latest; for a newer release, Update (or the command to copy) and its release notes.
+function prefs.updateRows()
+	if store.version == nil then
+		local ok, text = pcall(tern.fs.read, tern.plugin.dir .. "/plugin.toml", 65536)
+		-- The manifest's top table only, as codexbar_update.py reads it.
+		local top = if ok then string.match("\n" .. text, "^(.-)\n%s*%[") or ("\n" .. text) else ""
+		store.version = string.match(top, '\nversion%s*=%s*"([^"\n]*)"') or ""
+	end
+	local u = if type(store.update) == "table" then store.update else nil
+	local newer = prefs.newerRelease()
+	local plan = if u and type(val(u.update)) == "table" then u.update else {}
+	local possible, command = val(plan.possible) == true, str(plan.command)
+	local version, apply, notes = SETTINGS_BY_ID["update.version"], SETTINGS_BY_ID["update.apply"], SETTINGS_BY_ID["update.notes"]
+	local current = if u and str(u.current) ~= "" then str(u.current) else store.version :: string
+	version.label = if current ~= "" then "CodexBar AgentView " .. current else "CodexBar AgentView"
+	version.hint = if not setting("updateCheck") then "The update check is off: General › Updates."
+		elseif newer then newer .. " is available."
+		elseif u and str(u.error) ~= "" then str(u.error)
+		elseif u then "Up to date."
+		elseif store.updateError then "Couldn't check for updates: " .. store.updateError
+		else "Checking GitHub…"
+	-- Refused with nothing to run (the branch has the release already): the reason goes here.
+	apply.hidden = not newer or (not possible and command == "")
+	if newer and apply.hidden then
+		version.hint ..= " " .. str(plan.reason)
+	end
+	apply.label = "Update to " .. (newer or "")
+	apply.button = if store.updateApplying then "Updating…" elseif possible then "Update" else "Copy command"
+	apply.hint = if store.updateApplying then "Updating this checkout…"
+		elseif possible then "Moves this checkout to v" .. (newer or "") .. " with git, then reloads the plugin. Local changes are never stashed or discarded."
+		else str(plan.reason) .. " Copy the command to run it yourself."
+	notes.hidden = not newer
+	notes.url = if u and string.sub(str(u.url), 1, 19) == "https://github.com/" then str(u.url) else "https://github.com/materemias/codexbar-agentview/releases"
+	notes.hint = notes.url
+end
+
+-- Update's activation: `update --apply`, then a plugin reload from the new files. When
+-- the checkout can't fast-forward, the command to run instead goes to the clipboard.
+function prefs.applyUpdate(s: Settings)
+	local newer = prefs.newerRelease()
+	if store.updateApplying or not newer then
+		return
+	end
+	local plan = val(store.update.update)
+	plan = if type(plan) == "table" then plan else {}
+	if val(plan.possible) ~= true then
+		if str(plan.command) ~= "" then
+			s.cx:copy(str(plan.command))
+			s.cx:toast("info", "Update command copied", str(plan.reason))
+		end
+		return
+	end
+	store.updateApplying = true
+	prefs.updateRows()
+	python("codexbar_update.py", { "update", "--apply" }, 120000, function(res)
+		store.updateApplying = false
+		local okj, data = pcall(tern.json.decode, res.stdout)
+		data = if okj and type(data) == "table" then data else {}
+		if res.status ~= 0 or val(data.ok) ~= true then
+			local why = if str(data.error) ~= "" then str(data.error) elseif res.timed_out then "it took over 2 minutes"
+				elseif firstLine(res.stderr) ~= "" then firstLine(res.stderr) else "exit " .. res.status
+			if str(data.command) ~= "" then
+				s.cx:copy(str(data.command))
+				why ..= " The command to run instead is copied."
+			end
+			s.cx:toast("error", "CodexBar AgentView: update failed", why)
+			prefs.checkUpdate() -- the checkout changed since the plan: show the current one
+			prefs.updateRows()
+			renderAll()
+			return
+		end
+		-- Tern reloads a plugin whose manifest changed, as the release's version did, within about
+		-- 0.4 s; that reload ends this VM and this timer with it. Without one, reload here.
+		tern.timer(3000, function()
+			python("codexbar_update.py", { "reload" }, 60000, function(r)
+				if r.status ~= 0 then
+					local okr, answer = pcall(tern.json.decode, r.stdout)
+					local why = if okr and type(answer) == "table" and str(answer.error) ~= "" then str(answer.error) else firstLine(r.stderr)
+					s.cx:toast("error", "CodexBar AgentView: updated, but the reload failed", why .. " Run tern plugin reload codexbar-agentview.")
+				end
+			end)
+		end)
+		-- Until a reload comes, the rows say what the checkout now is.
+		store.update = nil
+		prefs.checkUpdate()
+		prefs.updateRows()
+		renderAll()
+		prefs.updatedToast(s.cx, data)
+	end)
+	renderAll()
+end
+
+-- The toast for a finished `update --apply`, from its answer `data`; nothing for any other answer.
+function prefs.updatedToast(cx: any, data: any)
+	if type(data) == "table" and val(data.ok) == true and val(data.updated) == true and str(data.to) ~= "" then
+		cx:toast("success", "Updated to " .. str(data.to), "Run /restart in omp sessions that were already running.")
+	end
 end
 
 -- In the dashboard's layer Tern draws the dialog as it draws omp's settings: a sheet,
@@ -4820,6 +5000,7 @@ function prefs.event(s: Settings, ev: UiEvent)
 		s.page, s.query, s.cursor, s.focus, s.editing, s.searching = ev.value, "", 0, nil, nil, true
 		if ev.value == "about" then
 			prefs.loadCompanions()
+			prefs.checkUpdate()
 		end
 	elseif (ev.ev == "action" and ev.act == "search_focus") or ev.ev == "focus" then
 		s.focus, s.editing, s.searching = nil, nil, true
@@ -4887,3 +5068,20 @@ store.loadMenu = function()
 	end)
 end
 store.loadMenu()
+
+-- The update check at load, then every 6 h; the helper's cache keeps GitHub to one request a day.
+store.updateTimer = function()
+	prefs.checkUpdate()
+	tern.timer(6 * 3600 * 1000, store.updateTimer :: () -> ())
+end
+prefs.updateRows()
+tern.timer(0, store.updateTimer)
+
+-- An `update --apply` that outlived the VM that started it: Tern's reload for the new manifest
+-- came before its answer, which arrives here instead of the callback, so its toast does too.
+tern.on("process_exit", function(ev: ProcessExitEvent, cx: any)
+	local okj, data = pcall(tern.json.decode, ev.stdout)
+	if ev.status == 0 and okj then
+		prefs.updatedToast(cx, data)
+	end
+end)

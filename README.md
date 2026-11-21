@@ -545,7 +545,27 @@ warnings are on by default and waiting-for-input alerts off.
 
 ## Update
 
-Tern extension. Close any open dashboard first so it can restore your layout:
+The Tern extension asks GitHub for the latest release once a day. The request
+names no user and sends nothing else, and every Tern daemon on the machine
+shares one answer. When that answer names a newer release whose tag isn't in
+the checkout yet, the same check runs `git fetch --tags origin` once, without
+prompting for a key or password, to tell whether the checkout can move to it.
+The dashboard footer then shows `1.1.0 available` beside Settings, and the omp
+extension says so once, in the first session that starts after the check.
+Turning off Settings › General › **Check for updates** stops both and deletes
+the saved answer.
+
+Settings › About › Version has **Update to 1.1.0**. It runs
+`git merge --ff-only v1.1.0` in the checkout and reloads the plugin, so run
+`/restart` in omp sessions that were already open. It refuses when the
+checkout has uncommitted changes, HEAD is detached, or your branch has commits
+the release doesn't; the button then copies the command to run yourself. It
+never stashes, resets or discards anything, and it leaves the Plasma widget
+alone. The dashboard stays open over the reload, so closing it afterwards
+leaves the panes as they are instead of restoring the layout from before it
+opened.
+
+To update by hand, close any open dashboard first so it can restore your layout:
 
 ```sh
 git pull

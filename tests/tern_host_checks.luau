@@ -262,5 +262,87 @@ do (function()
 		assert(#opened == 1 and opened[1].argv[1] == "xdg-open", "opens the install link")
 	end)
 
+	check("prefs: the update check fills About › Version and Update runs the helper, then reloads", function()
+		fresh("d1")
+		store.update, store.updateError, store.updateLoading, store.updateApplying, store.version = nil, nil, false, false, nil
+		fake.files["/plugin/tern/plugin.toml"] = 'id = "codexbar-agentview"\nversion = "1.0.0"\n'
+		local cx = fakeBlock().cx
+		local copied = {}
+		function cx.copy(_self, text: string)
+			table.insert(copied, text)
+		end
+		local s = prefs.new(cx, "about")
+		prefs.updateRows()
+		local function versionRows(): { any }
+			return settingsSections(s)[1].rows
+		end
+		assert(prefs.newerRelease() == nil, "nothing known yet")
+		local rows = versionRows()
+		assert(#rows == 1 and rows[1].label == "CodexBar AgentView 1.0.0" and rows[1].control == nil, tern.json.encode(rows))
+		prefs.checkUpdate()
+		prefs.checkUpdate()
+		local runs = fake.runsOf("codexbar_update.py")
+		assert(#runs == 1 and fake.has(runs[1].argv, "check"), "one check at a time")
+		local answer = {
+			current = "1.0.0", latest = "1.1.0", newer = true, url = "https://github.com/materemias/codexbar-agentview/releases/tag/v1.1.0",
+			update = { possible = false, reason = "Branch master has commits v1.1.0 doesn't.", command = "git -C /x merge v1.1.0" },
+		}
+		assert(fake.answer(runs[1], { stdout = fake.json(answer) }) == nil)
+		assert(prefs.newerRelease() == "1.1.0", "the footer's segment shows")
+		rows = versionRows()
+		assert(#rows == 3 and rows[1].hint == "1.1.0 is available.", tern.json.encode(rows))
+		assert(rows[2].label == "Update to 1.1.0" and rows[2].control.label == "Copy command", tern.json.encode(rows[2]))
+		assert(rows[3].control.label == "Open GitHub", tern.json.encode(rows[3]))
+		-- Refused: activation copies the command and runs nothing.
+		prefs.event(s, { ev = "action", act = "open_github", value = "update.apply" })
+		assert(copied[1] == "git -C /x merge v1.1.0" and #fake.runsOf("codexbar_update.py") == 1, tern.json.encode(copied))
+		-- Possible: `update --apply`, a toast, then a reload unless Tern's own came first.
+		store.update.update = { possible = true, command = "git -C /x merge --ff-only v1.1.0" }
+		prefs.updateRows()
+		assert(versionRows()[2].control.label == "Update", "the button updates")
+		assert(prefs.updateFocus() == "update.apply", "the footer opens on Update")
+		prefs.event(s, { ev = "action", act = "open_github", value = "update.apply" })
+		prefs.event(s, { ev = "action", act = "open_github", value = "update.apply" })
+		runs = fake.runsOf("codexbar_update.py")
+		assert(#runs == 2 and fake.has(runs[2].argv, "--apply"), "one apply at a time")
+		local timers = {}
+		local timer = tern.timer
+		tern.timer = function(ms: number, fn: any)
+			table.insert(timers, { ms = ms, fn = fn })
+		end
+		local err = fake.answer(runs[2], { stdout = fake.json({ ok = true, updated = true, from = "1.0.0", to = "1.1.0" }) })
+		tern.timer = timer
+		assert(err == nil, err)
+		local toast = cx.toasts[#cx.toasts]
+		assert(toast[1] == "success" and toast[2] == "Updated to 1.1.0", tern.json.encode(cx.toasts))
+		local function reloads(): number
+			local n = 0
+			for _, r in fake.runsOf("codexbar_update.py") do
+				n += if fake.has(r.argv, "reload") then 1 else 0
+			end
+			return n
+		end
+		runs = fake.runsOf("codexbar_update.py")
+		assert(#runs == 3 and fake.has(runs[3].argv, "check"), "the rows check the updated checkout")
+		assert(#timers == 1 and reloads() == 0, "the reload waits for Tern's own")
+		timers[1].fn()
+		assert(reloads() == 1, "reloads when Tern didn't")
+		-- An apply that outlived its VM toasts from the new one; other children's ends don't.
+		local count = #cx.toasts
+		fake.handlers.process_exit({ status = 0, stdout = fake.json({ ok = true, view = {} }) }, cx)
+		fake.handlers.process_exit({ status = 0, stdout = fake.json({ ok = true, updated = true, from = "1.0.0", to = "1.1.0" }) }, cx)
+		assert(#cx.toasts == count + 1 and cx.toasts[#cx.toasts][2] == "Updated to 1.1.0", tern.json.encode(cx.toasts))
+		-- Off: no check, the answer is forgotten and the helper's cache goes, for omp too.
+		local cache = STATE_DIR .. "/update_check.json"
+		fake.files[cache] = "{}"
+		saveSetting(s, SETTINGS_BY_ID.updateCheck, false)
+		assert(fake.files[cache] == nil, "the cache is removed")
+		assert(prefs.newerRelease() == nil and versionRows()[1].hint == "The update check is off: General › Updates.", tern.json.encode(versionRows()))
+		store.updateLoading = false
+		prefs.checkUpdate()
+		assert(#fake.runsOf("codexbar_update.py") == 4, "off runs no check")
+		store.writeSetting("updateCheck", nil)
+	end)
+
 	fake.runChecks()
 end)() end

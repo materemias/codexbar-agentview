@@ -142,6 +142,9 @@ do
 			exists = function(path: string): boolean
 				return fake.files[path] ~= nil
 			end,
+			remove = function(path: string)
+				fake.files[path] = nil
+			end,
 		},
 		json = {
 			null = NULL,

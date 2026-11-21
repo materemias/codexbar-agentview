@@ -45,6 +45,7 @@
 - Tern settings open as a dialog over the dashboard.
 - With omp-stretch installed, session peeks and finished-wait excerpts show replies' short forms.
 - Settings → About lists tern-awui, omp-stretch and omp-compact, and which are installed.
+- A daily check shows a newer release in the Tern footer, and Settings → About updates to it.
 
 ### Fixes
 
