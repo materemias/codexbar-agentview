@@ -141,6 +141,34 @@ console.log(JSON.stringify(["2026-11-07 10:30am standup", "snooze 2026-11-07 9.3
         answer = self.drive({"prompts": 2}, FAKE_PROMPTS=json.dumps(prompts), DROP="1")
         self.assertEqual((answer["sent"], sorted(answer["acks"])), (["hello"], ["delivered", "failed"]), answer)
 
+    def test_a_newer_release_is_announced_once_per_version(self) -> None:
+        with extension_folder() as folder:
+            root = Path(folder)
+            extension = root / "package" / "omp-extension" / EXTENSION_PATH.name
+            extension.parent.mkdir(parents=True)
+            shutil.copy(EXTENSION_PATH, extension)
+            (root / "package" / "tern").mkdir()
+            (root / "package" / "tern" / "plugin.toml").write_text('id = "x"\nversion = "1.0.0"\n', encoding="utf-8")
+            state = root / "state" / "codexbar-agentview"
+            state.mkdir(parents=True)
+            answer = run_extension_driver(self, r"""
+import * as fs from "node:fs";
+const { updateNotice } = await import(process.env.EXTENSION);
+const check = (latest, age = 0) => fs.writeFileSync(process.env.CHECK, JSON.stringify({ latest, checkedAt: Date.now() / 1000 - age }));
+const said = [];
+check("1.0.0"); said.push(updateNotice() ?? null);
+check("1.1.0", 3 * 86400); said.push(updateNotice() ?? null);
+check("1.1.0"); said.push(updateNotice() ?? null, updateNotice() ?? null);
+check("1.2.0"); said.push(updateNotice() ?? null);
+console.log(JSON.stringify(said));
+""", EXTENSION=str(extension), CHECK=str(state / "update_check.json"), XDG_STATE_HOME=str(root / "state"))
+            markers = sorted(path.name for path in state.glob("update_announced-*"))
+        self.assertEqual(answer[:2], [None, None], "up to date, then a check too old to trust")
+        self.assertEqual(answer[2], f"CodexBar AgentView 1.1.0 is out: update from Tern's settings › About, or `git -C {root / 'package'} pull --ff-only`")
+        self.assertIsNone(answer[3], "said once")
+        self.assertTrue(answer[4].startswith("CodexBar AgentView 1.2.0 is out"), answer)
+        self.assertEqual(markers, ["update_announced-1.2.0"])
+
 
 if __name__ == "__main__":
     unittest.main()

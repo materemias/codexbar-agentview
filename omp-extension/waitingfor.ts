@@ -1228,6 +1228,52 @@ function readMenu() {
 }
 const MENU = readMenu();
 
+/** This checkout: its Tern plugin's manifest names the installed version. */
+const CHECKOUT = path.resolve(SCRIPTS, "..", "..");
+/** codexbar_update.py's cache of GitHub's latest release; Tern refreshes it while its update check is on. */
+const UPDATE_FILE = path.join(STATE_DIR, "update_check.json");
+/** An older answer means nothing checks any more (the update check is off): it says nothing. */
+const UPDATE_STALE_MS = 2 * 86_400_000;
+
+function semver(text): number[] | undefined {
+	const found = typeof text === "string" ? /^v?(\d+)\.(\d+)\.(\d+)$/.exec(text.trim()) : null;
+	return found ? found.slice(1).map(Number) : undefined;
+}
+
+/**
+ * The one line saying a newer release is out, the first time any session asks for that version;
+ * undefined otherwise. Reads only what Tern's check left: this never fetches. The version's marker
+ * file is created exclusively, so of the sessions a reboot reopens at once only one says it.
+ */
+export function updateNotice(now = Date.now()): string | undefined {
+	try {
+		const manifest = fs.readFileSync(path.join(CHECKOUT, "tern", "plugin.toml"), "utf8").split(/^\s*\[/m)[0];
+		const current = semver(/^version\s*=\s*"([^"]*)"/m.exec(manifest)?.[1]);
+		const check = JSON.parse(fs.readFileSync(UPDATE_FILE, "utf8"));
+		const latest = semver(check?.latest);
+		const fresh = typeof check?.checkedAt === "number" && now - check.checkedAt * 1000 < UPDATE_STALE_MS;
+		if (!current || !latest || !fresh) return undefined;
+		const newer = latest.findIndex((part, i) => part !== current[i]);
+		if (newer < 0 || latest[newer] < current[newer]) return undefined;
+		const version = latest.join(".");
+		const marker = `update_announced-${version}`;
+		fs.writeFileSync(path.join(STATE_DIR, marker), "", { flag: "wx" });
+		try {
+			// Older versions' markers; another session deleting the same one at once is no reason to stay quiet.
+			for (const name of fs.readdirSync(STATE_DIR)) {
+				if (name.startsWith("update_announced-") && name !== marker) fs.rmSync(path.join(STATE_DIR, name), { force: true });
+			}
+		} catch {}
+		// As shlex.quote (codexbar_update.py's commands); cmd.exe and PowerShell take double quotes.
+		const safe = WINDOWS ? /^[\w@%+=:,./\\-]+$/ : /^[\w@%+=:,./-]+$/;
+		const where = safe.test(CHECKOUT) ? CHECKOUT : WINDOWS ? `"${CHECKOUT}"` : `'${CHECKOUT.replaceAll("'", "'\\''")}'`;
+		// --ff-only, as Tern's Update: a branch with commits of its own stops instead of merging.
+		return `CodexBar AgentView ${version} is out: update from Tern's settings › About, or \`git -C ${where} pull --ff-only\``;
+	} catch {
+		return undefined; // no check yet, no manifest, or announced already
+	}
+}
+
 export default function (pi) {
 	const z = pi.zod;
 	let ctx; // the main session with a UI; subagents and headless runs only get the tool and /wait
@@ -1658,7 +1704,12 @@ export default function (pi) {
 		];
 	}
 
-	pi.on("session_start", (_event, c) => activate(c));
+	pi.on("session_start", (_event, c) => {
+		activate(c);
+		// Once per release across sessions, and only where someone reads it.
+		const notice = c.agent?.kind === "sub" || !c.hasUI ? undefined : updateNotice();
+		if (notice) c.ui.notify(notice, "info");
+	});
 	pi.on("session_switch", (_event, c) => activate(c));
 	pi.on("session_branch", (_event, c) => activate(c));
 	pi.on("session_shutdown", () => {
