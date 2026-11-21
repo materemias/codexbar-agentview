@@ -35,6 +35,21 @@ static void waitUntil(const std::function<bool()> &done)
     require(done(), "Timed out waiting for process lifecycle transition");
 }
 
+// A killed process is gone once it no longer exists or only its zombie is
+// left: the orphaned grandchild's new parent may be an init that never reaps,
+// such as a container's `tail -f /dev/null`.
+static bool processGone(qint64 pid)
+{
+    if (kill(static_cast<pid_t>(pid), 0) == -1 && errno == ESRCH)
+        return true;
+    QFile stat(QStringLiteral("/proc/%1/stat").arg(pid));
+    if (!stat.open(QIODevice::ReadOnly))
+        return false;
+    const QByteArray fields = stat.readAll();
+    const qsizetype command = fields.lastIndexOf(')');
+    return command >= 0 && fields.mid(command + 2, 1) == "Z";
+}
+
 int main(int argc, char **argv)
 {
     QCoreApplication app(argc, argv);
@@ -135,9 +150,7 @@ int main(int argc, char **argv)
     const qint64 grandchild = grandchildFile.readAll().toLongLong();
     require(grandchild > 0, "Timed-out command wrote an empty PID");
     // The killed grandchild lingers as a zombie until its new parent reaps it.
-    waitUntil([&] {
-        return kill(static_cast<pid_t>(grandchild), 0) == -1 && errno == ESRCH;
-    });
+    waitUntil([&] { return processGone(grandchild); });
 
     // A command that ends in time completes once; its timer never fires.
     slow.run("printf fast");
