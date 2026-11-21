@@ -1750,18 +1750,27 @@ class ForecastTests(IsolatedUsageTestCase):
         payload = {"ok": True, "padding": "x" * 200_000}
         path = Path(fetch._state_file(fetch.FORECAST_CACHE_NAME))
         errors = []
+        reads = []
 
         def write(_):
             for _ in range(30):
                 fetch._forecast_cache_write(payload)
                 try:
                     json.loads(path.read_text(encoding="utf-8"))
+                except PermissionError:
+                    # Windows refuses an open while another writer replaces the
+                    # file; the product's reader takes that as a cache miss.
+                    if not WINDOWS:
+                        raise
+                    continue
                 except ValueError as error:
                     errors.append(error)
+                reads.append(True)
 
         with ThreadPoolExecutor(max_workers=8) as pool:
             list(pool.map(write, range(8)))
         self.assertEqual(errors, [])
+        self.assertTrue(reads)
         self.assertEqual([p.name for p in path.parent.iterdir()], [path.name])
 
 
