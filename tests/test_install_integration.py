@@ -272,7 +272,9 @@ class IntegrationPlatformTests(unittest.TestCase):
         other.write_text("export default () => {};\n")
         self.omp_link.parent.mkdir(parents=True)
         self.omp_link.symlink_to(other)
-        self.assertIn(str(other), self.run_main("--status")[1])
+        # The status names the resolved file: Windows spells a temp folder's
+        # user by its 8.3 short name (RUNNER~1), and resolving expands it.
+        self.assertIn(f"other copy: {other.resolve()}", self.run_main("--status")[1])
         with mock.patch.object(self.installer, "OMP_EXTENSION_SOURCE", self.home / "package/omp-extension/waitingfor.ts"):
             self.assertIn("omp extension:               yes", self.run_main("--status")[1])
 
