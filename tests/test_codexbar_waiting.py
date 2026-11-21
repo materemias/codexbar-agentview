@@ -4194,6 +4194,11 @@ class FiredPrTests(Case):
 
 
 class PinTests(Case):
+    # omp's withFileLock leaves nothing behind on Linux (an abstract socket) or
+    # Windows (a named mutex); elsewhere it flocks a sidecar that stays, and so
+    # must we, or omp and the helper would lock different files.
+    LOCK_FILES = [] if sys.platform == "linux" or WINDOWS else ["session-pins.json.lock"]
+
     @property
     def pins_path(self) -> Path:
         return self.omp / "session-pins.json"
@@ -4234,7 +4239,9 @@ class PinTests(Case):
         self.assertEqual(self.pins_path.read_bytes(), f'[\n\t"{SID}"\n]'.encode())
         if not WINDOWS:  # Windows files have no mode bits; the profile's ACL keeps them private.
             self.assertEqual(self.pins_path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual([path.name for path in self.omp.iterdir()], ["session-pins.json"])
+        self.assertEqual(
+            sorted(path.name for path in self.omp.iterdir()), ["session-pins.json", *self.LOCK_FILES],
+        )
 
     def test_the_view_shows_the_pin_at_once(self) -> None:
         answer = self.add_answer("--kind", "later")
@@ -4444,7 +4451,7 @@ class PinTests(Case):
         with mock.patch.object(waiting.os, "replace", replace):
             answer = self.add_answer("--kind", "later")
         self.assertEqual(answer["pin_error"], "disk full")
-        self.assertEqual(list(self.omp.iterdir()), [])
+        self.assertEqual([path.name for path in self.omp.iterdir()], self.LOCK_FILES)
         self.assertEqual(len(self.session()["waits"]), 1)
 
     def test_the_lock_is_released_after_a_write(self) -> None:
