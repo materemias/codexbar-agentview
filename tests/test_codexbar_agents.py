@@ -2190,7 +2190,9 @@ class WindowsSessionTests(unittest.TestCase):
                 for windows in platforms:
                     with self.subTest(windows=windows), mock.patch.object(agents.state_paths, "WINDOWS", windows):
                         self.assertEqual(agents._find_pi_rollout(work), str(rollout))
-                        self.assertEqual(agents._find_pi_rollout(work, "pi"), str(pi_folder / "pi.jsonl"))
+                # pi names its folder by the absolute path, spelled as this
+                # platform spells it: Linux's rule never sees a drive letter.
+                self.assertEqual(agents._find_pi_rollout(work, "pi"), str(pi_folder / "pi.jsonl"))
 
     def test_codex_rollouts_since_a_start_stand_in_for_held_ones(self) -> None:
         start = int(time.time() * 1000) - 3_600_000
