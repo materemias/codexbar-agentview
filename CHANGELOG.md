@@ -4,7 +4,7 @@
 
 ### Breaking
 
-- The Tern extension needs Tern 0.9.18 or later.
+- The Tern extension needs Tern 0.9.23 or later.
 - Usage, agent counts, "on me" and "to restore" are widgets: add them in palette › Edit widgets….
 
 ### Features

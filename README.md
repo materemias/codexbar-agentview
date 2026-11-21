@@ -154,7 +154,7 @@ build, so there usage comes from Meridian only, or you turn it off.
 
 | Requirement | Tern | Plasma | Enables |
 | --- | :---: | :---: | --- |
-| [Tern](https://stencil.so/tern) 0.9.18 or later | Required | | The extension |
+| [Tern](https://stencil.so/tern) 0.9.23 or later | Required | | The extension |
 | Python 3.10+ | Required | Required | The shared helpers |
 | [omp](https://github.com/can1357/oh-my-pi) | Optional | Optional | `/wait`, the agent's `waitingfor` tool, the row above the composer and prompt delivery for set-aside sessions |
 | [`gh`](https://cli.github.com), logged in | Optional | Optional | Pull request and release waits |
