@@ -383,31 +383,20 @@ def _writer_lock():
 def _transaction(
     now: datetime | None = None, agents: "Agents | None" = None, daemon: str | None = None,
 ):
-    """The state under the writer lock, saved on a clean exit if it changed. A
-    save that only moves extension heartbeats skips fsync: losing one costs a
-    heartbeat, while every other save holds waits that must survive a crash.
-    The first one of a boot settles the reboot (`_reconcile_boot`) before any
-    command reads the state."""
+    """The state under the writer lock, saved on a clean exit if it changed. Every
+    save is durable: it replaces the whole file, waits included, so a heartbeat
+    save without fsync could lose them in a power cut. The first one of a boot
+    settles the reboot (`_reconcile_boot`) before any command reads the state."""
     with _writer_lock():
         state = _load_state()
         before = json.dumps(state)
-        before_lasting = json.dumps(_lasting(state))
         _reconcile_boot(state, now or _now(), agents, daemon)
         yield state
         after = json.dumps(state)
         if after != before:
-            durable = json.dumps(_lasting(state)) != before_lasting
             state["save_seq"] += 1
-            state_paths.write_file(_state_path(), json.dumps(state, indent=1), durable=durable)
+            state_paths.write_file(_state_path(), json.dumps(state, indent=1), durable=True)
             state_paths.write_file(_stamp_path(), f"{state['save_seq']}\n", durable=False)
-
-
-# What an extension's heartbeat changes: cheap to lose, as the next one says it again.
-HEARTBEAT_KEYS = ("extensions", "extension_activity", "extension_features", "extension_panes", "extension_pids")
-
-
-def _lasting(state: dict) -> dict:
-    return {key: value for key, value in state.items() if key not in HEARTBEAT_KEYS}
 
 
 def _publish(

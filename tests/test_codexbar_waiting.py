@@ -2392,14 +2392,15 @@ class TickTests(Case):
             self.assertEqual(self.claim("--pane", "99"), [])
         self.assertEqual((view.stat().st_mtime_ns, view.read_text(encoding="utf-8")), before)
 
-    def test_a_heartbeat_alone_is_saved_without_fsync(self) -> None:
+    def test_a_heartbeat_alone_is_saved_durably(self) -> None:
+        # The save rewrites the whole file, waits included: a power cut after an
+        # unsynced one could leave an empty file and stop every wait.
         self.live()
+        self.add("--kind", "later")
         self.advance(seconds=30)
         with mock.patch.object(os, "fsync") as fsync, \
                 mock.patch.object(state_paths, "fsync_dir") as fsync_dir:
             self.heartbeat()
-            self.assertEqual((fsync.call_count, fsync_dir.call_count), (0, 0))
-            self.add("--kind", "later")
             self.assertTrue(fsync.called and fsync_dir.called)
 
     def test_result_of_a_changed_wait_is_dropped(self) -> None:
