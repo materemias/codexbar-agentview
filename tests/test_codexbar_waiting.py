@@ -5825,6 +5825,44 @@ class SettleTests(Case):
         self.heartbeat(SID, "--idle")
         self.assertEqual(self.wait_of(wait)["state"], "review")
 
+    def rebooted_mid_turn(self) -> str:
+        """SID's prompt "go" reached the agent, then the machine rebooted."""
+        self.system_boot = "one"
+        wait, _ = self.queued_prompt()
+        self.system_boot = "two"
+        self.advance(minutes=10)
+        return wait
+
+    def assert_sent_again_once(self, wait: str) -> None:
+        entry = self.state()["sessions"][SID]["prompt_queue"][0]
+        self.assertEqual((entry["state"], entry["text"]), ("queued", f"{waiting.REBOOT_NOTE}\n\ngo"))
+        self.assertEqual(self.wait_of(wait)["state"], "acting")
+        again = [line for line in self.history() if line.startswith("Sending again after a reboot")]
+        self.assertEqual(len(again), 1)
+        self.assertEqual(self.state()["boot_id"], "two")
+
+    def test_an_idle_heartbeat_before_the_first_tick_after_a_reboot_sends_the_prompt_again(self) -> None:
+        wait = self.rebooted_mid_turn()
+        self.heartbeat(SID, "--idle")
+        self.assert_sent_again_once(wait)
+        self.tick()
+        self.assert_sent_again_once(wait)
+
+    def test_a_claim_before_the_first_tick_after_a_reboot_gets_the_prompt_with_the_note(self) -> None:
+        self.system_boot = "one"
+        wait = self.due_prompt()
+        self.claim()  # the reboot comes before the ack
+        self.system_boot = "two"
+        self.advance(minutes=10)
+        prompt = self.claim()[0]
+        self.assertEqual(prompt["text"], f"{waiting.REBOOT_NOTE}\n\ngo")
+        self.assertFalse(prompt["resend_check"])
+        self.run_cli("ack", "--action", prompt["action"], "--result", "delivered")
+        self.tick()
+        entry = self.state()["sessions"][SID]["prompt_queue"][0]
+        self.assertEqual(entry["state"], "delivered")
+        self.assertEqual(self.wait_of(wait)["state"], "acting")
+
 
 class WakeTests(Case):
     def setUp(self) -> None:

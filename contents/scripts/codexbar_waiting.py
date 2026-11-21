@@ -380,14 +380,19 @@ def _writer_lock():
 
 
 @contextlib.contextmanager
-def _transaction():
+def _transaction(
+    now: datetime | None = None, agents: "Agents | None" = None, daemon: str | None = None,
+):
     """The state under the writer lock, saved on a clean exit if it changed. A
     save that only moves extension heartbeats skips fsync: losing one costs a
-    heartbeat, while every other save holds waits that must survive a crash."""
+    heartbeat, while every other save holds waits that must survive a crash.
+    The first one of a boot settles the reboot (`_reconcile_boot`) before any
+    command reads the state."""
     with _writer_lock():
         state = _load_state()
         before = json.dumps(state)
         before_lasting = json.dumps(_lasting(state))
+        _reconcile_boot(state, now or _now(), agents, daemon)
         yield state
         after = json.dumps(state)
         if after != before:
@@ -497,7 +502,7 @@ def _mutate(
 ) -> dict:
     """Run `apply(state, now)` in a transaction; its answer gains `view`."""
     now = now or _now()
-    with _transaction() as state:
+    with _transaction(now, agents) as state:
         answer = apply(state, now) or {}
         answer["ok"] = True
         answer["view"] = _publish(state, now, agents, omp)
@@ -585,10 +590,6 @@ def _system_boot_id() -> str:
     "" where there is none."""
     import codexbar_agents
     return codexbar_agents._read_boot_id()
-
-
-def _boot_id(agents: Agents) -> str:
-    return _system_boot_id() or agents.boot_id
 
 
 def _agents_stale(agents: Agents, now: datetime) -> bool:
@@ -3108,7 +3109,7 @@ def _after_reboot(state: dict, agents: Agents, now: datetime) -> None:
             wait = _wait_in(record, entry["wait"])
             if wait is not None:
                 _log(record, now, wait, f"Sending again after a reboot: {wait['label']}")
-    # Its unpark or resume goes with the other actions (`_housekeeping`).
+    # Its unpark or resume goes with the other actions (`_reconcile_boot`).
     waking = {action.get("wait") for action in state["actions"] if action["type"] in ("unpark", "resume")}
     for record in state["sessions"].values():
         snooze = _open_snooze(record)
@@ -3170,28 +3171,44 @@ def _prune_record(record: dict, now: datetime) -> None:
     record["waits"] = [wait for wait in record["waits"] if wait["id"] not in gone]
 
 
+def _reconcile_boot(
+    state: dict, now: datetime, agents: Agents | None = None, daemon: str | None = None,
+) -> None:
+    """The first transaction of a boot settles the reboot, before its command
+    touches anything a reboot ends: a heartbeat or a claim that came before the
+    first tick would otherwise take a prompt the reboot cut off for one that
+    ran. `daemon` names the Tern daemon whose pane ids this boot's items name;
+    by default the one the command runs under."""
+    boot = _system_boot_id()
+    if not boot:
+        agents = agents or _read_agents()
+        boot = agents.boot_id
+    if not boot or state["boot_id"] == boot:
+        return
+    if state["boot_id"]:
+        _after_reboot(state, agents or _read_agents(), now)
+        # Pane ids don't survive a reboot, and may belong to another pane now:
+        # only what this boot's daemon made, before its boot was known, stays.
+        daemon = daemon or _ancestor_daemon()
+        _panes_gone(state, now, daemon)
+        state["actions"] = [
+            action for action in state["actions"]
+            if action["type"] == "toast" or daemon is not None and action.get("daemon") == daemon
+        ]
+        # The daemon that ticked before the reboot holds nothing now.
+        state.pop("ticker", None)
+    state["boot_id"] = boot
+
+
 def _housekeeping(
     state: dict, agents: Agents, omp: Omp, now: datetime, daemon: str | None = None,
 ) -> None:
     """`daemon` is the ticking Tern daemon's id: under a new one, pane ids name
     other panes."""
     stamp = now.timestamp()
-    boot = _boot_id(agents)
-    rebooted = bool(boot and state["boot_id"] and state["boot_id"] != boot)
-    if boot:
-        if rebooted:
-            _after_reboot(state, agents, now)
-            # Pane ids don't survive a reboot, and may belong to another pane
-            # now: only what this boot's daemon made, before its first tick, stays.
-            _panes_gone(state, now, daemon)
-            state["actions"] = [
-                action for action in state["actions"]
-                if action["type"] == "toast" or daemon is not None and action.get("daemon") == daemon
-            ]
-        state["boot_id"] = boot
     if daemon:
         last = _ticking_daemon(state)
-        if last and last != daemon and not rebooted:
+        if last and last != daemon:
             # A new daemon: its panes are new too, and so may be the ones
             # extensions reported before it started.
             _panes_gone(state, now, daemon)
@@ -5347,7 +5364,7 @@ def cmd_menu_request(args: argparse.Namespace) -> dict:
     session, pane = _target(args)
     now = _now()
     agents = _read_agents()
-    with _transaction() as state:
+    with _transaction(now, agents) as state:
         if pane is not None:
             session = _reported_session(state, agents, pane, now)
             if session is None:
@@ -5620,7 +5637,7 @@ def _tick(args: argparse.Namespace) -> dict:
             "view": _publish(state, now, agents, omp, ticked=True, problems=problems),
         }
 
-    with _transaction() as state:
+    with _transaction(now, agents, args.daemon) as state:
         if args.daemon and _ticked_elsewhere(state, args.daemon, now):
             return {
                 "ok": True, "skipped": TICK_SKIPPED, "actions": [], "next_tick_s": TICK_MAX_S,
@@ -5643,7 +5660,7 @@ def _tick(args: argparse.Namespace) -> dict:
         now = moment()
         agents = _read_agents()
         stale = _agents_stale(agents, now)
-        with _transaction() as state:
+        with _transaction(now, agents, args.daemon) as state:
             _merge(state, finished, now)
             _delivery_pass(state, agents, now, args.window, stale, omp)
             answer = finish(state, agents)
@@ -5657,7 +5674,7 @@ def _tick(args: argparse.Namespace) -> dict:
         cache = PrCache(now=now)
     merged = _merged_prs(cache, _load_state())
     if due or merged:
-        with _transaction() as state:
+        with _transaction(now, agents, args.daemon) as state:
             for pr in merged:
                 _pr_merged(state, pr, now)
             answer = finish(state, agents)
