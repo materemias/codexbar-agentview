@@ -224,7 +224,9 @@ class UpdateTests(Scratch):
         self.assertIn("uncommitted changes", self.plan()["reason"])
         code, answer = self.apply()
         self.assertEqual((code, answer["ok"]), (1, False))
-        self.assertIn("fetch --tags origin && git -C", answer["command"])
+        # PowerShell 5.1, Windows' default shell, has no `&&`.
+        chain = "; if ($?) { git -C" if os.name == "nt" else " && git -C"
+        self.assertIn("fetch --tags origin" + chain, answer["command"])
         self.assertIn("1.0.1", (self.clone / "tern" / "plugin.toml").read_text())
 
     def test_a_detached_head_refuses(self) -> None:
