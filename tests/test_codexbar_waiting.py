@@ -4555,7 +4555,7 @@ class ArgvTests(Case):
 class MenuTests(Case):
     def test_menu_prints_the_shipped_items(self) -> None:
         items = self.run_cli("menu")["items"]
-        self.assertEqual(items, json.loads(waiting.MENU_PATH.read_text())["items"])
+        self.assertEqual(items, json.loads(waiting.MENU_PATH.read_text(encoding="utf-8"))["items"])
         self.assertEqual(len({item["id"] for item in items}), len(items))
         for item in items:
             with self.subTest(item=item["id"]):
