@@ -1,7 +1,7 @@
 schema = 1
 id = "codexbar-agentview"
 name = "CodexBar AgentView"
-version = "0.3.0"
+version = "1.0.0"
 description = "AI provider usage, coding-agent sessions and what set-aside sessions wait for, from the CodexBar AgentView helpers."
 icon = "gauge"
 host = "host.luau"

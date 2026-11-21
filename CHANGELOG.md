@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.0 (2026-11-21)
+
 ### Breaking
 
 - The Tern extension needs Tern 0.9.23 or later.
