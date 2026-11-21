@@ -587,8 +587,11 @@ class ConditionTests(Case):
         payload = json.loads((self.state_dir / "agents.json").read_text())
         payload["agents"] = [{"sessionId": SID, "cwd": str(folder)}]
         (self.state_dir / "agents.json").write_text(json.dumps(payload))
+        # samefile, not ==: getcwd() names the folder by its real path, and
+        # macOS's temp folder is under /var, a link to /private/var.
         wait = self.command(
-            f"import os; print(os.getcwd() == {str(folder)!r})", "--predicate", "stdout_regex:True",
+            f"import os; print(os.path.samefile(os.getcwd(), {str(folder)!r}))",
+            "--predicate", "stdout_regex:True",
         )
         self.tick()
         self.assertEqual(self.wait_of(wait)["state"], "fired")

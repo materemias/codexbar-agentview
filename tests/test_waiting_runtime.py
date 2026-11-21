@@ -308,6 +308,12 @@ class WaitingRuntimeTests(unittest.TestCase):
         (self.project / "status").write_text("pending")
         (self.helper / "status").write_text("ready")
 
+    def assert_same_folder(self, path: str, folder: Path) -> None:
+        """getcwd() names a folder by its real path, so what a command reports, or a
+        cwd captured from it, can differ from the temp path given: macOS's /var is a
+        link to /private/var."""
+        self.assertEqual(Path(path).resolve(), folder.resolve())
+
     def add_status_check(self, *target: str, cwd: Path | None = None) -> str:
         """A wait on a command that fires once ./status reads ready."""
         return self.cli(
@@ -345,7 +351,7 @@ class WaitingRuntimeTests(unittest.TestCase):
         first = self.tick()
         self.assertEqual(first["view"]["panes"][0]["waits"][0]["state"], "waiting")
         self.assertEqual(self.saved_wait(wait, pane=72)["condition"]["cwd"], str(self.project))
-        self.assertEqual((self.project / "checked").read_text(), str(self.project))
+        self.assert_same_folder((self.project / "checked").read_text(), self.project)
         self.assertFalse((self.helper / "checked").exists())
         self.assertEqual(first["actions"], [])
         (self.project / "status").write_text("ready")
@@ -369,7 +375,7 @@ class WaitingRuntimeTests(unittest.TestCase):
         )["wait"]["id"]
         self.tick()
         self.assertEqual(self.saved_wait(wait, pane=72)["state"], "waiting")
-        self.assertEqual((self.project / "checked").read_text(), str(self.project))
+        self.assert_same_folder((self.project / "checked").read_text(), self.project)
         self.assertFalse((self.helper / "checked").exists())
         (self.project / "status").write_text("v2")
         self.tick(seconds=1)
@@ -391,7 +397,7 @@ class WaitingRuntimeTests(unittest.TestCase):
         self.tick()
         self.assertEqual(self.saved_wait(wait)["state"], "done")
         self.assertEqual(self.saved_wait(following)["state"], "waiting")
-        self.assertEqual((declared / "checked").read_text(), str(declared))
+        self.assert_same_folder((declared / "checked").read_text(), declared)
         self.assertFalse((self.project / "checked").exists())
         self.assertFalse((self.helper / "checked").exists())
 
@@ -443,8 +449,8 @@ class WaitingRuntimeTests(unittest.TestCase):
             "a pane check without --cwd fired on the tick helper's ready file",
         )
         self.assertEqual(saved["errors"], 0)
-        self.assertEqual(saved["condition"]["cwd"], str(self.project))
-        self.assertEqual((self.project / "checked").read_text(), str(self.project))
+        self.assert_same_folder(saved["condition"]["cwd"], self.project)
+        self.assert_same_folder((self.project / "checked").read_text(), self.project)
         self.assertFalse((self.helper / "checked").exists())
         self.assertEqual(first["actions"], [])
         (self.project / "status").write_text("ready")
@@ -523,7 +529,7 @@ class WaitingRuntimeTests(unittest.TestCase):
         self.cli("event", "--type", "turn_finished", "--session", SID)
         self.tick(seconds=1)
         self.assertEqual(self.saved_wait(wait)["state"], "waiting")
-        self.assertEqual((self.project / "checked").read_text(), str(self.project))
+        self.assert_same_folder((self.project / "checked").read_text(), self.project)
         self.assertFalse((self.helper / "checked").exists())
         (self.project / "status").write_text("ready")
         self.tick(seconds=2)
