@@ -2122,7 +2122,7 @@ export default function (pi) {
 				.describe(
 					"add: start once this wait id fires or completes; stopping it stops this step too. Chain only behind waits code watches (pr, release, command, time, repeat); for a step after a something or later, ask the user in your reply to tell you once it happened",
 				),
-			no_fix: z.boolean().optional().describe("babysit_pr: skip the automatic review-fix prompt"),
+			no_fix: z.boolean().optional().describe("babysit_pr: skip the automatic review-fix and comment-answer prompts; comments come to the user"),
 			released: z.boolean().optional().describe("babysit_pr: also wait for a release"),
 			park: z.boolean().optional().describe("add, babysit_pr: also park this session in Tern"),
 			wait: z.string().optional().describe("stop, end_repeat: the wait id"),

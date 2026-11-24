@@ -69,6 +69,7 @@ def fake_github(**overrides) -> types.SimpleNamespace:
         is_transient=lambda text: "connect" in text or "HTTP 502" in text,
         FIX_PROMPT="fix {repo}#{number} at {head}",
         REBASE_PROMPT="rebase {repo}#{number}: {why}",
+        COMMENT_PROMPT="answer {repo}#{number}:\n{comments}\n",
         parse_pr=lambda text: ("o/r", 7) if "7" in text else None,
         poll=lambda cond, memo, **kwargs: {
             "memo": memo, "events": [], "fired": False, "fire_text": None,
@@ -1137,6 +1138,55 @@ class PrTests(Case):
         review = self.conflicted("--no-fix")
         self.assertEqual(self.run_cli("claim-prompts", "--session", SID)["prompts"], [])
         self.assertEqual(self.wait_of(review)["reason"], "conflicts with main, rebase it")
+
+    def commented(self, *argv: str, fired: bool = False) -> str:
+        """A babysat PR whose first poll brings a person's comment, and a second
+        poll another."""
+        polls = []
+
+        def poll(cond, memo, **kwargs):
+            if cond["until"] != "review_on_head":
+                return poll_result(memo)
+            polls.append(1)
+            talk = {"key": f"c:{len(polls)}", "text": f"comment from alice: #{len(polls)}", "on_me": False, "talk": True}
+            return poll_result(memo, events=[talk], fired=fired, fire_text="review landed", head="abc123")
+
+        self.github(poll=poll)
+        self.agents(SID)
+        self.heartbeat()
+        review = self.run_cli(
+            "babysit-pr", "--session", SID, "--repo", "o/r", "--number", "7", *argv,
+        )["waits"][0]["id"]
+        self.tick()
+        return review
+
+    def test_a_comment_on_a_babysat_pr_is_answered_by_the_agent(self) -> None:
+        review = self.commented()
+        # A second comment before the agent took the first joins its prompt.
+        self.advance(minutes=4)
+        self.tick()
+        prompts = self.run_cli("claim-prompts", "--session", SID)["prompts"]
+        self.assertEqual(
+            [prompt["text"] for prompt in prompts],
+            ["answer o/r#7:\n- comment from alice: #1\n- comment from alice: #2\n"],
+        )
+        self.run_cli("ack", "--action", prompts[0]["action"], "--result", "delivered")
+        self.run_cli("event", "--type", "turn_finished", "--session", SID)
+        seen = self.wait_of(review)
+        self.assertEqual((seen["state"], seen["ball"]), ("waiting", "on_machine"))
+
+    def test_a_review_landing_with_a_comment_sends_only_its_fix(self) -> None:
+        self.commented(fired=True)
+        self.assertEqual(
+            [prompt["text"] for prompt in self.run_cli("claim-prompts", "--session", SID)["prompts"]],
+            ["fix o/r#7 at abc123"],
+        )
+
+    def test_without_the_fix_a_comment_comes_to_me(self) -> None:
+        review = self.commented("--no-fix")
+        self.assertEqual(self.run_cli("claim-prompts", "--session", SID)["prompts"], [])
+        seen = self.wait_of(review)
+        self.assertEqual((seen["ball"], seen["reason"]), ("on_me", "comment from alice: #1"))
 
     def test_failed_fix_needs_attention_and_the_chain_stops(self) -> None:
         first = self.fix_chain(lambda repo, number, snapshot: (False, "head did not move"))

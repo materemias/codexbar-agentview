@@ -2205,7 +2205,7 @@ def _deliver(
             # A repeat's run too: it already counts, and stays the running one.
             _send_again(record, entry, CLOSE_NOTE, now)
             _log(record, now, wait, f"Sending again after the session closed: {wait['label']}")
-        elif entry.get("rebase"):
+        elif entry.get("rebase") or entry.get("comment"):
             queue.pop(0)
             if wait is not None:
                 _flag_on_me(state, record, wait, now, REASON_CUT_TWICE, "error")
@@ -2845,6 +2845,7 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
     if closed is not None:
         _pr_closed(state, wait["condition"], now, closed["text"])
         return
+    talk = []
     for event in result.get("events") or []:
         if str(event.get("key", "")).startswith("head:") and wait["event_flag"]:
             # What the event said was about the old head.
@@ -2858,6 +2859,13 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
             wait["event_flag"] = True
         else:
             _log(record, now, wait, event["text"])
+            if event.get("talk") and _hears_comments(wait):
+                talk.append(event)
+    # A head its last round was on doesn't fire it again (`_next_round`).
+    round_head = wait.get("round_head")
+    fired = bool(result.get("fired")) and not (round_head and result.get("head") == round_head)
+    if talk and not (fired and wait["prompt"]):  # The review fix answers them too.
+        _answer_comments(state, record, wait, talk, now)
     error = result.get("error")
     if error:
         if result.get("transient"):
@@ -2875,14 +2883,37 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
     _check_rebase(state, record, wait, result, now)
     # `confirm` needs nothing here: its on_me event told me, and the wait stays
     # watched, so a compare that later proves the release fires it.
-    if result.get("fired"):
-        if wait.get("round_head") and result.get("head") == wait["round_head"]:
-            return  # its last round was on this head (`_next_round`)
+    if fired:
         wait["snapshot"] = result.get("snapshot", wait["snapshot"])
         wait["fired_head"] = result.get("head")
         text = result.get("fire_text") or wait["label"]
         name = f"PR#{wait['condition']['number']} "
         _fire(state, record, wait, now, text, fired=text if text.startswith(name) else name + text)
+
+
+def _hears_comments(wait: dict) -> bool:
+    """A babysit's review step watches people's comments until the PR merges or
+    closes: it is the one step polling all along (`_rounds`)."""
+    return bool(wait.get("babysit")) and wait["condition"]["until"] == "review_on_head"
+
+
+def _answer_comments(state: dict, record: dict, wait: dict, talk: list[dict], now: datetime) -> None:
+    """People's new comments on a babysat PR: the agent answers them, one prompt
+    for those it hasn't got yet; without the fix they come to me."""
+    if not wait["fix"]:
+        _flag_on_me(state, record, wait, now, talk[-1]["text"])
+        return
+    lines = "\n".join(f"- {event['text']}" for event in talk)
+    queued = next((
+        entry for entry in record["prompt_queue"]
+        if entry.get("comment") and entry["wait"] == wait["id"] and entry["state"] == "queued"
+    ), None)
+    if queued is not None:
+        queued["text"] = f"{queued['text'].rstrip()}\n{lines}\n"
+        return
+    condition = wait["condition"]
+    text = _github().COMMENT_PROMPT.format(repo=condition["repo"], number=condition["number"], comments=lines)
+    _queue_prompt(state, record, wait, text, now, comment=True)
 
 
 def _queue_rebase(state: dict, record: dict, wait: dict, event: dict, result: dict, now: datetime) -> None:
@@ -5114,6 +5145,8 @@ def _settle_turn(state: dict, record: dict, now: datetime) -> None:
     entry = queue.pop(0)
     if entry.get("repeat"):
         _run_over(state, record, entry, now)
+        return
+    if entry.get("comment"):
         return
     if entry.get("rebase"):
         wait = _wait_in(record, entry["wait"])

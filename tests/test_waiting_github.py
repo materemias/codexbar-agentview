@@ -470,7 +470,7 @@ class EventsTest(PollTestCase):
         first = self.poll(gh)
         self.assertEqual(
             first["events"],
-            [{"key": "c:C1", "text": "comment from someone: please look", "on_me": False}],
+            [{"key": "c:C1", "text": "comment from someone: please look", "on_me": False, "talk": True}],
         )
         self.assertEqual(self.poll(gh)["events"], [])
 
@@ -497,18 +497,21 @@ class EventsTest(PollTestCase):
             "commit": {"oid": HEAD},
             "author": {"login": "alice", "__typename": "User"},
         }
+        approval = {**review, "id": "R2", "state": "APPROVED", "body": "", "author": {"login": "carol", "__typename": "User"}}
         gh.pr = pr_answer(
-            reviews=[review],
+            reviews=[review, approval],
             threads=[thread(comments=2, author="alice"), thread("T2", author="bob", line=None)],
         )
-        texts = [event["text"] for event in self.poll(gh)["events"]]
+        events = [(event["text"], event.get("talk", False)) for event in self.poll(gh)["events"]]
+        # A bare approval asks nothing to answer.
         self.assertEqual(
-            texts,
+            events,
             [
-                "review from alice (changes requested): no",
-                "new thread from alice on src/a.py:12: nit",
-                "thread reply from alice on src/a.py:12: nit",
-                "new thread from bob on src/a.py: nit",
+                ("review from alice (changes requested): no", True),
+                ("review from carol (approved): ", False),
+                ("new thread from alice on src/a.py:12: nit", True),
+                ("thread reply from alice on src/a.py:12: nit", True),
+                ("new thread from bob on src/a.py: nit", True),
             ],
         )
 

@@ -75,7 +75,8 @@ and a card over the pane tells you what happened while you were away.
 What you can now leave alone:
 
 - A PR you opened: a review bot comments, the agent fixes what's real, round
-  after round, and the wait follows it to ready and merged. `/wait gh babysit`
+  after round, answers people's comments until the PR merges or closes, and the
+  wait follows it to ready and merged. `/wait gh babysit`
 - A merge, then the release notes. `/wait gh pr 42 merged -- write the release notes`
 - Someone else's fix: upgrade once their release ships.
   `/wait gh release vercel/next.js bump once their fix ships -- upgrade and run the tests`

@@ -237,6 +237,19 @@ REBASE_PROMPT = """\
 - Never merge.
 """
 
+COMMENT_PROMPT = """\
+New comments on {repo}#{number}. Answer each one:
+
+- Read it in full on GitHub: the list below shows only its start.
+- Skip what the latest push or an earlier reply already handled.
+- When it asks for a change that holds up against the source, make it, run the checks that cover it, and push.
+- When it is wrong, a question, or needs no change, reply to it with the answer or the reason.
+- Never merge. Stop once you replied and pushed.
+
+Comments:
+{comments}
+"""
+
 
 class GhError(Exception):
     def __init__(self, message: str, transient: bool, auth: bool = False) -> None:
@@ -720,12 +733,17 @@ class _Events:
         always: bool = False,
         rest: bool = False,
         created: str | None = None,
+        talk: bool = False,
     ) -> None:
+        """`talk`: someone's words a babysitting agent answers (COMMENT_PROMPT)."""
         if not self.mark(key):
             return
         held = self.rest_baseline if rest else self.baseline
         if always or not held or self._after_start(created):
-            self.out.append({"key": key, "text": text, "on_me": on_me})
+            event = {"key": key, "text": text, "on_me": on_me}
+            if talk:
+                event["talk"] = True
+            self.out.append(event)
 
     def _after_start(self, created: str | None) -> bool:
         """Written after the wait's first poll: a REST-only start can't see
@@ -767,6 +785,7 @@ def _talk_events(pr: Json, events: _Events, known_bots: tuple[str, ...], mine: s
             f"c:{comment['id']}",
             f"comment from {login}: {_snippet(comment['body'])}",
             created=comment["created"],
+            talk=True,
         )
     for review in pr["reviews"]:
         login = review["login"]
@@ -780,6 +799,7 @@ def _talk_events(pr: Json, events: _Events, known_bots: tuple[str, ...], mine: s
                 f"review from {login} ({state}): {_snippet(review['body'])}",
                 rest=True,
                 created=review.get("created"),
+                talk=bool(review["body"].strip()),
             )
     for thread in pr["threads"]:
         for index, comment in enumerate(thread["comments"]):
@@ -791,6 +811,7 @@ def _talk_events(pr: Json, events: _Events, known_bots: tuple[str, ...], mine: s
                 f"c:{comment['id']}",
                 f"{kind} from {login} on {thread['where']}: {_snippet(comment['body'])}",
                 created=comment["created"],
+                talk=True,
             )
 
 

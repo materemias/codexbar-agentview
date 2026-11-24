@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Features
+
+- A babysat pull request's comments from people get answered by the agent until it merges or closes.
+
 ## 1.0.0 (2026-11-21)
 
 ### Breaking
