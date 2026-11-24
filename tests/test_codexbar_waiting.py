@@ -1175,11 +1175,12 @@ class PrTests(Case):
         seen = self.wait_of(review)
         self.assertEqual((seen["state"], seen["ball"]), ("waiting", "on_machine"))
 
-    def test_a_review_landing_with_a_comment_sends_only_its_fix(self) -> None:
+    def test_a_comment_before_the_reviewed_push_is_answered_beside_the_fix(self) -> None:
+        # The fix prompt handles only comments newer than the push; this one may be older.
         self.commented(fired=True)
         self.assertEqual(
-            [prompt["text"] for prompt in self.run_cli("claim-prompts", "--session", SID)["prompts"]],
-            ["fix o/r#7 at abc123"],
+            [entry["text"] for entry in self.state()["sessions"][SID]["prompt_queue"]],
+            ["answer o/r#7:\n- comment from alice: #1\n", "fix o/r#7 at abc123"],
         )
 
     def test_without_the_fix_a_comment_comes_to_me(self) -> None:

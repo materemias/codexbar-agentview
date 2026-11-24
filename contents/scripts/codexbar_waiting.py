@@ -2861,11 +2861,11 @@ def _apply_poll(state: dict, record: dict, wait: dict, result: dict, now: dateti
             _log(record, now, wait, event["text"])
             if event.get("talk") and _hears_comments(wait):
                 talk.append(event)
+    if talk:
+        _answer_comments(state, record, wait, talk, now)
     # A head its last round was on doesn't fire it again (`_next_round`).
     round_head = wait.get("round_head")
     fired = bool(result.get("fired")) and not (round_head and result.get("head") == round_head)
-    if talk and not (fired and wait["prompt"]):  # The review fix answers them too.
-        _answer_comments(state, record, wait, talk, now)
     error = result.get("error")
     if error:
         if result.get("transient"):
