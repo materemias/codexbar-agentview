@@ -3538,18 +3538,19 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	if verdict then
 		table.insert(kids, withp(ui.text({ ui.span(closeText, if verdict == "safe" then "success" elseif verdict == "park" then "warning" else "muted") }), { key = "close", role = "codexbar.close" }))
 	end
-	-- As the card's On you: each wait that came, what came, and for a review the start of the agent's reply.
+	-- As the card's On you: each wait that came, what came, and for a review the agent's reply.
 	local onYou = if type(r.on_you) == "table" and #r.on_you > 0 then r.on_you else nil
 	if onYou then
 		local lines: { Node } = {}
-		for i, o in onYou do
+		for _, o in onYou do
+			local id = str(o.id)
 			table.insert(lines, withp(ui.text({
 				ui.span(str(o.mark) .. clip(oneLine(o.label), 80), "strong"),
 				ui.span("  " .. clip(oneLine(o.text), 160), "warning"),
-			}), { key = "on-you-" .. i }))
+			}), { key = "on-you-" .. id }))
 			local report = oneLine(o.report)
 			if report ~= "" then
-				table.insert(lines, withp(ui.text({ ui.span(clip(report, 240), "muted") }), { key = "report-" .. i }))
+				table.insert(lines, withp(ui.text({ ui.span(clip(report, 400), "muted") }), { key = "report-" .. id }))
 			end
 		end
 		table.insert(kids, detailLines("on-you", "On you", lines))
