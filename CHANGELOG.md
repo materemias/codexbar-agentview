@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.1 (2026-11-26)
+
 ### Breaking
 
 - The omp extension needs omp 19.2.1 or later.

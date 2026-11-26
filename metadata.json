@@ -9,7 +9,7 @@
         "Icon": "applications-development",
         "Id": "io.github.materemias.codexbaragentview",
         "Name": "CodexBar AgentView",
-        "Version": "1.0.0",
+        "Version": "1.0.1",
         "License": "MIT",
         "Website": "https://github.com/materemias/codexbar-agentview"
     },
