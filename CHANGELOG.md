@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Fixes
+
+- The selected Waiting row says what came once, in On you.
+- On you leaves out what came when it only repeats the wait's label.
+
 ## 1.0.2 (2026-11-26)
 
 ### Features

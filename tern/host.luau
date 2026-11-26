@@ -3423,7 +3423,7 @@ local function waitingTime(r: any, now: number): (string, string)
 end
 
 -- A do block: the main chunk is at Luau's 200-local limit.
-local addWaitingRow: (kids: { Node }, r: any, now: number, q: string, state: string) -> ()
+local addWaitingRow: (kids: { Node }, r: any, now: number, q: string, state: string, peeked: boolean) -> ()
 do
 	local OUTCOMES = {
 		fulfilled = { prefix = "✅ ", tone = "success" },
@@ -3435,8 +3435,8 @@ do
 	-- The close verdict's mark, left of the state.
 	local CLOSE_MARK = { safe = { "✓", "success" }, manual = { "↺", "muted" }, park = { "⏸", "warning" } }
 
-	-- The row, then what happened under it, in the outcome's tone.
-	addWaitingRow = function(kids, r, now, q, state)
+	-- The row, then what happened under it, in the outcome's tone, unless its peek's On you tells it.
+	addWaitingRow = function(kids, r, now, q, state, peeked)
 		local onMe = r.ball == "on_me"
 		local outcome = OUTCOMES[r.outcome]
 		local label: { Span | string } = {}
@@ -3484,7 +3484,7 @@ do
 			tone = if outcome then outcome.tone elseif onMe then "warning" else nil,
 			role = "codexbar.waiting",
 		}))
-		if headline ~= "" then
+		if headline ~= "" and not (peeked and type(r.on_you) == "table" and #r.on_you > 0) then
 			table.insert(kids, withp(ui.text({ ui.span(clip(headline, 100), outcome.tone) }), { key = "hl-" .. waitKey(r), role = "codexbar.headline" }))
 		end
 	end
@@ -3657,7 +3657,8 @@ local function waitingView(b: Block, now: number, into: { Node })
 	for _, g in waitingGroups(q) do
 		table.insert(kids, groupHead("w-" .. g.ball.id, { ui.span(g.ball.title, "strong"), ui.span("  " .. #g.rows, "muted") }))
 		for _, r in g.rows do
-			addWaitingRow(kids, r, now, q, g.states[r])
+			local peeked = sel ~= nil and sel.key == waitKey(r)
+			addWaitingRow(kids, r, now, q, g.states[r], peeked)
 			local waitingFor = oneLine(r.waiting_for)
 			if waitingFor ~= "" and waitingFor ~= waitTitle(r) then -- a pane record named by the text says it already
 				local spans: { any } = { ui.span("Waiting for: ", "muted") }
@@ -3666,7 +3667,7 @@ local function waitingView(b: Block, now: number, into: { Node })
 				end
 				table.insert(kids, withp(ui.text(spans), { key = "wf-" .. waitKey(r), role = "codexbar.waitingfor" }))
 			end
-			if sel and sel.key == waitKey(r) then
+			if peeked then
 				table.insert(kids, waitingPeek(b, r, now))
 			end
 		end

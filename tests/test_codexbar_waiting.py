@@ -3523,6 +3523,12 @@ class SeenStopTests(SessionPrCase):
         seen = self.session()
         self.assertEqual((seen["on_you"], seen["stoppable"]), ([], 1))
 
+    def test_on_you_leaves_out_what_came_when_it_only_repeats_the_label(self) -> None:
+        said = self.wait_of(self.fired())["fired_text"]
+        self.run_cli("mark-seen", "--session", SID)
+        self.fired(label=said)
+        self.assertEqual([entry["text"] for entry in self.session()["on_you"]], [""])
+
     def test_a_pane_has_on_you_and_stoppable_too(self) -> None:
         self.run_cli("add", "--pane", "51", "--kind", "job")
         pane = self.run_cli("list")["panes"][0]

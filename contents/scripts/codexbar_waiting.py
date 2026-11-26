@@ -3942,12 +3942,14 @@ def _extension_panes(state: dict, agents: Agents, now: datetime) -> dict:
 
 
 def _on_you_text(view: dict) -> str:
-    """What came of an on_me wait, in a few words."""
-    if view["outcome"] == "attention":
-        return view["reason"] or view["label"]
+    """What came of an on_me wait, in a few words; empty when they would only repeat its label."""
     if view["outcome"] == "overdue":
         return view["reason"] or REASON_OVERDUE
-    return REASON_REVIEW if view["state"] == "review" else view["fired_text"]
+    if view["outcome"] == "attention":
+        text = view["reason"]
+    else:
+        text = REASON_REVIEW if view["state"] == "review" else view["fired_text"]
+    return "" if not text or text == view["label"] else text
 
 
 def _target_view(
