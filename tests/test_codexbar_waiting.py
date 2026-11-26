@@ -6758,6 +6758,7 @@ class PruneTests(Case):
 
 
 EXTENSION_PATH = Path(__file__).resolve().parents[1] / "omp-extension" / "waitingfor.ts"
+OMP_HOST_STUB = Path(__file__).resolve().parent / "omp_host_stub.mjs"
 
 
 @contextlib.contextmanager
@@ -6801,9 +6802,8 @@ const chain = new Proxy(function () {}, { get: () => chain, apply: () => chain }
 const handlers = {};
 const commands = {};
 let tool;
-class Text { constructor(text = "") { this.text = text; } setText(text) { this.text = text; } render() { return [this.text]; } describe() { return {}; } }
 const load = (api = {}) => extension.default({
-    zod: chain, logger: { debug() {} }, sendUserMessage() {}, pi: { Text },
+    zod: chain, logger: { debug() {} }, sendUserMessage() {},
     on: (name, fn) => { handlers[name] = fn; }, registerCommand: (name, spec) => { commands[name] = spec; },
     registerShortcut() {}, registerTool: (spec) => { tool = spec; }, ...api,
 });
@@ -6952,7 +6952,7 @@ def run_extension_driver(test: unittest.TestCase, code: str, **env: str) -> dict
         script = Path(folder) / "driver.mjs"
         script.write_text(code, encoding="utf-8")
         done = subprocess.run(
-            ["bun", "run", str(script)], cwd=folder, capture_output=True, encoding="utf-8", timeout=60,
+            ["bun", "run", "--preload", str(OMP_HOST_STUB), str(script)], cwd=folder, capture_output=True, encoding="utf-8", timeout=60,
             env={**os.environ, "EXTENSION": str(EXTENSION_PATH), **env},
         )
     test.assertEqual(done.returncode, 0, done.stderr)
@@ -7093,7 +7093,7 @@ console.log(JSON.stringify([
     row(safe, { checked_at: at(1), error: "boom", error_kind: "partial" }),
     row(null, { checked_at: at(20) }),
     [80, 40, 20].map((width) => [Bun.stringWidth(narrow(width)), narrow(width).replace(/\x1b\[\d+m/g, "")]),
-    rowNode(session(park), closeVerdict(session(park), checked, now)).c.map((node) => node.p.text ?? node.p.spans),
+    rowNode(session(park), closeVerdict(session(park), checked, now)).props.children.map((node) => node.props.text ?? node.props.spans),
 ]));
 """, TERN_PANE=pane)
 
@@ -7197,7 +7197,7 @@ const ctx = {
 handlers.session_start({}, ctx);
 await Bun.sleep(300);
 await commands.wait.handler("", ctx);
-const panel = widgets["waitingfor-panel"]?.(null, { fg: (_tone, text) => text })?.render(200).join("\n") ?? null;
+const panel = widgets["waitingfor-panel"]?.(null, { fg: (_tone, text) => text })?.render(200).map((row) => row.slice(1)).join("\n") ?? null;
 handlers.session_shutdown();
 console.log(JSON.stringify({ shutdown, panel, left: choices.length }));
 process.exit(0);
@@ -7315,7 +7315,7 @@ const result = call.tool
     ? await tool.execute("t", call.tool, null, null, ctx).then((answer) => JSON.parse(answer.content[0].text), (error) => ({ error: error.message }))
     : null;
 if (!call.tool) await commands.wait.handler(call.line, ctx);
-const panel = widgets["waitingfor-panel"]?.(null, { fg: (_tone, text) => text })?.render(200).join("\n") ?? null;
+const panel = widgets["waitingfor-panel"]?.(null, { fg: (_tone, text) => text })?.render(200).map((row) => row.slice(1)).join("\n") ?? null;
 handlers.session_shutdown();
 const calls = log().filter((args) => ["add", "stop", "snooze"].includes(args[0]));
 console.log(JSON.stringify({ shutdown, panel, calls, titles, left: choices.length + lines.length, result }));

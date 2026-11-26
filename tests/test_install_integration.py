@@ -329,7 +329,8 @@ class IntegrationPlatformTests(unittest.TestCase):
         )
         # setUp mocks subprocess.run; Popen is the real one.
         with subprocess.Popen(
-            ["bun", "run", str(driver)], cwd=self.home, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            ["bun", "run", "--preload", str(Path(__file__).resolve().parent / "omp_host_stub.mjs"), str(driver)],
+            cwd=self.home, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             env={**os.environ, "LOADER": str(self.omp_link)},
         ) as done:
             stdout, stderr = done.communicate(timeout=60)

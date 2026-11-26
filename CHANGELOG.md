@@ -2,9 +2,17 @@
 
 ## Unreleased
 
+### Breaking
+
+- The omp extension needs omp 19.2.1 or later.
+
 ### Features
 
 - A babysat pull request's comments from people get answered by the agent until it merges or closes.
+
+### Fixes
+
+- The `/wait` row and panel above the omp composer draw again on omp 19.2.
 
 ## 1.0.0 (2026-11-21)
 

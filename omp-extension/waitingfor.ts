@@ -11,6 +11,7 @@ import { execFile } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { jsx, nativeRendering } from "@oh-my-pi/pi-tui";
 
 const SCRIPTS = path.join(path.dirname(fs.realpathSync(import.meta.path)), "..", "contents", "scripts");
 const CLI = path.join(SCRIPTS, "codexbar_waiting.py");
@@ -644,14 +645,11 @@ export function rowNode(session, close?, href?: string) {
 	const { mark, text, detail } = rowParts(session);
 	const role = `codexbar.wait-row${TONES[session.outcome] ? `.${session.outcome}` : ""}`;
 	const children = [
-		{ k: "text", p: { role: "codexbar.wait-mark", text: mark, wrap: "none" } },
-		{
-			k: "text",
-			p: { role: "codexbar.wait-text", wrap: "none", spans: [{ t: text, s: "strong" }, ...(detail ? [{ t: ` · ${detail}`, s: "muted" }] : [])] },
-		},
+		jsx("text", { role: "codexbar.wait-mark", text: mark, wrap: "none" }),
+		jsx("text", { role: "codexbar.wait-text", wrap: "none", spans: [{ t: text, s: "strong" }, ...(detail ? [{ t: ` · ${detail}`, s: "muted" }] : [])] }),
 	];
-	if (close?.text) children.push({ k: "badge", p: { role: "codexbar.wait-close", text: close.text, tone: CLOSE_TONES[close.verdict] ?? "muted" } });
-	return { k: "row", p: { role, align: "center", gap: "sm", ...(href ? { href, actions: { click: "open" } } : {}) }, c: children };
+	if (close?.text) children.push(jsx("badge", { role: "codexbar.wait-close", text: close.text, tone: CLOSE_TONES[close.verdict] ?? "muted" }));
+	return jsx("row", { role, align: "center", gap: "sm", ...(href ? { href, actions: { click: "open" } } : {}), children });
 }
 
 /** An ISO time as the panel shows it, without seconds and year. */
@@ -1328,37 +1326,33 @@ export default function (pi) {
 		shownLine = shown;
 		// omp draws widgets in the order they were set: the warning, the row, then the panel.
 		ctx.ui.setWidget(HEALTH, warning && ((_tui, theme) => panelComponent((t) => t.fg("warning", warning), theme)), { placement: "aboveEditor" });
-		// In Tern a click on the row opens the session's card.
-		const href = process.env.TERN_PANE ? `codexbar-agentview://card/${sessionId}` : undefined;
-		const [open, close] = href ? [`\x1b]8;;${href}\x1b\\`, "\x1b]8;;\x1b\\"] : ["", ""];
+		// Drawn natively (Tern), the row is a node: a plain click opens the session's card and
+		// codexbar.css shapes it. Drawn as cells, it is rows, linked to the card inside a Tern pane.
+		const href = `codexbar-agentview://card/${sessionId}`;
+		const [open, close] = process.env.TERN_PANE ? [`\x1b]8;;${href}\x1b\\`, "\x1b]8;;\x1b\\"] : ["", ""];
 		const widget = (_tui, theme) => {
-			// Tern's native view paints an undescribed widget as terminal cells, where the link shows
-			// no pointer and no hover. Described, the row opens its card on a plain click (a span link
-			// would want Ctrl), and codexbar.css shapes it. The same node object while the row holds
-			// lets omp skip it.
 			const node = rowNode(session, verdict, href);
-			return {
-				...panelComponent((t, width) => open + rowText(session, t, verdict, width) + close, theme),
-				describe: () => node,
-			};
+			const rows = panelComponent((t, width) => open + rowText(session, t, verdict, width) + close, theme);
+			return () => (nativeRendering() ? node : jsx("canvas", { paint: rows.render }));
 		};
 		ctx.ui.setWidget(WIDGET, row ? widget : undefined, { placement: "aboveEditor" });
 		if (panel) drawPanel(ctx);
 	}
 
+	/** Rows of `build`'s text at the width omp offers, wrapped inside a one-column margin. */
 	function panelComponent(build, theme) {
-		let width: number | undefined;
-		let text;
 		return {
 			render(available: number) {
-				if (available !== width) {
-					width = available;
-					text = new pi.pi.Text(build(theme, available - 2), 1, 0);
-				}
-				return text.render(available);
-			},
-			invalidate() {
-				width = undefined;
+				const width = Math.max(1, available - 2);
+				// Each row is styled on its own: a style still open where a line ends opens again on the next.
+				let carried = "";
+				return build(theme, width)
+					.split("\n")
+					.flatMap((line) => {
+						const rows = Bun.wrapAnsi(carried + line, width, { hard: true, trim: false }).split("\n");
+						for (const [sgr] of line.matchAll(/\x1b\[[\d;:]*m/g)) carried = sgr === "\x1b[0m" || sgr === "\x1b[m" ? "" : carried + sgr;
+						return rows.map((row) => ` ${row}`);
+					});
 			},
 		};
 	}

@@ -157,7 +157,7 @@ build, so there usage comes from Meridian only, or you turn it off.
 | --- | :---: | :---: | --- |
 | [Tern](https://stencil.so/tern) 0.9.23 or later | Required | | The extension |
 | Python 3.10+ | Required | Required | The shared helpers |
-| [omp](https://github.com/can1357/oh-my-pi) | Optional | Optional | `/wait`, the agent's `waitingfor` tool, the row above the composer and prompt delivery for set-aside sessions |
+| [omp](https://github.com/can1357/oh-my-pi) 19.2.1 or later | Optional | Optional | `/wait`, the agent's `waitingfor` tool, the row above the composer and prompt delivery for set-aside sessions |
 | [`gh`](https://cli.github.com), logged in | Optional | Optional | Pull request and release waits |
 | [`codexbar`](https://github.com/steipete/CodexBar) CLI | Optional | Optional | Usage, which you can turn off. Agents, History and Waiting work without it; with Meridian, so do Claude and Codex seats |
 | [Meridian](https://github.com/rynfar/meridian) | Optional | Optional | Claude accounts and ChatGPT seats read from its usage poll |

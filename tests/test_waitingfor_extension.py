@@ -47,9 +47,8 @@ const handlers = {};
 const commands = {};
 let tool;
 const sent = [];
-class Text { constructor(text = "") { this.text = text; } setText(text) { this.text = text; } render() { return [this.text]; } describe() { return {}; } }
 install({
-    zod: chain, logger: { debug() {} }, pi: { Text },
+    zod: chain, logger: { debug() {} },
     sendUserMessage(text) {
         sent.push(text);
         if (process.env.DROP) return Promise.reject(Object.assign(new Error("dropped"), { name: "PromptDroppedError" }));
@@ -81,7 +80,7 @@ if (call.line) await commands.wait.handler(call.line, ctx);
 if (call.prompts) for (let i = 0; i < 200 && acks().length < call.prompts; i++) await Bun.sleep(50);
 // A tool call's answer is final; a line or prompts wait for the panel's refresh and any late send.
 if (!call.tool) await Bun.sleep(300);
-const panel = widgets["waitingfor-panel"]?.(null, { fg: (_tone, text) => text })?.render(200).join("\n") ?? null;
+const panel = widgets["waitingfor-panel"]?.(null, { fg: (_tone, text) => text })?.render(Number(process.env.PANEL_WIDTH || 200)).map((row) => row.slice(1)).join("\n") ?? null;
 handlers.session_shutdown();
 console.log(JSON.stringify({ panel, result, sent, acks: acks() }));
 process.exit(0);
@@ -122,6 +121,10 @@ console.log(JSON.stringify(["2026-11-07 10:30am standup", "snooze 2026-11-07 9.3
         # The check's own -- became the prompt's: the reading shows it.
         answer = self.drive({"line": "check ! grep -q -- x f -- tell me"})
         self.assertIn("Check: grep -q · prompt: x f -- tell me", answer["panel"] or "", answer)
+
+    def test_a_narrow_help_keeps_each_description_indented_under_its_form(self) -> None:
+        panel = self.drive({"line": "help"}, PANEL_WIDTH="40")["panel"] or ""
+        self.assertIn("/wait help\n    this help", panel)
 
     def test_a_cli_timeout_says_the_change_may_have_been_saved(self) -> None:
         # The fake answers `stop` after 5 s; the other calls, a fresh Python each, finish well within 0.5 s.
