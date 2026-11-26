@@ -386,9 +386,10 @@ pane to park, so it closes the session, and refuses when that isn't safe.
 its meaning:
 
 - **Seen** says you've read what came. It is offered only when something is on
-  you, and closes exactly those waits. The card lists them under **On you**,
-  each with what came and, for "ran, take a look", the start of the agent's
-  last message, so you can read it before pressing Seen.
+  you, and closes exactly those waits. The card and the selected row on the
+  Waiting tab list them under **On you**, each with what came and, for "ran,
+  take a look", the start of the agent's last message, so you can read it
+  before pressing Seen.
 - **Stop** ends waits still watched: `×` beside one wait on the card ends that
   one, and **Stop N waits…** ends all of them after a second press. Stopping a
   step never starts the step chained after it: the steps behind it stop too.

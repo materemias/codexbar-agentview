@@ -3527,7 +3527,7 @@ do
 	end
 end
 
--- The selected row: my sentence and the buttons; Space adds the rest of the record.
+-- The selected row: my sentence, what is on me (what Seen closes) and the buttons; Space adds the rest of the record.
 local function waitingPeek(b: Block, r: any, now: number): Node
 	local kids: { Node } = {}
 	local note = oneLine(r.note)
@@ -3537,6 +3537,22 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	local verdict, closeText = closeVerdict(r)
 	if verdict then
 		table.insert(kids, withp(ui.text({ ui.span(closeText, if verdict == "safe" then "success" elseif verdict == "park" then "warning" else "muted") }), { key = "close", role = "codexbar.close" }))
+	end
+	-- As the card's On you: each wait that came, what came, and for a review the start of the agent's reply.
+	local onYou = if type(r.on_you) == "table" and #r.on_you > 0 then r.on_you else nil
+	if onYou then
+		local lines: { Node } = {}
+		for i, o in onYou do
+			table.insert(lines, withp(ui.text({
+				ui.span(str(o.mark) .. clip(oneLine(o.label), 80), "strong"),
+				ui.span("  " .. clip(oneLine(o.text), 160), "warning"),
+			}), { key = "on-you-" .. i }))
+			local report = oneLine(o.report)
+			if report ~= "" then
+				table.insert(lines, withp(ui.text({ ui.span(clip(report, 240), "muted") }), { key = "report-" .. i }))
+			end
+		end
+		table.insert(kids, detailLines("on-you", "On you", lines))
 	end
 	local prs = prNodes(r, false)
 	if #prs > 0 then
@@ -3549,7 +3565,6 @@ local function waitingPeek(b: Block, r: any, now: number): Node
 	local rowKey = waitKey(r)
 	local live = waitLive(r)
 	local buttons: { Node } = {}
-	local onYou = if type(r.on_you) == "table" and #r.on_you > 0 then r.on_you else nil
 	if onYou then
 		table.insert(buttons, button("Seen", "wait_seen", { variant = "primary", title = "Close what came: " .. oneLine(onYou[1].label) .. (if #onYou > 1 then " and " .. (#onYou - 1) .. " more" else "") }))
 	end
