@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 1.0.2 (2026-11-26)
+
 ### Features
 
 - The selected Waiting row lists what's on you, what Seen closes, with the agent's reply.
