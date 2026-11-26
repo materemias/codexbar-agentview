@@ -2,16 +2,16 @@
 
 ## Unreleased
 
-### Fixes
-
-- The selected Waiting row says what came once, in On you.
-- On you leaves out what came when it only repeats the wait's label.
-
 ## 1.0.2 (2026-11-26)
 
 ### Features
 
 - The selected Waiting row lists what's on you, what Seen closes, with the agent's reply.
+
+### Fixes
+
+- The selected Waiting row says what came once, in On you.
+- On you leaves out what came when it only repeats the wait's label.
 
 ## 1.0.1 (2026-11-26)
 
